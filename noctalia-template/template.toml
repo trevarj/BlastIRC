@@ -1,0 +1,11 @@
+# Standalone Noctalia TemplateEngine target: noctalia theme IMAGE -c template.toml.
+# For Settings -> Templates registration, install the supplied user.toml fragment.
+[catalog.blastirc]
+name = "BlastIRC"
+category = "chat"
+
+[templates.blastirc]
+input_path = "palette.toml"
+output_path = "$XDG_CONFIG_HOME/blastirc/noctalia.toml"
+post_hook = "sh '{{ config_dir }}/apply.sh'"
+undo_hook = "sh '{{ config_dir }}/undo.sh'"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=BlastIRC
+Comment=Graphical IRCv3 chat with Emacs-style workspaces
+Exec=blastirc
+Icon=io.github.trevarj.blastirc
+Terminal=false
+Categories=Network;IRCClient;Chat;
+StartupWMClass=io.github.trevarj.blastirc

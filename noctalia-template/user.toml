@@ -1,0 +1,8 @@
+# Place this directory at <Noctalia config>/templates/blastirc/, then copy this
+# file to <Noctalia config>/blastirc.toml. Enable BlastIRC in Settings -> Templates.
+# Noctalia user templates do not run undo_hook: run the supplied undo.sh on removal.
+[theme.templates.user.blastirc]
+enabled = false
+input_path = "templates/blastirc/palette.toml"
+output_path = "$XDG_CONFIG_HOME/blastirc/noctalia.toml"
+post_hook = "sh '{{ config_dir }}/templates/blastirc/apply.sh'"

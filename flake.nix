@@ -1,0 +1,197 @@
+{
+  description = "BlastIRC native Wayland IRCv3 desktop client";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  outputs =
+    { self, nixpkgs }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs { inherit system; };
+      noctaliaSource = pkgs.fetchzip {
+        url = "https://github.com/trevarj/noctalia/archive/ad60f4c2a8841ce25c78f9d6ac8c111523fa34b6.tar.gz";
+        hash = "sha256-CVNuQ+DwKglOsJFgKQxwvL85A1hh7k+/aA+EPr9QgKU=";
+      };
+      # Match the headers required by the pinned upstream lib/meson.build.
+      stbHeaders = pkgs.stb.overrideAttrs (_: {
+        version = "unstable-2025-10-26";
+        src = pkgs.fetchFromGitHub {
+          owner = "nothings";
+          repo = "stb";
+          rev = "f1c79c02822848a9bed4315b12c8c8f3761e1296";
+          hash = "sha256-BlyXJtAI7WqXCTT3ylww8zoG0hBxaojJnQDvdQOXJPE=";
+        };
+      });
+      dependencies =
+        (with pkgs; [
+          sdl3
+          sdl3-mixer
+          openssl
+          curl
+          sqlite
+          tomlplusplus
+          wayland
+          wayland-protocols
+          libglvnd
+          freetype
+          fontconfig
+          cairo
+          pango
+          harfbuzz
+          libxkbcommon
+          glib
+          nlohmann_json
+          librsvg
+          libwebp
+          libjxl
+          libheif
+          libxml2
+          mpv-unwrapped
+          hunspell
+          hunspellDicts.en_US
+        ])
+        ++ [ stbHeaders ];
+      nativeTools = with pkgs; [
+        meson
+        ninja
+        pkg-config
+        wayland-scanner
+      ];
+      noctaliaDirectory = "noctalia-ad60f4c2a8841ce25c78f9d6ac8c111523fa34b6";
+      prepareNoctalia = ''
+        if [ ! -d subprojects/${noctaliaDirectory} ]; then
+          mkdir -p subprojects
+          cp -R "$NOCTALIA_UI_SOURCE_DIR" subprojects/${noctaliaDirectory}
+          chmod -R u+w subprojects/${noctaliaDirectory}
+        fi
+      '';
+    in
+    {
+      packages.${system}.default = pkgs.stdenv.mkDerivation {
+        pname = "blastirc";
+        version = "0.1.0";
+        meta.license = pkgs.lib.licenses.mit;
+        src = pkgs.lib.cleanSourceWith {
+          src = self;
+          filter =
+            path: type:
+            let
+              relative = pkgs.lib.removePrefix (toString self + "/") (toString path);
+            in
+            !(builtins.elem (builtins.baseNameOf path) [
+              "result"
+              ".direnv"
+              ".git"
+              ".cache"
+              ".env"
+              "__pycache__"
+            ])
+            && !(type == "directory" && pkgs.lib.hasPrefix "build" relative)
+            && relative != "output"
+            && relative != "profiles"
+            && relative != "subprojects/noctalia-ui"
+            && !(type == "directory" && pkgs.lib.hasPrefix "subprojects/noctalia-" relative)
+            && relative != "subprojects/packagecache"
+            && relative != "subprojects/.wraplock";
+        };
+        nativeBuildInputs =
+          nativeTools
+          ++ (with pkgs; [
+            makeWrapper
+            autoAddDriverRunpath
+          ]);
+        buildInputs = dependencies;
+        NOCTALIA_UI_SOURCE_DIR = noctaliaSource;
+        postPatch = prepareNoctalia;
+        mesonBuildType = "release";
+        mesonFlags = [
+          "-Dtests=true"
+          "-Dfont_dir=${pkgs.nerd-fonts.jetbrains-mono}/share/fonts"
+          "-Demoji_dir=${pkgs.noto-fonts-color-emoji}/share/fonts"
+          "-Ddictionary_dir=${pkgs.hunspellDicts.en_US}/share/hunspell"
+        ];
+        doCheck = true;
+        preCheck = ''
+          export XDG_CACHE_HOME="$TMPDIR/blastirc-test-cache"
+          export XDG_CONFIG_HOME="$TMPDIR/blastirc-test-config"
+          export XDG_DATA_HOME="$TMPDIR/blastirc-test-data"
+          mkdir -m 700 -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
+          export FONTCONFIG_FILE="${
+            pkgs.makeFontsConf {
+              includes = [ "${pkgs.fontconfig.out}/etc/fonts/conf.d" ];
+              impureFontDirectories = [ ];
+              fontDirectories = [
+                "${pkgs.dejavu_fonts}/share/fonts"
+                "${pkgs.nerd-fonts.jetbrains-mono}/share/fonts"
+              ];
+            }
+          }"
+        '';
+        postInstall = ''
+          install -Dm644 ${pkgs.hunspellDicts.en_US}/share/doc/hunspell-dict-en-us-wordlist.txt \
+            $out/share/licenses/blastirc/hunspell-en_US-README.txt
+        '';
+        postFixup = ''
+          wrapProgram $out/bin/blastirc \
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.libnotify ]} \
+            --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libheif ]}
+          substituteInPlace $out/share/blastirc/noctalia-template/apply.sh \
+            --replace-fail 'pkill -USR1' '${pkgs.procps}/bin/pkill -USR1' \
+            --replace-fail '$(id -u)' '$(${pkgs.coreutils}/bin/id -u)'
+          substituteInPlace $out/share/blastirc/noctalia-template/undo.sh \
+            --replace-fail 'rm -f' '${pkgs.coreutils}/bin/rm -f' \
+            --replace-fail 'dirname --' '${pkgs.coreutils}/bin/dirname --'
+        '';
+      };
+      devShells.${system} = {
+        icon-studio = pkgs.mkShellNoCC {
+          packages = [ (pkgs.python3.withPackages (ps: [ ps.pillow ])) ];
+        };
+        default = pkgs.mkShell {
+          packages =
+            dependencies
+            ++ nativeTools
+            ++ (with pkgs; [
+              gcc
+              gdb
+              clang-tools
+              nixfmt
+              desktop-file-utils
+              soju
+              znc
+              ergochat
+              (python3.withPackages (ps: [ ps.pillow ]))
+              imagemagick
+              tesseract
+              libnotify
+              procps
+              nodejs
+              ffmpeg
+              sway
+              wtype
+              wl-clipboard
+              wlrctl
+              grim
+              dbus
+              xdg-desktop-portal
+              xdg-desktop-portal-gtk
+              nerd-fonts.jetbrains-mono
+              noto-fonts-color-emoji
+            ]);
+          NOCTALIA_UI_SOURCE_DIR = noctaliaSource;
+          BLASTIRC_FONT_DIR = "${pkgs.nerd-fonts.jetbrains-mono}/share/fonts";
+          BLASTIRC_EMOJI_DIR = "${pkgs.noto-fonts-color-emoji}/share/fonts";
+          BLASTIRC_SPELL_DICT_DIR = "${pkgs.hunspellDicts.en_US}/share/hunspell";
+          BLASTIRC_PORTAL = "${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal";
+          BLASTIRC_PORTAL_BACKEND = "${pkgs.xdg-desktop-portal-gtk}/libexec/xdg-desktop-portal-gtk";
+          BLASTIRC_PORTAL_BACKEND_DIR = "${pkgs.xdg-desktop-portal-gtk}/share/xdg-desktop-portal/portals";
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libheif ];
+          shellHook = prepareNoctalia + ''
+            printf '%s\n' \
+              'Configure: meson setup build-native --wrap-mode=nodownload -Dfont_dir="$BLASTIRC_FONT_DIR" -Demoji_dir="$BLASTIRC_EMOJI_DIR" -Ddictionary_dir="$BLASTIRC_SPELL_DICT_DIR"' \
+              'Build: meson compile -C build-native' \
+              'Checks: meson test -C build-native --print-errorlogs' \
+              'Package: nix build path:.#default'
+          '';
+        };
+      };
+    };
+}

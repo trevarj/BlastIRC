@@ -1,0 +1,9 @@
+#pragma once
+#include <array>
+#include <cstdint>
+
+namespace blast {
+inline constexpr std::array<std::uint32_t, 16> ircPalette = {
+    0xffffff, 0x111111, 0x2456a6, 0x32a852, 0xd84848, 0x9e3b43, 0xa04ac1, 0xd98b34,
+    0xf0d74b, 0x65d176, 0x37b6b1, 0x66d6df, 0x6d89ef, 0xde74dc, 0x9299a4, 0xc7cbd1};
+}

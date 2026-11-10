@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BlastIRC · Icon studio</title>
+<style>
+  :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #eeeae5; background: #161616; font-synthesis: none; }
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  button, input { font: inherit; }
+  button, .import { cursor: pointer; }
+  button, .import, select { color: inherit; background: #252525; border: 1px solid #41403e; border-radius: 8px; padding: 9px 12px; }
+  button:hover, .import:hover { background: #35312c; }
+  :focus-visible { outline: 2px solid #ffab73; outline-offset: 4px; }
+  header { height: 82px; padding: 0 28px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #303030; gap: 20px; }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .brand img { width: 37px; height: 37px; object-fit: contain; }
+  h1 { font-size: 17px; margin: 0; letter-spacing: -.3px; }
+  .subtitle, .meta { color: #aaa49c; font-size: 12px; }
+  .subtitle { margin-top: 4px; }
+  .import { background: #e97f47; color: #22160f; border: 0; font-weight: 650; white-space: nowrap; }
+  .import:hover { background: #ff9b60; }
+  .layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: calc(100vh - 82px); }
+  aside { padding: 24px 16px; border-right: 1px solid #303030; }
+  .eyebrow { text-transform: uppercase; font-size: 10px; letter-spacing: 1.6px; color: #aaa49c; font-weight: 700; }
+  .library-heading { display: flex; justify-content: space-between; align-items: center; padding: 0 8px; }
+  .hint { color: #aaa49c; font-size: 12px; line-height: 1.6; margin: 12px 8px 20px; }
+  #library { display: grid; gap: 7px; }
+  .variant { width: 100%; display: flex; gap: 12px; align-items: center; text-align: left; background: transparent; border-color: transparent; padding: 9px; min-width: 0; }
+  .variant[aria-pressed="true"] { background: #35261e; border-color: #9c603b; }
+  .variant img, .variant svg { width: 46px; height: 46px; object-fit: contain; background: #272727; border-radius: 7px; flex: 0 0 auto; }
+  .variant .info { min-width: 0; }
+  .variant .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; margin-bottom: 5px; }
+  main { padding: 28px; min-width: 0; }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 18px; flex-wrap: wrap; margin-bottom: 22px; }
+  .controls { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  .segmented { display: flex; gap: 3px; padding: 3px; background: #202020; border: 1px solid #353535; border-radius: 9px; }
+  .segmented button { border: 0; padding: 7px 10px; background: transparent; font-size: 12px; }
+  .segmented button[aria-pressed="true"] { background: #48423b; color: #fff4e8; }
+  #zoom-control { display: flex; gap: 10px; align-items: center; font-size: 12px; color: #b8b1a7; }
+  input[type="range"] { width: 95px; accent-color: #ef9258; }
+  #zoom-value { width: 38px; font-variant-numeric: tabular-nums; }
+  #cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 18px; }
+  #cards.single { grid-template-columns: minmax(0, 1fr); }
+  .card { border: 1px solid #3a3835; border-radius: 14px; overflow: hidden; min-width: 0; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 18px; gap: 12px; background: #222120; }
+  h2 { font-size: 13px; margin: 0; overflow-wrap: anywhere; }
+  .card-head a { color: #e4b591; font-size: 11px; white-space: nowrap; }
+  .preview { height: clamp(260px, 42vw, 490px); padding: 38px; display: flex; justify-content: center; align-items: center; overflow: hidden; }
+  .hero-image { width: 100%; height: 100%; object-fit: contain; transform: scale(var(--zoom, 1)); }
+  .surface { background-color: #f1eee8; color: #48413a; }
+  body[data-background="dark"] .surface { background-color: #242424; color: #c9c2b9; }
+  body[data-background="checker"] .surface { background-color: #e8e4df; color: #48413a; background-image: conic-gradient(#d2cec8 25%, transparent 0 50%, #d2cec8 0 75%, transparent 0); background-size: 20px 20px; }
+  .sizes { display: flex; align-items: end; justify-content: center; flex-wrap: wrap; gap: 22px; padding: 24px 14px 20px; border-top: 1px solid #80808035; }
+  .size { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .size img { object-fit: contain; }
+  .size span { font-size: 10px; font-variant-numeric: tabular-nums; }
+  .card-foot { padding: 12px 18px; color: #a59d93; background: #222120; font-size: 11px; }
+  #status { min-height: 20px; color: #bdb4a8; font-size: 12px; margin: 19px 0 0; }
+  #status.error { color: #ffaf96; }
+  .empty { border: 1px dashed #625344; border-radius: 14px; padding: 80px 24px; text-align: center; color: #c7b8a7; grid-column: 1 / -1; }
+  #drop-overlay { position: fixed; inset: 12px; z-index: 10; border: 2px dashed #ffad70; border-radius: 18px; background: #241a12ee; display: none; place-items: center; pointer-events: none; font-size: 23px; }
+  body.dragging #drop-overlay { display: grid; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  @media (max-width: 1050px) { #cards { grid-template-columns: 1fr; } .preview { height: 350px; } }
+  @media (max-width: 640px) { header { padding: 0 16px; } .layout { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #303030; padding: 16px; } #library { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 220px; overflow-y: auto; } main { padding: 18px 16px; } .hint { margin-bottom: 12px; } }
+</style>
+<body data-background="light">
+  <header>
+    <div class="brand"><img src="/image/assets/icon.png" alt=""><div><h1>BlastIRC <span style="font-weight:400;color:#aaa49c">/ Icon studio</span></h1><div class="subtitle">Shape, color, and a little spark.</div></div></div>
+    <button class="import" id="import-button">+ Add variants</button>
+    <input id="file-input" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+  </header>
+  <div class="layout">
+    <aside aria-label="Variant library">
+      <div class="library-heading"><span class="eyebrow">Your variants</span><span class="meta" id="count">0</span></div>
+      <p class="hint">Select up to three to compare.<br>Drop images anywhere to add them.</p>
+      <div id="library"></div>
+    </aside>
+    <main>
+      <div class="toolbar">
+        <span class="eyebrow" id="view-label">Compare</span>
+        <div class="controls">
+          <div class="segmented" aria-label="Preview background" role="group">
+            <button data-background="light" aria-pressed="true">Light</button>
+            <button data-background="dark" aria-pressed="false">Dark</button>
+            <button data-background="checker" aria-pressed="false">Transparency</button>
+          </div>
+          <label id="zoom-control">Zoom <input id="zoom" type="range" min="50" max="200" value="100" step="10"><output id="zoom-value" for="zoom">100%</output></label>
+        </div>
+      </div>
+      <div id="cards"></div>
+      <p id="status" role="status" aria-live="polite">Loading your artwork…</p>
+    </main>
+  </div>
+  <div id="drop-overlay">Drop your next direction here</div>
+<script>
+  const library = document.querySelector('#library');
+  const cards = document.querySelector('#cards');
+  const status = document.querySelector('#status');
+  const fileInput = document.querySelector('#file-input');
+  const importButton = document.querySelector('#import-button');
+  let items = [];
+  let selected = [];
+  let fingerprint = '';
+  let initialized = false;
+  let uploading = false;
+  let refreshInFlight = null;
+  let persisted = {};
+  try { persisted = JSON.parse(localStorage.getItem('blastirc-icon-studio') || '{}') || {}; } catch {}
+  if (Array.isArray(persisted.selected)) selected = persisted.selected.filter(id => typeof id === 'string').slice(0, 3);
+  const backgrounds = ['light', 'dark', 'checker'];
+  document.body.dataset.background = backgrounds.includes(persisted.background) ? persisted.background : 'light';
+
+  function save() {
+    try { localStorage.setItem('blastirc-icon-studio', JSON.stringify({ selected, background: document.body.dataset.background })); } catch {}
+  }
+
+  function message(text, error = false) {
+    status.textContent = text;
+    status.classList.toggle('error', error);
+  }
+
+  function element(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function artwork(item, className = '') {
+    if (item.crop) {
+      const namespace = 'http://www.w3.org/2000/svg';
+      const viewport = document.createElementNS(namespace, 'svg');
+      viewport.setAttribute('viewBox', item.crop.join(' '));
+      viewport.setAttribute('class', className);
+      viewport.setAttribute('role', 'img');
+      viewport.setAttribute('aria-label', item.name);
+      const image = document.createElementNS(namespace, 'image');
+      image.setAttribute('href', item.url + '?v=' + item.revision);
+      image.setAttribute('width', item.sourceWidth);
+      image.setAttribute('height', item.sourceHeight);
+      viewport.append(image);
+      return viewport;
+    }
+    const image = element('img', className);
+    image.src = item.url + '?v=' + item.revision;
+    image.alt = item.name;
+    image.draggable = false;
+    return image;
+  }
+
+  function render() {
+    library.replaceChildren();
+    document.querySelector('#count').textContent = items.length;
+    for (const item of items) {
+      const button = element('button', 'variant');
+      button.title = item.name;
+      button.setAttribute('aria-pressed', String(selected.includes(item.id)));
+      const info = element('span', 'info');
+      info.append(element('span', 'name', item.name), element('span', 'meta', `${item.width} × ${item.height}`));
+      button.append(artwork(item), info);
+      button.addEventListener('click', () => {
+        if (selected.includes(item.id)) selected = selected.filter(id => id !== item.id);
+        else selected = [...selected.slice(-2), item.id];
+        save();
+        render();
+        library.querySelectorAll('button')[items.indexOf(item)]?.focus({ preventScroll: true });
+      });
+      library.append(button);
+    }
+    cards.replaceChildren();
+    cards.classList.toggle('single', selected.length === 1);
+    document.querySelector('#view-label').textContent = selected.length > 1 ? 'Side by side' : 'Inspect a variant';
+    if (!selected.length) cards.append(element('div', 'empty', 'Choose a variant from the library to begin.'));
+    for (const id of selected) {
+      const item = items.find(item => item.id === id);
+      if (!item) continue;
+      const card = element('article', 'card');
+      const heading = element('div', 'card-head');
+      const download = element('a', '', item.crop ? 'Download source sheet' : 'Download');
+      download.href = item.url;
+      download.download = item.id.split('/').pop().split('#')[0];
+      heading.append(element('h2', '', item.name), download);
+      const preview = element('div', 'preview surface');
+      preview.append(artwork(item, 'hero-image'));
+      const sizes = element('div', 'sizes surface');
+      sizes.setAttribute('aria-label', 'Icon sizes in CSS pixels');
+      for (const size of [16, 24, 32, 48, 64, 128]) {
+        const sample = element('div', 'size');
+        const image = artwork(item);
+        image.setAttribute('width', size);
+        image.setAttribute('height', size);
+        sample.append(image, element('span', '', `${size}`));
+        sizes.append(sample);
+      }
+      const detail = item.crop ? 'Concept sheet view · Background is baked in' : `${item.width} × ${item.height} source · Size previews in CSS pixels`;
+      card.append(heading, preview, sizes, element('div', 'card-foot', detail));
+      cards.append(card);
+    }
+  }
+
+  function refresh() {
+    if (refreshInFlight) return refreshInFlight;
+    refreshInFlight = loadLibrary();
+    return refreshInFlight;
+  }
+
+  async function loadLibrary() {
+    try {
+      const response = await fetch('/api/variants');
+      if (!response.ok) throw new Error('Could not load the library.');
+      const next = await response.json();
+      const sheet = next.find(item => item.id === 'output/imagegen/blastirc-ab-comparison.png');
+      const original = sheet ? [
+        { label: 'A', name: 'A · Refined original', x: 64 },
+        { label: 'B', name: 'B · Conversation bomb', x: 768 },
+      ].map(({ label, name, x }) => ({
+        ...sheet, id: sheet.id + '#' + label, name,
+        sourceWidth: sheet.width, sourceHeight: sheet.height,
+        width: 704, height: 800,
+        crop: [x * sheet.width / 1536, 64 * sheet.height / 1024,
+               704 * sheet.width / 1536, 800 * sheet.height / 1024],
+      })) : [];
+      next.unshift(...original);
+      const refined = [
+        ['output/imagegen/blastirc-A2-IRC.png', 'A2 · IRC lettering'],
+        ['output/imagegen/blastirc-B2-plain.png', 'B2 · Clean silhouette'],
+      ].map(([id, name]) => {
+        const item = next.find(item => item.id === id);
+        if (item) item.name = name;
+        return item;
+      }).filter(Boolean);
+      if (refined.length) next.splice(0, next.length, ...refined, ...next.filter(item => !refined.includes(item)));
+      const styles = [
+        ['output/imagegen/blastirc-A3-soft.png', 'A3 · Soft sculpted'],
+        ['output/imagegen/blastirc-A3-enamel.png', 'A3 · Satin enamel'],
+        ['output/imagegen/blastirc-A3-arcade.png', 'A3 · Glossy arcade'],
+      ].map(([id, name]) => {
+        const item = next.find(item => item.id === id);
+        if (item) item.name = name;
+        return item;
+      }).filter(Boolean);
+      if (styles.length) next.splice(0, next.length, ...styles, ...next.filter(item => !styles.includes(item)));
+      const creamsicle = [
+        ['output/imagegen/blastirc-A4-soft.png', 'A4 · Creamsicle soft'],
+        ['output/imagegen/blastirc-A4-ceramic.png', 'A4 · Creamsicle ceramic'],
+        ['output/imagegen/blastirc-A4-resin.png', 'A4 · Frosted resin'],
+      ].map(([id, name]) => {
+        const item = next.find(item => item.id === id);
+        if (item) item.name = name;
+        return item;
+      }).filter(Boolean);
+      if (creamsicle.length) next.splice(0, next.length, ...creamsicle, ...next.filter(item => !creamsicle.includes(item)));
+      const palette = [styles.find(item => item.id.endsWith('A3-soft.png')), creamsicle.find(item => item.id.endsWith('A4-soft.png'))].filter(Boolean);
+      const contenders = [
+        ['output/imagegen/blastirc-A5-precision.png', 'A5 · Precision creamsicle'],
+        ['output/imagegen/blastirc-A5-industrial.png', 'A5 · Industrial orange'],
+        ['output/imagegen/blastirc-A5-classic.png', 'A5 · Classic charcoal bomb'],
+      ].map(([id, name]) => {
+        const item = next.find(item => item.id === id);
+        if (item) item.name = name;
+        return item;
+      }).filter(Boolean);
+      if (contenders.length) next.splice(0, next.length, ...contenders, ...next.filter(item => !contenders.includes(item)));
+      const againstA4 = [creamsicle.find(item => item.id.endsWith('A4-soft.png')), ...contenders.filter(item => !item.id.endsWith('industrial.png'))].filter(Boolean);
+      const evolutions = [
+        ['output/imagegen/blastirc-A6-inset.png', 'A6 · Creamsicle inset'],
+        ['output/imagegen/blastirc-A6-graphite.png', 'A6 · Machined graphite'],
+        ['output/imagegen/blastirc-A6-duotone.png', 'A6 · Orange and charcoal'],
+      ].map(([id, name]) => {
+        const item = next.find(item => item.id === id);
+        if (item) item.name = name;
+        return item;
+      }).filter(Boolean);
+      if (evolutions.length) next.splice(0, next.length, ...evolutions, ...next.filter(item => !evolutions.includes(item)));
+      const orangeEvolution = [contenders.find(item => item.id.endsWith('precision.png')), ...evolutions.filter(item => !item.id.endsWith('graphite.png'))].filter(Boolean);
+      const graphiteEvolution = [contenders.find(item => item.id.endsWith('classic.png')), evolutions.find(item => item.id.endsWith('graphite.png'))].filter(Boolean);
+      const charcoalInset = next.find(item => item.id === 'output/imagegen/blastirc-A7-charcoal-inset.png');
+      if (charcoalInset) {
+        charcoalInset.name = 'A7 · Charcoal inset';
+        next.splice(0, next.length, charcoalInset, ...next.filter(item => item !== charcoalInset));
+      }
+      const insetComparison = [evolutions.find(item => item.id.endsWith('A6-inset.png')), charcoalInset].filter(Boolean);
+      const recent = charcoalInset ? [charcoalInset] : evolutions.length ? evolutions : contenders.length ? contenders : creamsicle.length ? creamsicle : styles.length ? styles : refined.length === 2 ? refined : original;
+      const nextFingerprint = JSON.stringify(next);
+      if (nextFingerprint !== fingerprint) {
+        items = next;
+        selected = selected.filter(id => items.some(item => item.id === id));
+        const comparison = new URLSearchParams(location.search).get('compare');
+        const comparisons = new Map([
+          ['original', original], ['refined', refined], ['styles', styles],
+          ['creamsicle', creamsicle], ['palette', palette], ['recent', recent],
+          ['contenders', contenders], ['against-a4', againstA4],
+          ['a6', evolutions], ['orange-evolution', orangeEvolution], ['graphite-evolution', graphiteEvolution],
+          ['a7', charcoalInset ? [charcoalInset] : []], ['inset-colors', insetComparison],
+        ]);
+        const requested = comparisons.get(comparison) || [];
+        if (!initialized && requested.length) {
+          selected = requested.map(item => item.id);
+        }
+        if (!initialized && !selected.length) selected = items.slice(0, 2).map(item => item.id);
+        initialized = true;
+        fingerprint = nextFingerprint;
+        render();
+      }
+      if (!uploading && (status.classList.contains('error') || status.textContent === 'Loading your artwork…')) {
+        message('Library updates automatically. Imports are saved locally.');
+      }
+    } catch (error) {
+      if (!uploading) message('Studio is offline. Restart the local server to reconnect.', true);
+    } finally {
+      refreshInFlight = null;
+    }
+  }
+
+  for (const button of document.querySelectorAll('button[data-background]')) {
+    button.setAttribute('aria-pressed', String(button.dataset.background === document.body.dataset.background));
+    button.addEventListener('click', () => {
+      document.body.dataset.background = button.dataset.background;
+      for (const other of document.querySelectorAll('button[data-background]')) other.setAttribute('aria-pressed', String(other === button));
+      save();
+    });
+  }
+  document.querySelector('#zoom').addEventListener('input', event => {
+    document.documentElement.style.setProperty('--zoom', event.target.value / 100);
+    document.querySelector('#zoom-value').textContent = event.target.value + '%';
+  });
+
+  async function upload(files) {
+    if (!files.length || uploading) return;
+    uploading = true;
+    importButton.disabled = true;
+    const added = [];
+    const errors = [];
+    for (const file of files) {
+      message(`Adding ${file.name}…`);
+      if (file.size > 20 * 1024 * 1024) {
+        errors.push(`${file.name}: maximum file size is 20 MB.`);
+        continue;
+      }
+      try {
+        const response = await fetch('/api/variants?name=' + encodeURIComponent(file.name), {
+          method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file,
+        });
+        if (!response.ok) throw new Error('Use PNG, JPEG, or WebP up to 20 MB and 20 megapixels.');
+        added.push((await response.json()).id);
+      } catch (error) { errors.push(`${file.name}: ${error.message}`); }
+    }
+    if (refreshInFlight) await refreshInFlight;
+    await refresh();
+    if (added.length) {
+      selected = [...selected, ...added].slice(-3);
+      save();
+      render();
+    }
+    uploading = false;
+    importButton.disabled = false;
+    message(errors.length ? errors.join(' ') : `Added ${added.length} variant${added.length === 1 ? '' : 's'}. Saved locally.`, errors.length > 0);
+    fileInput.value = '';
+  }
+  importButton.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => upload([...fileInput.files]));
+  let dragDepth = 0;
+  window.addEventListener('dragenter', event => {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    dragDepth++;
+    document.body.classList.add('dragging');
+  });
+  window.addEventListener('dragover', event => {
+    if (event.dataTransfer.types.includes('Files')) event.preventDefault();
+  });
+  window.addEventListener('dragleave', () => {
+    if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); }
+  });
+  window.addEventListener('drop', event => {
+    event.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove('dragging');
+    upload([...event.dataTransfer.files]);
+  });
+  refresh();
+  setInterval(() => { if (!document.hidden && !uploading) refresh(); }, 4000);
+</script>
+</body>
+</html>

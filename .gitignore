@@ -1,0 +1,14 @@
+/build*/
+/result
+/.direnv/
+/.cache/
+/.env
+/imgui.ini
+/output/
+/profiles/
+/subprojects/noctalia-ui/
+/subprojects/noctalia-*/
+/subprojects/packagecache/
+/subprojects/.wraplock
+*.bmp
+__pycache__/

@@ -1,0 +1,9 @@
+[wrap-file]
+directory = noctalia-ad60f4c2a8841ce25c78f9d6ac8c111523fa34b6
+source_url = https://github.com/trevarj/noctalia/archive/ad60f4c2a8841ce25c78f9d6ac8c111523fa34b6.tar.gz
+source_filename = noctalia-ad60f4c2a8841ce25c78f9d6ac8c111523fa34b6.tar.gz
+source_hash = 3364522d74e1b7f75f052e64e9d94a1ae831b0e50d5a06d70f63425f168163d3
+
+[provide]
+noctalia-ui = noctalia_ui_dep
+noctalia-ui-codecs = noctalia_ui_codecs_dep

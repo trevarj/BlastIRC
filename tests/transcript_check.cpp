@@ -1665,6 +1665,61 @@ void tightBubbleViewport(TranscriptTestRenderer &renderer, const char *kind) {
     assert(body(view, "Compact-11").row.height() < airyHeight);
     view.arrange(renderer, {17, 23, 900, 800});
     near(body(view, "Compact-11").row.height(), airyHeight);
+    if (std::string_view(kind) == "query") {
+        InputDispatcher dispatcher;
+        dispatcher.setSceneRoot(&view);
+        for (const auto *token : {"Compact-10", "Compact-11"}) {
+            revealBubbleText(renderer, view, {17, 23, 900, 800}, token, false);
+            const auto rendered = body(view, token);
+            auto *surface = bubbleSurface(rendered);
+            assert(surface && surface->x() > 0 &&
+                   surface->x() + surface->width() < rendered.row.width());
+            const float middleY = surface->y() + surface->height() * .5f;
+            const auto click = [&](float localX, float localY, int button, bool touch) {
+                float x, y;
+                Node::mapToScene(&rendered.row, localX, localY, x, y);
+                assert(dispatcher.pointerButton(x, y, button, true, 101, 1010, touch));
+                dispatcher.pointerButton(x, y, button, false, 102, 1020, touch);
+            };
+            for (const auto button : {BTN_LEFT, BTN_RIGHT})
+                for (const bool touch : {false, true}) {
+                    if (touch && button == BTN_RIGHT)
+                        continue;
+                    click(surface->x() * .5f, middleY, button, touch);
+                    assert(!host.open && model.actions.empty());
+                    click((surface->x() + surface->width() + rendered.row.width()) * .5f, middleY,
+                          button, touch);
+                    assert(!host.open && model.actions.empty());
+                    if (surface->y() + surface->height() < rendered.row.height()) {
+                        click(surface->x() + surface->width() * .5f,
+                              (surface->y() + surface->height() + rendered.row.height()) * .5f,
+                              button, touch);
+                        assert(!host.open && model.actions.empty());
+                    }
+                    click(surface->x() + 2, surface->y() + surface->height() * .5f, button, touch);
+                    assert(host.open && host.contains("Copy text") &&
+                           host.request.inputSerial == 101);
+                    host.select("Copy text");
+                    assert(clipboard.clipboardText() == token);
+                }
+        }
+        model.settings.messageLayouts[buffer.id] = blast::MessageLayout::Irc;
+        view.sync();
+        view.arrange(renderer, {17, 23, 900, 800});
+        const auto dense = body(view, "Compact-11");
+        float denseX, denseY;
+        Node::mapToScene(&dense.row, dense.row.width() - 2, dense.row.height() * .5f, denseX,
+                         denseY);
+        assert(dispatcher.pointerButton(denseX, denseY, BTN_RIGHT, true, 103, 1030, false));
+        dispatcher.pointerButton(denseX, denseY, BTN_RIGHT, false, 104, 1040, false);
+        assert(host.open && host.contains("Copy text"));
+        host.select("Copy text");
+        assert(clipboard.clipboardText() == "Compact-11");
+        model.settings.messageLayouts.erase(buffer.id);
+        view.sync();
+        view.arrange(renderer, {17, 23, 900, 800});
+        dispatcher.setSceneRoot(nullptr);
+    }
     view.arrange(renderer, {17, 23, 512, transcriptHeight});
     for (const auto *token : {"Compact-10", "Compact-11"})
         reachableBubble(renderer, view, {17, 23, 512, transcriptHeight}, token);
@@ -2475,6 +2530,21 @@ void tailAppendKeepsActions(TranscriptTestRenderer &renderer) {
     dispatcher.pointerButton(x, y - 48, BTN_LEFT, false, 53, 530, true);
     assert(!host.open && model.actions.empty());
     assert(dispatcher.focusedArea() == input->inputArea() &&
+           input->editingStateMatches(composition));
+    scroll->setScrollOffset(0);
+    view.sync();
+    view.arrange(renderer, viewport);
+    float blankX, blankY;
+    assert(surface->x() > 2);
+    Node::mapToScene(&retained.row, surface->x() * .5f, surface->y() + surface->height() * .5f,
+                     blankX, blankY);
+    assert(dispatcher.pointerButton(blankX, blankY, BTN_LEFT, true, 58, 580, true));
+    dispatcher.pointerMotion(blankX, blankY - 48, 59);
+    view.sync();
+    view.arrange(renderer, viewport);
+    assert(scroll->scrollOffset() > 0);
+    dispatcher.pointerButton(blankX, blankY - 48, BTN_LEFT, false, 60, 600, true);
+    assert(!host.open && model.actions.empty() && dispatcher.focusedArea() == input->inputArea() &&
            input->editingStateMatches(composition));
     scroll->setScrollOffset(0);
     view.sync();
@@ -5768,6 +5838,7 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         model.settings.avatars = false;
         model.settings.reducedMotion = false;
         model.settings.fx = blast::FxLevel::Full;
+        model.settings.incomingMotion = blast::SendMotion::Slide;
         blast::Theme theme;
         theme.update(model);
         auto &buffer = model.buffers["entrance"];
@@ -5775,9 +5846,11 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         buffer.kind = "query";
         blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
         Clipboard clipboard;
+        MenuHost host;
         Node motionHost;
         motionHost.setSize(800, 700);
         blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+        view.setPopupContext(&host);
         const LayoutRect viewport{17, 23, 700, 300};
         view.setComposerOrigin(367, 340);
         view.setMotionHost(&motionHost);
@@ -5808,7 +5881,7 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
             near(x, 367);
             near(y, 340);
         } else {
-            near(rendered.content.x(), 0);
+            assert(rendered.content.x() > 0);
             near(rendered.content.y(), 0);
         }
         model.now += .3;
@@ -5820,6 +5893,27 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         near(stillY, dateY);
         const float inFlightDistance =
             std::hypot(body(view, message.text).content.x(), body(view, message.text).content.y());
+        if (!own) {
+            const auto moving = body(view, message.text);
+            auto *surface = bubbleSurface(moving);
+            assert(surface && moving.content.x() > 0 &&
+                   surface->x() + surface->width() + moving.content.x() < moving.row.width());
+            InputDispatcher dispatcher;
+            dispatcher.setSceneRoot(&view);
+            const auto rightClick = [&](float localX) {
+                float x, y;
+                Node::mapToScene(&moving.row, localX, surface->y() + surface->height() * .5f, x, y);
+                assert(dispatcher.pointerButton(x, y, BTN_RIGHT, true, 31, 310, false));
+                dispatcher.pointerButton(x, y, BTN_RIGHT, false, 32, 320, false);
+            };
+            rightClick(surface->x() + moving.content.x() * .5f);
+            assert(!host.open);
+            rightClick(surface->x() + surface->width() + moving.content.x() * .5f);
+            assert(host.open && host.contains("Copy text"));
+            host.select("Copy text");
+            assert(clipboard.clipboardText() == message.text);
+            dispatcher.setSceneRoot(nullptr);
+        }
         if (own) {
             buffer.messages.back().id = "server-echo";
             buffer.messages.back().pending = false;

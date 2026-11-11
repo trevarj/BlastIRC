@@ -5175,7 +5175,15 @@ struct TranscriptView::Impl {
                 auto &slot = slots[slotIndex];
                 if (pointer.pressed) {
                     cancelFocusReveal();
-                    slot.clickArmed = true;
+                    const auto *surface = slot.material;
+                    float surfaceX = 0, surfaceY = 0;
+                    if (surface)
+                        Node::mapFromScene(surface, pointer.sceneX, pointer.sceneY, surfaceX,
+                                           surfaceY);
+                    slot.clickArmed =
+                        cache && (cache->geometry.dense() ||
+                                  (surface && surfaceX >= 0 && surfaceX < surface->width() &&
+                                   surfaceY >= 0 && surfaceY < surface->height()));
                     slot.pressX = pointer.localX;
                     slot.pressY = pointer.localY;
                     textDrag.suppressedClick = 0;

@@ -1,4 +1,4 @@
-<div align="center"><img src="assets/icon.png" alt="BlastIRC" width="96"></div>
+<div align="center"><img src="assets/icon.png" alt="BlastIRC" width="192"></div>
 
 # BLAST IRC
 

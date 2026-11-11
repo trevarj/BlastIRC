@@ -1045,6 +1045,7 @@ struct TranscriptView::Impl {
     MediaPreviewController *mediaController = nullptr;
     Renderer *selectionRenderer = nullptr;
     std::optional<TextRange> selectedText;
+    bool keyboardSelection = false;
     TextDrag textDrag;
     std::vector<MessageSelectionRect> selectionScratch;
 
@@ -1634,6 +1635,7 @@ struct TranscriptView::Impl {
         const bool captured = textDrag.armed;
         textDrag = {};
         selectedText.reset();
+        keyboardSelection = false;
         for (auto &slot : slots)
             for (auto *rect : slot.selectionRects)
                 rect->setVisible(false);
@@ -1826,6 +1828,7 @@ struct TranscriptView::Impl {
         for (auto &entry : slots)
             for (auto *rect : entry.selectionRects)
                 rect->setVisible(false);
+        keyboardSelection = false;
         textDrag = {};
         textDrag.armed = true;
         textDrag.owner = slot.focusIdentity;
@@ -2079,6 +2082,74 @@ struct TranscriptView::Impl {
                     break;
                 }
         return target.identity ? resolveMessage(target) : std::nullopt;
+    }
+    bool copySelectedMessage() {
+        if (keyboardSelection)
+            return false;
+        const auto target = selectedMessage();
+        const size_t index = target ? targetIndex(*target) : absent;
+        if (index == absent || model.buffers.at(active).messages[index].deleted)
+            return false;
+        const auto &entry = model.buffers.at(active).messages[index];
+        clipboard.setClipboardText(parseIrcFormatting(entry.text,
+                                                      themeForegroundColor("on_surface"),
+                                                      themeSurfaceColor("surface_container"))
+                                       .text);
+        return true;
+    }
+    bool textSelectionCommand(std::string_view command) {
+        const auto target = selectedMessage();
+        const size_t index = target ? targetIndex(*target) : absent;
+        if (index == absent || model.buffers.at(active).messages[index].deleted) {
+            clearTextSelection();
+            return false;
+        }
+        if (command == "set-mark") {
+            if (keyboardSelection && selectedText &&
+                selectedText->focus.identity == target->identity)
+                selectedText->anchor = selectedText->focus;
+            else {
+                clearTextSelection();
+                const TextEndpoint endpoint{target->identity, 0, index};
+                selectedText = TextRange{active, endpoint, endpoint};
+                keyboardSelection = true;
+            }
+            view.markPaintDirty();
+            return true;
+        }
+        if (!keyboardSelection || !selectedText ||
+            selectedText->focus.identity != target->identity || !orderedTextRange()) {
+            clearTextSelection();
+            return false;
+        }
+        const auto &entry = model.buffers.at(active).messages[index];
+        const auto document = parseIrcFormatting(entry.text, themeForegroundColor("on_surface"),
+                                                 themeSurfaceColor("surface_container"));
+        MessageSelectionText logical;
+        logical.update(document.text);
+        auto &byte = selectedText->focus.byte;
+        byte = logical.snap(std::min(byte, document.text.size()), MessageSelectionSnap::Before);
+        const auto &boundaries = logical.boundaries();
+        if (command == "backward-char") {
+            const auto it = std::lower_bound(boundaries.begin(), boundaries.end(), byte);
+            if (it != boundaries.begin())
+                byte = *std::prev(it);
+        } else if (command == "forward-char") {
+            const auto it = std::upper_bound(boundaries.begin(), boundaries.end(), byte);
+            if (it != boundaries.end())
+                byte = *it;
+        } else if (command == "beginning-of-line") {
+            const auto pos = byte ? document.text.rfind('\n', byte - 1) : std::string::npos;
+            byte =
+                logical.snap(pos == std::string::npos ? 0 : pos + 1, MessageSelectionSnap::After);
+        } else if (command == "end-of-line") {
+            const auto pos = document.text.find('\n', byte);
+            byte = logical.snap(pos == std::string::npos ? document.text.size() : pos,
+                                MessageSelectionSnap::Before);
+        } else
+            return false;
+        view.markPaintDirty();
+        return true;
     }
     bool navigateMessage(int delta) {
         auto *buffer = current();
@@ -5580,6 +5651,11 @@ bool TranscriptView::reactToMessage(const TranscriptMessageTarget &target, std::
     return impl->reactToMessage(target, std::move(emoji));
 }
 bool TranscriptView::copySelection() { return impl->copySelection(); }
+bool TranscriptView::copySelectedMessage() { return impl->copySelectedMessage(); }
+bool TranscriptView::keyboardTextSelection() const { return impl->keyboardSelection; }
+bool TranscriptView::textSelectionCommand(std::string_view command) {
+    return impl->textSelectionCommand(command);
+}
 bool TranscriptView::messageReadable(const std::string &key) const {
     const auto *buffer = impl->current();
     if (!buffer || !impl->cache || impl->active != impl->pane.buffer)

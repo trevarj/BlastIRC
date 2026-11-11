@@ -4175,6 +4175,42 @@ void runComposerNativeCheck() {
             dispatcher.keyEvent(XKB_KEY_End, 0, KeyMod::Ctrl, true);
             dispatcher.keyEvent(XKB_KEY_End, 0, KeyMod::Ctrl, false);
             frame();
+            {
+                const auto saved = input->editingState();
+                const auto key = [&](std::uint32_t sym, std::uint32_t modifiers) {
+                    for (const bool pressed : {true, false}) {
+                        InputArea::KeyData event{
+                            .sym = sym, .modifiers = modifiers, .pressed = pressed};
+                        if (!ui.handleKey(event))
+                            dispatcher.keyEvent(sym, 0, modifiers, pressed, false);
+                    }
+                };
+                const std::string draft = "a猫b\nsecond";
+                input->setValue(draft);
+                auto state = input->editingState();
+                state.current.cursorPos = state.current.selectionAnchor = 1;
+                input->restoreEditingState(state);
+                dispatcher.setFocus(input->inputArea());
+                key(XKB_KEY_space, KeyMod::Ctrl);
+                key(XKB_KEY_e, KeyMod::Ctrl);
+                assert(input->editingState().current.selectionAnchor == 1 &&
+                       input->editingState().current.cursorPos == 5 && input->value() == draft &&
+                       buffer.draft == draft && dispatcher.focusedArea() == input->inputArea());
+                key(XKB_KEY_w, KeyMod::Alt);
+                assert(clipboard.copied == "猫b");
+                key(XKB_KEY_g, KeyMod::Ctrl);
+                state = input->editingState();
+                state.current.selectionAnchor = 0;
+                state.current.cursorPos = 1;
+                input->restoreEditingState(state);
+                key(XKB_KEY_e, KeyMod::Ctrl);
+                assert(input->editingState().current.selectionAnchor == 0 &&
+                       input->editingState().current.cursorPos == 5 && input->value() == draft);
+                key(XKB_KEY_w, KeyMod::Alt);
+                assert(clipboard.copied == "a猫b");
+                input->restoreEditingState(saved);
+                frame();
+            }
 
             // Select and read a real retained message through the public native consumer path.
             const auto document = input->editingState();
@@ -4201,6 +4237,55 @@ void runComposerNativeCheck() {
                 return false;
             };
             assert(readerOwnsFocus());
+            {
+                const auto key = [&](std::uint32_t sym, std::uint32_t modifiers) {
+                    for (const bool pressed : {true, false}) {
+                        InputArea::KeyData event{
+                            .sym = sym, .modifiers = modifiers, .pressed = pressed};
+                        if (!ui.handleKey(event))
+                            dispatcher.keyEvent(sym, 0, modifiers, pressed, false);
+                    }
+                };
+                key(XKB_KEY_w, KeyMod::Alt);
+                assert(clipboard.copied == buffer.messages.front().text);
+                clipboard.copied = "sentinel";
+                key(XKB_KEY_space, KeyMod::Ctrl);
+                key(XKB_KEY_w, KeyMod::Alt);
+                assert(clipboard.copied == "sentinel");
+                key(XKB_KEY_Right, 0);
+                key(XKB_KEY_w, KeyMod::Alt);
+                assert(clipboard.copied == "H");
+                key(XKB_KEY_e, KeyMod::Ctrl);
+                key(XKB_KEY_w, KeyMod::Alt);
+                assert(clipboard.copied == buffer.messages.front().text);
+                assert(readerOwnsFocus() && documentPreserved());
+                key(XKB_KEY_g, KeyMod::Ctrl);
+                assert(dispatcher.focusedArea() == input->inputArea() && documentPreserved());
+                for (size_t i = 0; i < buffer.messages.size(); ++i) {
+                    ui.execute("message-prev");
+                    frame();
+                }
+                assert(readerOwnsFocus() && !transcript->keyboardTextSelection());
+                const auto nextBinding = model.settings.bindings.at("message-next");
+                model.settings.bindings["message-next"] = "RIGHT";
+                key(XKB_KEY_space, KeyMod::Ctrl);
+                key(XKB_KEY_Right, 0);
+                assert(!transcript->keyboardTextSelection() && readerOwnsFocus());
+                key(XKB_KEY_w, KeyMod::Alt);
+                assert(clipboard.copied == buffer.messages[1].text);
+                model.settings.bindings["message-next"] = "RIGHT x";
+                key(XKB_KEY_space, KeyMod::Ctrl);
+                key(XKB_KEY_Right, 0);
+                assert(transcript->keyboardTextSelection());
+                key(XKB_KEY_x, 0);
+                assert(!transcript->keyboardTextSelection() && readerOwnsFocus());
+                key(XKB_KEY_w, KeyMod::Alt);
+                assert(clipboard.copied == buffer.messages[2].text && documentPreserved());
+                model.settings.bindings["message-next"] = nextBinding;
+                ui.execute("message-prev");
+                ui.execute("message-prev");
+                frame();
+            }
             assert(ui.handleKey({.sym = XKB_KEY_Home, .pressed = true}));
             ui.handleKey({.sym = XKB_KEY_Home, .pressed = false});
             frame();

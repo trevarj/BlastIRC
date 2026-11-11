@@ -66,6 +66,9 @@ class TranscriptView final : public Node {
     bool replyToMessage(const TranscriptMessageTarget &);
     bool reactToMessage(const TranscriptMessageTarget &, std::string emoji);
     bool copySelection();
+    bool copySelectedMessage();
+    bool keyboardTextSelection() const;
+    bool textSelectionCommand(std::string_view command);
     // Pane-local privacy gate for stable message keys; unknown/stale rows fail closed.
     bool messageReadable(const std::string &key) const;
     void setMediaPreviewController(MediaPreviewController *);

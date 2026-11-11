@@ -3486,6 +3486,16 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
     }
     if (messageCommand(command))
         return;
+    if ((command == "backward-char" || command == "forward-char" ||
+         command == "beginning-of-line" || command == "end-of-line") &&
+        !jumpOpen && !paletteOpen && !reactionTarget && !dialogs->active() &&
+        transcriptOwnsFocus()) {
+        if (const auto view = views.find(workspace.focused);
+            view != views.end() && view->second->transcript->keyboardTextSelection()) {
+            view->second->transcript->textSelectionCommand(command);
+            return;
+        }
+    }
     if (command == "scroll-up" || command == "scroll-down") {
         if (!jumpOpen && !paletteOpen && !reactionTarget && !dialogs->active())
             if (const auto view = views.find(workspace.focused); view != views.end())
@@ -3500,10 +3510,17 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
     }
     if (command == "copy-region") {
         if (!jumpOpen && !paletteOpen && !reactionTarget && !dialogs->active() &&
-            (transcriptOwnsFocus() || (dispatcher && editors.ownsFocus(dispatcher->focusedArea()))))
-            if (const auto view = views.find(workspace.focused);
-                view != views.end() && view->second->transcript->copySelection())
-                return;
+            (transcriptOwnsFocus() ||
+             (dispatcher && editors.ownsFocus(dispatcher->focusedArea())))) {
+            if (const auto view = views.find(workspace.focused); view != views.end()) {
+                if (view->second->transcript->copySelection())
+                    return;
+                if (transcriptOwnsFocus()) {
+                    view->second->transcript->copySelectedMessage();
+                    return;
+                }
+            }
+        }
         if (!dispatcher || !editors.ownsFocus(dispatcher->focusedArea()))
             return;
     }
@@ -4202,13 +4219,18 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
         if (!customBinding) {
             if (isConsumed())
                 return true;
-            // The SDK's readline C-e ends the buffer; its End key ends a visual row.
-            // Restore only the caret through the public native API for a hard-line end.
-            auto state = focusedInput->editingState();
-            const auto end = focusedInput->value().find('\n', focusedInput->cursorPosition());
-            state.current.cursorPos = state.current.selectionAnchor =
-                end == std::string::npos ? focusedInput->value().size() : end;
-            focusedInput->restoreEditingState(state, true);
+            if (dispatcher && editors.ownsFocus(dispatcher->focusedArea())) {
+                if (auto pane = workspace.panes.find(workspace.focused);
+                    pane != workspace.panes.end())
+                    editors.execute("end-of-line", pane->second);
+            } else {
+                // Native non-composer Inputs still need hard-line rather than visual-row end.
+                auto state = focusedInput->editingState();
+                const auto end = focusedInput->value().find('\n', focusedInput->cursorPosition());
+                state.current.cursorPos = state.current.selectionAnchor =
+                    end == std::string::npos ? focusedInput->value().size() : end;
+                focusedInput->restoreEditingState(state, true);
+            }
             return consume();
         }
     }
@@ -4322,6 +4344,14 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
                 refresh();
                 return true;
             }
+            if (repeat->second.starts_with("@selection:")) {
+                if (transcriptOwnsFocus())
+                    if (const auto view = views.find(workspace.focused); view != views.end())
+                        view->second->transcript->textSelectionCommand(
+                            std::string_view(repeat->second).substr(11));
+                refresh();
+                return true;
+            }
             if (repeat->second == "@transcript") {
                 if (const auto view = views.find(workspace.focused); view != views.end())
                     view->second->transcript->handleKey(event);
@@ -4397,15 +4427,54 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
         }
     bool composer = !dispatcher || editors.ownsFocus(dispatcher->focusedArea());
     const std::string full = chord.empty() ? keyStroke : chord + " " + keyStroke;
+    auto view = views.find(workspace.focused);
+    auto *transcript = !dialogs->active() && transcriptOwnsFocus() && view != views.end()
+                           ? view->second->transcript
+                           : nullptr;
+    const auto movement = [](std::string_view command) {
+        return command == "backward-char" || command == "forward-char" ||
+               command == "beginning-of-line" || command == "end-of-line";
+    };
+    const auto selectionCandidate = [&](std::string_view command, const std::string &binding) {
+        auto candidate = ui_logic::canonical(binding);
+        if (command == "end-of-line" && candidate.empty()) {
+            const auto stock = ui_logic::canonical(defaultBindings().at("message-react"));
+            const bool claimed =
+                std::any_of(model.settings.bindings.begin(), model.settings.bindings.end(),
+                            [&](const auto &entry) {
+                                if (entry.first == "message-react")
+                                    return false;
+                                const auto other = ui_logic::canonical(entry.second);
+                                return other == stock || other.starts_with(stock + " ");
+                            });
+            if (!claimed)
+                candidate = stock;
+        }
+        return candidate;
+    };
+    const bool selectionBinding =
+        transcript && transcript->keyboardTextSelection() &&
+        std::any_of(model.settings.bindings.begin(), model.settings.bindings.end(),
+                    [&](const auto &entry) {
+                        if (!movement(entry.first))
+                            return false;
+                        const auto candidate = selectionCandidate(entry.first, entry.second);
+                        return candidate == full || candidate.starts_with(full + " ");
+                    });
     bool prefix = false;
     for (const auto &[command, binding] : model.settings.bindings) {
         const bool scrolling = command == "scroll-up" || command == "scroll-down" ||
                                command == "beginning-of-buffer" || command == "end-of-buffer";
-        const auto candidate = ui_logic::canonical(binding);
+        const auto candidate =
+            transcript && transcript->keyboardTextSelection() && movement(command)
+                ? selectionCandidate(command, binding)
+                : ui_logic::canonical(binding);
         if (candidate.empty() ||
             (!workspaceCommand(command) && !composer &&
-             !((command == "copy-region" || scrolling) && transcriptOwnsFocus())) ||
-            (command == "message-react" && !transcriptOwnsFocus()) ||
+             !((command == "copy-region" || scrolling || command == "set-mark" ||
+                (movement(command) && transcript && transcript->keyboardTextSelection())) &&
+               transcript)) ||
+            (command == "message-react" && (!transcriptOwnsFocus() || selectionBinding)) ||
             (scrolling && dialogs->active()) ||
             (dialogs->active() &&
              (command == "message-prev" || command == "message-next" ||
@@ -4416,6 +4485,14 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
             if (!synchronizeInput())
                 throw std::logic_error("Commands cannot be dispatched during native layout");
             chord.clear();
+            if (transcript && (command == "set-mark" ||
+                               (movement(command) && transcript->keyboardTextSelection()))) {
+                transcript->textSelectionCommand(command);
+                if (movement(command))
+                    repeatCommands[keyId] = "@selection:" + command;
+                refresh();
+                return consume();
+            }
             if (command.starts_with("backward-") || command.starts_with("forward-") ||
                 command == "previous-line" || command == "next-line" || command == "delete-char" ||
                 command == "kill-word" || command == "history-previous" ||
@@ -4442,6 +4519,14 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
     if (!chord.empty()) {
         model.status = "Unbound chord: " + full;
         chord.clear();
+        return consume();
+    }
+    if (transcript && transcript->keyboardTextSelection() && chord.empty() && !event.modifiers &&
+        (event.sym == XKB_KEY_Left || event.sym == XKB_KEY_Right)) {
+        const std::string command = event.sym == XKB_KEY_Left ? "backward-char" : "forward-char";
+        transcript->textSelectionCommand(command);
+        repeatCommands[keyId] = "@selection:" + command;
+        refresh();
         return consume();
     }
     if (!dialogs->active() && keyStroke == "c-c" &&

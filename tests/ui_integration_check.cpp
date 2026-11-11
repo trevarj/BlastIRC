@@ -7456,7 +7456,7 @@ void messageReactionPickerCheck() {
         assert(model.settings.bindings.at("message-react") == "C-e");
         const std::string firstLine = "first café é 猫🙂";
         const std::string multiline = firstLine + "\nsecond λ line\n";
-        const auto nativeEndOfLine = [&](Input &field) {
+        const auto nativeEndOfLine = [&](Input &field, bool composer) {
             field.restoreEditingState(Input::EditingState{});
             assert(field.insertText(multiline));
             assert(field.insertText("undo probe"));
@@ -7481,7 +7481,7 @@ void messageReactionPickerCheck() {
                 frame();
                 const auto after = field.editingState();
                 assert(after.current.value == multiline && field.cursorPosition() == expected &&
-                       field.selectionAnchor() == expected);
+                       field.selectionAnchor() == (composer ? 0 : expected));
                 assert(after.history == document.history && after.history->undo == savedUndo &&
                        after.history->redo == savedRedo);
                 assert(dispatcher.focusedArea() == field.inputArea());
@@ -7489,7 +7489,7 @@ void messageReactionPickerCheck() {
                 assert(!visibleNode<emoji::Picker>(ui.root()) && !menu.open);
             }
         };
-        nativeEndOfLine(*input);
+        nativeEndOfLine(*input, true);
         input->restoreEditingState(document);
         frame();
         unchanged();
@@ -7505,7 +7505,7 @@ void messageReactionPickerCheck() {
         auto *pasteArea = areaWithKey(ui.root(), "upload-text");
         auto *paste = pasteArea ? dynamic_cast<Input *>(pasteArea->textInputClient()) : nullptr;
         assert(paste && visible(*paste) && dispatcher.focusedArea() == pasteArea);
-        nativeEndOfLine(*paste);
+        nativeEndOfLine(*paste, false);
         auto *cancel = areaWithKey(ui.root(), "upload-close");
         assert(cancel && visible(*cancel));
         click(dispatcher, *cancel);

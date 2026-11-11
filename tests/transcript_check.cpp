@@ -3922,6 +3922,40 @@ void messageTextSelection(TranscriptTestRenderer &renderer, float zoom) {
         assert(!host.open && model.actions.empty());
     };
     arrange();
+    dispatcher.setFocus(&body(view, "Alpha").row);
+    assert(view.copySelectedMessage() && clipboard.clipboardText() == firstPlain);
+    assert(view.textSelectionCommand("set-mark"));
+    clipboard.setClipboardText("sentinel");
+    assert(!view.copySelection() && !view.copySelectedMessage() &&
+           clipboard.clipboardText() == "sentinel");
+    for (int i = 0; i < 6; ++i)
+        assert(view.textSelectionCommand("forward-char"));
+    assert(view.textSelectionCommand("set-mark"));
+    assert(view.textSelectionCommand("forward-char"));
+    assert(view.copySelection() && clipboard.clipboardText() == "e\xCC\x81");
+    viewport.width = 240 * zoom;
+    arrange();
+    assert(view.copySelection() && clipboard.clipboardText() == "e\xCC\x81");
+    assert(view.textSelectionCommand("end-of-line"));
+    assert(view.copySelection() && clipboard.clipboardText() == "e\xCC\x81 X tail");
+    view.clearTextSelection();
+    buffer.messages.front().text = "\x02"
+                                   "e\xCC\x81 first\nsecond";
+    assert(view.textSelectionCommand("set-mark"));
+    assert(view.textSelectionCommand("end-of-line"));
+    assert(view.copySelection() && clipboard.clipboardText() == "e\xCC\x81 first");
+    assert(view.textSelectionCommand("forward-char"));
+    assert(view.textSelectionCommand("end-of-line"));
+    assert(view.copySelection() && clipboard.clipboardText() == "e\xCC\x81 first\nsecond");
+    view.clearTextSelection();
+    buffer.messages.front().text = messages[0];
+    buffer.messages.front().deleted = true;
+    clipboard.setClipboardText("sentinel");
+    assert(!view.copySelection() && !view.copySelectedMessage() &&
+           !view.textSelectionCommand("set-mark") && clipboard.clipboardText() == "sentinel");
+    buffer.messages.front().deleted = false;
+    viewport.width = 1200 * zoom;
+    arrange();
     const auto caret = point("Alpha", 6);
     assert(dispatcher.pointerButton(caret.first, caret.second, BTN_LEFT, true, 89, 890, false));
     dispatcher.pointerButton(caret.first, caret.second, BTN_LEFT, false, 90, 900, false);

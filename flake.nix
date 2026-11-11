@@ -6,10 +6,6 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      noctaliaSource = pkgs.fetchzip {
-        url = "https://github.com/trevarj/noctalia/archive/ad60f4c2a8841ce25c78f9d6ac8c111523fa34b6.tar.gz";
-        hash = "sha256-CVNuQ+DwKglOsJFgKQxwvL85A1hh7k+/aA+EPr9QgKU=";
-      };
       # Match the headers required by the pinned upstream lib/meson.build.
       stbHeaders = pkgs.stb.overrideAttrs (_: {
         version = "unstable-2025-10-26";
@@ -55,14 +51,6 @@
         pkg-config
         wayland-scanner
       ];
-      noctaliaDirectory = "noctalia-ad60f4c2a8841ce25c78f9d6ac8c111523fa34b6";
-      prepareNoctalia = ''
-        if [ ! -d subprojects/${noctaliaDirectory} ]; then
-          mkdir -p subprojects
-          cp -R "$NOCTALIA_UI_SOURCE_DIR" subprojects/${noctaliaDirectory}
-          chmod -R u+w subprojects/${noctaliaDirectory}
-        fi
-      '';
     in
     {
       packages.${system}.default = pkgs.stdenv.mkDerivation {
@@ -99,8 +87,6 @@
             autoAddDriverRunpath
           ]);
         buildInputs = dependencies;
-        NOCTALIA_UI_SOURCE_DIR = noctaliaSource;
-        postPatch = prepareNoctalia;
         mesonBuildType = "release";
         mesonFlags = [
           "-Dtests=true"
@@ -176,7 +162,6 @@
               nerd-fonts.jetbrains-mono
               noto-fonts-color-emoji
             ]);
-          NOCTALIA_UI_SOURCE_DIR = noctaliaSource;
           BLASTIRC_FONT_DIR = "${pkgs.nerd-fonts.jetbrains-mono}/share/fonts";
           BLASTIRC_EMOJI_DIR = "${pkgs.noto-fonts-color-emoji}/share/fonts";
           BLASTIRC_SPELL_DICT_DIR = "${pkgs.hunspellDicts.en_US}/share/hunspell";
@@ -184,7 +169,7 @@
           BLASTIRC_PORTAL_BACKEND = "${pkgs.xdg-desktop-portal-gtk}/libexec/xdg-desktop-portal-gtk";
           BLASTIRC_PORTAL_BACKEND_DIR = "${pkgs.xdg-desktop-portal-gtk}/share/xdg-desktop-portal/portals";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libheif ];
-          shellHook = prepareNoctalia + ''
+          shellHook = ''
             printf '%s\n' \
               'Configure: meson setup build-native --wrap-mode=nodownload -Dfont_dir="$BLASTIRC_FONT_DIR" -Demoji_dir="$BLASTIRC_EMOJI_DIR" -Ddictionary_dir="$BLASTIRC_SPELL_DICT_DIR"' \
               'Build: meson compile -C build-native' \

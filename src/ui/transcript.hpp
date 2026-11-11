@@ -51,11 +51,14 @@ class TranscriptView final : public Node {
     void noteFocusReveal();
     // A newer explicit pointer/scroll/navigation intent supersedes only our queued reveal.
     void cancelFocusReveal();
+    // Focused typing-list navigation precedes global cancel/history bindings.
+    bool handleTypingKey(const InputArea::KeyData &);
     bool handleKey(const InputArea::KeyData &);
     // A false navigation result returns keyboard ownership to the composer.
     bool navigateMessage(int delta);
     // Scroll the actual history viewport without transferring composer focus.
     bool scrollHalfPage(int direction);
+    bool scrollToBoundary(bool newest);
     // Core has validated and materialized the original history; never changes composer state.
     bool jumpToSourceMessage(std::string_view id);
     std::optional<TranscriptMessageTarget> selectedMessage() const;
@@ -80,8 +83,8 @@ class TranscriptView final : public Node {
     void setWindowActive(bool active);
     // Actual native composer top-center, in scene-logical coordinates.
     void setComposerOrigin(float sceneX, float sceneY);
-    // Transparent footer overlays reserve content, never shorten the scroll viewport.
-    void setContextInset(float height, float typingRowHeight);
+    // Only typing reserves content; active reply occlusion affects controls/reveal, not scrolling.
+    void setContextInset(float typingInset, float typingRowHeight, float replyOverlayHeight);
     // Pane-owned overlay, detached before its native subtree is retired.
     void setMotionHost(Node *host);
 

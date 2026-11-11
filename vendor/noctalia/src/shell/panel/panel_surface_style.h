@@ -1,0 +1,68 @@
+#pragma once
+
+#include "config/config_service.h"
+#include "config/config_types.h"
+#include "ui/palette.h"
+#include "ui/surface_shadow.h"
+
+#include <algorithm>
+#include <cstdint>
+
+// Sizing and styling shared by the panel surfaces: PanelManager's single active
+// panel and PersistentPanelHost's long-lived ones.
+namespace shell::panel_surface {
+
+  // Extra margin around the shadow bleed. The shadow is drawn inside the surface,
+  // so a surface sized to the bleed alone clips its own outermost falloff row.
+  inline constexpr std::int32_t kShadowSafetyPadding = 2;
+
+  inline surface_shadow::Bleed bleed(bool hasDecoration, const ShadowStyle& shadow) noexcept {
+    auto out = surface_shadow::bleed(hasDecoration, shadow);
+    if (surface_shadow::enabled(hasDecoration, shadow)) {
+      out.left += kShadowSafetyPadding;
+      out.right += kShadowSafetyPadding;
+      out.up += kShadowSafetyPadding;
+      out.down += kShadowSafetyPadding;
+    }
+    return out;
+  }
+
+  inline std::uint32_t surfaceExtent(std::uint32_t contentSize, std::int32_t before, std::int32_t after) noexcept {
+    const auto total =
+        static_cast<std::int64_t>(contentSize) + static_cast<std::int64_t>(before) + static_cast<std::int64_t>(after);
+    return static_cast<std::uint32_t>(std::max<std::int64_t>(1, total));
+  }
+
+  inline float contentScale(const ConfigService* configService) noexcept {
+    if (configService == nullptr) {
+      return 1.0F;
+    }
+    return std::max(0.1F, configService->config().accessibility.uiScale);
+  }
+
+  inline float backgroundOpacity(const ConfigService* configService) noexcept {
+    const auto mode =
+        configService != nullptr ? configService->config().shell.panel.transparencyMode : PanelTransparencyMode::Solid;
+    return detachedPanelBackgroundOpacityForTransparencyMode(mode);
+  }
+
+  inline ColorSpec borderColor(const ConfigService* configService, float panelBackgroundOpacity) noexcept {
+    const ColorSpec spec = configService != nullptr ? configService->config().shell.panel.borderColor
+                                                    : colorSpecFromRole(ColorRole::OutlineVariant);
+    return scaleAlpha(spec, panelBackgroundOpacity);
+  }
+
+  inline float borderWidth(const ConfigService* configService) noexcept {
+    if (configService == nullptr) {
+      return Style::borderWidth;
+    }
+    return std::max(0.0F, configService->config().shell.panel.borderWidth);
+  }
+
+  inline float cardOpacity(const ConfigService* configService, float panelBackgroundOpacity) noexcept {
+    const auto mode =
+        configService != nullptr ? configService->config().shell.panel.transparencyMode : PanelTransparencyMode::Solid;
+    return panelCardOpacityForTransparencyMode(mode, panelBackgroundOpacity);
+  }
+
+} // namespace shell::panel_surface

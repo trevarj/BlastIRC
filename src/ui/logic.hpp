@@ -67,38 +67,50 @@ inline const Message *readTarget(const Buffer &buffer) {
                      [](const Message &message) { return !message.pending && !message.presence; });
     return last == buffer.messages.rend() ? nullptr : &*last;
 }
-inline bool hasUnreadMention(const Model &model, const Buffer &buffer) {
-    if (buffer.unread <= 0)
-        return false;
-    const auto marker = irc::parseTimestampParts(buffer.readMarker);
+// Read state belongs to the live source, even when the transcript retains older rows.
+// The visitor returns false to stop; neither the boundary nor rows are copied.
+template <class Visit>
+inline void forEachUnreadMention(const Model &model, const Buffer &live, const Buffer &rows,
+                                 Visit &&visit) {
+    if (live.unread <= 0)
+        return;
+    const auto marker = irc::parseTimestampParts(live.readMarker);
     const auto seconds = marker ? marker->seconds : 0;
     const auto fraction = marker ? marker->nanoseconds : 0;
-    const std::string_view stored = buffer.readMarker;
+    const std::string_view stored = live.readMarker;
     const auto id = stored.starts_with("local:") ? stored.substr(6) : stored;
     bool after = stored.empty();
     if (!seconds && !after)
-        after =
-            std::none_of(buffer.messages.begin(), buffer.messages.end(), [&](const auto &message) {
-                return message.id == stored || message.id == id;
-            });
-    for (const auto &message : buffer.messages) {
+        after = std::none_of(rows.messages.begin(), rows.messages.end(), [&](const auto &message) {
+            return message.id == stored || message.id == id;
+        });
+    for (const auto &message : rows.messages) {
         if (!seconds && (message.id == stored || message.id == id)) {
             after = true;
             continue;
         }
         if (!message.mention || message.own || message.presence ||
-            (!model.settings.foolUnread && isFool(model, buffer.server, message.nick)))
+            (!model.settings.foolUnread && isFool(model, live.server, message.nick)))
             continue;
         bool newer = after;
         if (seconds) {
-            const auto time = irc::parseTimestampParts(message.time);
-            newer = message.timestamp > seconds ||
-                    (message.timestamp == seconds && (time ? time->nanoseconds : 0) > fraction);
+            newer = message.timestamp > seconds;
+            if (message.timestamp == seconds) {
+                const auto time = irc::parseTimestampParts(message.time);
+                newer = (time ? time->nanoseconds : 0) > fraction;
+            }
         }
-        if (newer)
-            return true;
+        if (newer && !visit(message))
+            return;
     }
-    return false;
+}
+inline bool hasUnreadMention(const Model &model, const Buffer &buffer) {
+    bool found = false;
+    forEachUnreadMention(model, buffer, buffer, [&](const Message &) {
+        found = true;
+        return false;
+    });
+    return found;
 }
 inline std::optional<unsigned> colorNumber(std::string_view text, size_t &offset) {
     unsigned value = 0, digits = 0;
@@ -179,13 +191,15 @@ inline int fuzzy(std::string_view needle, std::string_view haystack) {
     return score - static_cast<int>(haystack.size() / 8);
 }
 enum class SidebarFilter { All, Unread, Dms, Archived };
-inline bool sidebarMatches(const Buffer &buffer, std::string_view query, SidebarFilter filter) {
+inline bool sidebarMatches(const Buffer &buffer, std::string_view query, SidebarFilter filter,
+                           std::string_view serverCaption = {}) {
     return buffer.archived == (filter == SidebarFilter::Archived) &&
            (filter != SidebarFilter::Archived || buffer.kind == "channel" ||
             buffer.kind == "query") &&
            (filter != SidebarFilter::Unread || buffer.unread > 0) &&
            (filter != SidebarFilter::Dms || buffer.kind == "query") &&
-           (fuzzy(query, buffer.target) > -100000 || fuzzy(query, buffer.server) > -100000);
+           (fuzzy(query, buffer.target) > -100000 || fuzzy(query, buffer.server) > -100000 ||
+            fuzzy(query, serverCaption) > -100000);
 }
 inline char jumpHintKey(uint32_t sym) {
     if (sym >= 'A' && sym <= 'Z')
@@ -491,11 +505,7 @@ struct Editor {
         } else if (op == "end-of-line") {
             auto p = text.find('\n', cursor);
             to = p == std::string::npos ? text.size() : p;
-        } else if (op == "beginning-of-buffer")
-            to = 0;
-        else if (op == "end-of-buffer")
-            to = text.size();
-        else if (op == "previous-line" || op == "next-line") {
+        } else if (op == "previous-line" || op == "next-line") {
             auto start = text.rfind('\n', cursor ? cursor - 1 : 0);
             start = cursor && start != std::string::npos ? start + 1 : 0;
             size_t col = 0;

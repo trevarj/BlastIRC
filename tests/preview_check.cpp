@@ -313,6 +313,144 @@ void statusFailures(Certificate &cert) {
         assert(server.requests == kinds.size() * 2);
     }
 }
+void youtubeParsers() {
+    // Captured official oEmbed fields; iframe HTML is deliberately not a preview consumer.
+    const auto observed = PreviewService::youtubeMetadata(
+        R"json({"title":"Why You Should DROP CLAUDE CODE for OMP (Oh-My-Pi)","type":"video",)json"
+        R"("thumbnail_url":"https://i.ytimg.com/vi/PtS2EdUsMeo/hqdefault.jpg",)"
+        R"("thumbnail_width":480,"thumbnail_height":360,)"
+        R"("html":"<iframe src='https://www.youtube.com/embed/PtS2EdUsMeo'></iframe>"})");
+    assert(observed && observed->title == "Why You Should DROP CLAUDE CODE for OMP (Oh-My-Pi)");
+    assert(observed->imageUrl == "https://i.ytimg.com/vi/PtS2EdUsMeo/hqdefault.jpg");
+    assert(observed->description.empty());
+    assert(PreviewService::classify("application/json") == PreviewKind::Unsupported);
+    assert(!PreviewService::youtubeMetadata(R"({"type":"video","title":"x\u0000hidden"})"));
+    const std::string source = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    const std::string route = "https://www.youtube.com/oembed?url="
+                              "https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ&format=json";
+    assert(PreviewService::youtubeMetadataUrl(source) == route);
+    assert(PreviewService::youtubeMetadataUrl(source + "#t=30") == route);
+    assert(PreviewService::youtubeMetadataUrl(source + "&t=30&feature=share") ==
+           "https://www.youtube.com/oembed?url="
+           "https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ"
+           "%26t%3D30%26feature%3Dshare&format=json");
+    assert(PreviewService::youtubeMetadataUrl(
+        "https://www.youtube.com:443/watch?feature=share&v=Ab_-0123456"));
+    for (std::string_view value : {
+             "https://example.com/watch?v=dQw4w9WgXcQ",
+             "https://youtube.com/watch?v=dQw4w9WgXcQ",
+             "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+             "https://www.youtube.com.evil.invalid/watch?v=dQw4w9WgXcQ",
+             "https://www.youtube.com./watch?v=dQw4w9WgXcQ",
+             "https://www.youtubе.com/watch?v=dQw4w9WgXcQ",
+             "https://www.youtube.com@evil.invalid/watch?v=dQw4w9WgXcQ",
+             "https://user:secret@www.youtube.com/watch?v=dQw4w9WgXcQ",
+             "https://@www.youtube.com/watch?v=dQw4w9WgXcQ",
+             "http://www.youtube.com/watch?v=dQw4w9WgXcQ",
+             "ftp://www.youtube.com/watch?v=dQw4w9WgXcQ",
+             "//www.youtube.com/watch?v=dQw4w9WgXcQ",
+             "https://www.youtube.com:444/watch?v=dQw4w9WgXcQ",
+             "https://www.youtube.com:80/watch?v=dQw4w9WgXcQ",
+             "https://www.youtube.com/Watch?v=dQw4w9WgXcQ",
+             "https://www.youtube.com/watch/?v=dQw4w9WgXcQ",
+             "https://www.youtube.com/embed/dQw4w9WgXcQ",
+             "https://www.youtube.com/%77atch?v=dQw4w9WgXcQ",
+             "https://www.youtube.com/watch.evil?v=dQw4w9WgXcQ",
+             "https://www.youtube.com/watch",
+             "https://www.youtube.com/watch?V=dQw4w9WgXcQ",
+             "https://www.youtube.com/watch?video=dQw4w9WgXcQ",
+             "https://www.youtube.com/watch?v=",
+             "https://www.youtube.com/watch?v=dQw4w9WgXc",
+             "https://www.youtube.com/watch?v=dQw4w9WgXcQQ",
+             "https://www.youtube.com/watch?v=dQw4w9WgXc!",
+             "https://www.youtube.com/watch?v=dQw4w9WgXcQ&v=dQw4w9WgXcQ",
+             "https://www.youtube.com/watch?v=dQw4w9WgXcQ&v=Ab_-0123456",
+             "https://www.youtube.com/watch?v=dQw4w9WgXcQ%26v%3DAb_-0123456",
+             "https://www.youtube.com/watch?v=dQw4w9WgXcQ\\evil",
+             "https://www.youtube.com/watch?v=dQw4w9WgXcQ\n",
+         })
+        assert(!PreviewService::youtubeMetadataUrl(value));
+    std::string nulSource = source;
+    nulSource.push_back('\0');
+    assert(!PreviewService::youtubeMetadataUrl(nulSource));
+
+    auto metadata = PreviewService::youtubeMetadata(
+        R"({"type":"video","title":" \tCaf\u00e9\n \u0001\u007f clip \r ",)"
+        R"("html":"<iframe src='http://127.0.0.1/private'></iframe><script>bad()</script>",)"
+        R"("description":"must not become a description","unrelated":{"title":"wrong"}})");
+    assert(metadata && metadata->title == "Café clip");
+    assert(metadata->description.empty() && metadata->imageUrl.empty());
+    metadata = PreviewService::youtubeMetadata(
+        "{\"type\":\"video\",\"title\":\"" + std::string(253, 'a') + R"(\u00e9\ud83d\ude00tail"})");
+    assert(metadata && metadata->title == std::string(253, 'a') + "é");
+    assert(metadata->title.size() == 255);
+
+    for (std::string_view json : {
+             "",
+             "{",
+             R"({"type":"video","title":"x",})",
+             R"({"type":"video","title":"x"} trailing)",
+             R"({"type":"video","title":"\q"})",
+             "null",
+             "true",
+             "42",
+             R"("video")",
+             "[]",
+             R"([{"type":"video","title":"x"}])",
+             "{}",
+             R"({"title":"x"})",
+             R"({"type":true,"title":"x"})",
+             R"({"type":"photo","title":"x"})",
+             R"({"type":"Video","title":"x"})",
+             R"({"type":"video"})",
+             R"({"type":"video","title":null})",
+             R"({"type":"video","title":123})",
+             R"({"type":"video","title":[]})",
+             R"({"type":"video","title":""})",
+             R"({"type":"video","title":" \t\r\n "})",
+             R"({"type":"video","title":"x","thumbnail_url":null})",
+             R"({"type":"video","title":"x","thumbnail_url":17})",
+             R"({"type":"video","title":"x","thumbnail_url":{}})",
+         })
+        assert(!PreviewService::youtubeMetadata(json));
+    const std::string valid = R"({"type":"video","title":"Bounded"})";
+    const std::string atLimit = valid + std::string(256 * 1024 - valid.size(), ' ');
+    assert(PreviewService::youtubeMetadata(atLimit));
+    assert(!PreviewService::youtubeMetadata(atLimit + " "));
+    assert(!PreviewService::youtubeMetadata(valid + std::string(1, '\0')));
+    const std::string nested = R"({"type":"video","title":"x","ignored":)" + std::string(17, '[') +
+                               "0" + std::string(17, ']') + "}";
+    assert(!PreviewService::youtubeMetadata(nested));
+    const auto thumbnailJson = [](std::string_view url) {
+        return R"({"type":"video","title":"Thumbnail","thumbnail_url":")" + std::string(url) +
+               R"("})";
+    };
+    for (std::string_view url : {
+             "",
+             "/relative.jpg",
+             "//i.ytimg.com/cover.jpg",
+             "http://i.ytimg.com/cover.jpg",
+             "file:///tmp/cover.jpg",
+             "data:image/png,abc",
+             "https://user:secret@i.ytimg.com/cover.jpg",
+             "https://@i.ytimg.com/cover.jpg",
+             "https://127.0.0.1/cover.jpg",
+             "https://10.0.0.1/cover.jpg",
+             "https://169.254.169.254/cover.jpg",
+             "https://192.168.1.1/cover.jpg",
+             "https://[::1]/cover.jpg",
+             "https://[fc00::1]/cover.jpg",
+         })
+        assert(!PreviewService::youtubeMetadata(thumbnailJson(url)));
+    assert(!PreviewService::youtubeMetadata(
+        thumbnailJson("https://i.ytimg.com/" + std::string(4096, 'x'))));
+    metadata = PreviewService::youtubeMetadata(thumbnailJson("https://127.0.0.1/cover.jpg"), true);
+    assert(metadata && metadata->imageUrl == "https://127.0.0.1/cover.jpg");
+    assert(!PreviewService::youtubeMetadata(thumbnailJson("http://127.0.0.1/cover.jpg"), true));
+    assert(!PreviewService::youtubeMetadata(
+        thumbnailJson("https://user:secret@127.0.0.1/cover.jpg"), true));
+}
+
 void parsers() {
     assert(PreviewService::url("https://example.com/a?q=1"));
     assert(PreviewService::url("https://8.8.8.8/a"));
@@ -715,6 +853,7 @@ void cacheLifetime(Certificate &cert, const Bytes &image) {
 int main() {
     signal(SIGPIPE, SIG_IGN);
     parsers();
+    youtubeParsers();
     TempDirectory directory;
     Certificate cert(directory.path), wrongHost(directory.path, "wrong.invalid");
     // Normal TLS trust only: no insecure flags, custom resolver, or service test API.

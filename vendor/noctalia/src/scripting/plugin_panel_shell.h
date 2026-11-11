@@ -1,0 +1,51 @@
+#pragma once
+
+#include "config/config_types.h"
+
+#include <array>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+namespace scripting {
+
+  struct PluginEntry;
+
+  // Manifest vocabulary for the `[[panel]]` keyboard_focus key. Mapped to a
+  // layer-shell keyboard interactivity mode by the panel host.
+  inline constexpr std::array<std::string_view, 3> kPanelKeyboardFocusModes = {"on_demand", "exclusive", "none"};
+
+  // Vocabulary for the injected floating-layer setting and optional `[[panel]]`
+  // default. An attached panel always sits at its host bar's layer.
+  inline constexpr std::array<std::string_view, 3> kPanelLayers = {"follow", "top", "overlay"};
+
+  // Tracks [shell.panel] floating_layer, so a plugin panel defaults to the same
+  // layer as the built-in ones.
+  inline constexpr std::string_view kPanelLayerFollow = "follow";
+
+  struct PluginPanelShellConfig {
+    PanelPlacement placement = PanelPlacement::Floating;
+    std::string position = "auto";
+    bool openNearClick = false;
+    std::string layer = "follow";
+  };
+
+  std::string panelShellSettingKey(std::string_view entryId, std::string_view suffix);
+
+  // Seeds standard placement, position, open-near-click, and layer settings on
+  // a [[panel]] entry when the plugin manifest does not declare them explicitly.
+  void injectStandardPanelShellSettings(PluginEntry& entry);
+
+  PluginPanelShellConfig resolvePluginPanelShellConfig(
+      const PluginEntry& entry, const std::unordered_map<std::string, WidgetSettingValue>& settings
+  );
+
+  PanelPlacement panelPlacementFromString(std::string_view value, PanelPlacement fallback) noexcept;
+  bool isValidPanelPosition(std::string_view value) noexcept;
+  bool isValidPanelKeyboardFocus(std::string_view value) noexcept;
+  bool isValidPanelLayer(std::string_view value) noexcept;
+  // True when the panel defers to [shell.panel] floating_layer instead of pinning a layer.
+  bool panelLayerFollowsFloating(std::string_view value) noexcept;
+  bool isPanelShellSettingKey(std::string_view entryId, std::string_view key) noexcept;
+
+} // namespace scripting

@@ -525,16 +525,14 @@ def focus_composer(window):
         # Empty/non-text focus has no current caret. Locate the native primary Input
         # in its current allocated pane, to the left of the nonmodal upload panel.
         point = (x + metrics["left"] + 16 * zoom, y + height - metrics["padding_y"] - 16 * zoom)
-    marker = gui.GUI_DEBUG[window][1].stat().st_size
     gui.click(window, *point)
-    gui.command("end-of-buffer", window=window)
+    gui.framed_keys(window, "ctrl+End")
     def focused():
         current = gui.native_input_state(window)
-        trace = gui.GUI_DEBUG[window][1].read_bytes()[marker:].decode(errors="replace")
         return (current is not None and current["caret"] is not None and
-                current["caret"][1] + current["caret"][3] >= point[1] - 64 * zoom and
-                re.search(r"zwp_text_input_v3[@#]\d+\.enable\(\)", trace))
-    gui.SESSION.until("fresh native composer Input focus after actual pointer activation", focused)
+                current["caret"][1] + current["caret"][3] >= point[1] - 64 * zoom)
+    # Refocusing an already active Input need not emit another text-input enable.
+    gui.SESSION.until("native composer caret after actual pointer activation and Ctrl+End", focused)
 
 
 def probe_accessory(proc, window, preferences, database, destination, ime, zoom=1):
@@ -963,6 +961,77 @@ def configure_soju_parent(proc, window, preferences, config, destination, lab):
             "masked_password_native_input": True, "registered_parent_catalog_received": True}
 
 
+def probe_network_names(proc, window, preferences, config, database, destination, lab):
+    setup = configure_soju_parent(proc, window, preferences, config, destination, lab)
+    first, second, discovered, channels = discover_children(proc, window, preferences, config, database)
+    identities = {row["name"]: (row["soju_parent"], row["soju_network_id"]) for row in discovered}
+    catalog = {str(row["id"]): row["name"] for row in remote_catalog(lab)}
+    assert catalog[identities[first][1]] == "local"
+    assert catalog[identities[second][1]] == "other"
+    original_buffers = {row[0] for row in buffer_rows(database)}
+    gui.close_settings_navigation(window)
+    # Start elsewhere so activating the result proves routing, not just an unchanged selection.
+    gui.switch_buffer("#blastirc-soju-other", catalog[identities[second][1]])
+    selected = gui.save_state(proc, preferences, database)
+    assert selected[1] == (channels[second],), "human caption selected the wrong starting child"
+    gui.close_settings_navigation(window)
+    geometry = gui.window_geometry(window)
+    width, height = min(620, geometry["WIDTH"] - 20), min(480, geometry["HEIGHT"] - 30)
+    left, top = (geometry["WIDTH"] - width) / 2, (geometry["HEIGHT"] - height) / 2
+    result_region = (left + 16, top + 104, width - 32, height - 120)
+    captions = {}
+
+    def caption(expected, label, absent=()):
+        def rendered():
+            words = visible_words(window, destination, label, region=result_region)
+            tokens = [word["text"].strip("()[],:;|").casefold() for word in words]
+            text = " ".join(tokens)
+            if expected.casefold() not in tokens or any(value.casefold() in text for value in absent):
+                return False
+            return text
+        captions[label] = gui.SESSION.until("actual palette network caption " + expected, rendered)
+        gui.capture_window(window, destination, label)
+
+    gui._open_native_palette("ctrl+x", "b", window=window)
+    gui.type_text("#blastirc-soju-other")
+    gui._palette_query(window, "#blastirc-soju-other")
+    caption("other", "network-names-other", (second,))
+    gui.framed_keys(window, "ctrl+a", "BackSpace")
+    gui.type_text("#blastirc-soju")
+    gui._palette_query(window, "#blastirc-soju")
+    # This prefix also matches the second channel; activate the actual renamed row below.
+    caption("local", "network-names-before", (first,))
+    netid = identities[first][1]
+    with FilehostObserver(dict(lab.endpoints["soju"], username="fixture"),
+                          lab.ca_file, control=True) as control:
+        assert "soju.im/bouncer-networks" in control.capabilities
+        control.send(f"BOUNCER CHANGENETWORK {netid} name=renamed")
+        command, params, _ = control.wait(
+            lambda command, params, prefix:
+                (command == "BOUNCER" and params[:2] == ["CHANGENETWORK", netid]) or
+                (command == "FAIL" and params[:1] == ["BOUNCER"]))
+        assert command == "BOUNCER", ("catalog rename rejected", params)
+        gui.SESSION.until("acknowledged rename in real soju catalog", lambda:
+                          any(str(row["id"]) == netid and row["name"] == "renamed"
+                              for row in remote_catalog(lab)))
+        # No GUI input or Settings snapshot between these captures: the palette stays open.
+        caption("renamed", "network-names-live", ("local", first))
+    click_label(window, destination, "renamed", region=result_region)
+    state = gui.save_state(proc, preferences, database)
+    assert state[1] == (channels[first],), "renamed palette result changed its routing target"
+    after = {row["name"]: (row.get("soju_parent"), row.get("soju_network_id"))
+             for row in saved_profiles(config) if row.get("soju_parent") == "Account"}
+    assert after == identities, "catalog rename changed stable child keys or parent links"
+    assert {row[0] for row in buffer_rows(database)} == original_buffers, "catalog rename changed buffer IDs"
+    gui.close_settings_navigation(window)
+    return {"native_setup": setup, "rendered_captions": captions,
+            "acknowledged_rename": {"network_id": netid, "before": "local", "after": "renamed"},
+            "child_identity": identities, "child_buffers": channels,
+            "activated_original_buffer": channels[first],
+            "palette_remained_open_during_rename": True,
+            "stable_child_and_buffer_ids_preserved": True}
+
+
 def probe_soju(proc, window, preferences, config, database, destination, lab, observer):
     def children():
         gui.save_preferences(proc, preferences, window)
@@ -1181,7 +1250,7 @@ def run():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", nargs="?", type=Path, default=gui.ROOT / "build-native/blastirc")
     parser.add_argument("--output-dir", type=Path, default=Path("/tmp/blastirc-upload-soju"))
-    parser.add_argument("--scope", choices=("uploads", "soju", "all"), default="all",
+    parser.add_argument("--scope", choices=("uploads", "soju", "network-names", "all"), default="all",
                         help="independent native consumer scope; default all preserves the complete workflow")
     parser.add_argument("--portal", type=Path, default=os.environ.get("BLASTIRC_PORTAL"))
     parser.add_argument("--portal-backend", type=Path, default=os.environ.get("BLASTIRC_PORTAL_BACKEND"))
@@ -1206,7 +1275,7 @@ def run():
         database = root / "data/blastirc/state.sqlite3"
         endpoint = lab.endpoints["soju"]
         q = json.dumps
-        native_soju_setup = args.scope in ("soju", "all")
+        native_soju_setup = args.scope in ("soju", "network-names", "all")
         config.write_text(
             "schema_version = 1\n"
             '[[identity]]\nname = "soju-user"\nnick = "soju"\nusername = "fixture"\n'
@@ -1259,7 +1328,15 @@ def run():
         (output / "soju-discovery.json").write_text(json.dumps(lab.filehost_evidence, indent=2) + "\n")
         try:
             proc, window = gui.launch_gui(binary, root / "initial.bmp", env, (1440, 940), logs)
-            if args.scope in ("soju", "all"):
+            if args.scope == "network-names":
+                report["limits"] = [
+                    "Native palette captions and live catalog rename are asserted from real rendered pixels.",
+                    "Screenshots retain other visible captions for human review; no font or cosmetic pixel assertions.",
+                    "Mentions caption caching is covered by transcript unit regressions, not this native scope.",
+                    "This focused scope does not exercise uploads, folding, restart, or every caption surface."]
+                report["network_names"] = probe_network_names(
+                    proc, window, preferences, config, database, destination, lab)
+            elif args.scope in ("soju", "all"):
                 first, second, report["soju"] = probe_soju(
                     proc, window, preferences, config, database, destination, lab, observer)
             else:
@@ -1278,33 +1355,35 @@ def run():
                     proc, window, preferences, database, destination, fixture, file, observer, first, lab, services)
                 gui.switch_buffer("#blastirc-soju", first)
                 report["filehost"] = probe_filehost(proc, window, preferences, database, destination, lab, file, services)
-            gui.click(window, *rail_point(preferences, 0))
-            persisted = snapshot(proc, window, preferences, database)
-            gui.wait_preference(proc, preferences, "workspace", "soju-group:Account", "collapsed")
-            assert tomllib.loads(preferences.read_text())["workspace"]["soju-group:Account"] == "collapsed"
+            if args.scope != "network-names":
+                gui.click(window, *rail_point(preferences, 0))
+                persisted = snapshot(proc, window, preferences, database)
+                gui.wait_preference(proc, preferences, "workspace", "soju-group:Account", "collapsed")
+                assert tomllib.loads(preferences.read_text())["workspace"]["soju-group:Account"] == "collapsed"
             stdout, stderr = gui.finish_gui(proc, window, root / "initial.bmp", destination, (1440, 940))
             logs.append(("initial", stdout, stderr))
             proc = None
-            proc, window = gui.launch_gui(binary, root / "restart.bmp", env, (1440, 940), logs)
-            restored = snapshot(proc, window, preferences, database)
-            gui.wait_preference(proc, preferences, "workspace", "soju-group:Account", "collapsed")
-            assert tomllib.loads(preferences.read_text())["workspace"]["soju-group:Account"] == "collapsed"
-            assert restored[1] == persisted[1], "fold restart changed current conversation"
-            if args.scope in ("soju", "all"):
-                assert next(profile for profile in saved_profiles(config) if profile["name"] == "Account")["alias"] == "Home"
-                assert {profile["name"]: profile.get("soju_parent") for profile in saved_profiles(config)
-                        if profile["name"] in (first, second)} == {first: "Account", second: "Account"}, \
-                    "restart changed child parent links"
-                assert_parent_alias_caption(window, preferences, destination, "parent-account-alias-restarted")
-                report["soju"]["parent_alias_restart_preserved"] = True
-            if args.scope in ("uploads", "all"):
-                assert tomllib.loads(preferences.read_text())["uploads"]["provider"] == "custom"
-            gui.capture_window(window, destination, "persisted-fold")
-            stdout, stderr = gui.finish_gui(proc, window, root / "restart.bmp",
-                                            output / "restart.bmp", (1440, 940))
-            logs.append(("restart", stdout, stderr))
-            proc = None
-            report["fold_restart_preserved"] = True
+            if args.scope != "network-names":
+                proc, window = gui.launch_gui(binary, root / "restart.bmp", env, (1440, 940), logs)
+                restored = snapshot(proc, window, preferences, database)
+                gui.wait_preference(proc, preferences, "workspace", "soju-group:Account", "collapsed")
+                assert tomllib.loads(preferences.read_text())["workspace"]["soju-group:Account"] == "collapsed"
+                assert restored[1] == persisted[1], "fold restart changed current conversation"
+                if args.scope in ("soju", "all"):
+                    assert next(profile for profile in saved_profiles(config) if profile["name"] == "Account")["alias"] == "Home"
+                    assert {profile["name"]: profile.get("soju_parent") for profile in saved_profiles(config)
+                            if profile["name"] in (first, second)} == {first: "Account", second: "Account"}, \
+                        "restart changed child parent links"
+                    assert_parent_alias_caption(window, preferences, destination, "parent-account-alias-restarted")
+                    report["soju"]["parent_alias_restart_preserved"] = True
+                if args.scope in ("uploads", "all"):
+                    assert tomllib.loads(preferences.read_text())["uploads"]["provider"] == "custom"
+                gui.capture_window(window, destination, "persisted-fold")
+                stdout, stderr = gui.finish_gui(proc, window, root / "restart.bmp",
+                                                output / "restart.bmp", (1440, 940))
+                logs.append(("restart", stdout, stderr))
+                proc = None
+                report["fold_restart_preserved"] = True
             if args.scope in ("uploads", "all"):
                 # A fresh private geometry fixture uses the supported minimum viewport at max zoom.
                 # The original full gui_smoke.py workflow is untouched.

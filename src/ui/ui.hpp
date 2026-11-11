@@ -70,8 +70,6 @@ void configureNativeControlBindings();
 const std::map<std::string, std::string> &defaultBindings();
 std::string_view commandDisplayName(std::string_view command);
 std::string commandLabel(const Model &, std::string_view label, std::string_view command);
-// Presentation only; connection and draft routing always retain the stable server key.
-std::string_view serverDisplayName(const Model &, const std::string &server);
 std::string sidebarModeToggleLabel(std::string_view panel, SidebarMode preferred,
                                    SidebarMode regularEffective);
 std::string bindingStroke(const InputArea::KeyData &);

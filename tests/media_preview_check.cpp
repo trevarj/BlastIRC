@@ -1,4 +1,5 @@
 #include "../src/model.hpp"
+#include "../src/preview.hpp"
 #include "../src/ui/media_preview.hpp"
 #include "preview_fixture.hpp"
 
@@ -162,7 +163,10 @@ void consent(Certificate &certificate) {
 class PreviewTextureSink final : public TextureManager {
   public:
     unsigned gifUploads = 0;
+    bool rejectUploads = false;
     TextureHandle loadFromRgba(const std::uint8_t *data, int width, int height, bool) override {
+        if (rejectUploads)
+            return {};
         if (width == 2 && height == 1) {
             constexpr std::array<std::uint8_t, 8> firstFrame{255, 0, 0, 255, 255, 0, 0, 255};
             assert(std::equal(firstFrame.begin(), firstFrame.end(), data));
@@ -596,17 +600,232 @@ void captionConsumers(Certificate &certificate, const std::string &body) {
             return controller.ready(id) || !controller.error(id).empty();
         });
         assert(controller.ready(id) && controller.error(id).empty());
-        assert(controller.replacesUrl(id) && !controller.active());
+        assert(controller.replacesUrl(id) == (id != 1) && !controller.active());
         view->sync(renderer, 400, 1);
         root.layout(renderer);
-        checkCaption(renderer, *view, url, id == 1 ? 120 : 96);
+        if (id != 1)
+            checkCaption(renderer, *view, url, 96);
         if (id == 1) {
             auto *image = previewImage(*view);
             assert(image && image->visible() && image->hasImage());
+            assert(view->height() == 128 && view->measure(renderer, 400, 1) == 128);
+            assert(!visibleLabelWithText(*view, url));
             assert(!visibleLabelWithText(*view, "Real image page title"));
         }
     }
     root.removeChild(view);
+}
+void htmlThumbnailConsumers(Certificate &certificate, const std::string &body) {
+    // Container preflight accepts this PNG; its empty IDAT cannot decode into pixels.
+    std::string undecodable(57, '\0');
+    undecodable.replace(0, 8, "\x89PNG\r\n\x1a\n", 8);
+    undecodable[11] = 13;
+    undecodable.replace(12, 4, "IHDR");
+    undecodable[19] = undecodable[23] = 1;
+    undecodable[24] = 8;
+    undecodable[25] = 6;
+    undecodable.replace(37, 4, "IDAT");
+    undecodable.replace(49, 4, "IEND");
+    assert(PreviewService::raster(
+        {reinterpret_cast<const std::uint8_t *>(undecodable.data()), undecodable.size()}));
+    for (const std::string_view scenario : {"missing", "pending", "denied", "failed", "undecodable",
+                                            "upload", "valid", "suffix", "click"}) {
+        const bool missing = scenario == "missing";
+        const bool pending = scenario == "pending";
+        const bool denied = scenario == "denied";
+        const bool click = scenario == "click";
+        const bool invalid = scenario == "undecodable";
+        const bool valid = scenario == "valid" || scenario == "suffix";
+        const bool upload = scenario == "upload";
+        Server server(certificate, [&](std::string_view path) {
+            if (path == "/page" || path == "/page.png")
+                return Reply{missing ? "<title>No thumbnail</title>"
+                                     : "<title>Thumbnail page</title>"
+                                       "<meta property='og:image' content='/thumb.png'>"};
+            assert(path == "/thumb.png");
+            if (scenario == "failed")
+                return Reply{"Unavailable", "Content-Type: text/plain\r\n", 404};
+            return invalid ? Reply{undecodable, "Content-Type: image/png\r\n"}
+                           : Reply{body, "Content-Type: image/webp\r\n", 200, pending};
+        });
+        Model model;
+        model.settings.previewAllowLocal = true;
+        model.settings.linkPreviews = PreviewMode::Automatic;
+        model.settings.imagePreviews = denied  ? PreviewMode::Off
+                                       : click ? PreviewMode::Click
+                                               : PreviewMode::Automatic;
+        RenderContext context;
+        PreviewImageRenderer renderer(context);
+        Node root;
+        root.setSize(800, 600);
+        InputDispatcher dispatcher;
+        dispatcher.setSceneRoot(&root);
+        MediaPreviewController controller(model, root, certificate.caPath);
+        controller.setInputDispatcher(dispatcher);
+        unsigned changed = 0;
+        controller.setChanged([&] { ++changed; });
+        auto card = std::make_unique<MediaPreviewCard>(controller);
+        auto *view = card.get();
+        root.addChild(std::move(card));
+        const auto url = server.endpoint + (scenario == "suffix" ? "/page.png" : "/page");
+        view->bind(17, url, true);
+        auto hidden = [&] {
+            assert(controller.measure(renderer, 17, 400, 1) == 0);
+            assert(view->measure(renderer, 400, 1) == 0);
+            view->sync(renderer, 400, 1);
+            root.layout(renderer);
+            assert(view->height() == 0 && !view->visible());
+            assert(dispatcher.inputAreaAt(10, 10) != firstArea(*view));
+            assert(!controller.replacesUrl(17));
+        };
+        // An image suffix may show its direct-image tile until MIME confirms HTML.
+        if (scenario != "suffix")
+            hidden();
+        until([&] {
+            controller.update(800, 600, 1);
+            if (pending)
+                return server.requests == 2;
+            if (missing || denied || click)
+                return changed > 0;
+            return controller.ready(17) || !controller.error(17).empty();
+        });
+        const unsigned requests = scenario == "suffix" ? 3 : missing || denied || click ? 1 : 2;
+        assert(server.requests == requests && !controller.active());
+        if (valid) {
+            assert(controller.ready(17) && controller.error(17).empty());
+            assert(controller.measure(renderer, 17, 400, 1) > 0);
+            view->sync(renderer, 400, 1);
+            root.layout(renderer);
+            auto *image = previewImage(*view);
+            assert(view->visible() && image && image->visible() && image->hasImage());
+            assert(image->sourceWidth() == 1 && image->sourceHeight() == 1);
+            assert(!visibleLabelWithText(*view, url) && !controller.replacesUrl(17));
+        } else if (upload) {
+            assert(controller.ready(17) && controller.error(17).empty());
+            assert(view->measure(renderer, 400, 1) > 0); // CPU pixels alone are insufficient.
+            const auto beforeUpload = changed;
+            renderer.textures.rejectUploads = true;
+            view->sync(renderer, 400, 1);
+            root.layout(renderer);
+            assert(view->height() == 0 && !view->visible());
+            assert(dispatcher.inputAreaAt(10, 10) != firstArea(*view));
+            hidden();
+            assert(controller.error(17) == "Image decode failed." && changed == beforeUpload);
+            controller.update(800, 600, 1);
+            assert(changed == beforeUpload + 1);
+        } else {
+            if (invalid)
+                assert(controller.ready(17) && controller.error(17).empty());
+            const auto beforeMeasure = changed;
+            hidden();
+            if (invalid) {
+                assert(controller.error(17) == "Image decode failed.");
+                assert(changed == beforeMeasure); // Layout never notifies re-entrantly.
+                controller.update(800, 600, 1);
+                assert(changed == beforeMeasure + 1);
+            }
+            if (scenario == "failed")
+                assert(controller.error(17).find("HTTP 404") != std::string_view::npos);
+        }
+        if (pending) {
+            assert(!controller.canLoadPreview(17, url));
+            assert(!controller.loadPreview(17, url) && !controller.active());
+        }
+        const auto settledChanges = changed;
+        for (unsigned i = 0; i < 12; ++i) {
+            view->bind(17, url, true);
+            controller.update(800, 600, 1);
+            if (!valid)
+                hidden();
+            else
+                assert(view->measure(renderer, 400, 1) > 0 && !controller.replacesUrl(17));
+            std::this_thread::sleep_for(2ms);
+            assert(server.requests == requests && changed == settledChanges);
+        }
+        if (click) {
+            assert(controller.canLoadPreview(17, url));
+            assert(controller.loadPreview(17, url));
+            until([&] {
+                controller.update(800, 600, 1);
+                return controller.ready(17) || !controller.error(17).empty();
+            });
+            assert(controller.ready(17) && controller.error(17).empty());
+            assert(server.requests == 2 && !controller.replacesUrl(17));
+            assert(view->measure(renderer, 400, 1) > 0);
+            controller.close();
+        } else if (!valid && !pending) {
+            assert(!controller.canLoadPreview(17, url));
+            assert(!controller.loadPreview(17, url) && server.requests == requests);
+        }
+        server.releaseBody = true;
+        model.settings.linkPreviews = model.settings.imagePreviews = PreviewMode::Off;
+        controller.update(800, 600, 1);
+        view->bind(18, server.endpoint + "/off", true);
+        hidden();
+        assert(view->measure(renderer, 400, 1) == 0);
+        assert(!controller.canLoadPreview(18, server.endpoint + "/off"));
+        assert(!controller.loadPreview(18, server.endpoint + "/off"));
+        assert(server.requests == requests + (click ? 1 : 0));
+        root.removeChild(view);
+    }
+    // Extensionless URLs need independent consent for Link -> Image MIME classification.
+    for (const auto imageMode : {PreviewMode::Click, PreviewMode::Off}) {
+        Server server(certificate, [&](std::string_view path) {
+            assert(path == "/extensionless");
+            return Reply{body, "Content-Type: image/webp\r\n"};
+        });
+        Model model;
+        model.settings.previewAllowLocal = true;
+        model.settings.linkPreviews = PreviewMode::Click;
+        model.settings.imagePreviews = imageMode;
+        RenderContext context;
+        PreviewImageRenderer renderer(context);
+        Node root;
+        root.setSize(800, 600);
+        MediaPreviewController controller(model, root, certificate.caPath);
+        auto card = std::make_unique<MediaPreviewCard>(controller);
+        auto *view = card.get();
+        root.addChild(std::move(card));
+        const auto url = server.endpoint + "/extensionless";
+        view->bind(71, url, true);
+        view->sync(renderer, 400, 1);
+        assert(!view->visible() && view->height() == 0 && server.requests == 0);
+        assert(controller.canLoadPreview(71, url));
+        assert(controller.loadPreview(71, url));
+        until([&] {
+            controller.update(800, 600, 1);
+            return !controller.error(71).empty();
+        });
+        assert(server.requests == 1 && !controller.ready(71) && !controller.replacesUrl(71));
+        for (unsigned i = 0; i < 12; ++i) {
+            view->bind(71, url, true);
+            view->measure(renderer, 400, 1);
+            controller.update(800, 600, 1);
+            std::this_thread::sleep_for(2ms);
+            assert(server.requests == 1 && !controller.ready(71));
+        }
+        if (imageMode == PreviewMode::Click) {
+            assert(controller.canLoadPreview(71, url));
+            assert(controller.loadPreview(71, url));
+            until([&] {
+                controller.update(800, 600, 1);
+                return controller.ready(71) || !controller.error(71).empty();
+            });
+            assert(controller.ready(71) && controller.error(71).empty());
+            view->sync(renderer, 400, 1);
+            root.layout(renderer);
+            auto *image = previewImage(*view);
+            assert(image && image->visible() && image->hasImage());
+            assert(image->sourceWidth() == 1 && image->sourceHeight() == 1);
+            assert(server.requests == 2 && controller.replacesUrl(71));
+        } else {
+            assert(!controller.canLoadPreview(71, url));
+            assert(!controller.loadPreview(71, url));
+            assert(view->measure(renderer, 400, 1) == 0 && server.requests == 1);
+        }
+        controller.close();
+        root.removeChild(view);
+    }
 }
 void gifConsumers(Certificate &certificate) {
     const auto body = gifBody();
@@ -689,8 +908,7 @@ void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     dispatcher.setSceneRoot(&root);
     MediaPreviewController controller(model, root, certificate.caPath);
     controller.setInputDispatcher(dispatcher);
-    unsigned changed = 0;
-    controller.setChanged([&] { ++changed; });
+
     auto card = std::make_unique<MediaPreviewCard>(controller);
     auto *view = card.get();
     root.addChild(std::move(card));
@@ -761,15 +979,18 @@ void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     const auto pageUrl = server.endpoint + "/page";
     const auto pageInfo = pageUrl + "\n\nReal page\nReal page description\n\nType: Web page";
     view->bind(43, pageUrl, true);
+    assert(view->measure(renderer, 400, 1) == 0);
     view->sync(renderer, 400, 1);
     root.layout(renderer);
-    const auto beforePage = changed;
-    area->dispatchKey(XKB_KEY_Return, 0, 0, true);
+    assert(!view->visible() && view->height() == 0);
+    assert(dispatcher.inputAreaAt(10, 10) != area && server.requests == 1);
+    assert(controller.canLoadPreview(43, pageUrl));
+    assert(controller.loadPreview(43, pageUrl));
     until([&] {
         controller.update(800, 600, 1);
-        return changed > beforePage + 1;
+        return info->visible() && info->value() == pageInfo;
     });
-    assert(controller.active() && controller.replacesUrl(43) && server.requests == 2);
+    assert(controller.active() && !controller.replacesUrl(43) && server.requests == 2);
     assert(info->visible() && info->value() == pageInfo);
     assert(dispatcher.focusedArea() == info->inputArea());
     info->inputArea()->dispatchKey(XKB_KEY_a, 0, KeyMod::Ctrl, true);
@@ -783,17 +1004,17 @@ void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     controller.close();
     view->sync(renderer, 400, 1);
     root.layout(renderer);
-    checkCaption(renderer, *view, pageUrl, 96);
+    assert(view->measure(renderer, 400, 1) == 0 && view->height() == 0 && !view->visible());
+    assert(dispatcher.inputAreaAt(10, 10) != area);
+    assert(!visibleLabelWithText(*view, pageUrl));
     assert(!visibleLabelWithText(*view, "Real page"));
-    area->dispatchPress(10, 10, BTN_LEFT, true, 10, 10, 1);
-    area->dispatchPress(10, 10, BTN_LEFT, false, 10, 10, 1);
-    assert(controller.active() && info->visible() && info->value() == pageInfo);
-    assert(dispatcher.focusedArea() == info->inputArea() && server.requests == 2);
-    controller.close();
-    rightClick();
-    view->bind(43, server.endpoint + "/page", false);
-    menu.choose("Info");
-    assert(!controller.active());
+    assert(!controller.canLoadPreview(43, pageUrl));
+    for (unsigned i = 0; i < 10; ++i) {
+        view->bind(43, pageUrl, true);
+        view->sync(renderer, 400, 1);
+        controller.update(800, 600, 1);
+        assert(view->measure(renderer, 400, 1) == 0 && server.requests == 2);
+    }
     bool liveReadable = true;
     view->setReadable([&](std::uint64_t message) {
         assert(message == 42);
@@ -839,6 +1060,7 @@ void checkMediaPreview() {
     statusDiagnostics(certificate, body);
     gifConsumers(certificate);
     captionConsumers(certificate, body);
+    htmlThumbnailConsumers(certificate, body);
     consent(certificate);
     cacheConsumers(certificate, body);
     unpolledConsumers(certificate, body);

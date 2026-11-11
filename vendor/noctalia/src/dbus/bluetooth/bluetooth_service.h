@@ -1,0 +1,163 @@
+#pragma once
+
+#include "core/timer_manager.h"
+
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+class SystemBus;
+class IpcService;
+class UPowerService;
+
+namespace sdbus {
+  class IProxy;
+}
+
+enum class BluetoothDeviceKind : std::uint8_t {
+  Unknown,
+  Headset,
+  Headphones,
+  Earbuds,
+  Speaker,
+  Microphone,
+  Mouse,
+  Keyboard,
+  Phone,
+  Computer,
+  Gamepad,
+  Watch,
+  Tv,
+};
+
+struct BluetoothDeviceInfo {
+  std::string path;
+  std::string address;
+  std::string alias;
+  BluetoothDeviceKind kind = BluetoothDeviceKind::Unknown;
+  bool paired = false;
+  bool trusted = false;
+  bool connected = false;
+  bool connecting = false;
+  bool hasRssi = false;
+  std::int16_t rssi = 0;
+  bool hasBattery = false;
+  std::uint8_t batteryPercent = 0;
+  // Set when batteryPercent came from UPower instead of BlueZ's Battery1.
+  bool batteryFromUPower = false;
+
+  bool operator==(const BluetoothDeviceInfo&) const = default;
+};
+
+struct BluetoothState {
+  bool adapterPresent = false;
+  bool powered = false;
+  /// rfkill soft block (e.g. GDM/GNOME login screen) prevents powering on until cleared.
+  bool rfkillSoftBlocked = false;
+  bool discoverable = false;
+  bool pairable = false;
+  bool discovering = false;
+  std::string adapterName;
+
+  bool operator==(const BluetoothState&) const = default;
+};
+
+enum class BluetoothStateChangeOrigin : std::uint8_t {
+  External,
+  Noctalia,
+};
+
+class BluetoothService {
+public:
+  using StateCallback = std::function<void(const BluetoothState&, BluetoothStateChangeOrigin)>;
+  using DevicesCallback = std::function<void(const std::vector<BluetoothDeviceInfo>&)>;
+  using StateFeedbackCallback = std::function<void(bool enabled)>;
+
+  // upowerService may be null when UPower is unavailable; it must outlive this service.
+  explicit BluetoothService(SystemBus& bus, UPowerService* upowerService);
+  ~BluetoothService();
+
+  BluetoothService(const BluetoothService&) = delete;
+  BluetoothService& operator=(const BluetoothService&) = delete;
+
+  void setStateCallback(StateCallback callback);
+  void setDevicesCallback(DevicesCallback callback);
+  void refresh();
+  void registerIpc(IpcService& ipc, const StateFeedbackCallback& stateFeedback = {});
+
+  const BluetoothState& state() const noexcept { return m_state; }
+  bool hasStateSnapshot() const noexcept { return m_hasStateSnapshot; }
+  const std::vector<BluetoothDeviceInfo>& devices() const noexcept { return m_devices; }
+
+  void setPowered(bool enabled);
+  void setDiscoverable(bool enabled);
+  void setPairable(bool enabled);
+  void startDiscovery();
+  void stopDiscovery();
+
+  bool connect(const std::string& devicePath);
+  bool disconnectDevice(const std::string& devicePath);
+  bool pair(const std::string& devicePath);
+  bool cancelPair(const std::string& devicePath);
+  void setTrusted(const std::string& devicePath, bool trusted);
+  void forget(const std::string& devicePath);
+
+  void refreshBatteryFromUPower();
+
+  // [bluetooth].connect_when_enabled; disabling cancels a queued or running connect pass.
+  void setConnectWhenEnabled(bool enabled);
+  // [bluetooth].connection_notifications; when false, device connect/disconnect transitions and failed
+  // connects stay silent.
+  void setConnectionNotifications(bool enabled);
+
+private:
+  struct Impl;
+  friend struct Impl;
+
+  BluetoothDeviceInfo* findDevice(const std::string& path);
+  [[nodiscard]] BluetoothStateChangeOrigin consumePoweredChangeOrigin(bool powered);
+  void emitState(BluetoothStateChangeOrigin origin = BluetoothStateChangeOrigin::External);
+  void emitDevices();
+  // Toasts a Connected transition unless it completes a device action the user started here.
+  void notifyConnectionChange(const BluetoothDeviceInfo& dev);
+  // Drops the device action entry once its reply shows the target state was reached (or never will be).
+  void settleLocalDeviceRequest(const std::string& devicePath);
+
+  /// One connect pass over paired, trusted, disconnected devices when the adapter comes up (power-on,
+  /// startup, resume). Devices go one at a time, each after the previous Connect() replies: the
+  /// controller pages serially, and parallel attempts hold off devices that reconnect on their own.
+  void requestConnectPass();
+  void cancelConnectPass();
+  void startConnectPass();
+  void connectNextQueued();
+  // Calls onReply after the Connect() reply (success or error), not when dispatch fails.
+  bool dispatchConnect(const std::string& devicePath, std::function<void()> onReply);
+
+  bool applyUPowerBattery();
+
+  std::unique_ptr<Impl> m_impl;
+
+  BluetoothState m_state;
+  std::vector<BluetoothDeviceInfo> m_devices;
+  std::optional<bool> m_pendingLocalPowered;
+  std::uint64_t m_pendingPoweredRevision = 0;
+  // Device path -> Connected value a user-started Connect/Disconnect/Pair/Forget is heading for. The
+  // matching Connected transition consumes the entry so feedback for the user's own action stays quiet.
+  std::unordered_map<std::string, bool> m_localDeviceRequests;
+  Timer m_connectPassTimer;
+  std::deque<std::string> m_connectQueue;
+  std::uint64_t m_connectPassGeneration = 0;
+  bool m_connectPassActive = false;
+  bool m_connectWhenEnabled = false;
+  bool m_connectionNotifications = false;
+  bool m_hasStateSnapshot = false;
+  StateCallback m_stateCallback;
+  DevicesCallback m_devicesCallback;
+
+  UPowerService* m_upowerService = nullptr;
+};

@@ -12,7 +12,7 @@ inline constexpr std::array commandCatalog{
     CommandInfo{"connect", "Connect a server", "[server]", true},
     CommandInfo{"disconnect", "Disconnect this server", "", true},
     CommandInfo{"clear", "Clear this buffer", "", true},
-    CommandInfo{"messagestyle", "Change conversation display", "[bubbles|irc]", true},
+    CommandInfo{"messagestyle", "Change conversation display", "[bubbles|irc|stacked]", true},
     CommandInfo{"quit", "Quit BlastIRC", "[reason]", true},
     CommandInfo{"me", "Send an action", "action", true},
     CommandInfo{"msg", "Open a query and optionally send", "nick [message]", true},

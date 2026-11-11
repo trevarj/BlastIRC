@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace blast {
 
@@ -34,6 +35,7 @@ class Workspace {
 
     std::uint64_t open(std::string_view buffer);
     void focus(std::uint64_t id);
+    std::optional<std::uint64_t> navigateHistory(bool forward);
     void reconcile();
     void remapBuffer(std::string_view oldId, std::string_view newId);
     void persist();
@@ -47,11 +49,17 @@ class Workspace {
     std::map<std::uint64_t, SavedPane> saved_;
     std::string publishedActive_, serialized_;
     std::optional<float> serverRailWidth_, channelSidebarWidth_, compactChannelSidebarWidth_;
+    std::vector<std::string> history_;
+    std::size_t historyCursor_ = 0;
+    bool suppressHistory_ = true;
 
     std::uint64_t freshId();
     const std::string &fallbackBuffer() const;
     void remove(std::uint64_t id);
     void deduplicate();
     void publish();
+    bool historyEligible(const std::string &buffer) const;
+    void recordHistory(const std::string &buffer);
+    void remapHistory(const std::string &oldId, const std::string &newId);
 };
 } // namespace blast

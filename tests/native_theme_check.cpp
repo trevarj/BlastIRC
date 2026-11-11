@@ -196,6 +196,25 @@ void presentation() {
     model.settings.reducedMotion = true;
     Theme theme;
     theme.update(model);
+    assert(model.settings.uiFontWeight == 400 && model.settings.messageFontWeight == 400);
+    assert(static_cast<int>(themeUiFont().weight) == 400 &&
+           static_cast<int>(themeMessageFont().weight) == 400);
+    for (int weight : {300, 400, 500, 600, 700}) {
+        model.settings.uiFontWeight = weight;
+        theme.update(model);
+        assert(static_cast<int>(themeUiFont().weight) == weight &&
+               static_cast<int>(themeMessageFont().weight) == 400);
+    }
+    for (int weight : {700, 600, 500, 400, 300}) {
+        model.settings.messageFontWeight = weight;
+        theme.update(model);
+        assert(static_cast<int>(themeUiFont().weight) == 700 &&
+               static_cast<int>(themeMessageFont().weight) == weight);
+    }
+    model.settings.uiFontWeight = model.settings.messageFontWeight = 400;
+    theme.update(model);
+    assert(static_cast<int>(themeUiFont().weight) == 400 &&
+           static_cast<int>(themeMessageFont().weight) == 400);
     const auto uiFont = themeUiFont().family;
     const auto messageFont = themeMessageFont().family;
     model.settings.uiFont = "serif";
@@ -218,12 +237,12 @@ void presentation() {
     assert(messageBubbles(model.settings, channel));
     assert(messageBubbles(model.settings, query));
     assert(!messageBubbles(model.settings, server));
-    model.settings.ircChannels.insert(channel.id);
+    model.settings.messageLayouts[channel.id] = MessageLayout::Irc;
     assert(!messageBubbles(model.settings, channel));
     assert(messageBubbles(model.settings, query));
-    model.settings.ircChannels.insert(query.id);
+    model.settings.messageLayouts[query.id] = MessageLayout::Stacked;
     assert(!messageBubbles(model.settings, query));
-    model.settings.ircChannels.erase(channel.id);
+    model.settings.messageLayouts.erase(channel.id);
     assert(messageBubbles(model.settings, channel));
     assert(!messageBubbles(model.settings, query));
 }

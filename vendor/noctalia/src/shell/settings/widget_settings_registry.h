@@ -1,0 +1,208 @@
+#pragma once
+
+#include "config/config_types.h"
+#include "config/schema/widget_schema.h"
+
+#include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace scripting {
+  struct ManifestField;
+  struct PluginEntry;
+  class PluginRegistry;
+  class PluginTranslationCatalog;
+} // namespace scripting
+
+namespace settings {
+
+  enum class WidgetReferenceKind : std::uint8_t {
+    BuiltIn,
+    Named,
+    Unknown,
+    Plugin, // a plugin [[widget]] entry from the plugin registry
+  };
+
+  struct WidgetTypeSpec {
+    std::string_view type;
+    std::string_view labelKey;
+    std::string_view glyph;
+    bool supportsMultipleInstances = true;
+    bool visibleInPicker = true;
+  };
+
+  struct WidgetReferenceInfo {
+    std::string title;
+    std::string detail;
+    WidgetReferenceKind kind = WidgetReferenceKind::Unknown;
+  };
+
+  struct WidgetPickerEntry {
+    std::string value; // for Plugin entries this is the entry id "author/plugin:entry"
+    std::string label;
+    std::string description;
+    std::string icon;
+    WidgetReferenceKind kind = WidgetReferenceKind::Unknown;
+  };
+
+  // How a setting is rendered in the settings UI. Distinct from the schema's
+  // WidgetSettingType (the value/validation type): File/Folder/Glyph all carry a
+  // String value, Select carries an Enum value, ColorSpec carries a Color value.
+  enum class WidgetControlKind : std::uint8_t {
+    Bool,
+    Int,
+    Double,
+    OptionalDouble,
+    String,
+    File,
+    Folder,
+    Glyph,
+    StringList,
+    StringMap,
+    Select,
+    ColorSpec,
+  };
+
+  struct WidgetSettingSelectOption {
+    std::string value;
+    std::string labelKey; // i18n key, unless the owning spec sets `literalLabels` (then a literal label)
+  };
+
+  struct WidgetSettingVisibilityCondition {
+    std::string key;
+    std::vector<std::string> values;
+    // When true, matches a non-empty string or string list (values are ignored).
+    bool nonEmpty = false;
+  };
+
+  struct WidgetSettingVisibility {
+    std::vector<WidgetSettingVisibilityCondition> any; // visible if any alternative matches (empty = unconstrained)
+    std::vector<WidgetSettingVisibilityCondition> all; // additionally requires every condition to match
+
+    WidgetSettingVisibility() = default;
+    WidgetSettingVisibility(std::string key, std::vector<std::string> values)
+        : any{WidgetSettingVisibilityCondition{std::move(key), std::move(values)}} {}
+    WidgetSettingVisibility(std::initializer_list<WidgetSettingVisibilityCondition> alternatives) : any(alternatives) {}
+  };
+
+  enum class WidgetSettingOptionSource : std::uint8_t {
+    Static,
+    BatteryDevices,
+    Outputs,
+  };
+
+  enum class WidgetSettingCapability : std::uint8_t {
+    TaskbarWorkspaceGrouping,
+  };
+
+  struct WidgetSettingCapabilities {
+    bool taskbarWorkspaceGrouping = false;
+  };
+
+  // UI-only overlay for a widget setting. It can be attached to a typed widget
+  // field without making presentation part of that field's value/schema contract.
+  struct WidgetSettingPresentation {
+    WidgetControlKind control = WidgetControlKind::String;
+    std::string labelKey;
+    std::string descriptionKey;
+    std::string literalLabel;       // when non-empty, used verbatim instead of tr(labelKey)
+    std::string literalDescription; // when non-empty, used verbatim instead of tr(descriptionKey)
+    bool literalLabels = false;     // when true, option.labelKey holds a literal label (not an i18n key)
+    // Section this setting renders under. Doubles as the i18n key suffix, resolved against
+    // settings.entities.widget.settings.groups.<group>. Shared across widgets: "widget", "presentation",
+    // "runtime". Anything meaningful to a single widget is prefixed with its type, e.g. "taskbar.grouping".
+    std::string group = "widget";
+    // Statically declared select options. A non-static option source appends
+    // runtime options, with these values taking precedence on duplicates.
+    std::vector<WidgetSettingSelectOption> options;
+    WidgetSettingOptionSource optionSource = WidgetSettingOptionSource::Static;
+    std::optional<WidgetSettingCapability> requiresCapability;
+    bool visibleInInspector = true;
+    bool advanced = false;
+    bool segmented = false;              // applies when control == Select
+    bool integerValue = false;           // applies when control == Select
+    bool stepper = false;                // applies when control == Int
+    std::string valueSuffix;             // applies when control == Int && stepper
+    bool allowCustomColor = true;        // applies when control == ColorSpec
+    std::vector<std::string> extensions; // applies when control == File
+    std::optional<WidgetSettingVisibility> visibleWhen;
+    bool horizontalBarOnly = false; // hide on left/right bars (e.g. media album-art-only)
+    std::function<WidgetSettingValue(const Config&)> defaultFromConfig;
+  };
+
+  // Complete setting description.
+  struct WidgetSettingSpec : WidgetSettingPresentation {
+    noctalia::config::schema::WidgetSettingField schema;
+  };
+
+  // The schema (validation) value type behind a UI control kind.
+  noctalia::config::schema::WidgetSettingType schemaTypeForControl(WidgetControlKind control);
+
+  const std::vector<WidgetTypeSpec>& widgetTypeSpecs();
+  bool isBuiltInWidgetType(std::string_view type);
+  // Whether `type` names a plugin [[widget]] entry ("author/plugin:entry").
+  bool isPluginWidgetType(std::string_view type);
+  bool widgetTypeRequiresNamedConfig(std::string_view type);
+  std::string widgetTypeForReference(const Config& cfg, std::string_view name);
+  std::string titleFromWidgetKey(std::string_view key);
+  WidgetReferenceInfo widgetReferenceInfo(const Config& cfg, std::string_view name, bool includeManifestVersion = true);
+  std::vector<WidgetPickerEntry> widgetPickerEntries(const Config& cfg);
+  std::vector<WidgetSettingSpec>
+  commonWidgetSettingSpecs(std::string_view shellFontFamily, bool populateFontCatalogs = true);
+  // `config` resolves a plugin [[widget]] type to its manifest-driven settings, and supplies the
+  // discriminator for types whose gesture defaults depend on a setting (a volume widget bound to
+  // the microphone). May be null when neither applies.
+  std::vector<WidgetSettingSpec> widgetSettingSpecs(
+      std::string_view type, const WidgetConfig* config, std::string_view shellFontFamily,
+      bool populateFontCatalogs = true
+  );
+  bool widgetSettingIsVisible(
+      const Config& config, std::string_view widgetName, const WidgetSettingSpec& spec,
+      const std::vector<WidgetSettingSpec>& allSpecs, const WidgetSettingCapabilities& capabilities
+  );
+  // Build settings specs from a plugin entry's declared setting schema.
+  std::vector<WidgetSettingSpec> manifestSettingSpecs(
+      const std::vector<scripting::ManifestField>& fields,
+      const scripting::PluginTranslationCatalog* translations = nullptr
+  );
+  std::vector<WidgetSettingSpec> pluginPanelShellSettingSpecs(const scripting::PluginEntry& entry);
+
+  // Schema projection (the validity half of the specs), consumed by the config
+  // layer (e.g. `config validate`). For plugin widgets the type alone resolves the
+  // manifest, so the config arg is no longer required for them.
+  noctalia::config::schema::WidgetSettingSchema widgetSettingSchema(std::string_view type);
+  noctalia::config::schema::WidgetSettingSchema widgetSettingSchema(
+      std::string_view type, const WidgetConfig* config, scripting::PluginRegistry* pluginRegistry = nullptr
+  );
+  // Semantic cross-field validation for a widget config entry. Nullopt means the
+  // resolved options are valid or the widget type declares no semantic rule.
+  std::optional<std::string> validateWidgetSemantics(std::string_view type, const WidgetConfig* config);
+  std::optional<noctalia::config::schema::WidgetSettingField>
+  findWidgetSettingField(std::string_view widgetType, std::string_view settingKey);
+
+  std::optional<WidgetSettingSpec> findWidgetSettingSpec(std::string_view widgetType, std::string_view settingKey);
+  std::optional<WidgetSettingSpec>
+  findWidgetSettingSpec(std::string_view widgetType, std::string_view settingKey, const WidgetConfig* config);
+  bool configOverrideValueMatchesWidgetSetting(
+      const ConfigOverrideValue& overrideValue, const WidgetSettingValue& settingValue
+  );
+  bool widgetOverrideValueMatchesRegistryDefault(
+      std::string_view widgetType, std::string_view settingKey, const ConfigOverrideValue& overrideValue
+  );
+  bool widgetSettingOverrideIsEffective(
+      std::string_view widgetName, std::string_view settingKey, const Config& withOverride,
+      const Config& withoutOverride
+  );
+  // Effectiveness of a [plugin_settings."author/plugin"] override: absent values
+  // resolve to the manifest-declared default, so an override equal to the plugin
+  // default is not "effective".
+  bool pluginSettingOverrideIsEffective(
+      std::string_view pluginId, std::string_view settingKey, const Config& withOverride, const Config& withoutOverride
+  );
+
+} // namespace settings

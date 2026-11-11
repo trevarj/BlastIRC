@@ -76,18 +76,22 @@ namespace blast {
 // explicitly only when privacy settings allow it; send() never bypasses settings.
 // read: text unprefixed RFC3339 marker, private to one logical IRC identity across
 // its connections; sharing an account alone need not attach different nicknames.
-// history_begin/end: target, label request,
-// tags[batch], tags[direction]=latest/before/after/search, tags[limit] page size.
+// history_begin/end: target, label caller requestId, tags[initial]=1 for initial sync,
+// tags[batch], tags[direction]=latest/before/after/around/search, tags[limit] page size.
 // End tags[count] counts primary logical events, including event-playback
 // presence, not auxiliary draft/chathistory-context records. tags[cursor] is
 // the last primary event's MSGREFTYPES-supported msgid=/timestamp= selector.
-// End carries tags[error] on rejection/timeout/disconnect. Historical NICK/QUIT
-// use their batch conversation target, never mutate current membership.
+// End carries tags[error] on rejection/timeout/disconnect; tags[rejected]=1 means
+// no protocol retry (admission/unsupported/disconnect). Deliberately canceled
+// pending initial requests also carry tags[cancelled]=1, with no generic error.
+// Historical NICK/QUIT use their batch conversation target, never mutate membership.
 // Events without server time deliberately do not invent historical timestamps.
-// history(target,before) accepts opaque msgids, msgid= or timestamp= selectors;
+// history(target,before,requestId,initial) accepts opaque msgids, msgid= or timestamp= selectors;
 // bare ids are never interpreted as dates. An after= prefix requests gap-fill
 // AFTER. Outgoing times keep milliseconds. Callers with cached rows resolve ids
 // to their original server time when MSGREFTYPES permits only timestamps.
+// Public enqueue throws synchronously when stopped/reconnecting or its submission
+// queue is full; no request was admitted and no history_end follows that exception.
 // command accepts raw IRC (optional leading slash) plus /me, /msg, /query,
 // /search <target> <query>, /bouncer <network-id>. Invalid/injected/oversized lines
 // report error events. commandId is opaque and independent of submission.
@@ -128,7 +132,15 @@ class NetworkClient {
     void command(const string &line, const string &submission = "", const string &commandId = "");
     void sojuMutation(const string &command, const string &id,
                       const std::map<string, string> &attributes);
-    void history(const string &target, const string &before = "");
+    void history(const string &target, const string &before, const string &requestId, bool initial);
+    // AROUND uses the first server-supported selector available from msgid and serverTime.
+    void historyAround(const string &target, const string &msgid, const string &serverTime,
+                       const string &requestId);
+    void search(const string &target, const string &query, const string &requestId);
+    // First target is viewed; foreground work follows, then remaining ordered initial targets.
+    // Only pending work is reprioritized or canceled; sent requests always complete.
+    void prioritizeHistory(const vector<string> &targets);
+    void cancelInitialHistory(const string &target);
     void markRead(const string &target, const string &timestamp);
     void typing(const string &target, const string &state);
     void react(const string &target, const string &id, const string &emoji, bool removing);

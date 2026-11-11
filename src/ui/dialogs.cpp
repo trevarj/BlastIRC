@@ -6,6 +6,7 @@
 #include "../storage.hpp"
 #include "../theme/theme.hpp"
 #include "channel_avatar.hpp"
+#include "foundry_avatar.hpp"
 #include "logic.hpp"
 #include "transcript.hpp"
 #include "ui.hpp"
@@ -117,13 +118,92 @@ class BindingRow final : public Flex {
     }
 };
 
+class ProfileAvatar final : public Node {
+  public:
+    ProfileAvatar() {
+        setHitTestVisible(false);
+        auto picture = std::make_unique<Image>();
+        image = picture.get();
+        image->setHitTestVisible(false);
+        addChild(std::move(picture));
+        auto caption = std::make_unique<Label>();
+        initials = caption.get();
+        initials->setHitTestVisible(false);
+        initials->setFontWeight(FontWeight::Bold);
+        addChild(std::move(caption));
+    }
+
+    void sync(const Model &model, const std::string &nick, const std::string &server, float scale) {
+        const bool shown = model.settings.avatars && model.settings.avatarStyle != "none";
+        setVisible(shown);
+        setParticipatesInLayout(shown);
+        extent = 40 * std::max(.1f, scale);
+        setSize(extent, extent);
+        if (name != nick) {
+            name.assign(nick);
+            initials->setText(nativeAvatarInitials(nick));
+            markLayoutDirty();
+        }
+        const auto network = model.networks.find(server);
+        const std::string_view mapping =
+            network == model.networks.end() ? "rfc1459" : network->second.caseMapping;
+        if (caseMapping != mapping) {
+            caseMapping.assign(mapping);
+            markLayoutDirty();
+        }
+        const bool sprite = model.settings.avatarStyle == "sprite";
+        if (sprite != useSprite) {
+            useSprite = sprite;
+            markLayoutDirty();
+        }
+        initials->setColor(nickColor(model, nick, server));
+        initials->setFontFamily(themeUiFont().family);
+        initials->setFontFeatures(themeUiFont().features);
+        initials->setFontSize(17 * scale);
+    }
+
+  private:
+    LayoutSize doMeasure(Renderer &, const LayoutConstraints &constraints) override {
+        return constraints.constrain(LayoutSize{.width = extent, .height = extent});
+    }
+
+    void doLayout(Renderer &renderer) override {
+        if (useSprite && (!loaded || loadedNick != name || loadedMapping != caseMapping)) {
+            image->clear(renderer);
+            setFoundryAvatar(*image, renderer, name, caseMapping);
+            loaded = true;
+            loadedNick = name;
+            loadedMapping = caseMapping;
+        }
+        const bool picture = useSprite && image->hasImage();
+        image->setVisible(picture);
+        initials->setVisible(!picture);
+        image->setSize(width(), height());
+        if (picture)
+            image->layout(renderer);
+        else
+            placement.place(*initials, renderer, 0, 0, width(), height());
+    }
+
+    Image *image = nullptr;
+    Label *initials = nullptr;
+    NativeAvatarLabelPlacement placement;
+    std::string name, caseMapping, loadedNick, loadedMapping;
+    float extent = 40;
+    bool useSprite = false, loaded = false;
+};
+
 void refreshFonts(Node &node) {
+    if (dynamic_cast<ProfileAvatar *>(&node))
+        return;
     if (auto *input = dynamic_cast<Input *>(&node)) {
         input->setFontFamily(themeUiFont().family);
         input->setFontFeatures(themeUiFont().features);
+        input->setFontWeight(themeUiFont().weight);
     } else if (auto *label = dynamic_cast<Label *>(&node)) {
         label->setFontFamily(themeUiFont().family);
         label->setFontFeatures(themeUiFont().features);
+        label->setFontWeight(themeUiFont().weight);
     }
     for (const auto &child : node.children())
         refreshFonts(*child);
@@ -152,6 +232,7 @@ struct Dialogs::Impl {
         MetricKind kind;
         float font = Style::fontSizeBody, gap = 0, top = 0, right = 0, bottom = 0, left = 0;
         float minWidth = 0, minHeight = 0, maxWidth = 0, maxHeight = 0;
+        bool explicitBold = false;
     };
     Dialogs &owner;
     Model &model;
@@ -169,9 +250,25 @@ struct Dialogs::Impl {
     Input *settingsSearch = nullptr;
     Select *settingsResults = nullptr;
     std::string settingsQuery, currentSection;
+    std::string currentSectionId, selectedSection;
+    struct SettingsSection {
+        std::string id, title;
+        Tab category;
+        Node *node;
+    };
+    struct TreeEntry {
+        Tab category;
+        std::string section;
+        Button *button;
+    };
+    std::vector<SettingsSection> sections;
+    std::vector<TreeEntry> treeEntries;
+    std::vector<std::pair<Tab, std::string>> compactEntries;
+    std::array<bool, 7> expanded{true, false, false, false, false, false, false};
     struct SearchTarget {
         Tab category;
         std::string caption, terms;
+        std::string section;
         Node *node;
     };
     std::vector<SearchTarget> searchTargets;
@@ -185,7 +282,8 @@ struct Dialogs::Impl {
     Label *topicTitle = nullptr;
     struct ProfileCard {
         Flex *body = nullptr;
-        Label *nick = nullptr, *avatar = nullptr;
+        Label *nick = nullptr;
+        ProfileAvatar *avatar = nullptr;
         std::array<Flex *, 5> groups{};
         std::array<Input *, 12> fields{};
     };
@@ -230,6 +328,7 @@ struct Dialogs::Impl {
     std::string mode, confirmation, nick, searchQuery, searchBuffer;
     std::string topicBuffer, editedTopic;
     std::string configMessage, recoveryMessage, fontFamily, fontFeatures;
+    FontWeight fontWeight = FontWeight::Normal;
     std::string lastThemeSource, lastGeometry, lastDialog;
     Tab tab = Tab::Appearance;
     std::size_t serverIndex = 0, identityIndex = 0;
@@ -252,7 +351,6 @@ struct Dialogs::Impl {
     bool metricsDirty = true;
     float geometryX = -1, geometryY = -1, geometryWidth = -1, geometryHeight = -1;
     std::vector<std::string> fonts;
-    std::vector<std::pair<Tab, Button *>> tabButtons;
     std::set<Input *> invalidFields;
     std::vector<Metric> metrics;
     // Detached controls survive their own callbacks; destruction happens after native dispatch.
@@ -340,6 +438,7 @@ struct Dialogs::Impl {
             metric.font = static_cast<Button *>(node)->label()->fontSize();
         metrics.push_back(metric);
         metricsDirty = true;
+        fontFamily.clear();
     }
 
     void padding(Flex &node, float value) {
@@ -479,6 +578,7 @@ struct Dialogs::Impl {
         result->setColor(colorSpecFromRole(
             mode == "settings" && !heading ? ColorRole::OnSurfaceVariant : ColorRole::OnSurface));
         track(ptr, MetricKind::Label);
+        metrics.back().explicitBold = heading;
         if (heading)
             result->setFontWeight(FontWeight::Bold);
         parent.addChild(std::move(result));
@@ -493,23 +593,35 @@ struct Dialogs::Impl {
         result->setVariant(variant);
         result->setOnClick(std::move(callback));
         track(ptr, MetricKind::Button);
+        if (&parent != categoryNavigation)
+            indexSetting(text, ptr, &parent);
         parent.addChild(std::move(result));
         return ptr;
     }
 
-    void indexSetting(std::string_view name, Node *node) {
+    void indexSetting(std::string_view name, Node *node, Node *parent = nullptr) {
         if (mode != "settings" || !page)
             return;
         const std::string category = tabNames[std::size_t(tab)];
-        searchTargets.push_back({tab, category + " · " + currentSection + " · " + std::string(name),
-                                 std::string(name) + " " + currentSection + " " + category, node});
+        auto sectionId = currentSectionId;
+        auto sectionTitle = currentSection;
+        for (auto *ancestor = parent; ancestor; ancestor = ancestor->parent())
+            for (const auto &section : sections)
+                if (section.node == ancestor) {
+                    sectionId = section.id;
+                    sectionTitle = section.title;
+                    break;
+                }
+        searchTargets.push_back({tab, category + " · " + sectionTitle + " · " + std::string(name),
+                                 std::string(name) + " " + sectionTitle + " " + category, sectionId,
+                                 node});
     }
 
     void jumpToSetting(std::size_t result) {
         if (result >= rankedTargets.size())
             return;
         const auto target = searchTargets[rankedTargets[result]];
-        chooseTab(target.category);
+        chooseLocation(target.category, target.section);
         // Search remains ready for refinement; Tab reaches the ranked result picker.
         if (dispatcher)
             dispatcher->setFocus(settingsSearch->inputArea());
@@ -536,14 +648,18 @@ struct Dialogs::Impl {
         settingsResults->clearSelection();
         settingsResults->setPlaceholder(rankedTargets.empty() ? "No matching settings"
                                                               : "Choose a setting…");
-        settingsResults->setVisible(!settingsQuery.empty());
-        settingsResults->setParticipatesInLayout(!settingsQuery.empty());
+        auto *resultsGroup = settingsResults->parent();
+        resultsGroup->setVisible(!settingsQuery.empty());
+        resultsGroup->setParticipatesInLayout(!settingsQuery.empty());
     }
 
-    Flex *section(std::string_view title, std::string_view description = {}) {
+    Flex *section(std::string_view id, std::string_view title, std::string_view description = {}) {
         auto group = column(12, MetricKind::Section);
         auto *body = group.get();
         currentSection = title;
+        currentSectionId = id;
+        if (mode == "settings")
+            sections.push_back({std::string(id), std::string(title), tab, body});
         indexSetting(title, body);
         label(*body, title, true);
         if (!description.empty())
@@ -581,7 +697,7 @@ struct Dialogs::Impl {
                 scroll->requestScrollIntoView(unit);
         });
         track(ptr, MetricKind::Input);
-        indexSetting(name, ptr);
+        indexSetting(name, ptr, &parent);
         group->addChild(std::move(result));
         parent.addChild(std::move(group));
         return ptr;
@@ -617,7 +733,7 @@ struct Dialogs::Impl {
         result->setCheckedImmediate(value);
         result->setOnChange(std::move(changed));
         track(ptr, MetricKind::Toggle);
-        indexSetting(name, ptr);
+        indexSetting(name, ptr, &parent);
         line->addChild(std::move(result));
         return ptr;
     }
@@ -648,7 +764,7 @@ struct Dialogs::Impl {
             number->setText(display);
         });
         track(ptr, MetricKind::Slider);
-        indexSetting(name, ptr);
+        indexSetting(name, ptr, &parent);
         group->addChild(std::move(result));
         parent.addChild(std::move(group));
         return ptr;
@@ -674,7 +790,7 @@ struct Dialogs::Impl {
         result->setFillWidth(true);
         result->setOnSelectionChanged(std::move(changed));
         track(ptr, MetricKind::Select);
-        indexSetting(name, ptr);
+        indexSetting(name, ptr, &parent);
         group->addChild(std::move(result));
         parent.addChild(std::move(group));
         return ptr;
@@ -729,33 +845,129 @@ struct Dialogs::Impl {
             dispatcher->setFocus(blocker);
     }
 
-    void chooseTab(Tab next) {
-        if (tab == next)
-            return;
-        tab = next;
-        for (const auto &[candidate, control] : tabButtons)
-            control->setVariant(candidate == tab ? ButtonVariant::TabActive : ButtonVariant::Tab);
-        if (categoryPicker)
-            categoryPicker->setSelectedIndexSilently(std::size_t(tab));
-        if (detailTitle)
-            detailTitle->setText(std::string("Settings · ") + tabNames[std::size_t(tab)]);
-        if (categoryNavigation)
-            categoryNavigation->notifyExternalSelectionChanged();
-        if (categoryPages[std::size_t(tab)]) {
-            stopRecording(false);
-            for (std::size_t i = 0; i < categoryPages.size(); ++i) {
-                auto *body = categoryPages[i];
-                if (!body)
-                    continue;
+    std::size_t selectedTreeIndex() const {
+        for (std::size_t i = 0; i < treeEntries.size(); ++i)
+            if (treeEntries[i].category == tab && treeEntries[i].section == selectedSection)
+                return i;
+        return 0;
+    }
+
+    void applyLocation() {
+        for (std::size_t i = 0; i < categoryPages.size(); ++i)
+            if (auto *body = categoryPages[i]) {
                 const bool active = i == std::size_t(tab);
                 body->setVisible(active);
                 body->setParticipatesInLayout(active);
                 body->setExcludeSubtreeFromTabOrder(!active);
             }
-            scroll->setScrollOffset(0);
-        } else {
-            rebuildPage(false);
+        for (const auto &section : sections) {
+            const bool shown = selectedSection.empty() || section.id == selectedSection;
+            section.node->setVisible(shown);
+            section.node->setParticipatesInLayout(shown);
+            section.node->setExcludeSubtreeFromTabOrder(!shown);
         }
+        for (const auto &entry : treeEntries) {
+            const bool root = entry.section.empty();
+            const bool shown = root || expanded[std::size_t(entry.category)];
+            entry.button->setVisible(shown);
+            entry.button->setParticipatesInLayout(shown);
+            entry.button->setSelected(entry.category == tab && entry.section == selectedSection);
+            if (root)
+                entry.button->setText(
+                    std::string(expanded[std::size_t(entry.category)] ? "▾ " : "▸ ") +
+                    tabNames[std::size_t(entry.category)]);
+        }
+        for (std::size_t i = 0; i < compactEntries.size(); ++i)
+            if (compactEntries[i].first == tab && compactEntries[i].second == selectedSection)
+                categoryPicker->setSelectedIndexSilently(i);
+        if (detailTitle)
+            detailTitle->setText(std::string("Settings · ") + tabNames[std::size_t(tab)] +
+                                 (selectedSection.empty() ? "" : " / " + currentLocationTitle()));
+        if (categoryNavigation) {
+            if (categoryNavigation->focusArea()->focused())
+                categoryNavigation->controller().onFocusGain();
+            else if (!treeEntries.empty())
+                navigation->requestScrollIntoView(treeEntries[selectedTreeIndex()].button);
+        }
+    }
+
+    std::string currentLocationTitle() const {
+        for (const auto &section : sections)
+            if (section.id == selectedSection)
+                return section.title;
+        return {};
+    }
+
+    void chooseLocation(Tab next, std::string section = {}) {
+        if (tab != next || selectedSection != section)
+            stopRecording(false);
+        tab = next;
+        selectedSection = std::move(section);
+        if (!selectedSection.empty())
+            expanded[std::size_t(tab)] = true;
+        applyLocation();
+        scroll->setScrollOffset(0);
+    }
+
+    void chooseTab(Tab next) { chooseLocation(next); }
+
+    void rebuildTree() {
+        if (!categoryNavigation)
+            return;
+        categoryNavigation->clearItems();
+        for (const auto &entry : treeEntries)
+            detach(entry.button, *categoryNavigation);
+        treeEntries.clear();
+        compactEntries.clear();
+        std::vector<std::string> captions(std::begin(tabNames), std::end(tabNames));
+        for (std::size_t i = 0; i < std::size(tabNames); ++i)
+            compactEntries.emplace_back(Tab(i), "");
+        static constexpr const char *icons[] = {"palette",  "keyboard", "messages", "sparkles",
+                                                "volume-2", "network",  "user"};
+        for (std::size_t i = 0; i < std::size(tabNames); ++i) {
+            const auto category = Tab(i);
+            const auto add = [this, category](std::string id, std::string title) {
+                auto *choice = button(
+                    *categoryNavigation, title,
+                    [this, category, id] {
+                        if (id.empty() && tab == category && selectedSection.empty())
+                            expanded[std::size_t(category)] = !expanded[std::size_t(category)];
+                        chooseLocation(category, id);
+                        if (dispatcher)
+                            dispatcher->setFocus(categoryNavigation->focusArea());
+                    },
+                    ButtonVariant::Ghost);
+                choice->setFillWidth(true);
+                choice->setContentAlign(ButtonContentAlign::Start);
+                choice->inputArea()->setTabFocusKey(id.empty()
+                                                        ? "blastirc.settings.category." +
+                                                              std::to_string(std::size_t(category))
+                                                        : "blastirc.settings.section." + id);
+                categoryNavigation->registerItem(
+                    choice, [this, category, id] { chooseLocation(category, id); });
+                treeEntries.push_back({category, std::move(id), choice});
+                return choice;
+            };
+            auto *root = add("", tabNames[i]);
+            root->setGlyph(icons[i]);
+            root->label()->setFontWeight(FontWeight::Bold);
+            for (auto &metric : metrics)
+                if (metric.node == root)
+                    metric.explicitBold = true;
+            for (const auto &section : sections)
+                if (section.category == category) {
+                    add(section.id, "    " + section.title);
+                    compactEntries.emplace_back(category, section.id);
+                    captions.push_back(std::string(tabNames[i]) + " / " + section.title);
+                }
+        }
+        categoryPicker->setOptions(std::move(captions));
+        if (!selectedSection.empty() &&
+            std::none_of(sections.begin(), sections.end(), [this](const auto &section) {
+                return section.category == tab && section.id == selectedSection;
+            }))
+            selectedSection.clear();
+        applyLocation();
     }
 
     void stopRecording(bool commit) {
@@ -839,7 +1051,10 @@ struct Dialogs::Impl {
         bindingFields.clear();
         bindingConflicts = nullptr;
         topicTitle = nullptr;
-        tabButtons.clear();
+        sections.clear();
+        treeEntries.clear();
+        compactEntries.clear();
+        selectedSection.clear();
         feedback = themeStatus = applicationStatus = motionStatus = soundStatus = cursorStatus =
             identityScope = connectionStatus = nullptr;
         connectButton = saveButton = nullptr;
@@ -896,12 +1111,13 @@ struct Dialogs::Impl {
             categoryPicker = compact.get();
             std::vector<std::string> names(std::begin(tabNames), std::end(tabNames));
             compact->setOptions(std::move(names));
-            compact->setOptionIcons(
-                {"palette", "keyboard", "messages", "sparkles", "volume-2", "network", "user"});
+            if (dispatcher)
+                if (auto *area = dispatcher->firstTabFocusUnder(compact.get()))
+                    area->setTabFocusKey("blastirc.settings.location");
             compact->setSelectedIndexSilently(std::size_t(tab));
             compact->setOnSelectionChanged([this](std::size_t index, std::string_view) {
-                if (index < std::size(tabNames))
-                    chooseTab(Tab(index));
+                if (index < compactEntries.size())
+                    chooseLocation(compactEntries[index].first, compactEntries[index].second);
             });
             compact->setFillWidth(true);
             compact->setVisible(false);
@@ -915,8 +1131,8 @@ struct Dialogs::Impl {
             auto sidebar = std::make_unique<ScrollView>();
             navigation = sidebar.get();
             sidebar->setFillHeight(true);
-            sidebar->setMinWidth(200);
-            sidebar->setMaxWidth(200);
+            sidebar->setMinWidth(240);
+            sidebar->setMaxWidth(240);
             sidebar->setViewportPaddingH(0);
             sidebar->setViewportPaddingV(0);
             sidebar->setReserveScrollbarGutter(true);
@@ -933,7 +1149,7 @@ struct Dialogs::Impl {
                         if (navigation)
                             navigation->requestScrollIntoView(target);
                     },
-                .syncIndexFromSelection = [this] { return std::size_t(tab); },
+                .syncIndexFromSelection = [this] { return selectedTreeIndex(); },
             });
             categoryNavigation = nav.get();
             nav->setTabFocusKey("blastirc.settings.categories");
@@ -941,23 +1157,38 @@ struct Dialogs::Impl {
             nav->setGap(2);
             nav->setPadding(6);
             track(nav.get(), MetricKind::Flex);
-            for (std::size_t index = 0; index < std::size(tabNames); ++index) {
-                const auto id = Tab(index);
-                auto *choice = button(
-                    *nav, tabNames[index],
-                    [this, id] {
-                        chooseTab(id);
-                        if (dispatcher)
-                            dispatcher->setFocus(categoryNavigation->focusArea());
-                    },
-                    id == tab ? ButtonVariant::TabActive : ButtonVariant::Tab);
-                choice->setFillWidth(true);
-                choice->setContentAlign(ButtonContentAlign::Start);
-                choice->label()->setFontWeight(FontWeight::Bold);
-                choice->setTooltip(tabNames[index]);
-                nav->registerItem(choice, [this, id] { chooseTab(id); });
-                tabButtons.emplace_back(id, choice);
-            }
+            nav->focusArea()->setOnKeyDown([this](const InputArea::KeyData &key) {
+                if (!key.pressed || key.preedit || key.modifiers)
+                    return;
+                if (key.sym == XKB_KEY_Left) {
+                    if (!selectedSection.empty())
+                        chooseLocation(tab);
+                    else {
+                        expanded[std::size_t(tab)] = false;
+                        applyLocation();
+                    }
+                } else if (key.sym == XKB_KEY_Right) {
+                    if (selectedSection.empty()) {
+                        if (!expanded[std::size_t(tab)]) {
+                            expanded[std::size_t(tab)] = true;
+                            applyLocation();
+                        } else {
+                            for (const auto &section : sections)
+                                if (section.category == tab) {
+                                    chooseLocation(tab, section.id);
+                                    break;
+                                }
+                        }
+                    }
+                } else if ((key.sym == XKB_KEY_Return || key.sym == XKB_KEY_KP_Enter ||
+                            key.sym == XKB_KEY_space) &&
+                           selectedSection.empty()) {
+                    expanded[std::size_t(tab)] = !expanded[std::size_t(tab)];
+                    applyLocation();
+                } else {
+                    categoryNavigation->controller().handleKey(key.sym, key.modifiers);
+                }
+            });
             sidebar->content()->addChild(std::move(nav));
             body->addChild(std::move(sidebar));
             auto detail = column(8);
@@ -1074,6 +1305,7 @@ struct Dialogs::Impl {
                         return true;
                 return false;
             };
+            std::erase_if(sections, [&](const auto &section) { return inside(section.node); });
             std::erase_if(searchTargets, [&](const auto &target) { return inside(target.node); });
             std::erase_if(invalidFields, [&](auto *field) { return inside(field); });
             std::erase_if(identityScopes, [&](const auto &scope) { return inside(scope.first); });
@@ -1098,6 +1330,7 @@ struct Dialogs::Impl {
             currentSection.clear();
             buildSettingsCategory();
             page = allPages;
+            rebuildTree();
             filterSettings();
             updateIdentityScope();
             if (focusContent)
@@ -1105,6 +1338,7 @@ struct Dialogs::Impl {
             return;
         }
         searchTargets.clear();
+        sections.clear();
         categoryPages.fill(nullptr);
         bindingFields.clear();
         bindingConflicts = nullptr;
@@ -1146,15 +1380,15 @@ struct Dialogs::Impl {
             }
             tab = selectedTab;
             page = allPages;
+            rebuildTree();
             filterSettings();
             applicationStatus = label(*page, "");
             applicationStatus->setColor(colorSpecFromRole(ColorRole::Error));
             applicationStatus->setVisible(false);
             applicationStatus->setParticipatesInLayout(false);
-            label(*page, "Changes are live. Automatic saving is attempted every 30 seconds and "
-                         "on exit; fix invalid profiles or reported storage errors before "
-                         "saving can succeed. Save now requests an earlier write. Close keeps "
-                         "your changes; it is not Undo.")
+            label(*page, "Changes apply now; autosave runs every 30 seconds and on exit, "
+                         "Save now writes sooner, invalid profiles or storage errors block "
+                         "saving, and Close does not undo changes.")
                 ->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
         } else if (mode == "whois") {
             profileLoading = profileField(*page, "Loading", "blastirc.whois.loading");
@@ -1204,7 +1438,11 @@ struct Dialogs::Impl {
                 label(*page, "This conversation no longer exists.");
             } else {
                 const auto &buffer = found->second;
-                topicTitle = label(*page, buffer.target + " · " + buffer.server, true);
+                topicTitle =
+                    label(*page,
+                          (buffer.kind == "server" ? std::string("Server log") : buffer.target) +
+                              " · " + std::string(serverDisplayName(model, buffer.server)),
+                          true);
                 label(*page, std::to_string(buffer.nicks.size()) + " members · " +
                                  (buffer.joined ? "Joined" : "Not joined"));
                 auto *field = text(*page, "Topic", editedTopic,
@@ -1224,7 +1462,7 @@ struct Dialogs::Impl {
     }
 
     void appearance() {
-        auto *theme = section("Theme and scale");
+        auto *theme = section("appearance.theme", "Theme & size");
         static constexpr const char *sourceIds[] = {"auto", "builtin", "noctalia"};
         static constexpr const char *sourceNames[] = {"Automatic", "Built-in",
                                                       "Noctalia (built-in fallback)"};
@@ -1239,33 +1477,46 @@ struct Dialogs::Impl {
                        model.settings.themeSource = sourceIds[index];
                });
         themeStatus = label(*theme, std::string("Active palette: ") + themeSource());
-        label(*theme, "Automatic and Noctalia both use the local Noctalia palette when present, "
-                      "otherwise Built-in. An invalid palette retains the current colors.");
+        label(*theme,
+              "Automatic and Noctalia use the local palette when available, fall back "
+              "to Built-in when missing, and keep current colors if the palette is invalid.");
         toggle(*theme, "Enable transparency", model.settings.transparency,
                [this](bool value) { model.settings.transparency = value; });
         slider(*theme, "Surface opacity", model.settings.opacity, .2, 1, .01,
                [this](float value) { model.settings.opacity = value; });
-        label(*theme, "Transparency is off by default. When enabled, surface opacity affects "
-                      "all backgrounds, never text. Desktop transparency requires a compositor.");
+        label(*theme,
+              "Opacity changes backgrounds, not text; desktop transparency needs a compositor.");
         slider(*theme, "Interface scale", model.settings.scale, .7, 2, .01,
                [this](float value) { model.settings.scale = value; });
         slider(*theme, "Message text scale", model.settings.messageScale, .7, 2, .01,
                [this](float value) { model.settings.messageScale = value; });
+        label(
+            *theme,
+            "Interface scale resizes controls; message text scale changes conversation text only.");
         if (!fontsLoaded) {
             fonts = installedFonts();
             fontsLoaded = true;
         }
-        auto *typography = section("Typography");
+        auto *typography = section("appearance.fonts", "Fonts");
         fontPicker(*typography, "UI font family", "Installed UI fonts", model.settings.uiFont);
         fontPicker(*typography, "Message font family", "Installed message fonts",
                    model.settings.messageFont);
+        const std::vector<std::string> weights{"300", "400", "500", "600", "700"};
+        select(*typography, "UI font weight", weights, std::to_string(model.settings.uiFontWeight),
+               [this](std::size_t index, std::string_view) {
+                   model.settings.uiFontWeight = 300 + static_cast<int>(index) * 100;
+               });
+        select(*typography, "Message font weight", weights,
+               std::to_string(model.settings.messageFontWeight),
+               [this](std::size_t index, std::string_view) {
+                   model.settings.messageFontWeight = 300 + static_cast<int>(index) * 100;
+               });
         if (fonts.empty())
-            label(*typography,
-                  "Fontconfig reported no installed families. You can still type a family name.");
-        label(*typography,
-              "Fontconfig resolves installed family names. Empty fields use "
-              "sans-serif for interface and messages; saved overrides stay independent.");
-        auto *spelling = section("Composer spelling");
+            label(*typography, "No installed fonts were found; you can still enter a family name.");
+        label(*typography, "Type to find installed fonts and choose one to apply, or press Enter "
+                           "for a custom family; each font is independent, empty uses sans-serif, "
+                           "and closing discards unapplied text.");
+        auto *spelling = section("appearance.spellcheck", "Spellcheck");
         auto *spellingStatus = label(*spelling, "");
         auto languages = Spellcheck::languages();
         const auto updateSpellingStatus = [this, spellingStatus, languages] {
@@ -1304,7 +1555,7 @@ struct Dialogs::Impl {
             std::find(languages.begin(), languages.end(), savedLanguage) == languages.end())
             languagePicker->setPlaceholder(savedLanguage + " (unavailable)");
         updateSpellingStatus();
-        auto *cursor = section("Composer cursor");
+        auto *cursor = section("appearance.cursor", "Cursor");
         static constexpr const char *shapeIds[] = {"line", "box", "underline"};
         static constexpr const char *shapeNames[] = {"Line", "Solid box", "Underline"};
         const std::size_t shapeIndex = model.settings.cursorShape == "box"         ? 1
@@ -1331,27 +1582,42 @@ struct Dialogs::Impl {
                240, 1, [this](float value) { model.settings.cursorTrailDurationMs = value; });
         slider(*cursor, "Animation strength (0.05–0.35)", model.settings.cursorTrailStrength, .05,
                .35, .01, [this](float value) { model.settings.cursorTrailStrength = value; });
-        label(*cursor, "Trail leaves a fading path; Comet tapers its tail; Ribbon bends between "
-                       "positions; Pulse expands at the destination. Duration and strength tune "
-                       "the selected animation. Preview in the composer; Effects Off and Reduced "
-                       "motion suppress animation without changing your preferences.");
+        label(*cursor,
+              "Trail fades, Comet tapers, Ribbon bends and Pulse expands; duration and "
+              "strength tune the animation, while Effects Off or Reduced motion pauses it.");
         button(*cursor, "Try in conversation", [this] { dismiss(); });
-        auto *messages = section("Message display");
-        label(*messages, "Channels and direct messages use grouped bubbles by default. "
-                         "Choose traditional IRC rows from each conversation's menu.");
+        auto *messages = section("appearance.messages", "Messages");
+        label(*messages, "Conversation menus can switch grouped bubbles to traditional IRC rows.");
         toggle(*messages, "Show timestamps", model.settings.timestamps,
                [this](bool value) { model.settings.timestamps = value; });
         toggle(*messages, "Show avatars", model.settings.avatars,
                [this](bool value) { model.settings.avatars = value; });
-        select(*messages, "Avatar style", {"sprite", "monogram", "initials", "none"},
-               model.settings.avatarStyle,
-               [this](std::size_t, std::string_view value) { model.settings.avatarStyle = value; });
-        select(*messages, "Nick palette", {"THEME", "CLASSIC", "VIVID"}, model.settings.nickPalette,
-               [this](std::size_t, std::string_view value) { model.settings.nickPalette = value; });
+        static constexpr const char *avatarIds[] = {"sprite", "monogram", "initials", "none"};
+        static constexpr const char *avatarNames[] = {"Generated picture", "Monogram", "Initials",
+                                                      "None"};
+        std::size_t avatarIndex = 0;
+        for (std::size_t i = 0; i < std::size(avatarIds); ++i)
+            if (model.settings.avatarStyle == avatarIds[i])
+                avatarIndex = i;
+        select(*messages, "Avatar style", {std::begin(avatarNames), std::end(avatarNames)},
+               avatarNames[avatarIndex], [this](std::size_t index, std::string_view) {
+                   if (index < std::size(avatarIds))
+                       model.settings.avatarStyle = avatarIds[index];
+               });
+        static constexpr const char *paletteIds[] = {"THEME", "CLASSIC", "VIVID"};
+        static constexpr const char *paletteNames[] = {"Theme", "Classic", "Vivid"};
+        const auto paletteIndex = model.settings.nickPalette == "CLASSIC" ? 1
+                                  : model.settings.nickPalette == "VIVID" ? 2
+                                                                          : 0;
+        select(*messages, "Nick palette", {std::begin(paletteNames), std::end(paletteNames)},
+               paletteNames[paletteIndex], [this](std::size_t index, std::string_view) {
+                   if (index < std::size(paletteIds))
+                       model.settings.nickPalette = paletteIds[index];
+               });
         slider(*messages, "Message wrap columns (0 = unlimited)", model.settings.messageWrapColumns,
                0, 1000, 1, [this](float value) { model.settings.messageWrapColumns = int(value); });
-        label(*messages, "Wrap at whole characters and word boundaries, or earlier to fit the "
-                         "window. This never adds newlines to copied text.");
+        label(*messages,
+              "Wrapping fits words to the window without adding newlines to copied text.");
         static constexpr const char *foolStyles[] = {"Minimized", "Blurred", "Dimmed", "Hidden"};
         select(*messages, "Fool messages", {std::begin(foolStyles), std::end(foolStyles)},
                foolStyles[std::clamp(int(model.settings.foolDisplay), 0, 3)],
@@ -1361,11 +1627,10 @@ struct Dialogs::Impl {
                });
         toggle(*messages, "Count fool messages as unread", model.settings.foolUnread,
                [this](bool value) { model.settings.foolUnread = value; });
-        label(*messages, "Fools never trigger notifications, sounds, typing or incoming effects. "
-                         "Minimized groups and blurred bodies require reveal before copying; "
-                         "dimmed text remains readable. Hidden messages stay in local history. "
-                         "Unread counts are off by default so muted activity stays quiet.");
-        auto *previews = section("Link and media previews");
+        label(*messages, "Fools never trigger notifications, sounds, typing or effects; minimized "
+                         "and blurred messages require reveal to copy, dimmed text is readable, "
+                         "hidden messages remain saved, and unread counts are optional.");
+        auto *previews = section("appearance.previews", "Previews");
         static constexpr const char *previewModes[] = {"Off", "Click to load", "Automatic"};
         select(*previews, "Link previews", {std::begin(previewModes), std::end(previewModes)},
                previewModes[std::clamp(int(model.settings.linkPreviews), 0, 2)],
@@ -1393,22 +1658,18 @@ struct Dialogs::Impl {
         integer(*previews, "Media duration limit (1–7200 seconds)",
                 model.settings.previewMediaMaxSeconds, 1, 7200,
                 [this](int value) { model.settings.previewMediaMaxSeconds = value; });
-        label(*previews,
-              "Click to load is the privacy default: no preview request is sent until "
-              "you choose to load it. Automatic requests can disclose your IP to remote "
-              "hosts. Link, image and media permissions are independent; media never "
-              "autoplays. Local and private network destinations are blocked by default.");
+        label(*previews, "Click to load sends no request until you choose it; Automatic can "
+                         "disclose your IP, each preview type has its own permission, media "
+                         "never autoplays, and local-network destinations are blocked by default.");
         toggle(*previews, "Allow local-network preview requests", model.settings.previewAllowLocal,
                [this](bool value) { model.settings.previewAllowLocal = value; });
-        label(*previews, "Advanced: enabling local requests allows previews to contact loopback "
-                         "and private-network services, including metadata endpoints. This can "
-                         "expose local services and private data to links posted by other people. "
-                         "Automatic preview modes also use this permission. Leave off unless you "
-                         "trust the links and your network.");
-        auto *workspace = section("Conversation navigation");
-        label(*workspace, "The channel sidebar expands to names or compacts to avatars. "
-                          "Channel hints navigate the selected server; the buffer picker "
-                          "reaches conversations across all servers.");
+        label(*previews,
+              "Local requests let other people's links contact loopback, private "
+              "services and metadata endpoints, potentially exposing private data; "
+              "this also applies to Automatic previews, so enable only for trusted links.");
+        auto *workspace = section("appearance.navigation", "Navigation");
+        label(*workspace,
+              "Channel hints stay on the selected server; All conversations reaches every server.");
         static constexpr const char *peopleModes[] = {"Expanded", "Avatars only", "Hidden"};
         select(*workspace, "People for the focused channel",
                {std::begin(peopleModes), std::end(peopleModes)},
@@ -1417,8 +1678,7 @@ struct Dialogs::Impl {
                    model.settings.peopleMode = SidebarMode(index);
                });
         label(*workspace,
-              "The selected People mode is kept when temporarily hidden outside channels or "
-              "when the conversation needs more room.");
+              "Your People preference is kept when the panel temporarily needs to hide.");
         label(*workspace, commandLabel(model, "Channel hints", "jump-channel") + " · " +
                               commandLabel(model, "All conversations", "switch-buffer"));
     }
@@ -1446,9 +1706,6 @@ struct Dialogs::Impl {
             family = value;
             syncSelection();
         });
-        label(parent, "Type to find installed fonts. Choose a family above, or press Enter "
-                      "in the family field to apply an arbitrary family name. "
-                      "Closing discards an unapplied query.");
         field->setOnChange([this, picker, options, syncSelection](const std::string &query) {
             options->clear();
             for (const auto &font : fonts)
@@ -1471,9 +1728,9 @@ struct Dialogs::Impl {
             if (name == "send" || name == "newline" || name == "complete" ||
                 name.starts_with("history-"))
                 return 0;
-            if (name.starts_with("beginning-") || name.starts_with("end-") ||
-                name == "backward-char" || name == "forward-char" || name == "previous-line" ||
-                name == "next-line" || name == "backward-word" || name == "forward-word")
+            if (name == "beginning-of-line" || name == "end-of-line" || name == "backward-char" ||
+                name == "forward-char" || name == "previous-line" || name == "next-line" ||
+                name == "backward-word" || name == "forward-word")
                 return 1;
             if (name.find("kill") != std::string_view::npos || name == "delete-char" ||
                 name == "backward-delete" || name == "copy-region" || name == "yank" ||
@@ -1482,8 +1739,9 @@ struct Dialogs::Impl {
                 name == "transpose-chars")
                 return 2;
             if (name == "switch-buffer" || name == "execute-command" || name == "jump-channel" ||
+                name == "conversation-back" || name == "conversation-forward" ||
                 name.starts_with("toggle-") || name == "search" || name == "settings" ||
-                name == "cancel")
+                name == "cancel" || name == "beginning-of-buffer" || name == "end-of-buffer")
                 return 3;
             return 4;
         };
@@ -1493,8 +1751,11 @@ struct Dialogs::Impl {
                 if (groupFor(name) != category)
                     continue;
                 if (!tasks) {
-                    tasks = section(groups[category]);
-                    label(*tasks, "Action / Current binding · Default · Record / Reset", true);
+                    static constexpr const char *ids[] = {"keyboard.messaging", "keyboard.cursor",
+                                                          "keyboard.editing", "keyboard.navigation",
+                                                          "keyboard.other"};
+                    tasks = section(ids[category], groups[category]);
+                    label(*tasks, "Action · Shortcut · Default · Record / Reset", true);
                 }
                 auto group = std::make_unique<BindingRow>();
                 group->setDirection(FlexDirection::Vertical);
@@ -1567,10 +1828,9 @@ struct Dialogs::Impl {
                 tasks->addChild(std::move(group));
             }
             if (category == 0 && tasks)
-                label(*tasks,
-                      "Bindings are live. Record captures Tab and Escape; Finish or Ctrl+Enter "
-                      "applies the sequence, Ctrl+G cancels and returns to normal focus. "
-                      "Shift+Tab moves between controls outside recording.");
+                label(*tasks, "Record captures Tab and Escape; Finish or Ctrl+Enter applies "
+                              "the sequence, Ctrl+G cancels, and Shift+Tab moves between "
+                              "controls when not recording.");
         }
         button(*page, "Restore default keymap", [this] {
             stopRecording(false);
@@ -1584,7 +1844,7 @@ struct Dialogs::Impl {
     }
 
     void effects() {
-        auto *motion = section("Motion and sound policy");
+        auto *motion = section("effects.general", "General");
         const char *levels[] = {"Off", "Subtle", "Full"};
         select(*motion, "Effects", {"Off", "Subtle", "Full"},
                levels[std::clamp(int(model.settings.fx), 0, 2)],
@@ -1592,10 +1852,9 @@ struct Dialogs::Impl {
         toggle(*motion, "Reduced motion", model.settings.reducedMotion,
                [this](bool value) { model.settings.reducedMotion = value; });
         motionStatus = label(*motion, "");
-        label(*motion, "Effects Off suppresses event motion, cursor animations and event sounds. "
-                       "Reduced motion suppresses animation, not enabled sound. "
-                       "Suppressed preferences below are kept, not reset.");
-        auto *sending = section("Sending messages");
+        label(*motion, "Effects Off pauses motion and sound; Reduced motion pauses animations "
+                       "only, and both keep your saved preferences.");
+        auto *sending = section("effects.sending", "Sending");
         static constexpr const char *movements[] = {"None", "Flight", "Rise",
                                                     "Pop",  "Slide",  "Drift"};
         select(*sending, "Sending movement", {std::begin(movements), std::end(movements)},
@@ -1611,12 +1870,9 @@ struct Dialogs::Impl {
                    if (index < std::size(reveals))
                        model.settings.sendReveal = SendReveal(index);
                });
-        label(*sending, "Movement and reveal are independent for sent bubbles. Flight travels "
-                        "from the composer, Rise slides upward, and Pop grows into place. "
-                        "Slide enters from the side; Drift eases gently into place. "
-                        "Fade changes opacity; Pixels uncovers the message in blocks. "
-                        "Choose None in either selector to keep only the other effect.");
-        auto *incoming = section("Incoming messages");
+        label(*sending, "Movement changes how a bubble arrives and reveal fades or uncovers its "
+                        "text; choose None for either to use only the other.");
+        auto *incoming = section("effects.receiving", "Receiving");
         static constexpr SendMotion incomingValues[] = {SendMotion::None, SendMotion::Rise,
                                                         SendMotion::Pop, SendMotion::Slide,
                                                         SendMotion::Drift};
@@ -1643,17 +1899,18 @@ struct Dialogs::Impl {
                });
         slider(*incoming, "Incoming duration (100–2000 ms)", model.settings.incomingDurationMs, 100,
                2000, 10, [this](float value) { model.settings.incomingDurationMs = value; });
-        label(*incoming, "Movement and reveal are independent from sending effects. None plus "
-                         "Fade is the default. Only new live messages animate; restored history "
-                         "and fool activity stay still. Effects Off and Reduced motion suppress "
-                         "animation without resetting these preferences.");
-        auto *physics = section("Advanced · Event physics");
+        label(*incoming, "Sending and receiving effects are independent; only new live messages "
+                         "animate, never restored history or fools, and Effects Off or Reduced "
+                         "motion pauses animation without resetting it.");
+        auto *physics = section("effects.physics", "Physics");
         auto *gravity = slider(*physics, "Gravity", model.settings.gravity, -200, 500, 1,
                                [this](float value) { model.settings.gravity = value; });
         auto *drag = slider(*physics, "Particle drag", model.settings.drag, 0, 10, .01,
                             [this](float value) { model.settings.drag = value; });
         auto *shake = slider(*physics, "Overlay shake", model.settings.shake, 0, 3, .01,
                              [this](float value) { model.settings.shake = value; });
+        label(*physics,
+              "Gravity pulls particles, drag slows them, and shake moves event overlays.");
         button(*physics, "Reset physics", [this, gravity, drag, shake] {
             model.settings.gravity = 80;
             model.settings.drag = model.settings.shake = 1;
@@ -1664,18 +1921,26 @@ struct Dialogs::Impl {
     }
 
     void sounds() {
-        auto *master = section("Playback");
+        auto *master = section("sounds.playback", "Playback");
         toggle(*master, "Sound enabled", model.settings.sound,
                [this](bool value) { model.settings.sound = value; });
         soundStatus = label(*master, "");
         slider(*master, "Master volume", model.settings.masterVolume, 0, 1, .01,
                [this](float value) { model.settings.masterVolume = value; });
-        select(*master, "Pitch variation", {"natural", "musical", "fixed"},
-               model.settings.pitchVariation, [this](std::size_t, std::string_view value) {
-                   model.settings.pitchVariation = value;
+        static constexpr const char *pitchIds[] = {"natural", "musical", "fixed"};
+        static constexpr const char *pitchNames[] = {"Natural", "Musical", "Fixed"};
+        const auto pitchIndex = model.settings.pitchVariation == "musical" ? 1
+                                : model.settings.pitchVariation == "fixed" ? 2
+                                                                           : 0;
+        select(*master, "Pitch variation", {std::begin(pitchNames), std::end(pitchNames)},
+               pitchNames[pitchIndex], [this](std::size_t index, std::string_view) {
+                   if (index < std::size(pitchIds))
+                       model.settings.pitchVariation = pitchIds[index];
                });
-        label(*master, "Effects Off also mutes event sounds. Reduced motion does not mute them.");
-        auto *cues = section("Event cues");
+        label(*master, "Effects Off mutes event sounds; Reduced motion does not.");
+        auto *cues = section("sounds.cues", "Event cues");
+        label(*cues,
+              "Each event has its own switch, volume and pitch; master volume applies to all.");
         for (const auto &[name, cue] : model.settings.cues) {
             auto group = column(12);
             toggle(*group, name, cue.enabled,
@@ -1713,7 +1978,7 @@ struct Dialogs::Impl {
     }
 
     void chat() {
-        auto *uploads = section("File uploads");
+        auto *uploads = section("chat.uploads", "Uploads");
         std::vector<std::string> providers;
         for (int i = 0; i <= int(UploadProvider::Soju); ++i)
             providers.emplace_back(uploadProviderLabel(UploadProvider(i)));
@@ -1781,19 +2046,18 @@ struct Dialogs::Impl {
                 } else
                     invalidFields.insert(endpoint);
             });
-            label(*uploads, "Changing the HTTPS authority clears saved credentials. Passwords "
-                            "are stored in plain text in your private configuration file.");
+            label(*uploads,
+                  "Changing the HTTPS host or port clears saved credentials; "
+                  "passwords are stored in plain text in your private configuration file.");
         }
         label(*uploads,
               provider == UploadProvider::Soju
-                  ? "Uses this conversation's authenticated soju account FILEHOST. Configure any "
-                    "extra "
-                    "trusted hostname on that account. No public-host fallback."
-                  : "Uploads leave this device. Links may be public; secret links are not access "
-                    "control. Host retention is independent of local history. Review before "
-                    "uploading; "
-                    "completed links are never sent automatically.");
-        auto *presence = section("Presence and typing");
+                  ? "Uses the conversation's authenticated soju FILEHOST with any extra "
+                    "trusted hostname set on that account, never a public-host fallback."
+                  : "Uploads leave this device, public or secret links are not access control, "
+                    "host retention is separate from local history, and completed links are "
+                    "never sent automatically; review before uploading.");
+        auto *presence = section("chat.typing", "Typing & events");
         const char *modes[] = {"All", "Smart", "Hidden"};
         select(*presence, "Presence rows", {"All", "Smart", "Hidden"},
                modes[std::clamp(int(model.settings.presence), 0, 2)],
@@ -1801,13 +2065,14 @@ struct Dialogs::Impl {
                    model.settings.presence = PresenceMode(index);
                });
         label(*presence,
-              "Smart shows recent conversational participants. Channel menus can override "
-              "the global setting.");
+              "Smart shows recent participants; each channel menu can override this setting.");
         toggle(*presence, "Send typing indicators", model.settings.typingSend,
                [this](bool value) { model.settings.typingSend = value; });
         toggle(*presence, "Show typing indicators", model.settings.typingReceive,
                [this](bool value) { model.settings.typingReceive = value; });
-        auto *people = section("People");
+        auto *people = section("chat.people", "Friends & fools");
+        label(*people, "Enter space-separated nicknames; fool display and unread counts are "
+                       "in Appearance / Messages.");
         text(*people, "Friends", joined(model.settings.friends), [this](const std::string &value) {
             const auto parsed = words(value);
             model.settings.friends = {parsed.begin(), parsed.end()};
@@ -1816,7 +2081,7 @@ struct Dialogs::Impl {
             const auto parsed = words(value);
             model.settings.fools = {parsed.begin(), parsed.end()};
         });
-        auto *colors = section("Nick color overrides");
+        auto *colors = section("chat.colors", "Nick colors");
         for (const auto &[name, value] : model.settings.nickColors) {
             (void)value;
             auto group = column(4);
@@ -1828,44 +2093,27 @@ struct Dialogs::Impl {
             colors->addChild(std::move(group));
         }
         label(*colors, "Add overrides from a member's context menu.");
-        auto *history = section("Local history");
+        auto *history = section("chat.history", "History");
         integer(*history, "Retention days (1–3650)", model.settings.retentionDays, 1, 3650,
                 [this](int value) { model.settings.retentionDays = value; });
         integer(*history, "Messages in memory / saved history (200–100000)",
                 model.settings.maxMessages, 200, 100000,
                 [this](int value) { model.settings.maxMessages = value; });
-        label(*history, "History is bounded in memory and SQLite. Clearing local history does not "
-                        "delete anything from your server.");
+        label(*history, "These limits apply to memory and saved local history; clearing it deletes "
+                        "nothing from your server.");
         button(
             *history, "Clear saved history…", [this] { clearHistory(); },
             ButtonVariant::Destructive);
     }
 
     std::string_view networkCaption(const ServerConfig &profile) const {
-        if (!profile.alias.empty())
-            return profile.alias;
-        if (!profile.sojuParent.empty()) {
-            const auto parent = model.networks.find(profile.sojuParent);
-            if (parent != model.networks.end()) {
-                const auto remote = parent->second.sojuNetworks.find(profile.sojuNetworkId);
-                if (remote != parent->second.sojuNetworks.end()) {
-                    const auto name = remote->second.attributes.find("name");
-                    if (name != remote->second.attributes.end() && !name->second.empty())
-                        return name->second;
-                }
-            }
-        }
-        return profile.name;
+        return serverDisplayName(model, profile.name);
     }
 
     std::string_view networkParentCaption(const ServerConfig &profile) const {
         if (profile.sojuParent.empty())
             return {};
-        const auto parent =
-            std::find_if(model.servers.begin(), model.servers.end(),
-                         [&](const auto &entry) { return entry.name == profile.sojuParent; });
-        return parent == model.servers.end() ? std::string_view(profile.sojuParent)
-                                             : networkCaption(*parent);
+        return serverDisplayName(model, profile.sojuParent);
     }
 
     std::vector<std::string> networkLabels() {
@@ -1885,12 +2133,13 @@ struct Dialogs::Impl {
             if (duplicate && !entry.parentCaption.empty())
                 result[i] += " · " + entry.parentCaption;
         }
-        std::vector<bool> ambiguous(result.size());
+        std::vector<std::size_t> ordinals(result.size());
         for (std::size_t i = 0; i < result.size(); ++i)
-            ambiguous[i] = std::count(result.begin(), result.end(), result[i]) > 1;
+            if (std::count(result.begin(), result.end(), result[i]) > 1)
+                ordinals[i] = std::count(result.begin(), result.begin() + i, result[i]) + 1;
         for (std::size_t i = 0; i < result.size(); ++i)
-            if (ambiguous[i])
-                result[i] += " [" + networkOptions[i].key + "]";
+            if (ordinals[i])
+                result[i] += " (" + std::to_string(ordinals[i]) + ")";
         return result;
     }
 
@@ -2047,8 +2296,8 @@ struct Dialogs::Impl {
         });
         label(parent, "Shared identity credentials", true);
         sharedIdentityText(parent, "SASL password (PLAIN)", index, &Identity::password, true);
-        label(parent, "Identity passwords are stored in plain text in your private configuration "
-                      "file. PLAIN requires TLS; select the authentication method per network.");
+        label(parent, "Passwords are stored in plain text in your private configuration file; "
+                      "PLAIN needs TLS, and each network chooses its authentication method.");
         text(parent, "Client certificate (PEM, EXTERNAL)", identity.certificate,
              [this, index](const std::string &value) {
                  model.identities.at(index).certificate = value;
@@ -2108,7 +2357,7 @@ struct Dialogs::Impl {
             sojuEditAttributes.clear();
             sojuEditChanges.clear();
         }
-        auto *manager = section("Remote soju networks");
+        auto *manager = section("networks.remote", "Remote soju networks");
         const auto found = model.networks.find(parent);
         const bool capable = found != model.networks.end() &&
                              found->second.caps.contains("soju.im/bouncer-networks") &&
@@ -2233,7 +2482,7 @@ struct Dialogs::Impl {
         ensureIdentity();
         if (first && model.servers.empty())
             model.servers.emplace_back();
-        auto *profiles = first ? page : section("Saved networks");
+        auto *profiles = first ? page : section("networks.saved", "Saved networks");
         if (!first) {
             if (!model.servers.empty()) {
                 serverIndex = std::min(serverIndex, model.servers.size() - 1);
@@ -2298,7 +2547,7 @@ struct Dialogs::Impl {
         auto found = std::find_if(model.identities.begin(), model.identities.end(),
                                   [&](const auto &id) { return id.name == server.identity; });
         const std::size_t ii = std::size_t(found - model.identities.begin());
-        auto *endpoint = first ? page : section("Network endpoint");
+        auto *endpoint = first ? page : section("networks.endpoint", "Address & connection");
         if (!server.sojuAccount) {
             auto *profileName = text(*endpoint, "Network name", server.name, {});
             profileName->setOnChange(onServer(
@@ -2378,12 +2627,11 @@ struct Dialogs::Impl {
                               model.servers.at(si).password = value;
                           }),
                  true);
-            label(*endpoint, "This server password is separate from shared identity credentials. "
-                             "It is stored in plain text in your private configuration file.");
+            label(*endpoint,
+                  "This network-only password is separate from shared identity "
+                  "credentials and is stored in plain text in your private configuration file.");
         }
-        auto *credentials = first ? page
-                                  : section(server.sojuAccount ? "Soju account authentication"
-                                                               : "Network authentication");
+        auto *credentials = first ? page : section("networks.authentication", "Authentication");
         if (!server.sojuAccount) {
             select(
                 *credentials, "Authentication method", {"None", "PLAIN", "EXTERNAL"},
@@ -2394,7 +2642,7 @@ struct Dialogs::Impl {
             label(*credentials, "PLAIN requires TLS and uses the selected identity's password. "
                                 "EXTERNAL uses that identity's certificate and private key.");
         }
-        auto *identity = first ? page : section("Shared identity");
+        auto *identity = first ? page : section("networks.identity", "Shared identity");
         networkIdentityPicker =
             select(*identity, "Shared identity profile", identityNames(), server.identity,
                    onServer(source, [this](std::size_t si, std::size_t index, std::string_view) {
@@ -2476,7 +2724,7 @@ struct Dialogs::Impl {
                              "connecting.")
                 ->setColor(colorSpecFromRole(ColorRole::Error));
         }
-        auto *startup = first ? page : section("Channels and bouncer");
+        auto *startup = first ? page : section("networks.channels", "Channels & bouncer");
         text(*startup, "Auto-join channels", joined(server.channels),
              onServer(source, [this](std::size_t si, const std::string &value) {
                  model.servers.at(si).channels = words(value);
@@ -2532,13 +2780,13 @@ struct Dialogs::Impl {
                 }));
             sojuAssociation(server.name, *startup);
         }
-        auto *actions = row(*page);
+        auto *actionSection = first ? page : section("networks.actions", "Actions");
+        auto *actions = row(*actionSection);
         connectButton = button(*actions, "Save and connect",
                                onServer(source, [this](std::size_t si) { connect(si); }),
                                ButtonVariant::Primary);
-        label(*page, "Saves the current network and shared identity settings before connecting. "
-                     "If saving fails, the current connection is kept and the error is shown "
-                     "here. Appearance edits do not reconnect.");
+        label(*actionSection, "Save and connect saves first; a save error keeps the current "
+                              "connection unchanged, and appearance changes never reconnect.");
         if (!first) {
             button(*actions, "Disconnect", onServer(source, [this](std::size_t si) {
                 model.actions.push_back(
@@ -2548,7 +2796,7 @@ struct Dialogs::Impl {
                    onServer(
                        source,
                        [this, source](std::size_t si) {
-                           const std::string name = model.servers.at(si).name;
+                           const std::string name(networkCaption(model.servers.at(si)));
                            confirm(
                                "remove-network", "Remove network?",
                                "Remove '" + name +
@@ -2580,7 +2828,7 @@ struct Dialogs::Impl {
     void identities() {
         ensureIdentity();
         identityIndex = std::min(identityIndex, model.identities.size() - 1);
-        auto *profiles = section("Saved identities");
+        auto *profiles = section("identities.saved", "Saved identities");
         identityPicker =
             select(*profiles, "Profile", identityNames(), model.identities[identityIndex].name,
                    [this](std::size_t index, std::string_view) {
@@ -2597,9 +2845,9 @@ struct Dialogs::Impl {
         const auto &identity = model.identities[ii];
         identityScope = label(*profiles, "");
         identityScopes.emplace_back(identityScope, ii);
-        label(*profiles, "Changes to this identity affect every network listed above. "
-                         "Network-specific server passwords stay in Networks.");
-        auto *details = section("Profile details");
+        label(*profiles, "Identity changes affect every network listed above; network-only "
+                         "server passwords stay in Networks.");
+        auto *details = section("identities.profile", "Profile");
         text(*details, "Profile name", identity.name, [this, ii](const std::string &value) {
             const std::string old = model.identities.at(ii).name;
             model.identities.at(ii).name = value;
@@ -2621,7 +2869,7 @@ struct Dialogs::Impl {
         });
         identityFields(*details, ii);
         auto *remove = button(
-            *page, "Remove identity…",
+            *details, "Remove identity…",
             [this, ii] {
                 const std::string name = model.identities.at(ii).name;
                 confirm("remove-identity", "Remove identity?",
@@ -2674,7 +2922,7 @@ struct Dialogs::Impl {
         }
         for (std::size_t i = 0; i < model.servers.size(); ++i)
             if (auto error = validateServerProfile(model, i); !error.empty()) {
-                setFeedback(model.servers[i].name + ": " + error);
+                setFeedback(std::string(networkCaption(model.servers[i])) + ": " + error);
                 return;
             }
         for (std::size_t i = 0; i < model.identities.size(); ++i)
@@ -2860,11 +3108,9 @@ struct Dialogs::Impl {
                 card.body = body.get();
                 page->addChild(std::move(body));
                 auto *header = row(*card.body, false);
-                auto avatar = column(0, MetricKind::Section);
-                padding(*avatar, 10);
-                card.avatar = label(*avatar, "", true);
+                auto avatar = std::make_unique<ProfileAvatar>();
+                card.avatar = avatar.get();
                 header->addChild(std::move(avatar));
-                card.avatar->setTooltip("Generated user avatar");
                 card.nick = label(*header, "", true);
                 for (std::size_t group = 0; group < card.groups.size(); ++group) {
                     auto sectionBody = column(8, MetricKind::Section);
@@ -2884,8 +3130,6 @@ struct Dialogs::Impl {
             card.body->setExcludeSubtreeFromTabOrder(false);
             card.nick->setText(record.nick);
             card.nick->setColor(nickColor(model, record.nick, profile.server));
-            card.avatar->setText(nativeAvatarInitials(record.nick));
-            card.avatar->setColor(nickColor(model, record.nick, profile.server));
             std::string details;
             for (const auto &detail : record.details) {
                 if (!details.empty())
@@ -3090,6 +3334,11 @@ struct Dialogs::Impl {
                 updateProfile();
             }
         }
+        if (mode == "whois")
+            for (std::size_t index = 0;
+                 index < std::min(profileCards.size(), profile.records.size()); ++index)
+                profileCards[index].avatar->sync(model, profile.records[index].nick, profile.server,
+                                                 scale);
         if (recordingButton && dispatcher &&
             dispatcher->focusedArea() != recordingButton->inputArea())
             stopRecording(false);
@@ -3112,6 +3361,14 @@ struct Dialogs::Impl {
             bindingConflicts->setText(warning);
             bindingConflicts->setVisible(!warning.empty());
             bindingConflicts->setParticipatesInLayout(!warning.empty());
+        }
+        if (topicTitle) {
+            const auto found = model.buffers.find(topicBuffer);
+            if (found != model.buffers.end())
+                topicTitle->setText((found->second.kind == "server" ? std::string("Server log")
+                                                                    : found->second.target) +
+                                    " · " +
+                                    std::string(serverDisplayName(model, found->second.server)));
         }
         retired.clear();
         zoom = std::max(.1f, scale);
@@ -3199,6 +3456,7 @@ struct Dialogs::Impl {
             else
                 networkPicker->clearSelection();
         }
+        updateIdentityScope();
         if (serverSourcePresent && connectButton && serverIndex < model.servers.size()) {
             const auto network = model.networks.find(model.servers[serverIndex].name);
             const bool reconnect = network != model.networks.end() &&
@@ -3244,10 +3502,19 @@ struct Dialogs::Impl {
                     "no create request will be substituted.");
             }
         }
-        if (fontFamily != themeUiFont().family || fontFeatures != themeUiFont().features) {
+        if (fontFamily != themeUiFont().family || fontFeatures != themeUiFont().features ||
+            fontWeight != themeUiFont().weight) {
             fontFamily = themeUiFont().family;
             fontFeatures = themeUiFont().features;
+            fontWeight = themeUiFont().weight;
             refreshFonts(owner);
+            for (const auto &metric : metrics)
+                if (metric.explicitBold) {
+                    auto *caption = metric.kind == MetricKind::Button
+                                        ? static_cast<Button *>(metric.node)->label()
+                                        : static_cast<Label *>(metric.node);
+                    caption->setFontWeight(FontWeight::Bold);
+                }
         }
         const bool confirming = !confirmation.empty();
         Box *visible = confirming ? confirmPanel : panel;
@@ -3270,6 +3537,8 @@ struct Dialogs::Impl {
             visible->setSize(w, h);
             (confirming ? confirmChrome : chrome)->setSize(w, h);
             if (!confirming && mode == "settings" && navigation && categoryPicker) {
+                navigation->setMinWidth(240.f * zoom);
+                navigation->setMaxWidth(240.f * zoom);
                 const bool compact = w < 760.f * zoom || h < 440.f * zoom;
                 bool focusInNavigation = false, focusInPicker = false;
                 if (dispatcher)
@@ -3334,7 +3603,10 @@ void Dialogs::remapBuffer(std::string_view oldId, std::string_view newId) {
     if (s.mode == "topic" && s.topicTitle && s.topicBuffer == newId) {
         const auto found = s.model.buffers.find(s.topicBuffer);
         if (found != s.model.buffers.end())
-            s.topicTitle->setText(found->second.target + " · " + found->second.server);
+            s.topicTitle->setText((found->second.kind == "server" ? std::string("Server log")
+                                                                  : found->second.target) +
+                                  " · " +
+                                  std::string(serverDisplayName(s.model, found->second.server)));
     }
 }
 void Dialogs::remapPane(std::uint64_t oldId, std::uint64_t newId) {

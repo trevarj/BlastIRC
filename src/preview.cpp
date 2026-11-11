@@ -17,6 +17,8 @@
 #include <limits.h>
 #include <limits>
 #include <mutex>
+#include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <thread>
@@ -161,6 +163,82 @@ std::optional<std::string> PreviewService::url(std::string_view value, bool loca
     if (!normalized || std::strlen(normalized.get()) > 4096)
         return {};
     return std::string(normalized.get());
+}
+
+std::optional<std::string> PreviewService::youtubeMetadataUrl(std::string_view value) {
+    auto source = url(value);
+    if (!source)
+        return {};
+    Url parsed(curl_url(), curl_url_cleanup);
+    if (!parsed || curl_url_set(parsed.get(), CURLUPART_URL, source->c_str(), 0) != CURLUE_OK)
+        return {};
+    auto host = part(parsed.get(), CURLUPART_HOST), path = part(parsed.get(), CURLUPART_PATH),
+         port = part(parsed.get(), CURLUPART_PORT), query = part(parsed.get(), CURLUPART_QUERY);
+    if (!host || lower(host.get()) != "www.youtube.com" || !path ||
+        std::strcmp(path.get(), "/watch") || (port && std::strcmp(port.get(), "443")) || !query)
+        return {};
+    bool video = false;
+    std::string_view fields(query.get());
+    while (!fields.empty()) {
+        const auto end = fields.find('&');
+        const auto field = fields.substr(0, end);
+        if (field.starts_with("v=")) {
+            const auto id = field.substr(2);
+            if (video || id.size() != 11 || !std::all_of(id.begin(), id.end(), [](unsigned char c) {
+                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') || c == '_' || c == '-';
+                }))
+                return {};
+            video = true;
+        }
+        if (end == fields.npos)
+            break;
+        fields.remove_prefix(end + 1);
+    }
+    if (!video)
+        return {};
+    Text escaped(curl_easy_escape(nullptr, source->c_str(), static_cast<int>(source->size())),
+                 curl_free);
+    if (!escaped)
+        return {};
+    return "https://www.youtube.com/oembed?url=" + std::string(escaped.get()) + "&format=json";
+}
+
+std::optional<PreviewMetadata> PreviewService::youtubeMetadata(std::string_view text, bool local) {
+    if (text.empty() || text.size() > htmlLimit || text.find('\0') != text.npos)
+        return {};
+    try {
+        const auto json = nlohmann::json::parse(
+            text,
+            [](int depth, nlohmann::json::parse_event_t, nlohmann::json &) {
+                if (depth > 16)
+                    throw std::length_error("JSON nesting limit");
+                return true;
+            },
+            false);
+        if (!json.is_object() || !json.contains("type") || !json["type"].is_string() ||
+            json["type"] != "video" || !json.contains("title") || !json["title"].is_string())
+            return {};
+        const auto &title = json["title"].get_ref<const std::string &>();
+        if (title.find('\0') != title.npos)
+            return {};
+        PreviewMetadata result;
+        result.title = plain(reinterpret_cast<const xmlChar *>(title.c_str()), 256);
+        if (result.title.empty())
+            return {};
+        if (json.contains("thumbnail_url")) {
+            if (!json["thumbnail_url"].is_string())
+                return {};
+            const auto image = url(json["thumbnail_url"].get_ref<const std::string &>(), local);
+            if (!image)
+                return {};
+            result.imageUrl = *image;
+        }
+        // oEmbed's html is executable markup, not preview metadata.
+        return result;
+    } catch (const std::exception &) {
+        return {};
+    }
 }
 
 PreviewKind PreviewService::classify(std::string_view contentType) {
@@ -438,7 +516,7 @@ struct PreviewService::Impl {
         std::size_t headers = 0;
         long status = 0;
         PreviewKind kind = PreviewKind::Unsupported;
-        bool classified = false, limited = false, blocked = false;
+        bool classified = false, limited = false, blocked = false, youtube = false;
     };
     std::shared_ptr<Budget> budget = std::make_shared<Budget>();
     std::mutex mutex;
@@ -550,7 +628,12 @@ struct PreviewService::Impl {
                 if (t.status >= 200 && t.status != 200)
                     return 0; // Only complete HTTP 200 bodies may become previews.
                 if (t.status == 200) {
-                    t.kind = classify(t.contentType);
+                    t.kind = t.youtube
+                                 ? (lower(trim(t.contentType.substr(0, t.contentType.find(';')))) ==
+                                            "application/json"
+                                        ? PreviewKind::Link
+                                        : PreviewKind::Unsupported)
+                                 : classify(t.contentType);
                     if (t.kind != t.request.kind) {
                         t.classified = true;
                         return 0;
@@ -605,18 +688,24 @@ struct PreviewService::Impl {
         result.id = r.id;
         result.generation = r.generation;
         result.url = r.url;
+        const auto endpoint =
+            r.kind == PreviewKind::Link ? youtubeMetadataUrl(r.url) : std::nullopt;
+        const bool youtube = endpoint.has_value();
+        std::string transportUrl = endpoint ? *endpoint : r.url;
         local = r.allowLocal;
         for (unsigned hop = 0; hop <= 4 && !abort; ++hop) {
-            auto admitted = url(result.url, r.allowLocal);
+            auto admitted = url(transportUrl, r.allowLocal);
             if (!admitted) {
                 result.error = "address policy";
                 return result;
             }
-            result.url = std::move(*admitted);
+            transportUrl = std::move(*admitted);
+            if (!youtube)
+                result.url = transportUrl;
             Url parsed(curl_url(), curl_url_cleanup);
-            curl_url_set(parsed.get(), CURLUPART_URL, result.url.c_str(), 0);
+            curl_url_set(parsed.get(), CURLUPART_URL, transportUrl.c_str(), 0);
             auto h = part(parsed.get(), CURLUPART_HOST);
-            result.host = h ? h.get() : "";
+            result.host = youtube ? "www.youtube.com" : h ? h.get() : "";
             using Handle = std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>;
             Handle handle(curl_easy_init(), curl_easy_cleanup);
             if (!handle) {
@@ -624,11 +713,12 @@ struct PreviewService::Impl {
                 return result;
             }
             Transfer t{*this, r};
+            t.youtube = youtube;
             blocked = false;
             auto set = [&](CURLoption o, auto v) {
                 return curl_easy_setopt(handle.get(), o, v) == CURLE_OK;
             };
-            if (!set(CURLOPT_URL, result.url.c_str()) || !set(CURLOPT_PROTOCOLS_STR, "https") ||
+            if (!set(CURLOPT_URL, transportUrl.c_str()) || !set(CURLOPT_PROTOCOLS_STR, "https") ||
                 !set(CURLOPT_PROXY, "") || !set(CURLOPT_PRE_PROXY, "") ||
                 !set(CURLOPT_FOLLOWLOCATION, 0L) || !set(CURLOPT_FRESH_CONNECT, 1L) ||
                 !set(CURLOPT_FORBID_REUSE, 1L) || !set(CURLOPT_DNS_CACHE_TIMEOUT, 0L) ||
@@ -663,12 +753,12 @@ struct PreviewService::Impl {
                     result.error = "redirect limit";
                     return result;
                 }
-                auto next = relative(result.url, t.location, r.allowLocal);
+                auto next = relative(transportUrl, t.location, r.allowLocal);
                 if (!next) {
                     result.error = "redirect address policy";
                     return result;
                 }
-                result.url = std::move(*next);
+                transportUrl = std::move(*next);
                 continue;
             }
             if (t.status >= 200 && t.status != 200) {
@@ -703,10 +793,16 @@ struct PreviewService::Impl {
             }
             result.kind = t.kind;
             if (r.kind == PreviewKind::Link) {
-                result.metadata =
-                    metadata(std::string_view(reinterpret_cast<const char *>(t.bytes.data()),
-                                              t.bytes.size()),
-                             result.url, r.allowLocal);
+                const std::string_view text(reinterpret_cast<const char *>(t.bytes.data()),
+                                            t.bytes.size());
+                if (youtube) {
+                    auto parsedMetadata = youtubeMetadata(text, r.allowLocal);
+                    if (!parsedMetadata)
+                        result.error = "invalid YouTube metadata response";
+                    else
+                        result.metadata = std::move(*parsedMetadata);
+                } else
+                    result.metadata = metadata(text, result.url, r.allowLocal);
                 return result;
             }
             if (r.kind == PreviewKind::Image) {

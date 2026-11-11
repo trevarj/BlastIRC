@@ -152,6 +152,8 @@ struct ApplicationRegression {
         auto &second = app.buffer("repeat-two", "#source");
         Message message;
         message.id = "same-message-id";
+        message.nick = "Peer";
+        message.reply = "parent-id";
         message.text = "first alpha beta";
         app.insert(first, message, false);
         message.text = "second alpha beta";
@@ -160,6 +162,25 @@ struct ApplicationRegression {
         app.action({"search", firstId, "alpha", {}});
         auto &firstResults = app.buffer(first.server, "*search*", "search");
         assert(firstResults.searchSource == firstId && firstResults.messages.size() == 1);
+        const auto searchRow = firstResults.messages.front();
+        assert(searchRow.sourceBuffer == firstId && searchRow.sourceServer == first.server &&
+               searchRow.sourceTarget == first.target && searchRow.sourceId == message.id &&
+               searchRow.sourceText == "first alpha beta" &&
+               searchRow.sourceReply == message.reply);
+        first.draft = "draft survives navigation";
+        const auto beforeJump = app.model.pendingSourceJump.revision;
+        app.action({"search-jump", firstResults.id, searchRow.id, {}});
+        assert(app.model.activeBuffer == firstId && first.draft == "draft survives navigation" &&
+               app.model.pendingSourceJump.revision == beforeJump + 1 &&
+               app.model.pendingSourceJump.buffer == firstId &&
+               app.model.pendingSourceJump.message == message.id);
+        app.model.activeBuffer = firstResults.id;
+        firstResults.messages.front().sourceText = "forged payload";
+        const auto beforeForged = app.model.pendingSourceJump.revision;
+        app.action({"search-jump", firstResults.id, searchRow.id, {}});
+        assert(app.model.activeBuffer == firstResults.id &&
+               app.model.pendingSourceJump.revision == beforeForged);
+        firstResults.messages.front() = searchRow;
         firstResults.searchSource.clear();
         app.model.activeBuffer = firstId;
         app.action({"search", firstResults.id, "no matching text", {}});
@@ -194,6 +215,160 @@ struct ApplicationRegression {
         app.action({"search", firstResults.id, "alpha", {}});
         assert(firstResults.messages.empty() && secondResults.messages.size() == 1);
     }
+    static void retainedSearchJump() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        auto &source = app.buffer("retained-search", "#source");
+        source.draft = "retained draft";
+        Message original;
+        original.id = "retained-original";
+        original.nick = "Peer";
+        original.text = "retained unique search text";
+        original.time = "2026-11-01T12:00:00Z";
+        original.timestamp = 1793534400;
+        app.storage_.append(source.id, original);
+        assert(source.messages.empty());
+        app.action({"search", source.id, "unique search", {}});
+        auto &results = app.buffer(source.server, "*search*", "search");
+        assert(results.messages.size() == 1 && source.messages.empty());
+        const auto revision = app.model.pendingSourceJump.revision;
+        app.action({"search-jump", results.id, results.messages.front().id, {}});
+        assert(app.model.pendingSourceJump.revision == revision + 1 &&
+               app.model.pendingSourceJump.buffer == source.id &&
+               app.model.pendingSourceJump.message == original.id &&
+               app.model.activeBuffer == source.id && source.draft == "retained draft" &&
+               std::any_of(source.messages.begin(), source.messages.end(),
+                           [&](const auto &m) { return m.id == original.id; }));
+        app.action({"search", source.id, "unique search", {}});
+        const string sourceId = source.id;
+        const string resultId = results.id;
+        const string rowId = results.messages.front().id;
+        app.action({"close_buffer", sourceId, {}, {}});
+        assert(!app.model.buffers.contains(sourceId));
+        const auto closedRevision = app.model.pendingSourceJump.revision;
+        app.action({"search-jump", resultId, rowId, {}});
+        assert(app.model.buffers.contains(sourceId) && app.model.activeBuffer == sourceId &&
+               app.model.pendingSourceJump.revision == closedRevision + 1 &&
+               app.model.pendingSourceJump.buffer == sourceId &&
+               app.model.pendingSourceJump.message == original.id &&
+               std::any_of(app.model.buffers.at(sourceId).messages.begin(),
+                           app.model.buffers.at(sourceId).messages.end(),
+                           [&](const auto &m) { return m.id == original.id; }));
+    }
+    static void correlatedSearchHistory() {
+        Application app;
+        app.model = Model{};
+        app.savingAllowed_ = false;
+        app.model.settings.retentionDays = 0;
+        auto &source = app.buffer("search-history", "#source");
+        source.draft = "pending draft";
+        auto &results = app.buffer(source.server, "*search*", "search");
+        Message row;
+        row.id = "result-row";
+        row.nick = "Peer";
+        row.text = "[#source] Peer: remote hit";
+        row.sourceBuffer = source.id;
+        row.sourceServer = source.server;
+        row.sourceTarget = source.target;
+        row.sourceId = "remote-id";
+        row.sourceText = "remote hit";
+        row.time = "2026-11-01T12:00:00Z";
+        row.presence = row.history = true;
+        results.messages.push_back(row);
+        app.model.activeBuffer = results.id;
+        app.searchRequests_[source.server] = {"old-search", source.id, source.server, source.target,
+                                              app.model.networks[source.server].sessionGeneration};
+        Event searchBegin;
+        searchBegin.type = "history_begin";
+        searchBegin.server = source.server;
+        searchBegin.target = source.target;
+        searchBegin.label = "old-search";
+        searchBegin.tags["direction"] = "search";
+        app.reduce(searchBegin);
+        assert(results.loading);
+        app.action({"search", source.id, "", {}});
+        assert(!results.loading && results.messages.empty());
+        searchBegin.type = "history_end";
+        app.reduce(searchBegin);
+        assert(!results.loading && results.messages.empty());
+        results.messages.push_back(row);
+        const auto start = [&](const string &label) {
+            app.searchJump_ = Application::SearchJump{
+                label,         results.id,
+                source.id,     source.server,
+                source.target, {},
+                row,           app.model.networks[source.server].sessionGeneration,
+                app.model.now, 0};
+            app.activeHistory_[label] = source.id;
+            source.loading = true;
+        };
+        Event end;
+        end.type = "history_end";
+        end.server = source.server;
+        end.target = source.target;
+        end.tags["direction"] = "around";
+        const auto initialRevision = app.model.pendingSourceJump.revision;
+        start("empty");
+        end.label = "unrelated";
+        app.reduce(end);
+        assert(app.searchJump_ && source.loading);
+        end.label = "empty";
+        app.reduce(end);
+        assert(!app.searchJump_ && !source.loading &&
+               app.model.pendingSourceJump.revision == initialRevision &&
+               app.model.activeBuffer == results.id);
+        start("failed");
+        end.label = "failed";
+        end.tags["error"] = "denied";
+        app.reduce(end);
+        assert(!app.searchJump_ && !source.loading &&
+               app.model.pendingSourceJump.revision == initialRevision);
+        end.tags.erase("error");
+        start("successful");
+        Event original;
+        original.type = "message";
+        original.server = source.server;
+        original.target = source.target;
+        original.label = "successful";
+        original.id = row.sourceId;
+        original.nick = row.nick;
+        original.text = row.sourceText;
+        original.time = row.time;
+        original.history = true;
+        app.reduce(original);
+        assert(app.searchJump_ && app.searchJump_->matches == 1 &&
+               app.model.pendingSourceJump.revision == initialRevision);
+        end.label = "successful";
+        app.reduce(end);
+        assert(!app.searchJump_ && !source.loading &&
+               app.model.pendingSourceJump.revision == initialRevision + 1 &&
+               app.model.pendingSourceJump.message == original.id &&
+               app.model.activeBuffer == source.id && source.draft == "pending draft");
+        app.model.activeBuffer = results.id;
+        start("hidden");
+        original.label = "hidden";
+        app.reduce(original);
+        app.model.settings.fools.insert(row.nick);
+        app.model.settings.foolDisplay = FoolDisplay::Hidden;
+        end.label = "hidden";
+        app.reduce(end);
+        assert(!app.searchJump_ && !source.loading &&
+               app.model.pendingSourceJump.revision == initialRevision + 1 &&
+               app.model.activeBuffer == results.id);
+        app.model.settings.fools.clear();
+        start("closed");
+        const string sourceId = source.id;
+        app.action({"close_buffer", sourceId, {}, {}});
+        assert(!app.searchJump_ && !app.model.buffers.contains(sourceId));
+        const auto closedRevision = app.model.pendingSourceJump.revision;
+        original.label = "closed";
+        app.reduce(original);
+        end.label = "closed";
+        app.reduce(end);
+        assert(!app.model.buffers.contains(sourceId) &&
+               app.model.pendingSourceJump.revision == closedRevision);
+    }
     static void privateSojuSearch() {
         const auto setting = [](const char *key) {
             const char *value = std::getenv(key);
@@ -227,7 +402,7 @@ struct ApplicationRegression {
         app.model.servers = {server};
         app.connect(server.name);
         string childName;
-        bool sourceHistoryEnded = false;
+        set<std::pair<string, string>> initialHistoryEnded;
         size_t searchEnds = 0;
         const auto drain = [&] {
             vector<Event> incoming;
@@ -235,9 +410,9 @@ struct ApplicationRegression {
                 for (auto &event : connected->poll())
                     incoming.push_back(std::move(event));
             for (auto &event : incoming) {
-                if (event.server == childName && event.type == "history_end" &&
-                    event.tags["direction"] != "search")
-                    sourceHistoryEnded = true;
+                if (event.type == "history_end" && event.tags["initial"] == "1" &&
+                    event.tags["error"].empty())
+                    initialHistoryEnded.emplace(event.server, event.target);
                 if (event.server == childName && event.type == "history_end" &&
                     event.tags["direction"] == "search")
                     ++searchEnds;
@@ -245,9 +420,10 @@ struct ApplicationRegression {
                     event.tags.contains("search") || event.type == "error")
                     std::cout << "EVENT " << event.type << " target=" << event.target
                               << " text=" << event.text << " label=" << event.label
-                              << " direction=" << event.tags["direction"] << '\n';
+                              << " direction=" << event.tags["direction"] << std::endl;
                 app.reduce(std::move(event));
             }
+            app.scheduleHistory();
         };
         const auto wait = [&](const auto &predicate, const string &why) {
             const auto deadline = RenameDrainPeer::Clock::now() + std::chrono::seconds(20);
@@ -282,8 +458,21 @@ struct ApplicationRegression {
         auto &source = app.buffer(childName, channel);
         client->command("JOIN " + channel);
         wait([&] { return source.joined; }, "Private child did not join search source");
-        wait([&] { return sourceHistoryEnded && !source.loading; },
-             "JOIN-triggered initial history did not complete before remote-only marker");
+        wait(
+            [&] {
+                return initialHistoryEnded.contains({childName, source.target}) &&
+                       source.initialHistorySync == HistorySyncState::Idle && !source.loading;
+            },
+            "JOIN-triggered initial history did not complete before remote-only marker");
+        const string beforeMarker = setting("BLAST_TEST_TOKEN") + " before context";
+        client->send(channel, beforeMarker);
+        wait(
+            [&] {
+                return std::any_of(
+                    source.messages.begin(), source.messages.end(),
+                    [&](const auto &m) { return m.text == beforeMarker && !m.pending; });
+            },
+            "Soju did not acknowledge preceding context");
         client->send(channel, marker);
         wait(
             [&] {
@@ -303,7 +492,7 @@ struct ApplicationRegression {
         require(source.messages.empty() && app.storage_.history(source.id, 100).empty(),
                 "Local source must be empty before remote-only search");
         std::cout << "LOCAL source rows=0; query=" << marker << std::endl;
-        app.action({"search", source.id, marker, {}});
+        app.command(source, "/search " + channel + " " + marker);
         auto &results = app.buffer(childName, "*search*", "search");
         require(results.messages.empty(), "Local fallback masked the remote-only probe");
         wait(
@@ -337,6 +526,32 @@ struct ApplicationRegression {
              "Empty repeat search did not complete");
         require(results.messages.empty() && source.messages.empty(),
                 "Empty repeat search retained results or polluted source history");
+        // Search only supplies a presentation row. The jump must fetch actual
+        // surrounding history and retain the source composer draft.
+        source.draft = "unsent source draft";
+        app.action({"search", results.id, marker, {}});
+        wait([&] { return searchEnds == 4 && !results.loading; },
+             "Context search did not complete");
+        const auto selected = std::find_if(results.messages.begin(), results.messages.end(),
+                                           [&](const auto &m) { return m.sourceText == marker; });
+        require(selected != results.messages.end() && source.messages.empty(),
+                "Context search did not produce a remote-only result");
+        const auto revision = app.model.pendingSourceJump.revision;
+        app.action({"search-jump", results.id, selected->id, {}});
+        wait([&] { return app.model.pendingSourceJump.revision > revision; },
+             "Remote-only result did not navigate after AROUND");
+        require(app.model.activeBuffer == source.id && source.draft == "unsent source draft" &&
+                    app.model.pendingSourceJump.buffer == source.id,
+                "Remote jump lost source selection or draft");
+        const auto match = std::find_if(source.messages.begin(), source.messages.end(),
+                                        [&](const auto &m) { return m.text == marker; });
+        require(match != source.messages.end() &&
+                    app.model.pendingSourceJump.message == match->id &&
+                    std::any_of(source.messages.begin(), source.messages.end(),
+                                [&](const auto &m) { return m.text == beforeMarker; }) &&
+                    std::any_of(source.messages.begin(), source.messages.end(),
+                                [&](const auto &m) { return m.text == secondMarker; }),
+                "AROUND did not restore the real selected message and its neighbors");
         client->stop();
         std::cout << "PASS private Soju remote-only multiword punctuation search" << std::endl;
     }
@@ -870,7 +1085,7 @@ struct ApplicationRegression {
                    app.model.buffers.at(elsewhere).messages.size() == elsewhereMessages);
         }
         const auto beforeMessages = app.model.buffers.at(origin).messages.size();
-        app.command(app.model.buffers.at(origin), "/search #target words");
+        app.command(app.model.buffers.at(origin), "/raw SEARCH #target words");
         assert(app.commandOrigins_.size() == beforeReject + 1);
         app.model.activeBuffer = elsewhere;
         const auto rejectionDeadline = RenameDrainPeer::Clock::now() + std::chrono::seconds(3);
@@ -1026,6 +1241,11 @@ struct ApplicationRegression {
         child.sojuNetworkId = "42";
         child.bouncer = "soju:42";
         app.model.servers = {parent, child};
+        assert(serverDisplayName(app.model, parent.name) == parent.name);
+        assert(serverDisplayName(app.model, "unconfigured-orphan") == "Network");
+        app.model.servers[0].alias = "Personal account";
+        assert(serverDisplayName(app.model, parent.name) == "Personal account");
+        app.model.servers[0].alias.clear();
         auto &room = app.buffer(child.name, "#kept");
         room.draft = "still local";
         auto &control = app.model.networks[parent.name];
@@ -1050,6 +1270,73 @@ struct ApplicationRegression {
         assert(control.sojuNetworks.at("42").attributes.at("state") == "connected");
         app.synchronizeSoju(parent.name);
         assert(!app.client(child.name)); // Catalog updates cannot undo a local disconnect.
+        assert(serverDisplayName(app.model, child.name) == "Network");
+        app.model.settings.retentionDays = 0;
+        app.model.networks[child.name].nick = "Me";
+        Event incoming;
+        incoming.type = "message";
+        incoming.server = child.name;
+        incoming.target = room.target;
+        incoming.nick = "Speaker";
+        incoming.text = "Me: retained catalog source";
+        incoming.id = "catalog-display-source";
+        incoming.timestamp = 1793836800;
+        incoming.time = "2026-11-05T00:00:00Z";
+        app.reduce(incoming);
+        const string roomId = room.id;
+        auto assertRouting = [&] {
+            assert(app.model.servers.size() == 2 && app.model.servers[1].name == child.name &&
+                   app.model.servers[1].sojuParent == parent.name &&
+                   app.model.servers[1].sojuNetworkId == "42");
+            assert(room.id == roomId && room.server == child.name &&
+                   roomId == child.name + "/#kept" && &app.model.buffers.at(roomId) == &room &&
+                   !app.client(child.name));
+            app.refreshMentions();
+            const auto &feed = app.model.buffers.at(GlobalMentionsBufferId);
+            const auto source =
+                std::find_if(feed.messages.begin(), feed.messages.end(),
+                             [&](const auto &message) { return message.sourceId == incoming.id; });
+            assert(source != feed.messages.end() && source->sourceBuffer == roomId &&
+                   source->sourceServer == child.name && source->sourceTarget == room.target);
+            assert(resolveMessageSource(app.model, feed, *source) == &room);
+        };
+        assertRouting();
+        Event row;
+        row.type = "network";
+        row.server = parent.name;
+        row.id = "42";
+        row.tags = {{"kind", "bouncer"}, {"name", "Late catalog name"}};
+        app.reduce(row);
+        assert(serverDisplayName(app.model, child.name) == "Late catalog name");
+        assert(app.model.servers[1].alias.empty());
+        assertRouting();
+        row.tags["name"] = "Renamed network";
+        app.reduce(row);
+        assert(serverDisplayName(app.model, child.name) == "Renamed network");
+        assert(app.model.servers[1].alias.empty());
+        assertRouting();
+        app.command(room, "/join #other");
+        assert(app.model.status == "Not connected to Renamed network" &&
+               room.messages.back().text == app.model.status);
+        row.tags["name"].clear();
+        app.reduce(row);
+        assert(serverDisplayName(app.model, child.name) == "Network");
+        assert(app.model.servers[1].alias.empty());
+        assertRouting();
+        app.model.servers[1].alias = "My network";
+        row.tags["name"] = "Another catalog name";
+        app.reduce(row);
+        assert(app.model.servers[1].alias == "My network" &&
+               serverDisplayName(app.model, child.name) == "My network");
+        assertRouting();
+        app.send(room, "offline draft", {}, false, roomId);
+        assert(app.model.status == "Not connected to My network" &&
+               room.messages.back().text == app.model.status);
+        app.connect("unconfigured-orphan", roomId);
+        assert(app.model.status == "Unknown server: Network" &&
+               room.messages.back().text == app.model.status &&
+               !app.model.buffers.contains("unconfigured-orphan/*server*"));
+        room.draft = "still local";
         control.sojuDiscoveryComplete = false;
         app.action({"connect", {}, child.name, {}});
         assert(app.model.servers[1].sojuEnabled && !app.client(child.name));
@@ -3294,15 +3581,292 @@ struct ApplicationRegression {
         app.storage_.load(disconnectedReload);
         assert(disconnectedReload.buffers.at(room.id).readMarker == room.readMarker);
     }
+    static void initialHistory() {
+        RenameDrainPeer peer;
+        Application app;
+        app.model = Model{};
+        app.savingAllowed_ = false;
+        app.model.settings.retentionDays = 0;
+        Identity identity;
+        identity.nick = "Me";
+        ServerConfig server;
+        server.name = "initial-history";
+        server.host = "127.0.0.1";
+        server.port = peer.port;
+        server.tls = false;
+        app.model.identities = {identity};
+        app.model.servers = {server};
+        app.clients_[server.name] = std::make_unique<NetworkClient>(server, identity);
+        auto &client = *app.clients_.at(server.name);
+        auto &network = app.model.networks[server.name];
+        auto &room = app.buffer(server.name, "#room");
+        const auto idle = [](const Buffer &b) {
+            if (b.initialHistorySync != HistorySyncState::Idle || b.loading)
+                std::cerr << "Initial-history idle failure: target=" << b.target
+                          << " sync=" << static_cast<int>(b.initialHistorySync)
+                          << " foreground=" << b.loading << '\n';
+            assert(b.initialHistorySync == HistorySyncState::Idle && !b.loading);
+        };
+        // Neither configuration, capability, nor membership alone admits work.
+        app.requestHistory(room, "", true);
+        idle(room);
+        network.state = "Ready";
+        room.joined = true;
+        app.requestHistory(room, "", true);
+        idle(room);
+        network.caps.insert("draft/chathistory");
+        room.joined = false;
+        app.requestHistory(room, "", true);
+        idle(room);
+        auto &unbound = app.buffer("initial-unbound", "Peer", "query");
+        app.model.networks[unbound.server].state = "Ready";
+        app.model.networks[unbound.server].caps.insert("draft/chathistory");
+        app.requestHistory(unbound, "", true);
+        idle(unbound);
+        auto &search = app.buffer(server.name, "*search*", "search");
+        app.requestHistory(search, "", true);
+        idle(search);
+        assert(app.requestedHistory_.empty() && app.activeHistory_.empty());
+        // A bouncer can restore membership before its deferred Ready event.
+        // Eligibility starts at Ready, without losing that already-observed JOIN.
+        network.state = "Registering";
+        Event earlyJoin;
+        earlyJoin.type = "join";
+        earlyJoin.server = server.name;
+        earlyJoin.target = room.target;
+        earlyJoin.nick = identity.nick;
+        earlyJoin.own = true;
+        app.reduce(earlyJoin);
+        assert(room.joined);
+        idle(room);
+        Event ready;
+        ready.type = "state";
+        ready.server = server.name;
+        ready.text = "Ready";
+        app.reduce(ready);
+        assert(room.initialHistorySync == HistorySyncState::Queued);
+        app.cancelHistory(room);
+        room.joined = false;
+        network.state.clear();
+        network.caps.clear();
+        client.start();
+        peer.accept();
+        peer.expect("CAP", {"LS", "302"});
+        peer.send(":server CAP * LS :batch draft/chathistory");
+        peer.expect("NICK", {identity.nick});
+        peer.expect("USER", {identity.username, "0", "*", identity.realname});
+        peer.expect("CAP", {"REQ", "batch draft/chathistory"});
+        peer.send(":server CAP Me ACK :batch draft/chathistory");
+        peer.expect("CAP", {"END"});
+        peer.send(":server 001 Me :Welcome");
+        peer.send(":server 005 Me CHATHISTORY=2 :supported");
+        peer.send(":server 376 Me :End of MOTD");
+        bool historyLimitSeen = false;
+        const auto drain = [&] {
+            for (auto &event : client.poll()) {
+                if (event.type == "network" && event.tags["kind"] == "isupport" &&
+                    event.tags["CHATHISTORY"] == "2")
+                    historyLimitSeen = true;
+                const bool gapEnd = event.type == "history_end" && event.tags.contains("initial") &&
+                                    event.tags["direction"] == "after";
+                const string target = event.target;
+                app.reduce(std::move(event));
+                if (gapEnd) {
+                    const auto &b = app.buffer(server.name, target);
+                    if (std::any_of(app.initialHistory_.begin(), app.initialHistory_.end(),
+                                    [&](const auto &v) { return v.second == b.id; }))
+                        assert(b.initialHistorySync == HistorySyncState::Loading);
+                }
+            }
+            app.scheduleHistory();
+            assert(app.initialHistory_.size() <= 16);
+        };
+        const auto wait = [&](const auto &predicate) {
+            const auto deadline = RenameDrainPeer::Clock::now() + std::chrono::seconds(3);
+            do {
+                drain();
+                if (predicate())
+                    return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } while (RenameDrainPeer::Clock::now() < deadline);
+            throw std::runtime_error("Initial-history reduction deadline expired");
+        };
+        // Ready may precede a separately delivered 005 frame; establish the advertised
+        // page limit before checking two-row continuation behavior.
+        wait([&] { return network.state == "Ready" && historyLimitSeen; });
+        auto &viewed = app.buffer(server.name, "Viewed", "query");
+        auto &pinFirst = app.buffer(server.name, "PinFirst", "query");
+        auto &pinSecond = app.buffer(server.name, "PinSecond", "query");
+        auto &unread = app.buffer(server.name, "Unread", "query");
+        auto &recent = app.buffer(server.name, "Recent", "query");
+        auto &muted = app.buffer(server.name, "Muted", "query");
+        auto &archived = app.buffer(server.name, "Archived", "query");
+        viewed.muted = muted.muted = archived.archived = true;
+        unread.unread = 1;
+        unread.lastChatTimestamp = 1;
+        recent.lastChatTimestamp = 100;
+        app.model.settings.pinnedBuffers = {muted.id, archived.id, pinSecond.id, pinFirst.id};
+        vector<string> ids{viewed.id, pinFirst.id, pinSecond.id, unread.id,
+                           recent.id, muted.id,    archived.id};
+        for (int i = 0; i < 18; ++i)
+            ids.push_back(app.buffer(server.name, "Backlog" + std::to_string(i), "query").id);
+        app.model.activeBuffer = viewed.id;
+        for (const auto &id : ids) {
+            auto &b = app.model.buffers.at(id);
+            app.requestHistory(b, "", true);
+            app.requestHistory(b, "", true); // Repeated Ready/caps/JOIN is idempotent.
+            assert(b.initialHistorySync == HistorySyncState::Queued && !b.loading);
+        }
+        const auto order = app.historyOrder(server.name);
+        assert(order.size() == ids.size());
+        assert((vector<string>(order.begin(), order.begin() + 5) ==
+                vector<string>{"Viewed", "PinSecond", "PinFirst", "Unread", "Recent"}));
+        assert(order[order.size() - 2] == "Muted" && order.back() == "Archived");
+        app.scheduleHistory();
+        assert(app.initialHistory_.size() == 16 && app.activeHistory_.size() == 16);
+        peer.expect("CHATHISTORY", {"LATEST", "Viewed", "*", "2"});
+        wait([&] { return viewed.initialHistorySync == HistorySyncState::Loading; });
+        assert(!viewed.loading);
+        // Switching to a Core-backlogged buffer must displace unsent admitted work.
+        app.model.activeBuffer = archived.id;
+        wait([&] {
+            return std::any_of(app.initialHistory_.begin(), app.initialHistory_.end(),
+                               [&](const auto &v) { return v.second == archived.id; });
+        });
+        assert(app.historyOrder(server.name).front() == "Archived");
+        peer.send(":server BATCH +first chathistory Viewed");
+        peer.send(":server BATCH -first");
+        peer.expect("CHATHISTORY", {"LATEST", "Archived", "*", "2"});
+        wait([&] { return archived.initialHistorySync == HistorySyncState::Loading; });
+        assert(viewed.initialHistorySync == HistorySyncState::Idle && !archived.loading);
+        // Cancellation clears both Core backlog and enqueued wire work.
+        for (const auto &id : ids)
+            app.cancelHistory(app.model.buffers.at(id));
+        assert(app.initialHistory_.empty() && app.activeHistory_.empty() &&
+               app.requestedHistory_.empty());
+        peer.send(":server BATCH +second chathistory Archived");
+        peer.send(":server BATCH -second");
+        peer.fence();
+        drain();
+        for (const auto &id : ids)
+            idle(app.model.buffers.at(id));
+
+        // A cached tail starts AFTER; full pages and error fallback never blink Idle.
+        room.joined = true;
+        Message cached;
+        cached.id = "cached-tail";
+        cached.text = "cached";
+        cached.time = "2026-11-01T00:00:00Z";
+        room.messages.push_back(cached);
+        app.model.activeBuffer = room.id;
+        app.requestHistory(room, "", true);
+        assert(app.gaps_.at(room.id).cursor == "msgid=cached-tail");
+        Event live;
+        live.type = "message";
+        live.server = server.name;
+        live.target = room.target;
+        live.nick = "Other";
+        live.id = "live-after-queue";
+        live.text = "arrived while initial sync was queued";
+        live.time = "2026-11-01T00:01:00Z";
+        live.timestamp = 1793491260;
+        app.reduce(live);
+        assert(app.gaps_.at(room.id).cursor == "msgid=cached-tail");
+        app.scheduleHistory();
+        peer.expect("CHATHISTORY", {"AFTER", "#room", "msgid=cached-tail", "2"});
+        wait([&] { return room.initialHistorySync == HistorySyncState::Loading; });
+        peer.send(":server BATCH +gap chathistory #room");
+        peer.send("@batch=gap;msgid=gap-one :Other!u@h PRIVMSG #room :one");
+        peer.send("@batch=gap;msgid=gap-two :Other!u@h PRIVMSG #room :two");
+        peer.send(":server BATCH -gap");
+        wait([&] { return app.gaps_.at(room.id).cursor == "msgid=gap-two"; });
+        peer.expect("CHATHISTORY", {"AFTER", "#room", "msgid=gap-two", "2"});
+        assert(room.initialHistorySync == HistorySyncState::Loading && !room.loading);
+        peer.send(":server FAIL CHATHISTORY INVALID_PARAMS #room :cursor expired");
+        wait([&] { return !app.gaps_.contains(room.id); });
+        assert(room.initialHistorySync == HistorySyncState::Loading && !room.loading);
+        peer.expect("CHATHISTORY", {"LATEST", "#room", "*", "2"});
+        // All queued foreground routes count, even before their history_begin.
+        app.requestHistory(room, "manual-one", false);
+        app.requestHistory(room, "manual-two", false);
+        assert(room.loading && app.activeHistory_.size() == 3);
+        Event searchBegin;
+        searchBegin.type = "history_begin";
+        searchBegin.server = server.name;
+        searchBegin.target = room.target;
+        searchBegin.label = "independent-search";
+        searchBegin.tags["direction"] = "search";
+        app.reduce(searchBegin); // Unowned search batches must not affect either spinner.
+        assert(!search.loading && room.loading);
+        app.searchRequests_[server.name] = {searchBegin.label, room.id, server.name, room.target,
+                                            network.sessionGeneration};
+        app.reduce(searchBegin);
+        assert(search.loading && room.loading);
+        peer.send(":server BATCH +fallback chathistory #room");
+        peer.send(":server BATCH -fallback");
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=manual-one", "2"});
+        wait([&] { return room.initialHistorySync == HistorySyncState::Idle; });
+        assert(room.loading && search.loading && app.initialHistory_.empty());
+        peer.send(":server BATCH +manual chathistory #room");
+        peer.send(":server BATCH -manual");
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=manual-two", "2"});
+        wait([&] { return app.activeHistory_.size() == 2; });
+        assert(room.loading && search.loading);
+        peer.send(":server FAIL CHATHISTORY INVALID_PARAMS #room :manual failed");
+        wait([&] { return !room.loading; });
+        assert(search.loading && app.model.status.find("manual failed") != string::npos);
+        searchBegin.type = "history_end";
+        app.reduce(searchBegin);
+        assert(!search.loading && app.activeHistory_.empty());
+
+        app.cancelHistory(room);
+        // Disconnect clears both admitted and still-unadmitted work and search.
+        network.state = "Ready";
+        app.requestHistory(room, "", true);
+        app.scheduleHistory();
+        app.requestHistory(viewed, "", true);
+        app.requestHistory(room, "disconnect-manual", false);
+        app.searchRequests_[server.name] = {searchBegin.label, room.id, server.name, room.target,
+                                            network.sessionGeneration};
+        searchBegin.type = "history_begin";
+        app.reduce(searchBegin);
+        assert(!app.initialHistory_.empty() && room.loading && search.loading &&
+               viewed.initialHistorySync == HistorySyncState::Queued);
+        Event disconnected;
+        disconnected.type = "state";
+        disconnected.server = server.name;
+        disconnected.text = "Disconnected";
+        app.reduce(disconnected);
+        idle(room);
+        idle(viewed);
+        idle(search);
+        assert(app.initialHistory_.empty() && app.activeHistory_.empty() && app.gaps_.empty() &&
+               app.requestedHistory_.empty());
+        // Transport rejection cannot strand an initial spinner or its cached gap.
+        app.cancelHistory(room);
+        client.stop();
+        drain(); // Consume stop's state reset before simulating stale Ready admission.
+        network.state = "Ready";
+        room.joined = true;
+        app.requestHistory(room, "", true);
+        app.scheduleHistory();
+        idle(room);
+        assert(app.initialHistory_.empty());
+        assert(!room.loading && app.activeHistory_.empty() && !app.gaps_.contains(room.id));
+        assert(!app.requestedHistory_.contains(room.id));
+    }
     static void run() {
         commandArgumentContext();
         repeatSearch();
+        retainedSearchJump();
+        correlatedSearchHistory();
         appOriginAfterSwitch();
         localOriginErrors();
         closedQueuedCommandOrigin();
         networkStatusErrors();
         sojuHierarchy();
         globalRead();
+        initialHistory();
         sojuReconnectCatalog();
         sendStatuses();
         avatars();
@@ -3432,8 +3996,8 @@ struct ApplicationRegression {
         zncRoom.messages.push_back(historyMessage);
         app.reviseMessages(zncRoom);
         app.clients_[znc.name] = std::make_unique<NetworkClient>(znc, Identity{});
-        app.requestHistory(zncRoom);
-        assert(!zncRoom.loading); // A configured bouncer alone does not promise the module.
+        app.requestHistory(zncRoom, "", true);
+        assert(!zncRoom.loading && zncRoom.initialHistorySync == HistorySyncState::Idle);
         Event nativeCaps;
         nativeCaps.type = "caps";
         nativeCaps.server = znc.name;
@@ -3442,8 +4006,8 @@ struct ApplicationRegression {
         zncRoom.joined = true;
         app.reduce(nativeCaps);
         assert(app.historyCursor(zncRoom, historyMessage.id) == "timestamp=" + historyMessage.time);
-        app.requestHistory(zncRoom);
-        assert(zncRoom.loading);
+        app.requestHistory(zncRoom, "", true);
+        assert(!zncRoom.loading && zncRoom.initialHistorySync == HistorySyncState::Queued);
         assert(app.gaps_.at(zncRoom.id).cursor == "timestamp=" + historyMessage.time);
         app.clients_.erase(znc.name); // This admission check never starts a transport.
 
@@ -3622,18 +4186,27 @@ struct ApplicationRegression {
         assert(app.buffer("test", "OfflinePeer").draft == "disconnected private text ✨");
         const auto messageCount = room.messages.size();
         const auto preferenceDraft = room.draft, currentReadMarker = room.readMarker;
-        assert(app.model.settings.ircChannels.empty());
+        assert(app.model.settings.messageLayouts.empty());
         app.command(room, "/messagestyle irc");
-        assert(app.model.settings.ircChannels == set<string>{room.id});
+        assert(app.model.settings.messageLayouts.at(room.id) == MessageLayout::Irc);
         Model preferenceReload;
         app.storage_.load(preferenceReload);
-        assert(preferenceReload.settings.ircChannels == app.model.settings.ircChannels);
+        assert(preferenceReload.settings.messageLayouts == app.model.settings.messageLayouts);
         app.command(room, "/messagestyle bubbles");
-        assert(app.model.settings.ircChannels.empty());
+        assert(app.model.settings.messageLayouts.empty());
         app.command(room, "/messagestyle");
-        assert(app.model.settings.ircChannels == set<string>{room.id});
+        assert(app.model.settings.messageLayouts.at(room.id) == MessageLayout::Irc);
+        app.command(room, "/messagestyle");
+        assert(app.model.settings.messageLayouts.empty());
+        app.command(room, "/messagestyle stacked");
+        assert(app.model.settings.messageLayouts.at(room.id) == MessageLayout::Stacked);
+        app.storage_.load(preferenceReload);
+        assert(preferenceReload.settings.messageLayouts == app.model.settings.messageLayouts);
+        app.command(room, "/messagestyle");
+        assert(app.model.settings.messageLayouts.empty());
+        app.command(room, "/messagestyle stacked");
         app.command(room, "/messagestyle invalid");
-        assert(app.model.settings.ircChannels == set<string>{room.id});
+        assert(app.model.settings.messageLayouts.at(room.id) == MessageLayout::Stacked);
         assert(room.messages.size() == messageCount + 1 && room.messages.back().presence &&
                room.messages.back().text == app.model.status && room.draft == preferenceDraft &&
                room.readMarker == currentReadMarker);
@@ -3696,7 +4269,8 @@ struct ApplicationRegression {
         app.model.settings.workspace["visible_buffers"] = sourceId;
         app.model.settings.workspace["last_buffer:rename"] = sourceId;
         app.model.settings.workspace["settings_feedback"] = sourceId;
-        app.model.settings.ircChannels.insert(sourceId);
+        app.model.settings.messageLayouts[sourceId] = MessageLayout::Stacked;
+        app.model.settings.messageLayouts[destinationId] = MessageLayout::Irc;
         app.model.settings.channelPresence[sourceId] = PresenceMode::All;
         app.model.actions.push_back({"history", sourceId, {}, {}});
         app.activeHistory_["rename-history"] = sourceId;
@@ -3740,15 +4314,15 @@ struct ApplicationRegression {
         assert(app.model.actions.back().buffer == destinationId &&
                app.requestedHistory_.contains(destinationId));
         assert(app.model.settings.channelPresence.at(destinationId) == PresenceMode::All);
-        assert(app.model.settings.ircChannels.contains(destinationId) &&
-               !app.model.settings.ircChannels.contains(sourceId) &&
-               app.model.settings.ircChannels.contains(room.id));
+        assert(app.model.settings.messageLayouts.at(destinationId) == MessageLayout::Stacked &&
+               !app.model.settings.messageLayouts.contains(sourceId) &&
+               app.model.settings.messageLayouts.at(room.id) == MessageLayout::Stacked);
         assert(app.model.settings.workspace.at("last_buffer:rename") == destinationId &&
                app.model.settings.workspace.at("settings_feedback") == sourceId);
         assert(app.model.settings.workspace.at("visible_buffers") == destinationId);
         assert(app.save());
         app.storage_.load(preferenceReload);
-        assert(preferenceReload.settings.ircChannels == app.model.settings.ircChannels);
+        assert(preferenceReload.settings.messageLayouts == app.model.settings.messageLayouts);
         assert(std::all_of(app.pending_.begin(), app.pending_.end(), [&](const auto &entry) {
             return entry.second.label != "rename-submission" ||
                    entry.second.buffer == destinationId;
@@ -3795,17 +4369,19 @@ struct ApplicationRegression {
         lateFailure.tags["original-text"] = "late unseen fragment";
         app.reduce(lateFailure);
         assert(!app.model.buffers.contains(closingId));
-        assert(app.model.settings.ircChannels.contains(closingId));
+        assert(app.model.settings.messageLayouts.at(closingId) == MessageLayout::Irc);
         assert(app.save());
         app.storage_.load(preferenceReload);
-        assert(preferenceReload.settings.ircChannels.contains(closingId) &&
+        assert(preferenceReload.settings.messageLayouts.at(closingId) == MessageLayout::Irc &&
                !preferenceReload.buffers.contains(closingId));
         auto &reopened = app.buffer("test", closingTarget, "query");
-        assert(reopened.id == closingId && app.model.settings.ircChannels.contains(reopened.id));
+        assert(reopened.id == closingId &&
+               app.model.settings.messageLayouts.at(reopened.id) == MessageLayout::Irc);
         app.command(reopened, "/messagestyle bubbles");
         app.storage_.load(preferenceReload);
-        assert(!preferenceReload.settings.ircChannels.contains(closingId) &&
-               preferenceReload.settings.ircChannels.contains(destinationId));
+        assert(!preferenceReload.settings.messageLayouts.contains(closingId) &&
+               preferenceReload.settings.messageLayouts.at(destinationId) ==
+                   MessageLayout::Stacked);
 
         // A failed preference commit must not authorize deleting an imported layout.
         assert(app.save());

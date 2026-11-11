@@ -103,6 +103,8 @@ Workspace::Workspace(Model &model) : model_(model), publishedActive_(model.activ
         focused = panes.begin()->first;
     deduplicate();
     reconcile();
+    suppressHistory_ = false;
+    recordHistory(panes.at(focused).buffer);
     // Native composers may claim focus while being constructed; only the selected pane may ask.
     for (auto &[id, pane] : panes)
         pane.focusComposer = id == focused;
@@ -186,7 +188,70 @@ void Workspace::focus(Id id) {
         previous->second.focusComposer = false;
     focused = id;
     selected->second.focusComposer = true;
+    if (!suppressHistory_ && selected->second.buffer != publishedActive_)
+        recordHistory(selected->second.buffer);
     publish();
+}
+bool Workspace::historyEligible(const std::string &buffer) const {
+    const auto found = model_.buffers.find(buffer);
+    return found != model_.buffers.end() && !found->second.archived &&
+           (found->second.kind == "channel" || found->second.kind == "query");
+}
+void Workspace::recordHistory(const std::string &buffer) {
+    if (!historyEligible(buffer))
+        return;
+    if (!history_.empty()) {
+        history_.resize(historyCursor_ + 1);
+        if (history_.back() == buffer)
+            return;
+    }
+    if (history_.size() == 128)
+        history_.erase(history_.begin());
+    history_.push_back(buffer);
+    historyCursor_ = history_.size() - 1;
+}
+std::optional<Id> Workspace::navigateHistory(bool forward) {
+    if (history_.empty())
+        return std::nullopt;
+    auto cursor = historyCursor_;
+    const auto selected = panes.find(focused);
+    const bool atCursor = selected != panes.end() && selected->second.buffer == history_[cursor];
+    bool includeCursor = !forward && !atCursor;
+    for (;;) {
+        if (!includeCursor) {
+            if (forward ? cursor + 1 == history_.size() : cursor == 0)
+                return std::nullopt;
+            if (forward)
+                ++cursor;
+            else
+                --cursor;
+        }
+        includeCursor = false;
+        if (!historyEligible(history_[cursor]))
+            continue;
+        const bool suppressed = suppressHistory_;
+        suppressHistory_ = true;
+        const auto pane = open(history_[cursor]);
+        suppressHistory_ = suppressed;
+        historyCursor_ = cursor;
+        return pane;
+    }
+}
+void Workspace::remapHistory(const std::string &oldId, const std::string &newId) {
+    std::size_t count = 0;
+    const auto oldCursor = historyCursor_;
+    for (std::size_t i = 0; i < history_.size(); ++i) {
+        if (history_[i] == oldId)
+            history_[i] = newId;
+        if (count == 0 || history_[count - 1] != history_[i]) {
+            if (count != i)
+                history_[count] = std::move(history_[i]);
+            ++count;
+        }
+        if (i == oldCursor)
+            historyCursor_ = count - 1;
+    }
+    history_.resize(count);
 }
 void Workspace::deduplicate() {
     std::set<std::string_view> seen;
@@ -203,8 +268,6 @@ void Workspace::deduplicate() {
     }
 }
 void Workspace::reconcile() {
-    const bool externalSelection =
-        model_.activeBuffer != publishedActive_ && model_.buffers.contains(model_.activeBuffer);
     const Id previousFocus = focused;
     bool remapped = false;
     for (auto &[id, pane] : panes) {
@@ -216,6 +279,11 @@ void Workspace::reconcile() {
             // Only reassignment away from a still-live conversation retires its quote.
             if (pane.buffer != setting->second && model_.buffers.contains(pane.buffer))
                 pane.reply.clear();
+            else if (pane.buffer != setting->second) {
+                remapHistory(pane.buffer, setting->second);
+                if (publishedActive_ == pane.buffer)
+                    publishedActive_ = setting->second;
+            }
             pane.buffer = setting->second;
             saved.published = setting->second;
             remapped = true;
@@ -223,6 +291,8 @@ void Workspace::reconcile() {
     }
     if (remapped)
         deduplicate();
+    const bool externalSelection =
+        model_.activeBuffer != publishedActive_ && model_.buffers.contains(model_.activeBuffer);
     for (auto it = panes.begin(); it != panes.end();) {
         if (model_.buffers.contains(it->second.buffer) || panes.size() == 1)
             ++it;
@@ -255,9 +325,12 @@ void Workspace::reconcile() {
     }
     if (externalSelection)
         open(model_.activeBuffer);
-    else if (focused != previousFocus)
+    else if (focused != previousFocus) {
+        const bool suppressed = suppressHistory_;
+        suppressHistory_ = true;
         focus(focused);
-    else
+        suppressHistory_ = suppressed;
+    } else
         publish();
 }
 void Workspace::remapBuffer(std::string_view oldId, std::string_view newId) {
@@ -265,6 +338,7 @@ void Workspace::remapBuffer(std::string_view oldId, std::string_view newId) {
         return;
     // Callers may borrow either name from a pane that is renamed or merged below.
     const std::string oldBuffer(oldId), newBuffer(newId);
+    remapHistory(oldBuffer, newBuffer);
     for (auto &[id, pane] : panes)
         if (pane.buffer == oldBuffer) {
             pane.buffer = newBuffer;

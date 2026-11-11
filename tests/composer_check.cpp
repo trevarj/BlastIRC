@@ -415,11 +415,8 @@ void checkIndependentMessageScales(Renderer &renderer) {
                                .hasPreedit = true});
     const auto document = input->editingState();
     const auto undo = document.history->undo, redo = document.history->redo;
-    for (const bool traditional : {false, true}) {
-        if (traditional)
-            model.settings.ircChannels.insert(buffer.id);
-        else
-            model.settings.ircChannels.erase(buffer.id);
+    for (const auto layout : {MessageLayout::Bubbles, MessageLayout::Irc, MessageLayout::Stacked}) {
+        model.settings.messageLayouts[buffer.id] = layout;
         float smallGlyphWidth = 0;
         for (const float messageScale : {.7f, 2.f}) {
             float messageWidth = 0;
@@ -647,12 +644,9 @@ void checkComposerReplyCard(Renderer &renderer) {
         }
         model.settings.fools.clear();
     }
-    for (const bool traditional : {false, true}) {
+    for (const auto layout : {MessageLayout::Bubbles, MessageLayout::Irc, MessageLayout::Stacked}) {
         buffer.kind = "channel";
-        if (traditional)
-            model.settings.ircChannels.insert(buffer.id);
-        else
-            model.settings.ircChannels.erase(buffer.id);
+        model.settings.messageLayouts[buffer.id] = layout;
         for (const float interfaceScale : {.7f, 2.f})
             for (const float messageScale : {.7f, 2.f}) {
                 model.settings.scale = interfaceScale;
@@ -669,7 +663,7 @@ void checkComposerReplyCard(Renderer &renderer) {
             }
     }
     model.settings.scale = model.settings.messageScale = 1;
-    model.settings.ircChannels.erase(buffer.id);
+    model.settings.messageLayouts.erase(buffer.id);
     theme.update(model);
     buffer.messages.front() = source;
     frame(280);
@@ -1973,6 +1967,11 @@ void runComposerCheck() {
     model.settings.reducedMotion = true;
     model.settings.cursorShape = "box";
     model.settings.cursorEffect = "trail";
+    ServerConfig server;
+    server.name = "test";
+    server.host = "example.invalid";
+    server.alias = "Private test network";
+    model.servers.push_back(server);
     model.networks["test"].name = "Private test network";
     model.networks["test"].caps.insert("message-tags");
     auto &buffer = model.buffers["test/room"];
@@ -2442,7 +2441,8 @@ void runComposerCheck() {
            input->value() == formatOnlyLine && a.reply == replyKey);
     input->setValue("draft");
     input->clearSelection();
-    assert(editors.execute("end-of-buffer", a));
+    input->inputArea()->dispatchKey(XKB_KEY_End, 0, KeyMod::Ctrl, true);
+    input->inputArea()->dispatchKey(XKB_KEY_End, 0, KeyMod::Ctrl, false);
     editors.flush();
     activateTooltip(*first, "Formatting toolbar");
     editors.sync();
@@ -3413,7 +3413,8 @@ void runComposerNativeCheck() {
                                                  "Alice";
                 input->setValue(raw);
                 frame();
-                assert(editors.execute("beginning-of-buffer", pane));
+                input->inputArea()->dispatchKey(XKB_KEY_Home, 0, KeyMod::Ctrl, true);
+                input->inputArea()->dispatchKey(XKB_KEY_Home, 0, KeyMod::Ctrl, false);
                 if (!prefix.empty()) {
                     auto caret = input->editingState();
                     caret.current.cursorPos = caret.current.selectionAnchor = prefix.size();
@@ -4171,7 +4172,8 @@ void runComposerNativeCheck() {
             assert(!nativeVisible(*formattingPanel) &&
                    std::abs(input->height() - stableInputHeight) <= .5f);
             input->restoreEditingState(selectedDraft);
-            ui.execute("end-of-buffer");
+            dispatcher.keyEvent(XKB_KEY_End, 0, KeyMod::Ctrl, true);
+            dispatcher.keyEvent(XKB_KEY_End, 0, KeyMod::Ctrl, false);
             frame();
 
             // Select and read a real retained message through the public native consumer path.
@@ -5587,10 +5589,12 @@ void runComposerNativeCheck() {
                     assert(std::abs(input->height() - capped) <= .5f &&
                            input->measuredMultilineHeight() > input->height() &&
                            input->editingState().scrollY > end.scrollY);
-                    ui.execute("beginning-of-buffer");
+                    dispatcher.keyEvent(XKB_KEY_Home, 0, KeyMod::Ctrl, true);
+                    dispatcher.keyEvent(XKB_KEY_Home, 0, KeyMod::Ctrl, false);
                     frame(720, 480);
                     assert(input->cursorPosition() == 0 && input->editingState().scrollY == 0);
-                    ui.execute("end-of-buffer");
+                    dispatcher.keyEvent(XKB_KEY_End, 0, KeyMod::Ctrl, true);
+                    dispatcher.keyEvent(XKB_KEY_End, 0, KeyMod::Ctrl, false);
                     frame(720, 480);
                     assert(input->cursorPosition() == input->value().size() &&
                            input->editingState().scrollY > 0);

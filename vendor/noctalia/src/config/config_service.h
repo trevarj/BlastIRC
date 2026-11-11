@@ -1,0 +1,330 @@
+#pragma once
+
+#include "config/config_credentials.h"
+#include "config/config_migrations.h"
+#include "config/config_types.h"
+#include "config/schema/diagnostics.h"
+#include "config/state_store.h"
+#include "config/toml.h"
+#include "core/inotify/inotify.h"
+#include "core/timer_manager.h"
+
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+class IpcService;
+class NotificationManager;
+
+// Diagnostics a caller already computed for an override mutation, so validation does not merge
+// and validate the same tables again. Null members are computed on demand.
+struct OverrideDiagnostics {
+  const noctalia::config::schema::Diagnostics* baseline = nullptr;  // for the persisted overrides
+  const noctalia::config::schema::Diagnostics* candidate = nullptr; // for the candidate table
+};
+
+class ConfigService {
+public:
+  using ReloadCallback = std::function<void()>;
+  using ChangeCallback = std::function<void()>;
+
+  // RAII scope that coalesces wallpaper changes: any setWallpaperPath() calls
+  // inside the scope skip the per-call callback, and a single callback is
+  // fired on scope exit if anything actually changed.
+  class WallpaperBatch {
+  public:
+    explicit WallpaperBatch(ConfigService& config);
+    ~WallpaperBatch();
+    WallpaperBatch(const WallpaperBatch&) = delete;
+    WallpaperBatch& operator=(const WallpaperBatch&) = delete;
+
+  private:
+    ConfigService& m_config;
+  };
+
+  ConfigService();
+  ~ConfigService() = default;
+
+  ConfigService(const ConfigService&) = delete;
+  ConfigService& operator=(const ConfigService&) = delete;
+
+  const Config& config() const noexcept { return m_config; }
+  std::shared_ptr<const toml::table> configTable() const noexcept { return m_configTable; }
+  bool isLockScreenEnabled() const noexcept { return ::isLockScreenEnabled(m_config.lockscreen); }
+  bool shouldLockBeforeSuspend() const noexcept { return ::shouldLockBeforeSuspend(m_config.lockscreen); }
+  // Which sections changed in the reload currently being dispatched. Valid while
+  // reload callbacks run; subscribers consult it to skip unaffected work.
+  const ConfigChangeSet& lastChange() const noexcept { return m_lastChange; }
+  const std::string& lastMutationError() const noexcept { return m_lastMutationError; }
+  bool matchesKeybind(KeybindAction action, std::uint32_t sym, std::uint32_t modifiers) const;
+  int watchFd() const noexcept { return m_inotify.fd(); }
+  std::string buildSupportReport() const;
+  std::string buildMergedUserConfig(noctalia::config::CredentialExportMode credentials) const;
+  std::string buildEffectiveConfig(noctalia::config::CredentialExportMode credentials) const;
+  static std::string buildMergedUserConfigFromSources(
+      std::string_view configDir, std::string_view settingsPath, std::string* error = nullptr,
+      noctalia::config::CredentialExportMode credentials = noctalia::config::CredentialExportMode::Keep
+  );
+  static std::string buildEffectiveConfigFromSources(
+      std::string_view configDir, std::string_view settingsPath, std::string* error = nullptr,
+      noctalia::config::CredentialExportMode credentials = noctalia::config::CredentialExportMode::Keep
+  );
+  bool shouldRunSetupWizard() const;
+  std::optional<bool> stateBool(std::string_view owner, std::string_view key) const;
+  bool stateOwnerValid(std::string_view owner) const;
+  bool stateContains(std::string_view owner, std::string_view key) const;
+  const std::string& stateParseError() const noexcept { return m_stateStore.parseError(); }
+  std::optional<std::vector<std::string>> stateStringArray(std::string_view owner, std::string_view key) const;
+  bool setStateStringArray(std::string_view owner, std::string_view key, const std::vector<std::string>& value);
+  std::optional<std::string> stateString(std::string_view owner, std::string_view key) const;
+  const noctalia::config::LegacyConfigIssues& legacyConfigIssues() const noexcept { return m_legacyConfigIssues; }
+
+  // The optional label is used only for opt-in reload profiling (NOCTALIA_PROFILE);
+  // unlabeled subscribers are reported by registration index.
+  void addReloadCallback(ReloadCallback callback, std::string_view label = {});
+  void setNotificationManager(NotificationManager* manager);
+  void checkReload();
+  void forceReload();
+
+  void registerIpc(IpcService& ipc);
+
+  // Persisted wallpaper paths (written to settings.toml, app-managed).
+  std::string getWallpaperPath(const std::string& connectorName) const;
+  const std::unordered_map<std::string, std::string>& monitorWallpaperPaths() const { return m_monitorWallpaperPaths; }
+  std::string getDefaultWallpaperPath() const;
+  // Last applied wallpaper, else default. Drives palette generation and template previews.
+  std::string getPaletteWallpaperPath() const;
+  // Greeter sync fallback when no monitor-specific path is chosen.
+  std::string getGreeterSyncWallpaperPath() const;
+  void setWallpaperPath(const std::optional<std::string>& connectorName, const std::string& path);
+  void setWallpaperChangeCallback(ChangeCallback callback);
+
+  const std::vector<WallpaperFavorite>& wallpaperFavorites() const noexcept;
+  bool isWallpaperFavorite(std::string_view path) const;
+  const WallpaperFavorite* wallpaperFavorite(std::string_view path) const;
+  void addWallpaperFavorite(std::string path, const std::optional<WallpaperFavorite>& preset = std::nullopt);
+  void removeWallpaperFavorite(std::string_view path);
+  void setWallpaperFavoriteThemeMode(std::string_view path, ThemeMode themeMode);
+  void setWallpaperFavoritePaletteSource(std::string_view path, std::optional<PaletteSource> source);
+  void setWallpaperFavoritePaletteSelection(std::string_view path, std::string_view value);
+  void applyWallpaperSelection(
+      const std::optional<std::string>& connectorName, const std::string& path, const WallpaperFavorite* applyTheme,
+      const std::vector<std::string>& allConnectors
+  );
+
+  // Add/remove a plugin id ("author/plugin") from the effective [plugins].enabled
+  // list. Persists the resulting override list to settings.toml and triggers the
+  // reload pipeline. No-op if already in that state.
+  void setPluginEnabled(std::string_view pluginId, bool enabled);
+
+  // Add (replacing any same-named entry) or remove a plugin source in
+  // [[plugins.source]], then trigger the reload pipeline.
+  void addPluginSource(const PluginSourceConfig& source);
+  void removePluginSource(std::string_view name);
+
+  // Persist the global [plugins].auto_update mode to settings.toml and trigger the
+  // reload pipeline. Drives background auto-update of git sources per mode.
+  void setPluginsAutoUpdate(PluginAutoUpdateMode mode);
+
+  // Persist a theme-mode override to settings.toml and trigger the reload pipeline.
+  void setThemeMode(ThemeMode mode);
+  // Persist `[theme].source` and the palette field for that source, then reload.
+  [[nodiscard]] bool setThemeColorScheme(PaletteSource source, std::string_view value);
+  // Persist dock enabled override to settings.toml and trigger the reload pipeline.
+  void setDockEnabled(bool enabled);
+  // Persist desktop widget layout/editor state to settings.toml and trigger the reload pipeline.
+  bool setDesktopWidgetsState(const DesktopWidgetsConfig& desktopWidgets);
+  bool setLockscreenWidgetsState(const LockscreenWidgetsConfig& lockscreenWidgets);
+  // Persist app-owned UI/runtime state to state.toml. This does not affect Config reloads.
+  bool setStateBool(std::string_view owner, std::string_view key, bool value);
+  bool setStateString(std::string_view owner, std::string_view key, std::string_view value);
+  bool clearStateOwner(std::string_view owner);
+  bool markSetupWizardCompleted();
+  bool hasOverride(const std::vector<std::string>& path) const;
+  bool hasEffectiveOverride(const std::vector<std::string>& path) const;
+  // Lane content as the settings GUI presents it: the widget list plus the capsule groups it
+  // references, so moving a widget into a lane's group still reports the lane as overridden.
+  bool hasEffectiveBarLaneOverride(const std::vector<std::string>& lanePath) const;
+  // Reverts a lane to the config file: drops the lane-list override and restores the capsule groups
+  // that lane references, leaving groups owned by other lanes alone.
+  bool resetBarLaneOverride(const std::vector<std::string>& lanePath, bool* changed = nullptr);
+  bool isOverrideOnlyBar(std::string_view name) const;
+  bool isOverrideOnlyCalendarAccount(std::string_view id) const;
+  bool canMoveBarOverride(std::string_view name, int direction) const;
+  bool canDeleteBarOverride(std::string_view name) const;
+  bool isOverrideOnlyMonitorOverride(std::string_view barName, std::string_view match) const;
+  bool isOverrideOnlyDockMonitorOverride(std::string_view tableName) const;
+  bool createBarOverride(std::string_view name);
+  bool moveBarOverride(std::string_view name, int direction);
+  bool renameBarOverride(std::string_view oldName, std::string_view newName);
+  bool deleteBarOverride(std::string_view name);
+  bool createMonitorOverride(std::string_view barName, std::string_view match);
+  bool renameMonitorOverride(std::string_view barName, std::string_view oldMatch, std::string_view newMatch);
+  bool deleteMonitorOverride(std::string_view barName, std::string_view match);
+  bool createDockMonitorOverride(std::string_view match);
+  bool renameDockMonitorOverride(std::string_view oldTableName, std::string_view newMatch);
+  bool deleteDockMonitorOverride(std::string_view tableName);
+  bool deleteCalendarAccountOverride(std::string_view id);
+  bool setOverride(const std::vector<std::string>& path, ConfigOverrideValue value);
+  bool setOverride(const std::vector<std::string>& path, ConfigOverrideValue value, bool* changed);
+  bool validateOverride(
+      const std::vector<std::string>& path, const ConfigOverrideValue& value, std::string* error = nullptr
+  );
+  bool setOverrides(const std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>& overrides);
+  bool
+  setOverrides(const std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>& overrides, bool* changed);
+  // Sets and clears in one commit. Callers that both write new keys and retire keys the new shape no
+  // longer owns must use this: two separate commits publish an intermediate config that fails schema
+  // validation and raises a config-error notification.
+  bool mutateOverrides(
+      const std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>& overrides,
+      const std::vector<std::vector<std::string>>& clearPaths, bool* changed
+  );
+  bool clearOverride(const std::vector<std::string>& path);
+  bool clearOverrides(const std::vector<std::vector<std::string>>& paths, bool* changed);
+  bool renameOverrideTable(const std::vector<std::string>& oldPath, const std::vector<std::string>& newPath);
+
+  static BarConfig resolveForOutput(const BarConfig& base, const WaylandOutput& output);
+  static DockConfig resolveForOutput(const DockConfig& base, const WaylandOutput& output);
+
+  // Recursively overlays `overlay` onto `base` (tables merge, everything else
+  // replaces). Public so `config validate` can reproduce loadAll's merge order.
+  static void deepMerge(toml::table& base, const toml::table& overlay);
+
+private:
+  void loadAll();
+  void applyPendingWatchReload();
+  static Config makeDefaultConfig();
+  static void
+  parseConfigTable(const toml::table& tbl, Config& config, bool logSummary, bool logSchemaDiagnostics = true);
+  std::optional<Config> configForOverrides(const toml::table& overrides) const;
+  noctalia::config::schema::Diagnostics diagnosticsForOverrides(const toml::table& overrides) const;
+  // Rejects a candidate that adds errors compared to the persisted overrides.
+  bool validateOverrideMutation(const toml::table& candidateOverrides, const OverrideDiagnostics& known = {});
+  bool overridePathEffectiveInTable(
+      const std::vector<std::string>& path, const toml::table& overrides, const Config* parsedWith = nullptr
+  ) const;
+  std::size_t overridePreserveDepthForPath(const std::vector<std::string>& path) const;
+  // A capsule_group override replaces the whole array, so clearing a lane override can restore a
+  // config-file lane whose group token the override no longer defines. Rewrites the affected
+  // arrays in `candidate` so every referenced group resolves again.
+  void reconcileCapsuleGroupOverrides(toml::table& candidate) const;
+  // Validates `next`, persists it, and reloads. `changed` reports whether anything moved.
+  bool commitOverrideTable(toml::table next, bool* changed, const OverrideDiagnostics& known = {});
+  void setupWatch();
+  // Reconciles inotify watches for [include]d files: watches the parent dir of
+  // every loaded file plus every directory named in an [include].files list, and
+  // drops watches no longer needed. Safe no-op when hot reload is disabled.
+  void refreshIncludeWatches();
+  void fireReloadCallbacks();
+  void loadOverridesFromFile();
+  // A config problem kept as location + text rather than one pre-joined string:
+  // the on-screen notification puts the location in its title and the text in
+  // its body. `message` is "<dotted.path>: <problem>" and never carries a location.
+  struct ConfigProblem {
+    noctalia::config::schema::SourceOrigin origin;
+    std::string message;
+
+    bool empty() const { return message.empty(); }
+    // Single-line form for logs and the settings status banner.
+    std::string flatten(std::string_view baseDir) const { return origin.prefixedShort(baseDir, message); }
+    static ConfigProblem from(const noctalia::config::schema::Diagnostics::Entry& entry) {
+      return ConfigProblem{entry.origin, entry.path + ": " + entry.message};
+    }
+  };
+
+  void setConfigParseError(ConfigProblem problem);
+  void updateLegacyConfigIssues(noctalia::config::LegacyConfigIssues issues);
+  void notifyLegacyConfigIssues();
+  // Validates m_overridesTable against the persisted table and writes it; restores the persisted
+  // table on failure.
+  bool writeOverridesToFile(const OverrideDiagnostics& known = {});
+  void extractWallpaperFromOverrides();
+  void extractWallpaperFromTable(const toml::table& table);
+  void syncWallpaperFavoritesToOverridesTable();
+  bool hasConfiguredWallpaper() const;
+  std::string fallbackWallpaperPath() const;
+
+  Config m_config;
+  ConfigChangeSet m_lastChange;
+
+  std::shared_ptr<const toml::table> m_configTable;
+
+  // Hand-authored config directory: all *.toml merged alphabetically.
+  std::string m_configDir;
+
+  // App-writable settings file (state dir): lives outside config dir so it
+  // can still be written when the config dir is read-only (e.g. NixOS).
+  std::string m_overridesPath;
+  // App-owned UI/runtime state. This is not a config layer and is never
+  // deep-merged into Config.
+  StateStore m_stateStore;
+  // Marker file (state dir): its existence means onboarding has been completed
+  // or dismissed. Single canonical signal for the setup wizard.
+  std::string m_setupMarkerPath;
+  toml::table m_overridesTable;
+  toml::table m_persistedOverridesTable;
+  std::unordered_set<std::string> m_configFileBarNames;
+  std::unordered_map<std::string, std::unordered_set<std::string>> m_configFileMonitorOverrideNames;
+  std::unordered_set<std::string> m_configFileDockMonitorOverrideNames;
+  std::unordered_set<std::string> m_configFileCalendarAccountNames;
+  std::string m_defaultWallpaperPath;
+  std::string m_lastWallpaperPath;
+  std::unordered_map<std::string, std::string> m_monitorWallpaperPaths;
+  std::vector<WallpaperFavorite> m_wallpaperFavorites;
+  mutable std::unordered_map<std::string, bool> m_effectiveOverrideCache;
+
+  ConfigProblem m_overridesParseError;
+  ConfigProblem m_pendingError;             // parse error from initial load, notified once the manager is wired up
+  uint32_t m_configErrorNotificationId = 0; // ID of the active config-error notification, 0 if none
+  noctalia::config::LegacyConfigIssues m_legacyConfigIssues;
+  std::string m_loggedLegacyIssueFingerprint;
+  bool m_legacyReminderPending = false;
+  Timer m_legacyReminderTimer;
+  NotificationManager* m_notificationManager = nullptr;
+
+  // Single inotify fd, two watch descriptors (config dir + state dir).
+  Inotify m_inotify;
+  int m_configWatchWd = -1;
+  int m_overridesWatchWd = -1;
+  // Watch events are coalesced into one reload after a short quiet period.
+  Timer m_watchReloadTimer;
+  bool m_pendingConfigReload = false;
+  bool m_pendingOverridesReload = false;
+  struct SymlinkTargetWatch {
+    std::string filename;
+    bool overrides = false;
+  };
+  // Extra watches on symlink-target directories: wd -> list of filenames to match.
+  std::unordered_map<int, std::vector<SymlinkTargetWatch>> m_symlinkDirWds;
+
+  // Watches on directories that hold [include]d files (subdirs / absolute paths
+  // outside the config dir). Any *.toml change in one of these is a config change.
+  // Kept separate from m_symlinkDirWds because matching is dir-wide, not per-file.
+  std::unordered_set<int> m_includeDirWds;
+  // Canonical directory path -> inotify watch descriptor, for diffing on reload.
+  std::unordered_map<std::string, int> m_includeDirWatches;
+  // Set by the last loadAll(): every file pulled in (root + included) and every
+  // directory named in an [include].files list. Drives refreshIncludeWatches().
+  std::vector<std::filesystem::path> m_includeLoadedFiles;
+  std::vector<std::filesystem::path> m_includeDirs;
+
+  bool m_ownOverridesWritePending = false;
+  std::string m_lastMutationError;
+  int m_wallpaperBatchDepth = 0;
+  bool m_wallpaperBatchDirty = false;
+
+  ChangeCallback m_wallpaperChangeCallback;
+  struct ReloadSubscriber {
+    ReloadCallback callback;
+    std::string label;
+  };
+  std::vector<ReloadSubscriber> m_reloadCallbacks;
+};

@@ -14,7 +14,9 @@
 #include <render/scene/input_dispatcher.h>
 #include <string>
 #include <ui/builders.h>
+#include <ui/controls/glyph.h>
 #include <ui/controls/input.h>
+#include <ui/controls/spinner.h>
 #include <utility>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
@@ -30,6 +32,8 @@ void labelStyle(Label &label, float size, std::string_view role) {
         label.setFontFamily(themeUiFont().family);
     if (label.font().features != themeUiFont().features)
         label.setFontFeatures(themeUiFont().features);
+    if (label.font().weight != themeUiFont().weight)
+        label.setFontWeight(themeUiFont().weight);
     label.setFontSize(size);
     label.setColor(themeForegroundColor(role));
     label.setBaselineMode(LabelBaselineMode::TextFixedHeight);
@@ -118,6 +122,11 @@ struct BufferTitleLine::Impl {
     Label *avatarInitials;
     NativeAvatarLabelPlacement avatarInitialsPlacement;
     Label *title, *network;
+    InputArea *historyArea;
+    Glyph *historyIcon;
+    Label *historyStatus;
+    Spinner *historySpinner;
+    HistorySyncState historySync = HistorySyncState::Idle;
     std::array<ChromeButton *, 3> tools{};
     ChromeButton *topic;
     std::uint64_t pane = 0;
@@ -170,6 +179,23 @@ struct BufferTitleLine::Impl {
         network->setFocusable(false);
         network->setTabStop(false);
         network->setAcceptedButtons(0);
+        historyArea = static_cast<InputArea *>(owner.addChild(std::make_unique<InputArea>()));
+        historyArea->setFocusable(false);
+        historyArea->setTabStop(false);
+        historyArea->setAcceptedButtons(0);
+        historyArea->setVisible(false);
+        historyStatus = static_cast<Label *>(historyArea->addChild(ui::label({.text = ""})));
+        historyStatus->setUseMarkup(false);
+        historyStatus->setMaxLines(1);
+        historyStatus->setEllipsize(TextEllipsize::End);
+        historyStatus->setHitTestVisible(false);
+        historyStatus->setVisible(false);
+        historyIcon = static_cast<Glyph *>(historyArea->addChild(std::make_unique<Glyph>()));
+        historyIcon->setGlyph("history");
+        historyIcon->setHitTestVisible(false);
+        historySpinner = static_cast<Spinner *>(historyArea->addChild(std::make_unique<Spinner>()));
+        historySpinner->setHitTestVisible(false);
+        historySpinner->setVisible(false);
         constexpr std::array<std::string_view, 3> icons = {"users", "search", "ellipsis"};
         for (std::size_t i = 0; i < tools.size(); ++i) {
             auto tool = std::make_unique<ChromeButton>(
@@ -186,7 +212,7 @@ struct BufferTitleLine::Impl {
             tools[i] = static_cast<ChromeButton *>(owner.addChild(std::move(tool)));
         }
         topic = static_cast<ChromeButton *>(owner.addChild(std::make_unique<ChromeButton>(
-            "type", [this](Node &anchor, std::optional<InputArea::PointerData> pointer) {
+            "info", [this](Node &anchor, std::optional<InputArea::PointerData> pointer) {
                 callbacks.topic(pane, anchor, pointer);
             })));
         topic->hint("Channel topic");
@@ -209,6 +235,31 @@ struct BufferTitleLine::Impl {
         }
         const auto found = model.buffers.find(state.buffer);
         const auto *buffer = found == model.buffers.end() ? nullptr : &found->second;
+        const auto nextHistorySync = buffer ? buffer->initialHistorySync : HistorySyncState::Idle;
+        if (historySync != nextHistorySync) {
+            historySync = nextHistorySync;
+            historyStatus->setText(historySync == HistorySyncState::Queued ? "Waiting for history"
+                                                                           : "Syncing history");
+            historyArea->setTooltip(historyStatus->text());
+            owner.markLayoutDirty();
+        }
+        historyArea->setVisible(historySync != HistorySyncState::Idle);
+        const bool loadingHistory = historySync == HistorySyncState::Loading;
+        historySpinner->setVisible(loadingHistory);
+        historyIcon->setVisible(!loadingHistory);
+        historyIcon->setColor(themeForegroundColor("on_surface_variant"));
+        historyIcon->setGlyphSize(12 * scale);
+        bool paneVisible = true;
+        for (const Node *node = &owner; node && paneVisible; node = node->parent())
+            paneVisible = node->visible();
+        if (loadingHistory && paneVisible && !model.settings.reducedMotion &&
+            model.settings.fx != FxLevel::Off)
+            historySpinner->start();
+        else
+            historySpinner->stop();
+        historySpinner->setColor(themeForegroundColor("on_surface_variant"));
+        historySpinner->setSpinnerSize(12 * scale);
+        labelStyle(*historyStatus, 11 * scale, "on_surface_variant");
         const bool nextChannel = buffer && buffer->kind == "channel";
         serverLog = buffer && buffer->kind == "server";
         const bool changedSource =
@@ -297,6 +348,7 @@ struct BufferTitleLine::Impl {
     }
     void layout(Renderer &renderer) {
         const float gap = 6 * scale, extent = hitExtent(scale), avatarExtent = 28 * scale;
+        const float chromeHeight = owner.height();
         if (measuredScale != scale || measuredRenderScale != renderer.renderScale() ||
             measuredGeneration != renderer.textMetricsGeneration() ||
             measuredFont != title->font()) {
@@ -339,10 +391,36 @@ struct BufferTitleLine::Impl {
         const std::array<bool, 3> visible{showPeople, !hiddenTools, true};
         const int count = hiddenTools ? (channel ? 3 : 1) : fullCount;
         const float reserved = count * extent + (count - 1) * gap;
-        const float identityBudget = std::max(0.f, available - reserved - gap);
-        const bool showIdentity =
-            (navigationMode != SidebarMode::Expanded || serverLog) && identityBudget > 0;
-        place(*identity, padding, 0, identityBudget, owner.height());
+        const float leftBudget = std::max(0.f, available - reserved - gap);
+        const bool wantsIdentity = navigationMode != SidebarMode::Expanded || serverLog;
+        const float identityMinimum = wantsIdentity ? avatarExtent + gap + minimumTitleWidth : 0.f;
+        const float historyNatural =
+            historySync == HistorySyncState::Idle
+                ? 0.f
+                : std::ceil(
+                      renderer.measureText(historyStatus->text(), 11 * scale, historyStatus->font())
+                          .width) +
+                      18 * scale;
+        const float historyBudget =
+            historyNatural > 0
+                ? std::min(historyNatural, std::max(std::min(12 * scale, leftBudget),
+                                                    leftBudget - identityMinimum - gap))
+                : 0.f;
+        const float identityBudget =
+            wantsIdentity
+                ? std::max(0.f, leftBudget - historyBudget - (historyBudget > 0 ? gap : 0.f))
+                : 0.f;
+        if (historyBudget > 0) {
+            const float historyX = padding + (identityBudget > 0 ? identityBudget + gap : 0.f);
+            place(*historyArea, historyX, 0, historyBudget, chromeHeight);
+            place(*historyIcon, 0, (chromeHeight - 12 * scale) / 2, 12 * scale, 12 * scale);
+            place(*historySpinner, 0, (chromeHeight - 12 * scale) / 2, 12 * scale, 12 * scale);
+            const float textWidth = std::max(0.f, historyBudget - 18 * scale);
+            historyStatus->setVisible(textWidth >= 12 * scale);
+            placeLabel(*historyStatus, renderer, 18 * scale, 0, textWidth, chromeHeight);
+        }
+        const bool showIdentity = wantsIdentity && identityBudget > 0;
+        place(*identity, padding, 0, identityBudget, chromeHeight);
         identity->setVisible(showIdentity);
         if (!showIdentity) {
             if (avatarImage->hasImage())
@@ -352,7 +430,7 @@ struct BufferTitleLine::Impl {
             avatarImage->setVisible(false);
         }
         if (showIdentity) {
-            const float avatarTop = (owner.height() - avatarExtent) / 2;
+            const float avatarTop = (chromeHeight - avatarExtent) / 2;
             place(*avatarBackground, 0, avatarTop, avatarExtent, avatarExtent);
             place(*avatarImage, 0, avatarTop, avatarExtent, avatarExtent);
             avatarImage->setRadius(themeCornerRadius());
@@ -375,7 +453,7 @@ struct BufferTitleLine::Impl {
                                           ? textBudget - networkReserve
                                           : textBudget;
             const float titleWidth = std::min(titleNaturalWidth, titleBudget);
-            placeLabel(*title, renderer, titleX, 0, titleWidth, owner.height());
+            placeLabel(*title, renderer, titleX, 0, titleWidth, chromeHeight);
             const float chipBudget =
                 std::min(120 * scale, std::max(0.f, textBudget - titleWidth - gap));
             const bool fullNetwork = networkNaturalWidth + 2 * chipPadding <= chipBudget;
@@ -396,9 +474,8 @@ struct BufferTitleLine::Impl {
                 network->measure(renderer);
                 const float chipX = titleX + titleWidth + gap;
                 const float chipHeight = network->height() + 8 * scale;
-                place(*networkChip, chipX, (owner.height() - chipHeight) / 2, chipWidth,
-                      chipHeight);
-                placeLabel(*network, renderer, chipX + chipPadding, 0, textWidth, owner.height());
+                place(*networkChip, chipX, (chromeHeight - chipHeight) / 2, chipWidth, chipHeight);
+                placeLabel(*network, renderer, chipX + chipPadding, 0, textWidth, chromeHeight);
             }
         }
         float x = std::max(0.f, owner.width() - padding - reserved);
@@ -416,10 +493,10 @@ struct BufferTitleLine::Impl {
             tools[i]->setExcludeSubtreeFromTabOrder(!visible[i]);
             if (!visible[i])
                 continue;
-            place(*tools[i], x, (owner.height() - extent) / 2, extent, extent);
+            place(*tools[i], x, (chromeHeight - extent) / 2, extent, extent);
             x += extent + gap;
             if (i == 0 && showTopic) {
-                place(*topic, x, (owner.height() - extent) / 2, extent, extent);
+                place(*topic, x, (chromeHeight - extent) / 2, extent, extent);
                 x += extent + gap;
             }
         }
@@ -559,6 +636,7 @@ struct TopicPopover::Impl {
             appliedFeatures = font.features;
             text->setFontFeatures(appliedFeatures);
         }
+        text->setFontWeight(font.weight);
         text->setFontSize(14 * scale);
         text->setHorizontalPadding(8 * scale);
         place(*text, pad, extent + 2 * pad, std::max(0.f, w - 2 * pad),

@@ -22,6 +22,7 @@ enum class SendReveal { None, Fade, Pixels };
 enum class FoolDisplay { Minimized, Blurred, Dimmed, Hidden, Shown };
 enum class PreviewMode { Off, Click, Automatic };
 enum class PresenceMode { All, Smart, Hidden, Global };
+enum class MessageLayout { Bubbles, Irc, Stacked };
 enum class SidebarMode { Expanded, Compact, Hidden };
 constexpr SidebarMode nextSidebarMode(SidebarMode mode) {
     switch (mode) {
@@ -85,6 +86,7 @@ struct Settings {
     bool timestamps = true, avatars = true, transparency = false;
     int retentionDays = 30, maxMessages = 100000;
     string uiFont, messageFont, nickPalette = "THEME", avatarStyle = "sprite";
+    int uiFontWeight = 400, messageFontWeight = 400;
     string themeSource = "auto", pitchVariation = "natural";
     bool spellcheck = true;
     string spellcheckLanguage = "auto";
@@ -93,7 +95,8 @@ struct Settings {
     SidebarMode peopleMode = SidebarMode::Hidden;
     map<string, Cue> cues;
     map<string, string> bindings, nickColors, workspace;
-    set<string> friends, fools, ircChannels;
+    set<string> friends, fools;
+    map<string, MessageLayout> messageLayouts;
     vector<string> pinnedBuffers; // Full buffer IDs, newest pin first.
     map<string, PresenceMode> channelPresence;
     map<string, bool> bufferFools;
@@ -125,6 +128,8 @@ enum class ActivityKind { None, Join, Part, Quit, Nick };
 struct Message {
     string id, nick, text, time, reply, label, activityTarget;
     string sourceBuffer, sourceId, sourceServer, sourceTarget;
+    // Unmodified payload of a search result; presentation text is not source identity.
+    string sourceText, sourceReply;
     int64_t storageSequence = 0;
     int64_t orderingTimestamp = 0;
     int64_t timestamp = 0;
@@ -144,6 +149,7 @@ struct ChatActivityKey {
     int64_t timestamp = 0, sequence = 0;
     string time;
 };
+enum class HistorySyncState { Idle, Queued, Loading };
 struct Buffer {
     string id, server, target, title, kind = "channel", draft, topic, readMarker;
     // Live channel metadata and its validated private cache file; never persisted.
@@ -167,6 +173,7 @@ struct Buffer {
     vector<Nick> nicks;
     map<string, double> typing;
     int unread = 0;
+    HistorySyncState initialHistorySync = HistorySyncState::Idle; // Runtime only.
     bool loading = false, joined = false;
     bool muted = false, archived = false;
 };
@@ -283,6 +290,27 @@ struct Model {
     // a case-only presentation change, never a document/pane replacement.
     std::function<void(const string &, const string &)> bufferRenamed;
 };
+// Views borrow model storage; do not retain them across model mutations.
+inline std::string_view serverDisplayName(const Model &model, std::string_view key) {
+    const auto profile = std::find_if(model.servers.begin(), model.servers.end(),
+                                      [&](const auto &server) { return server.name == key; });
+    if (profile == model.servers.end())
+        return "Network";
+    if (!profile->alias.empty())
+        return profile->alias;
+    if (profile->sojuParent.empty())
+        return profile->name;
+    const auto parent = model.networks.find(profile->sojuParent);
+    if (parent != model.networks.end()) {
+        const auto network = parent->second.sojuNetworks.find(profile->sojuNetworkId);
+        if (network != parent->second.sojuNetworks.end()) {
+            const auto name = network->second.attributes.find("name");
+            if (name != network->second.attributes.end() && !name->second.empty())
+                return name->second;
+        }
+    }
+    return "Network";
+}
 // Prefer live state, including tombstones, over the retained-source snapshot.
 inline const Message *sourceMessage(const Model &model, const string &buffer, const string &id) {
     auto live = model.buffers.find(buffer);
@@ -343,6 +371,17 @@ inline const Buffer *resolveMessageSource(const Model &model, const Buffer &rowB
                                    original->own || original->presence || !original->mention)))
         return nullptr;
     return context;
+}
+inline bool isFriend(const Model &model, std::string_view server, std::string_view nick) {
+    if (nick.empty() || model.settings.friends.empty())
+        return false;
+    const auto network = model.networks.find(string(server));
+    const std::string_view mapping = network == model.networks.end()
+                                         ? std::string_view{"rfc1459"}
+                                         : std::string_view{network->second.caseMapping};
+    const auto folded = irc::casefold(nick, mapping);
+    return std::any_of(model.settings.friends.begin(), model.settings.friends.end(),
+                       [&](const auto &entry) { return irc::casefold(entry, mapping) == folded; });
 }
 inline bool isFool(const Model &model, std::string_view server, std::string_view nick) {
     if (nick.empty() || model.settings.fools.empty())

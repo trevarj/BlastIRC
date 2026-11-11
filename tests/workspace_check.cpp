@@ -21,6 +21,7 @@ Model model() {
     for (const auto *name : {"room", "other", "renamed"}) {
         auto &buffer = m.buffers[name];
         buffer.id = name;
+        buffer.kind = "channel";
         buffer.draft = std::string("draft for ") + name;
         Message message;
         message.id = std::string("message-") + name;
@@ -656,6 +657,220 @@ void settingsRenameConvergence() {
         assert(bindings(reloaded) == bindings(w) && reloaded.focused == selected);
     }
 }
+void historyStep(Workspace &w, Model &m, bool forward, std::string_view expected) {
+    const auto previous = w.focused;
+    const auto active = m.activeBuffer;
+    const auto destination = w.navigateHistory(forward);
+    if (expected.empty()) {
+        assert(!destination && w.focused == previous && m.activeBuffer == active);
+    } else {
+        assert(destination && *destination == w.focused);
+        assert(w.panes.at(*destination).buffer == expected && m.activeBuffer == expected);
+        // UI focus and subsequent frames must not turn navigation into another visit.
+        w.focus(*destination);
+        w.reconcile();
+    }
+}
+void conversationHistorySequence() {
+    auto m = model();
+    m.buffers.at("other").kind = "query";
+    Workspace w(m);
+    const auto room = w.focused;
+    auto *retained = &w.panes.at(room);
+    retained->reply = ui_logic::messageKey(m.buffers.at("room").messages.front());
+    const auto reply = retained->reply;
+    retained->following = false;
+    retained->unseen = 9;
+    historyStep(w, m, false, "");
+    historyStep(w, m, true, "");
+    const auto other = w.open("other");
+    w.open("renamed");
+    for (int i = 0; i < 3; ++i) {
+        w.focus(w.focused);
+        w.open("renamed");
+        w.reconcile();
+    }
+    historyStep(w, m, true, "");
+    historyStep(w, m, false, "other");
+    assert(w.focused == other);
+    historyStep(w, m, false, "room");
+    assert(w.focused == room && &w.panes.at(room) == retained);
+    assert(retained->reply == reply && !retained->following && retained->unseen == 9);
+    assert(m.buffers.at("room").draft == "draft for room");
+    historyStep(w, m, false, "");
+    historyStep(w, m, true, "other");
+    historyStep(w, m, true, "renamed");
+    historyStep(w, m, true, "");
+    historyStep(w, m, false, "other");
+    w.open("room"); // A normal selection branches instead of replaying the old forward tail.
+    historyStep(w, m, true, "");
+    historyStep(w, m, false, "other");
+    historyStep(w, m, false, "room");
+    historyStep(w, m, false, "");
+    w.persist();
+    const auto saved = m.settings.workspace;
+    Workspace restarted(m);
+    historyStep(restarted, m, false, "");
+    historyStep(restarted, m, true, "");
+    assert(m.settings.workspace == saved);
+}
+void conversationHistoryUtilitiesAndSkippedChats() {
+    auto m = model();
+    m.buffers["utility"].id = "utility";
+    m.buffers.at("utility").kind = "search";
+    m.buffers["server"].id = "server";
+    m.buffers.at("server").kind = "server";
+    Workspace w(m);
+    w.open("other");
+    w.open("renamed");
+    w.open("utility");
+    w.reconcile();
+    historyStep(w, m, false, "renamed"); // First Back leaves the utility, not the cursor.
+    historyStep(w, m, false, "other");
+    w.open("server");
+    historyStep(w, m, true, "renamed"); // Utilities neither append nor truncate.
+    w.open("utility");
+    m.buffers.at("renamed").archived = true;
+    historyStep(w, m, false, "other");
+    m.buffers.erase("other");
+    w.reconcile();
+    historyStep(w, m, false, "room");
+    historyStep(w, m, true, "");
+    w.open("renamed"); // Archived/non-chat selections are not visits.
+    historyStep(w, m, false, "room");
+    historyStep(w, m, false, "");
+
+    Model utilityModel;
+    utilityModel.buffers["status"].id = "status";
+    utilityModel.buffers.at("status").kind = "server";
+    utilityModel.activeBuffer = "status";
+    Workspace utility(utilityModel);
+    historyStep(utility, utilityModel, false, "");
+    utilityModel.buffers["chat"].id = "chat";
+    utilityModel.buffers.at("chat").kind = "query";
+    utility.open("chat");
+    historyStep(utility, utilityModel, false, "");
+    utility.open("status");
+    historyStep(utility, utilityModel, false, "chat");
+}
+void conversationHistoryExternalAndFallback() {
+    auto m = model();
+    Workspace w(m);
+    m.activeBuffer = "other";
+    w.reconcile();
+    m.activeBuffer = "renamed";
+    w.reconcile();
+    historyStep(w, m, false, "other");
+    historyStep(w, m, false, "room");
+    historyStep(w, m, true, "other");
+    historyStep(w, m, true, "renamed");
+    m.buffers.erase("renamed");
+    w.reconcile(); // Automatic focus fallback must not branch away the closed cursor.
+    assert(m.activeBuffer == "room");
+    w.reconcile();
+    historyStep(w, m, false, "other");
+    historyStep(w, m, false, "room");
+    historyStep(w, m, false, "");
+    historyStep(w, m, true, "other");
+    historyStep(w, m, true, "");
+
+    auto singleModel = model();
+    Workspace single(singleModel);
+    singleModel.buffers.erase("room");
+    single.reconcile(); // The lone pane is rebound without recording a fallback visit.
+    assert(singleModel.activeBuffer == "other");
+    historyStep(single, singleModel, false, "");
+    single.open("renamed");
+    historyStep(single, singleModel, false, "");
+
+    auto reassignedModel = model();
+    Workspace reassigned(reassignedModel);
+    reassignedModel.settings.workspace[std::to_string(reassigned.focused)] = "other";
+    reassigned.reconcile(); // Both buffers exist: not a rename and not a visit.
+    historyStep(reassigned, reassignedModel, false, "room");
+    historyStep(reassigned, reassignedModel, false, "");
+    historyStep(reassigned, reassignedModel, true, "");
+}
+void conversationHistoryRename() {
+    for (const bool settingsOnly : {false, true}) {
+        auto m = model();
+        Workspace w(m);
+        const auto room = w.focused;
+        w.open("other");
+        w.open("room");
+        w.open("renamed");
+        historyStep(w, m, false, "room");
+        historyStep(w, m, false, "other");
+        auto node = m.buffers.extract("room");
+        node.key() = "moved";
+        node.mapped().id = "moved";
+        m.buffers.insert(std::move(node));
+        if (settingsOnly) {
+            m.settings.workspace[std::to_string(room)] = "moved";
+            w.reconcile();
+        } else
+            w.remapBuffer("room", "moved");
+        historyStep(w, m, false, "moved");
+        historyStep(w, m, false, "");
+        historyStep(w, m, true, "other");
+        historyStep(w, m, true, "moved");
+        historyStep(w, m, true, "renamed");
+        historyStep(w, m, true, "");
+    }
+}
+void conversationHistoryMergeCursor() {
+    for (const bool settingsOnly : {false, true}) {
+        for (int cursor = 0; cursor < 5; ++cursor) {
+            auto m = model();
+            Workspace w(m);
+            const auto room = w.focused;
+            w.open("other");
+            w.open("room");
+            w.open("renamed");
+            w.open("other");
+            for (int i = 4; i > cursor; --i)
+                assert(w.navigateHistory(false));
+            auto *retained = &w.panes.at(w.focused);
+            retained->following = false;
+            retained->unseen = 17;
+            m.buffers.erase("room");
+            if (settingsOnly) {
+                m.settings.workspace[std::to_string(room)] = "other";
+                w.reconcile();
+            } else
+                w.remapBuffer("room", "other");
+            assert(&w.panes.at(w.focused) == retained);
+            assert(!retained->following && retained->unseen == 17);
+            // [room,other,room,renamed,other] coalesces to [other,renamed,other].
+            const int mappedCursor = cursor < 3 ? 0 : cursor - 2;
+            for (int i = mappedCursor - 1; i >= 0; --i)
+                historyStep(w, m, false, i == 1 ? "renamed" : "other");
+            historyStep(w, m, false, "");
+            historyStep(w, m, true, "renamed");
+            historyStep(w, m, true, "other");
+            historyStep(w, m, true, "");
+        }
+    }
+}
+void conversationHistoryBound() {
+    Model m;
+    for (int i = 0; i < 140; ++i) {
+        const auto name = "chat-" + std::to_string(i);
+        auto &buffer = m.buffers[name];
+        buffer.id = name;
+        buffer.kind = i % 2 ? "query" : "channel";
+    }
+    m.activeBuffer = "chat-0";
+    Workspace w(m);
+    for (int i = 1; i < 140; ++i)
+        w.open("chat-" + std::to_string(i));
+    for (int i = 138; i >= 12; --i)
+        historyStep(w, m, false, "chat-" + std::to_string(i));
+    historyStep(w, m, false, "");
+    for (int i = 13; i < 140; ++i)
+        historyStep(w, m, true, "chat-" + std::to_string(i));
+    historyStep(w, m, true, "");
+}
 } // namespace
 int main() {
     retainedSelectionCache();
@@ -672,4 +887,10 @@ int main() {
     renameCollision(1);
     renameCollision(2);
     settingsRenameConvergence();
+    conversationHistorySequence();
+    conversationHistoryUtilitiesAndSkippedChats();
+    conversationHistoryExternalAndFallback();
+    conversationHistoryRename();
+    conversationHistoryMergeCursor();
+    conversationHistoryBound();
 }

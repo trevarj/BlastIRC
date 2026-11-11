@@ -39,7 +39,8 @@
     "Link": "link",
     "Music": "music",
     "Video": "video",
-    "Mentions": "at-sign"
+    "Mentions": "at-sign",
+    "Topic": "info"
   },
   "sha256": {
     "LICENSE": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57",
@@ -66,6 +67,7 @@
     "link.svg": "06c4d0315cf4b249a075f1ee02209c908948f27abdc43fccb9dcece7499b299d",
     "music.svg": "e00564ea5a423cb9cd6c78e16b408c22ef0a0bbe97221a8aa081f078c19b0e35",
     "video.svg": "7aba91f4696672e2a3cb94a75f380f93250d2456739ebedfd4d8bad498942586",
-    "at-sign.svg": "1428d7340c24ddcca35b9bb17be413dcb26f5e2f6c30e041dafb694ecf10bf90"
+    "at-sign.svg": "1428d7340c24ddcca35b9bb17be413dcb26f5e2f6c30e041dafb694ecf10bf90",
+    "info.svg": "9d6fa66f4fefff302573f1e6173d1080c30ccca867ef96d53fbeb49df9dfc57e"
   }
 }

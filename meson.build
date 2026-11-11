@@ -1,10 +1,11 @@
 project('blastirc', 'c', 'cpp',
   version: '0.1.0',
   meson_version: '>=1.3.0',
+  subproject_dir: 'vendor',
   default_options: ['cpp_std=c++23', 'warning_level=3', 'buildtype=debugoptimized'],
 )
 
-noctalia = subproject('noctalia-ui', default_options: ['library_only=true'])
+noctalia = subproject('noctalia', default_options: ['library_only=true'])
 noctalia_ui_dep = noctalia.get_variable('noctalia_ui_dep')
 noctalia_ui_codecs_dep = noctalia.get_variable('noctalia_ui_codecs_dep')
 noctalia_ui_assets_dir = noctalia.get_variable('noctalia_ui_assets_dir')
@@ -51,12 +52,12 @@ avatar_dep = declare_dependency(
 )
 preview_lib = static_library('blastirc-preview', 'src/preview.cpp',
   include_directories: src_inc,
-  dependencies: [avatar_dep, curl_dep, webp_dep, xml_dep, threads_dep],
+  dependencies: [avatar_dep, curl_dep, webp_dep, xml_dep, json_dep, threads_dep],
 )
 preview_dep = declare_dependency(
   link_with: preview_lib,
   include_directories: src_inc,
-  dependencies: [avatar_dep, curl_dep, webp_dep, xml_dep, threads_dep],
+  dependencies: [avatar_dep, curl_dep, webp_dep, xml_dep, json_dep, threads_dep],
 )
 upload_lib = static_library('blastirc-upload', 'src/upload.cpp',
   include_directories: src_inc,
@@ -114,6 +115,7 @@ executable('blastirc',
   'src/ui/emoji_picker.cpp',
   'src/ui/message_selection.cpp',
   'src/ui/transcript.cpp',
+  'src/ui/foundry_avatar.cpp',
   'src/ui/media_preview.cpp',
   'src/ui/media_player.cpp',
   'src/ui/presentation.cpp',
@@ -142,6 +144,13 @@ if get_option('tests')
     dependencies: avatar_dep, cpp_args: check_args)
   test('avatar', avatar_check)
 
+  foundry_avatar_check = executable('blastirc-foundry-avatar-check',
+    'tests/foundry_avatar_check.cpp', 'src/ui/foundry_avatar.cpp',
+    include_directories: src_inc,
+    dependencies: [noctalia_ui_dep, noctalia_ui_codecs_dep, openssl_dep],
+    cpp_args: check_args)
+  test('foundry_avatar', foundry_avatar_check)
+
   preview_check = executable('blastirc-preview-check', 'tests/preview_check.cpp',
     dependencies: [preview_dep, openssl_dep], cpp_args: check_args)
   test('preview', preview_check)
@@ -160,7 +169,7 @@ if get_option('tests')
   test('upload', upload_check)
 
   ui_check = executable('blastirc-ui-check', 'src/ui/logic_check.cpp',
-    include_directories: src_inc, cpp_args: check_args)
+    include_directories: src_inc, dependencies: irc_dep, cpp_args: check_args)
   test('workspace_logic', ui_check)
 
   workspace_check = executable('blastirc-workspace-check',
@@ -202,6 +211,7 @@ if get_option('tests')
     'src/ui/editor.cpp', 'src/ui/emoji.cpp', 'src/ui/emoji_picker.cpp',
     'src/ui/command_completion.cpp',
     'src/ui/message_selection.cpp', 'src/ui/transcript.cpp', 'src/ui/presentation.cpp',
+    'src/ui/foundry_avatar.cpp',
     'src/ui/media_preview.cpp', 'src/ui/media_player.cpp',
     'src/render/graphics.cpp', 'src/theme/theme.cpp', 'src/fx/effects.cpp',
     include_directories: src_inc,
@@ -251,6 +261,7 @@ install_data(noctalia.get_variable('noctalia_ui_emoji'), install_dir: asset_dir)
 install_subdir('assets/lucide', install_dir: asset_dir)
 install_subdir('assets/sfx', install_dir: asset_dir)
 install_data('assets/icon.png', install_dir: asset_dir)
+install_data('assets/foundry/atlas.png', install_dir: asset_dir / 'foundry')
 install_data('assets/icon.png',
   install_dir: get_option('datadir') / 'icons' / 'hicolor' / '512x512' / 'apps',
   rename: 'io.github.trevarj.blastirc.png')
@@ -277,6 +288,7 @@ foreach bundle_dir : [
   noctalia_ui_assets_dir / 'fonts',
   meson.project_source_root() / 'assets' / 'lucide',
   meson.project_source_root() / 'assets' / 'sfx',
+  meson.project_source_root() / 'assets' / 'foundry',
   meson.project_source_root() / 'assets' / 'icon.png',
 ]
   run_command('ln', '-sfn', bundle_dir, build_assets, check: true)

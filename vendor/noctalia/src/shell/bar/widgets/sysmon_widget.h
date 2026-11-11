@@ -1,0 +1,165 @@
+#pragma once
+
+#include "core/frame_rate_limiter.h"
+#include "core/timer_manager.h"
+#include "render/scene/tooltip_content.h"
+#include "shell/bar/widget.h"
+#include "shell/bar/widget_custom_image.h"
+#include "system/format_units.h"
+#include "ui/controls/flex.h"
+#include "ui/palette.h"
+#include "ui/signal.h"
+
+#include <chrono>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+class Box;
+class ConfigService;
+class Glyph;
+class Graph;
+class Image;
+class Label;
+class ProgressBar;
+class SystemMonitorService;
+struct SystemStats;
+
+enum class SysmonStat {
+  CpuUsage,
+  CpuTemp,
+  CpuFreq,
+  GpuTemp,
+  GpuUsage,
+  GpuVram,
+  GpuVramUsed,
+  RamUsed,
+  RamPct,
+  SwapPct,
+  DiskUsedPct,
+  DiskUsed,
+  DiskFreePct,
+  DiskFree,
+  NetRx,
+  NetTx
+};
+enum class SysmonVisualization { Graph, Gauge, None };
+
+class SysmonWidget : public Widget {
+public:
+  struct Options {
+    SysmonStat stat = SysmonStat::CpuUsage;
+    std::string diskPath = "/";
+    std::string glyph;
+    std::string customImage;
+    std::string customLabel;
+    bool customImageColorize = false;
+    std::string networkInterface;
+    FormatUnits::DecimalByteRateUnit networkSpeedUnit = FormatUnits::DecimalByteRateUnit::Auto;
+    bool networkSpeedCompact = false;
+    int networkSpeedDecimalPlaces = 1;
+    SysmonVisualization visualization = SysmonVisualization::Gauge;
+    bool showCpuCores = false;
+    ColorSpec highlightColor = colorSpecFromRole(ColorRole::Error);
+    bool showGlyph = true;
+    bool showValue = true;
+    int labelMinWidth = 0;
+    bool showUnits = true;
+    GlyphPosition glyphPosition = GlyphPosition::Before;
+    bool peek = false;
+    int peekDelayMs = kBarRevealDelayMs;
+  };
+
+  SysmonWidget(SystemMonitorService* monitor, ConfigService& configService, Options options);
+  ~SysmonWidget() override;
+
+  void create() override;
+  static const char* glyphName(SysmonStat stat);
+
+private:
+  void doLayout(Renderer& renderer, float containerWidth, float containerHeight) override;
+  void doUpdate(Renderer& renderer) override;
+  void onFrameTick(float deltaMs) override;
+  bool needsFrameTick() const override;
+  bool syncLabelText(const std::string& raw);
+  void syncGaugeProgress(double normalized);
+  bool splitCoresActive() const;
+  void syncCoreGauge();
+  void rebuildCoreGauge(std::size_t coreCount);
+  std::string formatValue() const;
+  double currentNormalized();
+  void scheduleNextUpdate(std::chrono::steady_clock::time_point latestSampleAt);
+  void clearGraph();
+  void syncVisualPalette();
+  void syncValueColor();
+  void syncIdentity(Renderer& renderer);
+  LayoutSize layoutIdentityGroup(float gap);
+  void updateGraph(Renderer& renderer);
+  float iconWidth() const;
+  float iconHeight() const;
+  void setIconPosition(float x, float y);
+  float scrollProgressForSample(std::chrono::steady_clock::time_point sampledAt) const;
+  Color currentValueColor(ColorSpec baseColor, std::optional<double> value = std::nullopt);
+  double currentGradientValue();
+  std::pair<double, double> currentThresholds() const;
+  std::optional<std::string> formatValueFor(SysmonStat stat, const SystemStats& stats) const;
+  bool statAvailableForTooltip(SysmonStat stat, const SystemStats& stats) const;
+  std::vector<TooltipRow> buildTooltipRows(const std::string& currentValue) const;
+  static double normalizedFromStats(
+      SysmonStat stat, const SystemStats& stats, double& tempMin, double& tempMax, std::string_view networkInterface
+  );
+
+  SystemMonitorService* m_monitor;
+  SysmonStat m_stat;
+  SysmonVisualization m_visualization;
+  bool m_showCpuCores = false;
+  ColorSpec m_highlightColor = colorSpecFromRole(ColorRole::Error);
+  ConfigService& m_configService;
+  bool m_showGlyph;
+  bool m_showValue;
+  float m_labelMinWidth = 0.0F;
+  std::string m_diskPath;
+  std::string m_networkInterface;
+  FormatUnits::DecimalByteRateUnit m_networkSpeedUnit = FormatUnits::DecimalByteRateUnit::Auto;
+  FormatUnits::ByteRateLabelStyle m_networkSpeedLabelStyle = FormatUnits::ByteRateLabelStyle::Full;
+  int m_networkSpeedDecimalPlaces = 1;
+  std::string m_glyphOverride;
+  std::string m_customLabelText;
+  WidgetCustomImage m_customImage;
+  bool m_showUnits;
+  GlyphPosition m_glyphPosition;
+  std::string m_lastRawValue;
+  bool m_isVerticalBar = false;
+  bool m_lastLabelVertical = false;
+
+  Glyph* m_glyph = nullptr;
+  Image* m_image = nullptr;
+  Label* m_label = nullptr;
+  Label* m_customLabel = nullptr;
+  Box* m_identityGroup = nullptr;
+  Flex* m_containerRow = nullptr;
+
+  static constexpr int kHistorySamples = 30;
+  bool m_graphInitialized = false;
+  std::chrono::steady_clock::time_point m_lastSampleAt;
+  double m_tempMin = 30.0;
+  double m_tempMax = 80.0;
+  Box* m_chartBg = nullptr;
+  Graph* m_graph = nullptr;
+  float m_scrollProgress = 1.0F;
+  Timer m_updateTimer;
+  FrameRateLimiter m_redrawLimiter{std::chrono::milliseconds{200}};
+
+  // Gauge mode
+  ProgressBar* m_gauge = nullptr;
+
+  // Per-core split gauges (show_cpu_cores). The row repopulates whenever the sampler's core
+  // count changes, because an entry's position is not its core id.
+  Flex* m_coreGaugeRow = nullptr;
+  std::vector<ProgressBar*> m_coreGauges;
+  std::vector<double> m_lastCoreUsage;
+
+  Signal<>::ScopedConnection m_paletteConn;
+};

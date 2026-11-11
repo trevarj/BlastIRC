@@ -1,0 +1,255 @@
+#include "application.h"
+
+#include "app/build_info.h"
+#include "app/main_loop.h"
+#include "compositors/umbriel/umbriel_audio_provider.h"
+#include "config/config_types.h"
+#include "core/deferred_call.h"
+#include "core/log.h"
+#include "dbus/accounts/accounts_service.h"
+#include "dbus/idle/screensaver_poll_source.h"
+#include "dbus/idle/screensaver_service.h"
+#include "dbus/logind/logind_service.h"
+#include "dbus/modem/modem_manager_service.h"
+#include "dbus/network/inetwork_service.h"
+#include "dbus/network/iwd_secret_agent.h"
+#include "dbus/notification/kde_notification_client.h"
+#include "dbus/notification/notification_service.h"
+#include "dbus/polkit/polkit_agent.h"
+#include "dbus/polkit/polkit_poll_source.h"
+#include "dbus/power/power_profiles_service.h"
+#include "dbus/session_bus.h"
+#include "dbus/session_bus_poll_source.h"
+#include "dbus/system_bus.h"
+#include "dbus/system_bus_poll_source.h"
+#include "debug/debug_service.h"
+#include "launcher/app_provider.h"
+#include "launcher/math_provider.h"
+#include "launcher/plugin_launcher_provider.h"
+#include "launcher/session_provider.h"
+#include "launcher/wallpaper_provider.h"
+#include "launcher/window_provider.h"
+#include "notification/notifications.h"
+#include "pipewire/pipewire_poll_source.h"
+#include "pipewire/pipewire_service.h"
+#include "pipewire/pipewire_spectrum.h"
+#include "pipewire/pipewire_spectrum_poll_source.h"
+#include "pipewire/wireplumber_mixer.h"
+#include "scripting/plugin_ipc.h"
+#include "scripting/plugin_runtime_context.h"
+#include "shell/clipboard/clipboard_panel.h"
+#include "shell/control_center/control_center_panel.h"
+#include "shell/dialogs/color_picker_dialog.h"
+#include "shell/dialogs/file_dialog.h"
+#include "shell/dialogs/glyph_picker_dialog.h"
+#include "shell/dialogs/search_picker_popup.h"
+#include "shell/greeter/greeter_appearance_sync.h"
+#include "shell/launcher/launcher_panel.h"
+#include "shell/panel/plugin_panel.h"
+#include "shell/polkit/polkit_panel.h"
+#include "shell/session/session_ipc.h"
+#include "shell/session/session_panel.h"
+#include "shell/setup_wizard/setup_wizard_panel.h"
+#include "shell/tooltip/tooltip_manager.h"
+#include "shell/tray/tray_drawer_panel.h"
+#include "shell/wallpaper/panel/wallpaper_panel.h"
+#include "shell/wayland/clipboard_globals.h"
+#include "system/brightness_poll_source.h"
+#include "system/brightness_service.h"
+#include "system/easyeffects_service.h"
+#include "system/keyboard_backlight_service.h"
+#include "system/system_monitor_service.h"
+
+#include <chrono>
+#include <cstring>
+#include <malloc.h>
+#ifdef NOCTALIA_USE_JEMALLOC
+#include <jemalloc/jemalloc.h>
+#endif
+#include <string_view>
+
+#ifdef NOCTALIA_USE_JEMALLOC
+#define NOCTALIA_STRINGIFY_HELPER(x) #x
+#define NOCTALIA_STRINGIFY(x) NOCTALIA_STRINGIFY_HELPER(x)
+#endif
+
+std::atomic<bool> Application::s_shutdownRequested{false};
+
+namespace {
+  constexpr Logger kLog("app");
+
+  float elapsedSince(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+  }
+
+  template <typename Fn> void runStartupPhase(std::string_view label, Fn&& fn) {
+    constexpr float kSlowStartupPhaseDebugMs = 50.0F;
+    constexpr float kSlowStartupPhaseWarnMs = 1000.0F;
+
+    const auto start = std::chrono::steady_clock::now();
+    try {
+      fn();
+    } catch (...) {
+      kLog.warn("startup phase {} failed after {:.1F}ms", label, elapsedSince(start));
+      throw;
+    }
+
+    const float ms = elapsedSince(start);
+    if (ms >= kSlowStartupPhaseWarnMs) {
+      kLog.warn("startup phase {} took {:.1F}ms", label, ms);
+    } else if (ms >= kSlowStartupPhaseDebugMs) {
+      kLog.debug("startup phase {} took {:.1F}ms", label, ms);
+    }
+  }
+} // namespace
+
+Application::Application()
+    : m_lockKeysService(m_wayland),
+      m_calendarService(m_configService, m_httpClient, m_secretStore, m_storageKeyProvider, &m_notificationManager),
+      m_gammaService(m_wayland), m_locationService(m_configService, m_httpClient),
+      m_weatherService(m_configService, m_httpClient) {
+  m_notificationManager.loadPersistedHistory();
+  notify::setInstance(&m_notificationManager);
+
+  m_notificationManager.addEventCallback([this](const Notification& n, NotificationEvent event) {
+    const char* kind = "updated";
+    if (event == NotificationEvent::Added) {
+      kind = "added";
+    } else if (event == NotificationEvent::Closed) {
+      kind = "closed";
+    }
+    const char* origin = (n.origin == NotificationOrigin::Internal) ? "internal" : "external";
+    kLog.debug("notification {} id={} origin={}", kind, n.id, origin);
+
+    if (event == NotificationEvent::Added && m_panelManager.isActivePanelContext("notifications")) {
+      m_notificationManager.markNotificationHistorySeen();
+    }
+
+    // Keep bar widgets in sync with notification state changes.
+    scheduleNotificationShellRefresh();
+  });
+
+  m_notificationManager.setStateCallback([this] {
+    if (m_notificationManager.doNotDisturb()) {
+      m_notificationToast.hideDndSuppressed();
+    }
+    scheduleNotificationShellRefresh();
+  });
+}
+
+Application::~Application() {
+  m_compositorPlatform.setOutputPowerChangeCallback({});
+  ++m_outputPowerRequestGeneration;
+  m_lockScreen.cancelOutputPowerOff();
+  ColorPickerDialog::setPresenter(nullptr);
+  GlyphPickerDialog::setPresenter(nullptr);
+  FileDialog::setPresenter(nullptr);
+  SearchPickerDialog::setPopup(nullptr);
+  m_settingsWindow.shutdownDialogPresenter();
+  // m_systemMonitor is declared after the plugin hosts, so it is destroyed first; drop the script
+  // API's pointer to it here, while both are still alive, or a plugin that used noctalia.cpuCores
+  // releases its reference through a dangling pointer as its host is torn down.
+  m_scriptApi.setSystemMonitor(nullptr);
+  TooltipManager::instance().shutdown();
+  m_notificationManager.flushPersistedHistory();
+  auto& clipboardGlobals = m_wayland.extension<ClipboardGlobals>();
+  clipboardGlobals.setClipboardService(nullptr);
+  m_wayland.setTextInputService(nullptr);
+  clipboardGlobals.setVirtualKeyboardService(nullptr);
+  notify::setInstance(nullptr);
+}
+
+void Application::run(const std::function<void()>& startupReadyCallback) {
+  initLogFile();
+  initLogLevelFromEnvironment();
+  kLog.info("noctalia {}", noctalia::build_info::displayVersion());
+  // Claim the tray watcher name first. The tray UI itself is wired up later.
+  // Item callbacks run from deferred work on the main loop, after the shell
+  // is initialized.
+  initEarlySessionBusAndTray();
+  runStartupPhase("initServices", [this] { initServices(); });
+  runStartupPhase("initPlugins", [this] {
+    // Configure the plugin registry from [plugins] before any UI consumes it, and
+    // re-apply on reload. Registered first so the registry updates ahead of bar /
+    // control-center rebuilds when a plugin is enabled or disabled.
+    m_pluginManager.refresh();
+    m_configService.addReloadCallback([this] { m_pluginManager.refresh(); });
+    // Opt-in auto-update: pull each flagged git source in the background, once now
+    // and then every 6h so a long-running session isn't stuck on the startup snapshot.
+    runPluginAutoUpdate();
+    m_pluginAutoUpdateTimer.startRepeating(std::chrono::hours(6), [this] { runPluginAutoUpdate(); });
+  });
+  runStartupPhase("initUi", [this] { initUi(); });
+  runStartupPhase("initPluginServices", [this] {
+    // Outputs are enumerated by now (wallpaper created its surfaces in initUi); refresh
+    // the script-visible output snapshot before any service/panel reads noctalia.outputs().
+    if (m_syncScriptApiOutputs) {
+      m_syncScriptApiOutputs();
+    }
+    m_pluginServiceHost.start(m_configService.config().plugins.pluginSettings);
+    // Reconcile services when plugin settings change (start new, stop removed, re-seed
+    // changed). Guarded by the plugins change flag so unrelated reloads don't churn.
+    m_configService.addReloadCallback([this] {
+      if (m_configService.lastChange().plugins) {
+        m_pluginServiceHost.refresh(m_configService.config().plugins.pluginSettings);
+        reloadPluginLauncherProviders();
+        reloadPluginPanels();
+        reloadPluginLayers();
+        m_settingsWindow.onPluginsChanged();
+      }
+    });
+    // Plugins materialized after the bar was built (first-run clone/export) or a git
+    // update() advance a source without a config change, so they bypass the config-reload
+    // path. reload() rebuilds the bar widget tree against the now-populated registry —
+    // refresh() only repaints, leaving newly available plugin widgets uncreated.
+    m_pluginManager.setOnChanged([this] {
+      m_pluginServiceHost.refresh(m_configService.config().plugins.pluginSettings);
+      m_bar.reload();
+      reloadPluginLauncherProviders();
+      reloadPluginPanels();
+      reloadPluginLayers();
+      m_settingsWindow.onPluginsChanged();
+    });
+    // A git-source enable exports on a worker thread; redraw the plugins list so the
+    // row swaps between its spinner and toggle as the export starts and finishes.
+    m_pluginManager.setOnEnablingChanged([this] { m_settingsWindow.onPluginsChanged(); });
+    m_pluginManager.setOnSourceUpdated([this](const std::string& sourceName) {
+      m_settingsWindow.invalidatePluginSourceCache(sourceName);
+    });
+    m_pluginManager.setOnEnabled([this](std::string_view pluginId) { m_pluginServiceHost.enablePlugin(pluginId); });
+  });
+  runStartupPhase("initIpc", [this] { initIpc(); });
+  runStartupPhase("buildPollSources", [this] { (void)buildPollSources(); });
+
+  runStartupPhase("startup hooks", [this] {
+    m_hookManager.reload(m_configService.config().hooks);
+    m_hookManager.fire(HookKind::Started);
+  });
+  runStartupPhase("telemetry enqueue", [this] {
+    m_telemetryService.maybeSend(m_configService, m_httpClient, m_wayland);
+  });
+
+#ifdef __GLIBC__
+  runStartupPhase("allocator_trim", [] {
+#ifdef NOCTALIA_USE_JEMALLOC
+    // jemalloc exports no malloc_trim; purge unused pages in every arena.
+    const int purgeResult =
+        mallctl("arena." NOCTALIA_STRINGIFY(MALLCTL_ARENAS_ALL) ".purge", nullptr, nullptr, nullptr, 0);
+    if (purgeResult != 0) {
+      kLog.warn("failed to purge jemalloc arenas: {}", std::strerror(purgeResult));
+    }
+#else
+    malloc_trim(0);
+#endif
+  });
+#endif
+
+  m_polkitInitTimer.start(std::chrono::milliseconds(1000), [this] { syncPolkitAgent(); });
+
+  m_mainLoop = std::make_unique<MainLoop>(m_wayland, m_bar, [this] { return currentPollSources(); });
+  if (startupReadyCallback) {
+    startupReadyCallback();
+  }
+  m_mainLoop->run();
+  kLog.info("shutdown");
+}

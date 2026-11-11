@@ -4,6 +4,26 @@
 #include <cmath>
 #include <limits>
 
+static void friendIdentity() {
+    blast::Model model;
+    model.settings.friends = {"[Alice]^", "BOB"};
+    assert(blast::isFriend(model, "missing", "{alice}~"));
+    assert(blast::isFriend(model, "missing", "bob"));
+    assert(!blast::isFriend(model, "missing", ""));
+    assert(!blast::isFriend(model, "missing", "other"));
+    auto &network = model.networks["network"];
+    network.caseMapping = "ascii";
+    assert(!blast::isFriend(model, "network", "{alice}~"));
+    assert(blast::isFriend(model, "network", "[alice]^"));
+    network.caseMapping = "strict-rfc1459";
+    assert(blast::isFriend(model, "network", "{alice}^"));
+    assert(!blast::isFriend(model, "network", "{alice}~"));
+    network.caseMapping = "rfc1459";
+    assert(blast::isFriend(model, "network", "{alice}~"));
+    model.settings.friends.clear();
+    assert(!blast::isFriend(model, "network", "[Alice]^"));
+}
+
 static void sidebarNavigation() {
     using namespace blast;
     using namespace blast::ui_logic;
@@ -30,6 +50,11 @@ static void sidebarNavigation() {
     assert(!sidebarMatches(first, "first", SidebarFilter::Dms));
     assert(!sidebarMatches(query, "missing", SidebarFilter::Dms));
     assert(sidebarMatches(duplicate, "", SidebarFilter::All));
+    assert(sidebarMatches(first, "libera", SidebarFilter::All, "Libera Chat"));
+    assert(sidebarMatches(first, "first", SidebarFilter::All, "Libera Chat"));
+    assert(sidebarMatches(first, "same", SidebarFilter::All, "Libera Chat"));
+    assert(!sidebarMatches(first, "libera", SidebarFilter::Dms, "Libera Chat"));
+    assert(!sidebarMatches(first, "missing", SidebarFilter::All, "Libera Chat"));
     query.archived = true;
     assert(!sidebarMatches(query, "", SidebarFilter::All));
     assert(!sidebarMatches(query, "", SidebarFilter::Unread));
@@ -363,6 +388,79 @@ static void transcriptIdentity() {
     assert(!readTarget(transcript));
 }
 
+static void unreadMentions() {
+    using namespace blast;
+    using namespace blast::ui_logic;
+    Model model;
+    Buffer live;
+    live.server = "network";
+    live.unread = 1;
+    live.readMarker = "2026-11-05T01:57:16.500Z";
+    Message message;
+    message.id = "equal";
+    message.nick = "Speaker";
+    message.mention = true;
+    message.time = live.readMarker;
+    message.timestamp = irc::parseTimestampParts(message.time)->seconds;
+    live.messages.push_back(message);
+    assert(!hasUnreadMention(model, live));
+    live.messages.back().time = "2026-11-05T01:57:16.500000001Z";
+    assert(hasUnreadMention(model, live)); // Fractions, not just whole seconds.
+    live.messages.back().time = "2026-11-05T01:57:16.499999999Z";
+    assert(!hasUnreadMention(model, live));
+
+    message.time.clear();
+    message.timestamp = 0;
+    live.messages = {message, message};
+    live.messages.front().id = "local:boundary";
+    live.messages.back().id = "new";
+    live.readMarker = "local:local:boundary";
+    assert(hasUnreadMention(model, live));
+    live.messages.back().mention = false;
+    assert(!hasUnreadMention(model, live)); // The boundary itself is never unread.
+    live.readMarker = "local:pruned";
+    assert(hasUnreadMention(model, live)); // A missing local boundary admits the tail.
+    live.readMarker = "local:boundary";    // Also accept already-local message IDs.
+    assert(!hasUnreadMention(model, live));
+    live.readMarker.clear();
+
+    live.messages = {message};
+    live.messages.front().own = true;
+    assert(!hasUnreadMention(model, live));
+    live.messages.front().own = false;
+    live.messages.front().presence = true;
+    assert(!hasUnreadMention(model, live));
+    live.messages.front().presence = false;
+    model.settings.fools.insert("speaker");
+    assert(!hasUnreadMention(model, live));
+    model.settings.foolUnread = true;
+    assert(hasUnreadMention(model, live));
+    model.settings.foolUnread = false;
+    model.settings.fools.clear();
+
+    Buffer retained = live;
+    retained.unread = 0; // Retained counters/markers are not live read state.
+    retained.readMarker = "local:new";
+    retained.messages = {message, message};
+    retained.messages.front().id = "boundary";
+    retained.messages.back().id = "new";
+    live.messages.clear(); // Retained mentions can be outside the loaded window.
+    live.readMarker = "local:boundary";
+    const auto collect = [&] {
+        std::vector<std::string> ids;
+        forEachUnreadMention(model, live, retained, [&](const Message &entry) {
+            ids.push_back(entry.id);
+            return true;
+        });
+        return ids;
+    };
+    assert(collect() == std::vector<std::string>{"new"});
+    live.readMarker = "local:missing";
+    assert((collect() == std::vector<std::string>{"boundary", "new"}));
+    live.unread = 0;
+    assert(collect().empty()); // Mark-read hides retained mentions immediately.
+}
+
 static void draftRecovery() {
     using namespace blast::ui_logic;
     Editor editor;
@@ -581,6 +679,7 @@ static void messageBindings() {
 
 int main() {
     using namespace blast::ui_logic;
+    friendIdentity();
     messageBindings();
     editingCommands();
     assert(fuzzy("br", "blastirc") > fuzzy("zz", "blastirc"));
@@ -609,6 +708,7 @@ int main() {
     jumpHintKeyboard();
     focusKeyRemapping();
     transcriptIdentity();
+    unreadMentions();
     draftRecovery();
     clipboardAndSelection();
     // A genuine prepend removes the old first row's date/author headers. Its body,

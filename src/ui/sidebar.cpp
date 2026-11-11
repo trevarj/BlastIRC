@@ -4,6 +4,7 @@
 #include "../render/graphics.hpp"
 #include "../theme/theme.hpp"
 #include "channel_avatar.hpp"
+#include "foundry_avatar.hpp"
 #include "logic.hpp"
 #include "ui.hpp"
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <render/scene/rect_node.h>
 #include <ui/controls/button.h>
 #include <ui/controls/flex.h>
+#include <ui/controls/glyph.h>
 #include <ui/controls/image.h>
 #include <ui/controls/input.h>
 #include <ui/controls/label.h>
@@ -151,8 +153,12 @@ class Row final : public InputArea {
                             ? std::max(16 * zoom, badgeFontHeight.get(*badge, renderer)) +
                                   (avatarOnly ? 4 * zoom : 0)
                             : 0;
-        if (avatarOnly)
-            return minimum;
+        if (avatarOnly) {
+            const float indicatorHeight = (int(muted) + int(pinned) + int(friendNick)) * 12 * zoom;
+            return std::max({minimum + (draft ? 20 * zoom : 0),
+                             indicatorHeight ? minimum + indicatorHeight + 4 * zoom : 0.f,
+                             muted || pinned || friendNick || draft ? 48 * zoom : 0.f});
+        }
         title->measure(renderer);
         float textHeight = std::max(title->height(), titleFontHeight.get(*title, renderer, true));
         if (!subtitle->text().empty()) {
@@ -184,13 +190,26 @@ class Row final : public InputArea {
         if (avatarCaption != caption) {
             avatarCaption.assign(caption);
             avatarInitials->setText(nativeAvatarInitials(caption, true));
+            markLayoutDirty();
         }
     }
 
-    void enableSprite() {
-        for (auto &pixel : avatarPixels) {
-            pixel = child<RectNode>(*this);
-            pixel->setHitTestVisible(false);
+    void enableIndicators() {
+        mutedIcon = child<Glyph>(*this);
+        pinIcon = child<Glyph>(*this);
+        friendIcon = child<Glyph>(*this);
+        mutedIcon->setGlyph("bell-off");
+        pinIcon->setGlyph("pin");
+        friendIcon->setGlyph("star");
+        mutedIcon->setHitTestVisible(false);
+        pinIcon->setHitTestVisible(false);
+        friendIcon->setHitTestVisible(false);
+    }
+    void syncSpriteAvatar(bool enabled, std::string_view mapping) {
+        if (spriteAvatar != enabled || avatarMapping != mapping) {
+            spriteAvatar = enabled;
+            avatarMapping.assign(mapping);
+            markLayoutDirty();
         }
     }
 
@@ -233,18 +252,32 @@ class Row final : public InputArea {
                                                         : error ? "error"
                                                         : draft ? "tertiary"
                                                                 : "on_surface_variant"));
-        badge->setColor(badgeBackground ? (mentioned ? ::palette.onError : ::palette.onPrimary)
-                                        : themeForegroundColor(hover       ? "on_hover"
-                                                               : mentioned ? "error"
-                                                               : primary   ? "on_primary_container"
-                                                                           : "primary"));
+        const bool mutedBadge = unreadCountBadge && muted;
+        const Color mutedBadgeFill =
+            mutedBadge ? themeForegroundColor("surface_container_highest") : clear;
+        badge->setColor(
+            mutedBadge        ? withAlpha(themePairedForeground(
+                                       mutedBadgeFill, themeForegroundColor("on_surface_variant")),
+                                          1.f)
+            : badgeBackground ? (mentioned ? ::palette.onError : ::palette.onPrimary)
+                              : themeForegroundColor(hover       ? "on_hover"
+                                                     : mentioned ? "error"
+                                                     : primary   ? "on_primary_container"
+                                                                 : "primary"));
         if (badgeBackground) {
             RoundedRectStyle badgeStyle{};
-            badgeStyle.fill = unreadCountBadge ? (mentioned ? ::palette.error : ::palette.primary)
-                                               : themeSurfaceColor(mentioned ? "error" : "primary");
+            badgeStyle.fill = mutedBadge ? mutedBadgeFill
+                              : unreadCountBadge
+                                  ? (mentioned ? ::palette.error : ::palette.primary)
+                                  : themeSurfaceColor(mentioned ? "error" : "primary");
             badgeStyle.radius = 4 * zoom;
             badgeBackground->setStyle(badgeStyle);
         }
+        for (auto *indicator : {mutedIcon, pinIcon, friendIcon})
+            if (indicator)
+                indicator->setColor(themeForegroundColor(primary ? "on_primary_container"
+                                                         : hover ? "on_hover"
+                                                                 : "on_surface_variant"));
         if (icon) {
             icon->setVisible(!showAvatar || draft);
             icon->setColor(showAvatar && draft ? themeForegroundColor("on_tertiary_container")
@@ -261,9 +294,8 @@ class Row final : public InputArea {
     bool avatarOnly = false, avatarLaneVisible = true, mentioned = false;
     bool unreadCountBadge = false;
     bool pinnedCurrent = false;
-    bool spriteAvatar = false;
+    bool muted = false, pinned = false, friendNick = false;
     float allocatedMinimum = 0, nativeMinimum = 0;
-    std::uint32_t avatarHash = 0;
     Color titleColor{};
     Label *title = nullptr, *subtitle = nullptr, *badge = nullptr;
     std::function<void(Row &)> activate, reveal;
@@ -272,34 +304,27 @@ class Row final : public InputArea {
   protected:
     void doLayout(Renderer &renderer) override {
         background->setSize(width(), height());
-        const float padding = avatarOnly ? 4 * zoom : 9 * zoom;
+        const float padding = avatarOnly ? 2 * zoom : 9 * zoom;
         const bool showAvatar = avatarImage && avatarLaneVisible;
+        const float indicatorSize = (avatarOnly ? 10.f : 12.f) * zoom;
+        const float indicatorGap = (avatarOnly ? 2.f : 4.f) * zoom;
+        const int indicatorCount = int(muted) + int(pinned) + int(friendNick);
+        const float compactIndicatorLane =
+            avatarOnly && indicatorCount ? indicatorSize + indicatorGap : 0;
         const float avatarSize =
-            showAvatar ? std::max(0.f, std::min({width() - 2 * padding, height() - 8 * zoom,
-                                                 avatarOnly ? width() - 16 * zoom
-                                                            : 32 * zoom *
-                                                                  std::clamp(width() / (240 * zoom),
-                                                                             .85f, 1.25f)}))
-                       : 0;
-        const float avatarLeft = avatarOnly ? (width() - avatarSize) / 2 : padding;
+            showAvatar
+                ? std::max(
+                      0.f,
+                      std::min(
+                          {width() - 2 * padding, height() - 8 * zoom,
+                           avatarOnly
+                               ? width() - std::max(16 * zoom, compactIndicatorLane + 2 * padding)
+                               : 32 * zoom * std::clamp(width() / (240 * zoom), .85f, 1.25f)}))
+                : 0;
+        const float avatarLeft =
+            avatarOnly ? compactIndicatorLane + (width() - compactIndicatorLane - avatarSize) / 2
+                       : padding;
         const float avatarTop = (height() - avatarSize) / 2;
-        const bool sprite = showAvatar && spriteAvatar && avatarPixels.front();
-        if (avatarPixels.front()) {
-            const float pixelSize = avatarSize / 7;
-            for (int y = 0; y < 5; ++y)
-                for (int x = 0; x < 5; ++x) {
-                    auto *pixel = avatarPixels[y * 5 + x];
-                    pixel->setVisible(sprite && ((avatarHash >> (y * 3 + std::min(x, 4 - x))) & 1));
-                    if (pixel->visible()) {
-                        pixel->setPosition(avatarLeft + (x + 1) * pixelSize,
-                                           avatarTop + (y + 1) * pixelSize);
-                        pixel->setSize(pixelSize, pixelSize);
-                        RoundedRectStyle style{};
-                        style.fill = titleColor;
-                        pixel->setStyle(style);
-                    }
-                }
-        }
         float left = padding;
         if (avatarImage && !showAvatar) {
             avatarBackground->setVisible(false);
@@ -308,7 +333,6 @@ class Row final : public InputArea {
             draftBackground->setVisible(false);
         }
         if (showAvatar) {
-            avatarBackground->setVisible(true);
             avatarBackground->setPosition(avatarLeft, avatarTop);
             avatarBackground->setSize(avatarSize, avatarSize);
             avatarImage->setPosition(avatarLeft, avatarTop);
@@ -316,16 +340,28 @@ class Row final : public InputArea {
             avatarImage->setRadius(themeCornerRadius());
             const int target =
                 std::max(1, int(std::ceil(avatarSize * std::max(1.f, renderer.renderScale()))));
-            if (loadedAvatarSource != avatarSource || loadedAvatarSize != target) {
+            if (spriteAvatar && avatarSource.empty()) {
+                if (!loadedSprite || loadedSpriteNick != avatarCaption ||
+                    loadedSpriteMapping != avatarMapping) {
+                    avatarImage->clear(renderer);
+                    setFoundryAvatar(*avatarImage, renderer, avatarCaption, avatarMapping);
+                    loadedSprite = true;
+                    loadedSpriteNick = avatarCaption;
+                    loadedSpriteMapping = avatarMapping;
+                }
+            } else if (loadedSprite || loadedAvatarSource != avatarSource ||
+                       loadedAvatarSize != target) {
+                loadedSprite = false;
                 loadedAvatarSource = avatarSource;
                 loadedAvatarSize = target;
                 loadChannelAvatarRaster(*avatarImage, renderer, avatarSource, target);
             }
+            avatarBackground->setVisible(!(loadedSprite && avatarImage->hasImage()));
             avatarImage->setVisible(avatarImage->hasImage());
             if (avatarImage->visible())
                 avatarImage->layout(renderer);
             labelFont(*avatarInitials, avatarSize * (13.f / 32.f));
-            avatarInitials->setVisible(!avatarImage->hasImage() && !sprite);
+            avatarInitials->setVisible(!avatarImage->hasImage());
             if (avatarInitials->visible())
                 avatarInitialsPlacement.place(*avatarInitials, renderer, avatarLeft, avatarTop,
                                               avatarSize, avatarSize);
@@ -339,8 +375,9 @@ class Row final : public InputArea {
                                    : iconOnly ? (width() - iconSize) / 2
                                               : padding;
             icon->setVisible(!showAvatar || draft);
-            const float iconTop =
-                overlay ? avatarTop + avatarSize - iconSize : (height() - iconSize) / 2;
+            const float iconTop = overlay ? (avatarOnly ? height() - iconSize - 4 * zoom
+                                                        : avatarTop + avatarSize - iconSize)
+                                          : (height() - iconSize) / 2;
             icon->setPosition(iconLeft, iconTop);
             if (overlay) {
                 draftBackground->setPosition(iconLeft - 2 * zoom, iconTop - 2 * zoom);
@@ -360,6 +397,32 @@ class Row final : public InputArea {
             badgeBackground ? std::max(badgeHeight, badge->width() + 8 * zoom) : badge->width();
         const float badgeWidth =
             badge->visible() ? badgeExtent + (badgeBackground ? 6 : 8) * zoom : 0;
+        const float indicatorWidth =
+            !avatarOnly ? indicatorCount * (indicatorSize + indicatorGap) : 0;
+        float indicatorX = avatarOnly ? padding : width() - padding - badgeWidth - indicatorWidth;
+        float indicatorY =
+            avatarOnly ? std::max(badge->visible() ? badgeHeight + 4 * zoom : 0.f,
+                                  (height() - (indicatorCount * (indicatorSize + indicatorGap) -
+                                               indicatorGap)) /
+                                      2)
+                       : (height() - indicatorSize) / 2;
+        for (const auto &[indicator, visible] :
+             {std::pair{mutedIcon, muted}, std::pair{pinIcon, pinned},
+              std::pair{friendIcon, friendNick}}) {
+            if (!indicator)
+                continue;
+            indicator->setVisible(visible);
+            if (!visible)
+                continue;
+            indicator->setPosition(indicatorX, indicatorY);
+            indicator->setSize(indicatorSize, indicatorSize);
+            indicator->setGlyphSize(indicatorSize);
+            indicator->layout(renderer);
+            if (avatarOnly)
+                indicatorY += indicatorSize + indicatorGap;
+            else
+                indicatorX += indicatorSize + indicatorGap;
+        }
         title->setVisible(!avatarOnly);
         if (badgeBackground)
             badgeBackground->setVisible(badge->visible());
@@ -374,20 +437,22 @@ class Row final : public InputArea {
                                2 * zoom + (badgeHeight - badge->height()) / 2);
             return;
         }
-        const float available = std::max(0.f, width() - left - padding);
+        const float available =
+            std::max(0.f, width() - left - padding - badgeWidth - indicatorWidth);
         const bool hasSubtitle = !subtitle->text().empty();
         subtitle->setVisible(hasSubtitle);
         subtitle->setMaxWidth(inlineSubtitle ? available * .45f : available);
         if (hasSubtitle)
             subtitle->measure(renderer);
         const float stateWidth = hasSubtitle && inlineSubtitle ? subtitle->width() + 8 * zoom : 0;
-        title->setMaxWidth(std::max(0.f, available - badgeWidth - stateWidth));
+        title->setMaxWidth(std::max(0.f, available - stateWidth));
         title->measure(renderer);
         const bool twoLines = hasSubtitle && !inlineSubtitle;
         const float textHeight = title->height() + (twoLines ? subtitle->height() + 3 * zoom : 0);
         const float top = std::max(2 * zoom, (height() - textHeight) / 2);
         title->setPosition(left, top);
-        subtitle->setPosition(inlineSubtitle ? width() - padding - badgeWidth - subtitle->width()
+        subtitle->setPosition(inlineSubtitle ? width() - padding - badgeWidth - indicatorWidth -
+                                                   subtitle->width()
                                              : left,
                               inlineSubtitle ? (height() - subtitle->height()) / 2
                                              : top + title->height() + 3 * zoom);
@@ -437,10 +502,12 @@ class Row final : public InputArea {
     RectNode *badgeBackground = nullptr;
     Image *avatarImage = nullptr;
     Label *avatarInitials = nullptr;
-    std::array<RectNode *, 25> avatarPixels{};
     LucideIcon *icon = nullptr;
+    Glyph *mutedIcon = nullptr, *pinIcon = nullptr, *friendIcon = nullptr;
     std::string tooltipText, avatarSource, loadedAvatarSource, avatarCaption;
     int loadedAvatarSize = 0;
+    std::string avatarMapping, loadedSpriteNick, loadedSpriteMapping;
+    bool spriteAvatar = false, loadedSprite = false;
     NativeAvatarLabelPlacement avatarInitialsPlacement;
     float zoom = 1;
     bool active = false;
@@ -490,6 +557,7 @@ struct Popup {
         request.menuWidth = 230 * scale;
         request.maxMenuWidth = 330 * scale;
         request.fontSize = 14 * scale;
+        request.font = themeUiFont();
         request.maxVisibleOptions = menu.size();
         request.menu = std::move(menu);
         const std::weak_ptr<int> guard = alive;
@@ -643,8 +711,6 @@ class Avatar final : public InputArea {
                                         : state == "Disconnected"          ? "outline"
                                                                            : "secondary");
         scratch.assign(caption);
-        if (caption != key)
-            scratch.append(" (").append(key).append(")");
         scratch.append("\n").append(state);
         if (network && !network->error.empty())
             scratch.append("\n").append(network->error);
@@ -971,10 +1037,8 @@ struct ServerRail::Impl {
                    });
         };
         const auto placeProfile = [&](const ServerConfig &config) {
-            place(entry(config.name),
-                  config.alias.empty() ? std::string_view(config.name)
-                                       : std::string_view(config.alias),
-                  config.avatar, false, false, -1, false,
+            place(entry(config.name), serverDisplayName(model, config.name), config.avatar, false,
+                  false, -1, false,
                   !config.sojuParent.empty() && !config.sojuEnabled
                       ? "\nLocally disabled; remote upstream network is unchanged"
                       : "");
@@ -1005,8 +1069,7 @@ struct ServerRail::Impl {
                     childError |=
                         network != model.networks.end() &&
                         (network->second.state == "Failed" || !network->second.error.empty());
-                    childStatus.append("\n").append(configChild.alias.empty() ? configChild.name
-                                                                              : configChild.alias);
+                    childStatus.append("\n").append(serverDisplayName(model, configChild.name));
                     childStatus.append(": ").append(
                         network == model.networks.end() ? "Disconnected" : network->second.state);
                     if (!configChild.sojuEnabled)
@@ -1027,11 +1090,8 @@ struct ServerRail::Impl {
             item.capsule->setVisible(true);
             const float groupTop = y;
             y += 3 * scale;
-            place(item,
-                  config.alias.empty() ? std::string_view(config.name)
-                                       : std::string_view(config.alias),
-                  config.avatar, collapsed, collapsed && hiddenSelected,
-                  collapsed ? aggregateUnread : item.unread,
+            place(item, serverDisplayName(model, config.name), config.avatar, collapsed,
+                  collapsed && hiddenSelected, collapsed ? aggregateUnread : item.unread,
                   collapsed ? aggregateMention : item.mentioned, childStatus, childError);
             for (const auto &configChild : model.servers) {
                 if (configChild.sojuAccount || configChild.sojuParent != config.name)
@@ -1053,7 +1113,7 @@ struct ServerRail::Impl {
         for (const auto &name : order) {
             auto &item = servers.at(name);
             if (item.seen == epoch)
-                place(item, name, {});
+                place(item, serverDisplayName(model, name), {});
         }
         for (auto it = servers.begin(); it != servers.end();) {
             if (it->second.seen != epoch) {
@@ -1093,11 +1153,12 @@ void ServerRail::sync(std::string_view selected, float width, float height, floa
 
 struct Sidebar::Impl {
     struct Group {
-        Row *header = nullptr, *error = nullptr;
+        Row *header = nullptr, *error = nullptr, *friendsHeader = nullptr;
+        Row *conversationsHeader = nullptr;
         std::map<std::string, Row *> buffers;
         std::vector<Row *> order;
         bool orderDirty = true;
-        std::uint64_t seen = 0, configured = 0;
+        std::uint64_t seen = 0;
         std::string state;
     };
     struct Conversation {
@@ -1112,6 +1173,7 @@ struct Sidebar::Impl {
         int64_t lastChatTimestamp = 0, lastChatSequence = 0;
         std::string lastChatTime;
         std::size_t pinRank = SIZE_MAX;
+        std::string friendTarget;
     };
 
     Sidebar &owner;
@@ -1129,6 +1191,7 @@ struct Sidebar::Impl {
     std::map<std::string, Conversation> conversations;
     std::vector<std::string> cachedPins;
     decltype(Settings::fools) cachedFools;
+    decltype(Settings::friends) cachedFriends;
     bool cachedFoolUnread = false;
     std::map<std::string, std::size_t> pinRanks;
     ui_logic::SidebarFilter filter = ui_logic::SidebarFilter::All;
@@ -1181,7 +1244,7 @@ struct Sidebar::Impl {
         searchIcon->setZIndex(1);
         searchIcon->setHitTestVisible(false);
         search = child<Input>(*filterHeader);
-        search->setPlaceholder("Filter loaded names…");
+        search->setPlaceholder("Filter");
         search->setClearButtonEnabled(true);
         search->inputArea()->setTooltip("Filter loaded channel, person and network names");
         search->inputArea()->setTabFocusKey("sidebar-search");
@@ -1261,7 +1324,7 @@ struct Sidebar::Impl {
             result.header = child<Row>(*canvas, "server");
             result.header->key = name;
             result.header->setTabFocusKey("sidebar-server:" + name);
-            result.header->title->setText(name);
+            result.header->title->setText(serverDisplayName(model, name));
             result.header->inlineSubtitle = true;
             result.header->emphasized = true;
             result.header->activate = [this](Row &row) {
@@ -1290,6 +1353,16 @@ struct Sidebar::Impl {
                 model.actions.push_back({"connect", {}, row.key, {}});
             };
             result.error->reveal = result.header->reveal;
+            result.friendsHeader = child<Row>(*canvas);
+            result.friendsHeader->title->setText("Friends");
+            result.friendsHeader->setFocusable(false);
+            result.friendsHeader->setHitTestVisible(false);
+            result.friendsHeader->setExcludeSubtreeFromTabOrder(true);
+            result.conversationsHeader = child<Row>(*canvas);
+            result.conversationsHeader->title->setText("Conversations");
+            result.conversationsHeader->setFocusable(false);
+            result.conversationsHeader->setHitTestVisible(false);
+            result.conversationsHeader->setExcludeSubtreeFromTabOrder(true);
         }
         return result;
     }
@@ -1381,15 +1454,23 @@ struct Sidebar::Impl {
             const auto &buffer = found->second;
             ui_logic::sidebarPreview(model, buffer, buffer.draft, row.preview);
             row.scratch.clear();
-            row.scratch.append(buffer.target)
+            row.scratch
+                .append(buffer.kind == "server" ? serverDisplayName(model, buffer.server)
+                                                : std::string_view(buffer.target))
                 .append("\n")
-                .append(buffer.server)
+                .append(serverDisplayName(model, buffer.server))
                 .append("\n")
                 .append(row.preview);
             if (buffer.unread > 0)
                 row.scratch.append("\nUnread: ").append(std::to_string(buffer.unread));
             if (row.mentioned)
                 row.scratch.append("\nUnread mention");
+            if (row.muted)
+                row.scratch.append("\nMuted");
+            if (row.pinned)
+                row.scratch.append("\nPinned");
+            if (row.friendNick)
+                row.scratch.append("\nFriend");
             if (row.pinnedCurrent)
                 row.scratch.append("\nCurrent conversation (outside regular filters)");
             row.tooltip(row.scratch);
@@ -1472,7 +1553,9 @@ struct Sidebar::Impl {
             group.state = state;
             group.header->subtitle->setText(state);
         }
-        group.header->scratch.assign(name);
+        const auto caption = serverDisplayName(model, name);
+        group.header->title->setText(caption);
+        group.header->scratch.assign(caption);
         group.header->scratch.append(" · Open server or connection settings\n");
         group.header->scratch.append(net ? net->state : "Disconnected");
         group.header->tooltip(group.header->scratch);
@@ -1499,15 +1582,36 @@ struct Sidebar::Impl {
             std::sort(group.order.begin(), group.order.end(), [this](const Row *a, const Row *b) {
                 const auto left = conversations.at(a->key).pinRank;
                 const auto right = conversations.at(b->key).pinRank;
-                return left != right
-                           ? left < right
-                           : chatActivityBefore(model.buffers.at(a->key), model.buffers.at(b->key));
+                if (left != right)
+                    return left < right;
+                if (left == SIZE_MAX && a->friendNick != b->friendNick)
+                    return a->friendNick;
+                return chatActivityBefore(model.buffers.at(a->key), model.buffers.at(b->key));
             });
             group.orderDirty = false;
         }
+        group.friendsHeader->setVisible(false);
+        group.conversationsHeader->setVisible(false);
+        bool friendsPlaced = false, conversationsPlaced = false;
         for (auto *row : group.order) {
             if (!row->matched || row->pinnedCurrent)
                 continue;
+            if (row->friendNick && !row->pinned && !friendsPlaced) {
+                friendsPlaced = true;
+                if (details) {
+                    group.friendsHeader->setVisible(true);
+                    group.friendsHeader->style(zoom);
+                    place(*group.friendsHeader, y, std::max(28.f, 28 * zoom), 4 * zoom);
+                }
+            }
+            if (friendsPlaced && !row->friendNick && !conversationsPlaced) {
+                conversationsPlaced = true;
+                if (details) {
+                    group.conversationsHeader->setVisible(true);
+                    group.conversationsHeader->style(zoom);
+                    place(*group.conversationsHeader, y, std::max(28.f, 28 * zoom), 4 * zoom);
+                }
+            }
             ++matched;
             place(*row, y, conversationHeight(), expanded ? 4 * zoom : 0);
         }
@@ -1629,6 +1733,9 @@ struct Sidebar::Impl {
         compactFilter->setSize(expanded ? selectorWidth : inner, searchHeight);
         compactFilter->setControlHeight(searchHeight);
         compactFilter->setFontSize(12 * scale);
+        for (const auto &node : compactFilter->children())
+            if (auto *label = dynamic_cast<Label *>(node.get()))
+                labelFont(*label, 12 * scale);
         compactFilter->setHorizontalPadding(8 * scale);
         compactFilter->setGlyphSize(12 * scale);
         compactFilter->setRadius(themeCornerRadius());
@@ -1650,6 +1757,7 @@ struct Sidebar::Impl {
         search->setFontSize(14 * scale);
         search->setFontFamily(themeUiFont().family);
         search->setFontFeatures(themeUiFont().features);
+        search->setFontWeight(themeUiFont().weight);
         const float filterPadding = 6 * scale;
         for (auto [button, value] : {std::pair{all, ui_logic::SidebarFilter::All},
                                      std::pair{unread, ui_logic::SidebarFilter::Unread},
@@ -1665,6 +1773,7 @@ struct Sidebar::Impl {
             button->setFontSize(12 * scale);
             button->label()->setFontFamily(themeUiFont().family);
             button->label()->setFontFeatures(themeUiFont().features);
+            button->label()->setFontWeight(themeUiFont().weight);
             button->setSelected(filter == value);
         }
         for (auto it = conversations.begin(); it != conversations.end();) {
@@ -1677,16 +1786,10 @@ struct Sidebar::Impl {
             } else
                 ++it;
         }
-        for (const auto &server : model.servers) {
-            auto &target = group(server.name);
-            target.configured = epoch;
-            target.header->title->setText(server.alias.empty() ? server.name : server.alias);
-        }
-        for (const auto &[name, network] : model.networks) {
-            auto &target = group(name);
-            if (target.configured != epoch)
-                target.header->title->setText(name);
-        }
+        for (const auto &server : model.servers)
+            group(server.name);
+        for (const auto &[name, network] : model.networks)
+            group(name);
         if (cachedPins != model.settings.pinnedBuffers) {
             cachedPins = model.settings.pinnedBuffers;
             pinRanks.clear();
@@ -1699,6 +1802,9 @@ struct Sidebar::Impl {
             cachedFoolUnread = model.settings.foolUnread;
             cachedFools = model.settings.fools;
         }
+        const bool friendRulesChanged = cachedFriends != model.settings.friends;
+        if (friendRulesChanged)
+            cachedFriends = model.settings.friends;
         Row *pinnedCurrent = nullptr;
         for (const auto &[id, buffer] : model.buffers) {
             auto &target = group(buffer.server);
@@ -1714,6 +1820,7 @@ struct Sidebar::Impl {
             auto &conversation = it->second;
             if (inserted) {
                 conversation.row = child<Row>(*canvas, "type", true);
+                conversation.row->enableIndicators();
                 conversation.row->unreadCountBadge = true;
                 conversation.row->key = id;
                 conversation.row->setTabFocusKey("buffer:" + id);
@@ -1755,9 +1862,10 @@ struct Sidebar::Impl {
             }
             const std::string_view caption = buffer.target;
             const bool isTarget = buffer.kind == "channel" || buffer.kind == "query";
-            const bool filterMatch = !hintsActive && buffer.server == selected &&
-                                     (expanded || isTarget) &&
-                                     ui_logic::sidebarMatches(buffer, search->value(), filter);
+            const bool filterMatch =
+                !hintsActive && buffer.server == selected && (expanded || isTarget) &&
+                ui_logic::sidebarMatches(buffer, search->value(), filter,
+                                         serverDisplayName(model, buffer.server));
             const bool pin =
                 !buffer.archived && filter != ui_logic::SidebarFilter::Archived && id == focused;
             row.pinnedCurrent = !hintsActive && pin && !filterMatch;
@@ -1768,23 +1876,34 @@ struct Sidebar::Impl {
                               : filterMatch || pin;
             if (row.pinnedCurrent) {
                 pinnedCurrent = &row;
-                row.scratch.assign("Current · ");
-                row.scratch.append(buffer.kind == "mentions" ? "All networks"
-                                   : buffer.server.empty()   ? "No network"
-                                                             : buffer.server);
-                row.subtitle->setText(row.scratch);
+                row.subtitle->setText("Current");
             } else
-                row.subtitle->setText(conversation.pinRank != SIZE_MAX ? "Pinned" : "");
+                row.subtitle->setText("");
             row.setVisible(row.matched);
             row.setExcludeSubtreeFromTabOrder(!row.matched);
             row.title->setText(caption);
             row.draft = !buffer.draft.empty();
+            if (row.muted != buffer.muted || row.pinned != (conversation.pinRank != SIZE_MAX))
+                row.markLayoutDirty();
+            row.muted = buffer.muted;
+            row.pinned = conversation.pinRank != SIZE_MAX;
             row.monospace = buffer.kind == "channel";
             row.avatarOnly = !expanded;
             const auto network = model.networks.find(buffer.server);
             const std::string_view mapping = network == model.networks.end()
                                                  ? std::string_view{"rfc1459"}
                                                  : std::string_view(network->second.caseMapping);
+            if (inserted || friendRulesChanged || conversation.friendTarget != buffer.target ||
+                conversation.caseMapping != mapping || (row.friendNick && buffer.kind != "query")) {
+                const bool friendNick =
+                    buffer.kind == "query" && isFriend(model, buffer.server, buffer.target);
+                if (row.friendNick != friendNick) {
+                    target.orderDirty = true;
+                    row.friendNick = friendNick;
+                    row.markLayoutDirty();
+                }
+                conversation.friendTarget = buffer.target;
+            }
             if (conversation.unread != buffer.unread ||
                 conversation.size != buffer.messages.size() ||
                 conversation.revision != buffer.messagesRevision ||
@@ -1826,6 +1945,8 @@ struct Sidebar::Impl {
             if (it->second.seen != epoch) {
                 canvas->removeChild(it->second.header);
                 canvas->removeChild(it->second.error);
+                canvas->removeChild(it->second.friendsHeader);
+                canvas->removeChild(it->second.conversationsHeader);
                 it = groups.erase(it);
             } else
                 ++it;
@@ -1840,7 +1961,8 @@ struct Sidebar::Impl {
                 placeGroup(name, value, y, matched);
                 continue;
             }
-            for (auto *row : {value.header, value.error}) {
+            for (auto *row :
+                 {value.header, value.error, value.friendsHeader, value.conversationsHeader}) {
                 row->setVisible(false);
                 row->setExcludeSubtreeFromTabOrder(true);
             }
@@ -1883,6 +2005,7 @@ struct Sidebar::Impl {
                 clear->setFontSize(13 * scale);
                 clear->label()->setFontFamily(themeUiFont().family);
                 clear->label()->setFontFeatures(themeUiFont().features);
+                clear->label()->setFontWeight(themeUiFont().weight);
                 y += clearHeight + 4 * scale;
             }
         }
@@ -2079,7 +2202,7 @@ void Sidebar::remapBuffer(std::string_view oldId, std::string_view newId) {
 struct People::Impl final : VirtualListAdapter {
     struct Member {
         std::string name, prefix, account, lower, title, tooltip;
-        bool away = false;
+        bool away = false, friendNick = false;
         double arrived = 0;
         std::uint32_t hash = 2166136261u;
         std::uint64_t key = 0, revision = 1, seen = 0;
@@ -2101,7 +2224,10 @@ struct People::Impl final : VirtualListAdapter {
     float zoom = 1, lastRadius = -1;
     std::uint64_t lastThemeRevision = 0;
     std::string lastFont, lastFeatures, lastAvatarStyle;
+    FontWeight lastWeight = FontWeight::Normal;
     bool lastAvatars = false;
+    decltype(Settings::friends) cachedFriends;
+    std::string cachedFriendMapping;
     SidebarMode mode = SidebarMode::Hidden;
 
     Impl(People &node, Model &value, std::function<void(std::string)> command,
@@ -2155,7 +2281,6 @@ struct People::Impl final : VirtualListAdapter {
         row->setFocusable(false);
         row->setTabStop(false);
         row->customTitle = true;
-        row->enableSprite();
         row->activate = [this](Row &item) {
             keyboardNick = item.key;
             execute("insert-nick:" + item.context + "\n" + item.key);
@@ -2188,8 +2313,7 @@ struct People::Impl final : VirtualListAdapter {
             row.avatarLaneVisible = avatars;
             row.markLayoutDirty();
         }
-        row.spriteAvatar = model.settings.avatarStyle == "sprite";
-        row.avatarHash = member.hash;
+        row.syncSpriteAvatar(model.settings.avatarStyle == "sprite", cachedFriendMapping);
         row.syncAvatar({}, member.name);
         const auto privilege = std::string_view(member.prefix).substr(0, 1);
         row.badge->setText(compact ? privilege : std::string_view{});
@@ -2258,6 +2382,21 @@ struct People::Impl final : VirtualListAdapter {
         }
         const auto found = model.buffers.find(buffer);
         const bool channel = found != model.buffers.end() && found->second.kind == "channel";
+        const auto network =
+            channel ? model.networks.find(found->second.server) : model.networks.end();
+        const std::string_view mapping = network == model.networks.end()
+                                             ? std::string_view{"rfc1459"}
+                                             : std::string_view(network->second.caseMapping);
+        const bool mappingChanged = cachedFriendMapping != mapping;
+        if (mappingChanged) {
+            ++visualRevision;
+            changed = true;
+        }
+        const bool friendRulesChanged = cachedFriends != model.settings.friends || mappingChanged;
+        if (friendRulesChanged) {
+            cachedFriends = model.settings.friends;
+            cachedFriendMapping = mapping;
+        }
         if (channel)
             for (const auto &nick : found->second.nicks) {
                 auto [it, inserted] = members.try_emplace(nick.name);
@@ -2270,6 +2409,14 @@ struct People::Impl final : VirtualListAdapter {
                     for (unsigned char c : member.lower) {
                         member.hash ^= c;
                         member.hash *= 16777619;
+                    }
+                }
+                if (inserted || friendRulesChanged) {
+                    const bool friendNick = isFriend(model, found->second.server, nick.name);
+                    if (member.friendNick != friendNick) {
+                        member.friendNick = friendNick;
+                        reordered = changed = true;
+                        ++member.revision;
                     }
                 }
                 if (inserted || member.prefix != nick.prefix || member.account != nick.account ||
@@ -2315,6 +2462,8 @@ struct People::Impl final : VirtualListAdapter {
             for (auto &[name, member] : members)
                 order.push_back(&member);
             std::sort(order.begin(), order.end(), [](const Member *a, const Member *b) {
+                if (a->friendNick != b->friendNick)
+                    return a->friendNick;
                 const int left = prefixRank(a->prefix), right = prefixRank(b->prefix);
                 return left != right          ? left < right
                        : a->lower != b->lower ? a->lower < b->lower
@@ -2329,13 +2478,15 @@ struct People::Impl final : VirtualListAdapter {
         const float radius = themeCornerRadius();
         if (presentationChanged || zoom != scale || lastRadius != radius ||
             lastThemeRevision != revision || lastFont != font.family ||
-            lastFeatures != font.features || lastAvatars != model.settings.avatars ||
+            lastFeatures != font.features || lastWeight != font.weight ||
+            lastAvatars != model.settings.avatars ||
             lastAvatarStyle != model.settings.avatarStyle) {
             zoom = scale;
             lastRadius = radius;
             lastThemeRevision = revision;
             lastFont = font.family;
             lastFeatures = font.features;
+            lastWeight = font.weight;
             lastAvatars = model.settings.avatars;
             lastAvatarStyle = model.settings.avatarStyle;
             ++visualRevision;

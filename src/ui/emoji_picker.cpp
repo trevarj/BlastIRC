@@ -143,6 +143,7 @@ struct Picker::Impl {
         }
         query->setFontFamily(font.family);
         query->setFontFeatures(font.features);
+        query->setFontWeight(font.weight);
         query->setFontSize(14 * scale);
         query->setControlHeight(36 * scale);
         query->setHorizontalPadding(8 * scale);

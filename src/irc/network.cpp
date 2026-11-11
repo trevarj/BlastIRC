@@ -170,6 +170,8 @@ struct NetworkClient::Impl {
         string type, target, text, extra, submission;
         string commandId{};
         string fallbackNick{};
+        bool initial = false;
+        vector<string> targets{};
     };
     struct SentMultiline {
         Request request;
@@ -220,6 +222,7 @@ struct NetworkClient::Impl {
         size_t count = 0;
         string cursor;
         std::uint64_t cursorOrder = 0;
+        bool initial = false;
     };
     struct Command {
         string id, label, name, target;
@@ -274,6 +277,7 @@ struct NetworkClient::Impl {
     std::map<string, History> histories;
     std::shared_ptr<Resolution> resolution;
     std::deque<Request> historyQueue;
+    vector<string> historyPriority;
     string unlabeledHistory;
     std::map<string, std::pair<string, Clock::time_point>> typed;
     // ponytail: at most 4096 channels; scan using current CASEMAPPING rather than
@@ -481,6 +485,12 @@ struct NetworkClient::Impl {
         failedSend(target, text, l, reason);
     }
     void rejectRequest(const Request &r, const string &reason) {
+        if (r.type == "history" || r.type == "history-around" || r.type == "search") {
+            deliver(historyFailure(r, reason));
+            return;
+        }
+        if (r.type == "history-priority" || r.type == "history-cancel")
+            return;
         if (r.type == "soju") {
             sojuFailure(r.text, r.target, reason);
             return;
@@ -676,6 +686,8 @@ struct NetworkClient::Impl {
     void enqueue(Request r) {
         size_t bytes = r.type.size() + r.target.size() + r.text.size() + r.extra.size() +
                        r.submission.size() + r.commandId.size() + r.fallbackNick.size();
+        for (const auto &target : r.targets)
+            bytes += target.size();
         std::lock_guard lock(queueMutex);
         if (!accepting)
             throw std::runtime_error("IRC client is stopped or reconnecting");
@@ -1652,6 +1664,29 @@ struct NetworkClient::Impl {
         e.tags.erase("command-name");
         return e;
     }
+    static string historyDirection(const Request &r) {
+        return r.type == "search"             ? "search"
+               : r.type == "history-around"   ? "around"
+               : r.text.starts_with("after=") ? "after"
+               : r.text.empty()               ? "latest"
+                                              : "before";
+    }
+    static Event historyFailure(const Request &r, const string &reason) {
+        Event e;
+        e.type = "history_end";
+        e.target = r.target;
+        e.label = r.submission;
+        e.tags = {{"direction", historyDirection(r)},
+                  {"limit", r.type == "search" ? "100" : "200"},
+                  {"count", "0"},
+                  {"cursor", ""},
+                  {"batch", ""},
+                  {"error", reason}};
+        e.tags["rejected"] = "1";
+        if (r.initial)
+            e.tags["initial"] = "1";
+        return e;
+    }
     void beginHistory(History &h, const string &batch = {}) {
         if (h.begun)
             return;
@@ -1664,9 +1699,11 @@ struct NetworkClient::Impl {
         e.tags["batch"] = batch;
         e.tags["direction"] = h.direction;
         e.tags["limit"] = std::to_string(h.limit);
+        if (h.initial)
+            e.tags["initial"] = "1";
         emit(std::move(e));
     }
-    void endHistory(const string &key, const string &err = {}) {
+    void endHistory(const string &key, const string &err = {}, bool rejected = false) {
         auto it = histories.find(key);
         if (it == histories.end())
             return;
@@ -1679,6 +1716,10 @@ struct NetworkClient::Impl {
         e.tags["limit"] = std::to_string(it->second.limit);
         e.tags["count"] = std::to_string(it->second.count);
         e.tags["cursor"] = it->second.cursor;
+        if (it->second.initial)
+            e.tags["initial"] = "1";
+        if (rejected)
+            e.tags["rejected"] = "1";
         if (!err.empty())
             e.tags["error"] = err;
         emit(std::move(e));
@@ -1689,14 +1730,24 @@ struct NetworkClient::Impl {
     void startHistory() {
         if (historyQueue.empty() || !unlabeledHistory.empty() || histories.size() >= 16)
             return;
-        Request r = std::move(historyQueue.front());
-        historyQueue.pop_front();
-        string l = label();
-        History h{r.target, l, {}, Clock::now(), false, "latest", 200, 0, {}, 0};
-        h.direction = r.type == "search"             ? "search"
-                      : r.text.starts_with("after=") ? "after"
-                      : r.text.empty()               ? "latest"
-                                                     : "before";
+        // ponytail: at most 128 pending requests; scan rather than maintain a second queue index.
+        auto rank = [&](const Request &r) {
+            const auto target =
+                std::find_if(historyPriority.begin(), historyPriority.end(),
+                             [&](const string &t) { return fold(t) == fold(r.target); });
+            if (target == historyPriority.begin() && target != historyPriority.end())
+                return size_t{0};
+            return !r.initial ? size_t{1}
+                              : size_t{2} + static_cast<size_t>(target - historyPriority.begin());
+        };
+        auto next =
+            std::min_element(historyQueue.begin(), historyQueue.end(),
+                             [&](const Request &a, const Request &b) { return rank(a) < rank(b); });
+        Request r = std::move(*next);
+        historyQueue.erase(next);
+        string l = r.submission.empty() ? label() : r.submission;
+        History h{r.target, l,  {}, Clock::now(), false, historyDirection(r), 200,
+                  0,        {}, 0,  r.initial};
         auto page = isupport.find("CHATHISTORY");
         if (page != isupport.end()) {
             int n = integer(page->second, 200);
@@ -1718,7 +1769,7 @@ struct NetworkClient::Impl {
                     {"in=" + irc::escapeTag(r.target) + ";text=" + irc::escapeTag(r.text) +
                      ";limit=100"},
                     tags);
-            } else if (has("draft/chathistory")) {
+            } else if (has("draft/chathistory") || has("chathistory")) {
                 int limit = 200;
                 auto it = isupport.find("CHATHISTORY");
                 if (it != isupport.end()) {
@@ -1727,8 +1778,23 @@ struct NetworkClient::Impl {
                         limit = std::min(limit, advertisedLimit);
                 }
                 string selector = "*", sub = "LATEST", bound = r.text;
+                if (r.type == "history-around") {
+                    sub = "AROUND";
+                    auto refs = isupport.find("MSGREFTYPES");
+                    auto supports = [&](const string &kind) {
+                        return refs == isupport.end() ||
+                               ("," + refs->second + ",").find("," + kind + ",") != string::npos;
+                    };
+                    if (!r.text.empty() && supports("msgid"))
+                        bound = "msgid=" + r.text;
+                    else if (!r.extra.empty() && supports("timestamp"))
+                        bound = "timestamp=" + r.extra;
+                    else
+                        throw std::invalid_argument("No supported AROUND history selector");
+                }
                 if (!bound.empty()) {
-                    sub = "BEFORE";
+                    if (r.type != "history-around")
+                        sub = "BEFORE";
                     if (bound.starts_with("after=")) {
                         sub = "AFTER";
                         bound.erase(0, 6);
@@ -1746,7 +1812,8 @@ struct NetworkClient::Impl {
                                                     " history selectors");
                 }
                 raw("CHATHISTORY", {sub, r.target, selector, std::to_string(limit)}, tags);
-            } else if (config.bouncer == "znc" && has("znc.in/playback")) {
+            } else if (r.type != "history-around" && config.bouncer == "znc" &&
+                       has("znc.in/playback")) {
                 unlabeledHistory = l;
                 string cursor = "0";
                 string bound = r.text;
@@ -1779,9 +1846,9 @@ struct NetworkClient::Impl {
                 raw("ZNC", {"*playback", "PLAY " + r.target + " " + (after ? cursor : "0") +
                                              (!after && !bound.empty() ? " " + cursor : "")});
             } else
-                endHistory(l, "Server does not advertise history playback");
+                endHistory(l, "Server does not advertise history playback", true);
         } catch (const std::invalid_argument &e) {
-            endHistory(l, e.what());
+            endHistory(l, e.what(), true);
         }
     }
     void batch(const WireMessage &m) {
@@ -1980,6 +2047,11 @@ struct NetworkClient::Impl {
                 const size_t before = request.target.size();
                 retarget(request.target);
                 requestBytes = requestBytes - before + request.target.size();
+                for (auto &target : request.targets) {
+                    const size_t oldSize = target.size();
+                    retarget(target);
+                    requestBytes = requestBytes - oldSize + target.size();
+                }
             }
             if (requestBytes > 8 * 1024 * 1024)
                 throw Failure("Renamed IRC request queue exceeds safe bounds");
@@ -2000,6 +2072,8 @@ struct NetworkClient::Impl {
             throw Failure("Renamed IRC reactions exceed safe bounds");
         for (auto &request : historyQueue)
             retarget(request.target);
+        for (auto &target : historyPriority)
+            retarget(target);
         for (auto &[label, history] : histories)
             retarget(history.target);
         for (auto &[id, batch] : batches) {
@@ -2513,11 +2587,14 @@ struct NetworkClient::Impl {
                         failAttempt(e.label, rejection.what());
                     }
                 } else {
-                    if (!e.label.empty() && histories.contains(e.label))
+                    if (!e.label.empty() && histories.contains(e.label)) {
                         endHistory(e.label, e.text);
-                    else if (!unlabeledHistory.empty() && !m.params.empty() &&
-                             (m.params[0] == "CHATHISTORY" || m.params[0] == "SEARCH"))
+                        return;
+                    } else if (!unlabeledHistory.empty() && !m.params.empty() &&
+                               (m.params[0] == "CHATHISTORY" || m.params[0] == "SEARCH")) {
                         endHistory(unlabeledHistory, e.text);
+                        return;
+                    }
                     bool chatFailure =
                         !m.params.empty() && (m.params[0] == "PRIVMSG" || m.params[0] == "BATCH");
                     string rejected = chatFailure ? rejectedSend(m, e) : "";
@@ -2848,6 +2925,21 @@ struct NetworkClient::Impl {
         typingTargets.erase(fold(target));
     }
     void execute(const Request &r) {
+        if (r.type == "history-priority") {
+            historyPriority = r.targets;
+            return;
+        }
+        if (r.type == "history-cancel") {
+            for (auto it = historyQueue.begin(); it != historyQueue.end();)
+                if (it->initial && fold(it->target) == fold(r.target)) {
+                    auto end = historyFailure(*it, "Initial history request canceled");
+                    end.tags["cancelled"] = "1";
+                    deliver(std::move(end));
+                    it = historyQueue.erase(it);
+                } else
+                    ++it;
+            return;
+        }
         if (!ready)
             throw std::invalid_argument("Not connected");
         if (r.type == "soju") {
@@ -2874,10 +2966,24 @@ struct NetworkClient::Impl {
                      r.fallbackNick);
             return;
         }
-        if (r.type == "history") {
+        if (r.type == "history" || r.type == "history-around") {
             if (!token(r.target) || r.target.size() > 512 || r.text.size() > 2048 ||
-                (!r.text.empty() && !token(r.text)))
+                (!r.text.empty() && !token(r.text)) || r.extra.size() > 2048 ||
+                (!r.extra.empty() && (!token(r.extra) || !irc::parseTimestampParts(r.extra))) ||
+                !token(r.submission) || r.submission.size() > 512)
                 throw std::invalid_argument("Invalid history request");
+            if (historyQueue.size() >= 128)
+                throw std::invalid_argument("Too many queued history requests");
+            historyQueue.push_back(r);
+            return;
+        }
+        if (r.type == "search") {
+            if (!token(r.target) || r.target.size() > 512 || r.text.empty() ||
+                r.text.size() > 4096 || !clean(r.text) || !token(r.submission) ||
+                r.submission.size() > 512)
+                throw std::invalid_argument("SEARCH needs a bounded target and query");
+            if (!has("soju.im/search"))
+                throw std::invalid_argument("Server-side search is not advertised");
             if (historyQueue.size() >= 128)
                 throw std::invalid_argument("Too many queued history requests");
             historyQueue.push_back(r);
@@ -3264,7 +3370,10 @@ struct NetworkClient::Impl {
                 for (const auto &[key, h] : histories)
                     keys.push_back(key);
                 for (const auto &key : keys)
-                    endHistory(key, "Connection closed");
+                    endHistory(key, "Connection closed", true);
+                for (const auto &queued : historyQueue)
+                    rejectRequest(queued, "Connection closed");
+                historyQueue.clear();
                 closeTransport();
                 enabled.clear();
                 publishCaps();
@@ -3337,8 +3446,26 @@ void NetworkClient::sojuMutation(const string &command, const string &id,
     }
     impl_->enqueue({"soju", id, cmd, std::move(encoded), {}});
 }
-void NetworkClient::history(const string &target, const string &before) {
-    impl_->enqueue({"history", target, before, {}, {}});
+void NetworkClient::history(const string &target, const string &before, const string &requestId,
+                            bool initial) {
+    Impl::Request request{"history", target, before, {}, requestId};
+    request.initial = initial;
+    impl_->enqueue(std::move(request));
+}
+void NetworkClient::historyAround(const string &target, const string &msgid,
+                                  const string &serverTime, const string &requestId) {
+    impl_->enqueue({"history-around", target, msgid, serverTime, requestId});
+}
+void NetworkClient::search(const string &target, const string &query, const string &requestId) {
+    impl_->enqueue({"search", target, query, {}, requestId});
+}
+void NetworkClient::prioritizeHistory(const vector<string> &targets) {
+    Impl::Request request{"history-priority", {}, {}, {}, {}};
+    request.targets = targets;
+    impl_->enqueue(std::move(request));
+}
+void NetworkClient::cancelInitialHistory(const string &target) {
+    impl_->enqueue({"history-cancel", target, {}, {}, {}});
 }
 void NetworkClient::markRead(const string &target, const string &timestamp) {
     impl_->enqueue({"read", target, timestamp, {}, {}});

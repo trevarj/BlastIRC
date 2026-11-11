@@ -91,6 +91,8 @@ const std::map<std::string, std::string> &defaultBindings() {
         {"switch-buffer", "C-x b"},
         {"execute-command", "M-x"},
         {"jump-channel", "C-x j"},
+        {"conversation-back", "C-o"},
+        {"conversation-forward", "C-i"},
         {"global-mentions", ""},
         {"toggle-fools", "C-x f"},
         {"show-fools", ""},
@@ -145,6 +147,8 @@ std::string_view commandDisplayName(std::string_view command) {
         {"switch-buffer", "Switch conversation"},
         {"execute-command", "Execute command"},
         {"jump-channel", "Jump to channel or conversation"},
+        {"conversation-back", "Previous viewed conversation"},
+        {"conversation-forward", "Next viewed conversation"},
         {"global-mentions", "Global mentions"},
         {"toggle-fools", "Toggle fools in this conversation"},
         {"show-fools", "Show fools"},
@@ -176,8 +180,8 @@ std::string_view commandDisplayName(std::string_view command) {
         {"next-line", "Next line"},
         {"backward-word", "Previous word"},
         {"forward-word", "Next word"},
-        {"beginning-of-buffer", "Beginning of draft"},
-        {"end-of-buffer", "End of draft"},
+        {"beginning-of-buffer", "Beginning of messages"},
+        {"end-of-buffer", "End of messages"},
         {"kill-word", "Cut next word"},
         {"backward-kill-word", "Cut previous word"},
         {"delete-char", "Delete next character"},
@@ -210,21 +214,12 @@ std::string_view commandDisplayName(std::string_view command) {
         {"topic", "Conversation details / topic"},
         {"quit", "Quit BlastIRC"},
         {"message-style:irc", "Use traditional IRC rows"},
-        {"message-style:bubbles", "Use message bubbles"}};
+        {"message-style:bubbles", "Use message bubbles"},
+        {"message-style:stacked", "Use stacked IRC rows"}};
     const auto found =
         std::find_if(std::begin(names), std::end(names),
                      [command](const auto &entry) { return entry.first == command; });
     return found == std::end(names) ? command : found->second;
-}
-std::string_view serverDisplayName(const Model &model, const std::string &server) {
-    const auto profile = std::find_if(model.servers.begin(), model.servers.end(),
-                                      [&](const auto &config) { return config.name == server; });
-    if (profile != model.servers.end() && !profile->alias.empty())
-        return profile->alias;
-    const auto network = model.networks.find(server);
-    return network != model.networks.end() && !network->second.name.empty()
-               ? std::string_view(network->second.name)
-               : std::string_view(server);
 }
 std::string commandLabel(const Model &model, std::string_view label, std::string_view command) {
     std::string result(label);
@@ -517,7 +512,8 @@ std::string bindingStroke(const InputArea::KeyData &key) {
 namespace {
 bool workspaceCommand(std::string_view name) {
     return name == "switch-buffer" || name == "execute-command" || name == "jump-channel" ||
-           name == "settings" || name == "search" || name == "cancel" || name == "toggle-people" ||
+           name == "conversation-back" || name == "conversation-forward" || name == "settings" ||
+           name == "search" || name == "cancel" || name == "toggle-people" ||
            name == "toggle-navigation" || name == "quit" || name == "connect" ||
            name == "disconnect" || name == "load-history" || name == "clear-history" ||
            name == "manage-networks" || name == "mark-all-read" ||
@@ -947,8 +943,13 @@ struct Ui::Impl {
     ScrollView *paletteList = nullptr;
     Label *paletteHelp = nullptr, *paletteTitle = nullptr;
     std::string paletteFont, paletteFeatures;
+    FontWeight paletteWeight = FontWeight::Normal;
     float paletteScale = 0;
     std::vector<std::pair<std::string, std::string>> matches;
+    struct PaletteSource {
+        std::string id, target, caption;
+    };
+    std::vector<PaletteSource> paletteSources;
     std::vector<Button *> paletteRows;
     std::size_t paletteStart = 0;
     std::deque<std::string> pending;
@@ -1048,7 +1049,7 @@ struct Ui::Impl {
     UploadConfig uploadConfig;
     std::optional<SojuFileHostContext> uploadSoju;
     platform::PickedFile uploadFile;
-    std::string uploadSource, uploadSourceLabel, uploadMessage, uploadUrl;
+    std::string uploadSource, uploadSourceTarget, uploadMessage, uploadUrl;
     std::optional<UploadFileIdentity> uploadFileIdentity;
     UploadProgress uploadProgress;
     bool uploadCancelRequested = false;
@@ -1084,7 +1085,8 @@ struct Ui::Impl {
             return model.settings.bindings.contains(std::string(name));
         });
         for (const auto &[name, binding] : defaultBindings()) {
-            if ((name == "jump-channel" || name == "toggle-fools") &&
+            if ((name == "jump-channel" || name == "toggle-fools" || name == "conversation-back" ||
+                 name == "conversation-forward") &&
                 !model.settings.bindings.contains(name) &&
                 std::any_of(model.settings.bindings.begin(), model.settings.bindings.end(),
                             [&](const auto &entry) {
@@ -1534,6 +1536,8 @@ struct Ui::Impl::PaneView final : Node {
         setVisible(selected);
         setExcludeSubtreeFromTabOrder(!selected);
         transcript->setWindowActive(ui.windowActive);
+        titleLine->sync(pane, ui.workspace.focused == pane.id, ui.scale, ui.peopleRegularMode,
+                        ui.navigationMode);
         if (!selected) {
             transcript->setReadEligible(false);
             ui.editors.setComposerHeightLimit(pane.id, 0);
@@ -1544,8 +1548,6 @@ struct Ui::Impl::PaneView final : Node {
         const bool exists = found != ui.model.buffers.end();
         const bool search =
             exists && (found->second.kind == "search" || found->second.kind == "mentions");
-        titleLine->sync(pane, ui.workspace.focused == pane.id, userScale, ui.peopleRegularMode,
-                        ui.navigationMode);
         conversationMaterial->sync();
         titleDivider->setFill(withAlpha(themeColor("outline_variant"), .18f * themeSurfaceAlpha()));
         transcript->setVisible(exists);
@@ -1560,6 +1562,7 @@ struct Ui::Impl::PaneView final : Node {
         for (auto *label : {welcomeTitle, welcomeBody}) {
             label->setFontFamily(themeUiFont().family);
             label->setFontFeatures(themeUiFont().features);
+            label->setFontWeight(themeUiFont().weight);
             label->setFontSize((label == welcomeTitle ? 22.f : 14.f) * userScale);
             label->setColor(themeForegroundColor("on_surface"));
         }
@@ -1591,15 +1594,15 @@ struct Ui::Impl::PaneView final : Node {
                                       ? messageTextSize(ui.model.settings, Buffer{})
                                       : messageTextSize(ui.model.settings, activeBuffer->second);
         const float historyRow = renderer.fontRowExtent(messageSize, themeMessageFont());
-        const float typingRow = composing ? typingIndicatorHeight(renderer, s) : 0;
+        const float typingRow = composing ? typingIndicatorHeight(renderer, s, messageSize) : 0;
         const float replyHeight =
             composing ? ui.editors.replyContextHeight(pane.id, renderer, innerWidth) : 0;
-        const float contextHeight = composing ? replyHeight + typingRow + 4 * s : 0;
+        const float replyOverlayHeight = composing ? replyHeight + typingRow + 4 * s : 0;
         const float historyMinimum = 2 * historyRow + 12 * s;
-        // The transparent context still needs physical space above the input. Let
-        // paste previews/accessories compact before spending the native history floor.
+        // Only typing reserves history space; the reply card floats above it.
+        // Let paste previews/accessories compact before spending the native history floor.
         const float preferredMaximum =
-            std::max(0.f, available - 2 * paddingY - historyMinimum - contextHeight - panelGap);
+            std::max(0.f, available - 2 * paddingY - historyMinimum - typingRow - panelGap);
         const float preferredBudget =
             std::max(std::max(32.f, 32 * s), std::min(available * .5f, preferredMaximum));
         const float minimumComposer =
@@ -1623,13 +1626,13 @@ struct Ui::Impl::PaneView final : Node {
         const float historyHeight = std::max(0.f, available - composerCardHeight - composerGap);
         const float composerY = top + historyHeight + composerGap;
         place(*transcript, left, top, innerWidth, historyHeight);
-        // Content inset keeps the followed tail clear; older rows retain the full viewport.
-        // In an impossible pane the transparent inset yields first, not native text height;
-        // bottom anchoring still keeps reply, typing and editable input from overlapping.
-        const float inset = std::min(contextHeight, std::max(0.f, historyHeight - 2 * historyRow));
-        transcript->setContextInset(inset, typingRow);
+        // In an impossible pane the typing inset yields before native history text.
+        // Reply visibility never changes the content extent or composer budget.
+        const float inset = std::min(typingRow, std::max(0.f, historyHeight - 2 * historyRow));
+        transcript->setContextInset(inset, typingRow,
+                                    composing && !pane.reply.empty() ? replyOverlayHeight : 0);
         // Zero host bounds pass empty-zone hits through while traversing the real card.
-        place(*replyHost, left, top + historyHeight - contextHeight, 0, 0);
+        place(*replyHost, left, top + historyHeight - replyOverlayHeight, 0, 0);
         replyHost->setVisible(composing);
         replyHost->setExcludeSubtreeFromTabOrder(!composing);
         for (const auto &reply : replyHost->children())
@@ -2068,8 +2071,7 @@ void Ui::Impl::showUploadMenu(std::uint64_t pane, const std::string &buffer, Nod
         return;
     uploadOrigin = *origin;
     uploadSource = source->second.server;
-    uploadSourceLabel =
-        source->second.target + " · " + std::string(serverDisplayName(model, uploadSource));
+    uploadSourceTarget = source->second.kind == "server" ? "Server log" : source->second.target;
     uploadConfig = model.settings.uploads;
     uploadAuthorizationRevoked = false;
     uploadSoju = sojuFileHostContext(model, uploadSource);
@@ -2100,6 +2102,7 @@ void Ui::Impl::showUploadMenu(std::uint64_t pane, const std::string &buffer, Nod
     request.inputSerial = pointer ? pointer->serial : 0;
     request.menuWidth = 250 * scale;
     request.fontSize = 14 * scale;
+    request.font = themeUiFont();
     request.menu = std::move(sources);
     SelectPopupContext::DropdownCallbacks callbacks{};
     callbacks.onSelect = [this, generation](std::size_t value) {
@@ -2154,6 +2157,7 @@ void Ui::Impl::showUploadHosts() {
     request.menuWidth = 300 * scale;
     request.maxMenuWidth = 440 * scale;
     request.fontSize = 14 * scale;
+    request.font = themeUiFont();
     request.maxVisibleOptions = 10;
     request.selectedIndex = static_cast<std::size_t>(uploadConfig.provider);
     request.menu = std::move(entries);
@@ -2496,8 +2500,10 @@ void Ui::Impl::syncUploadPanel() {
     uploadText->setVisible(showText);
     uploadText->setExcludeSubtreeFromTabOrder(!showText);
     uploadText->setFontSize(13 * scale);
-    std::string caption =
-        uploadSourceLabel + " · " + std::string(uploadProviderLabel(uploadConfig.provider));
+    uploadText->setFontWeight(themeUiFont().weight);
+    std::string caption = uploadSourceTarget;
+    caption.append(" · ").append(serverDisplayName(model, uploadSource));
+    caption.append(" · ").append(uploadProviderLabel(uploadConfig.provider));
     if (uploadStage == UploadStage::Choosing)
         caption += "\nChoose one local file in the native file chooser";
     else if (uploadStage == UploadStage::Reading)
@@ -2545,6 +2551,7 @@ void Ui::Impl::syncUploadPanel() {
     uploadCaption->setText(caption);
     uploadCaption->setTooltip(caption);
     uploadCaption->setFontFamily(themeUiFont().family);
+    uploadCaption->setFontWeight(themeUiFont().weight);
     uploadCaption->setFontSize(12 * scale);
     uploadCaption->setColor(themeForegroundColor("on_surface"));
     uploadButtons[0]->setText(uploadStage == UploadStage::Error ? "Retry upload" : "Upload");
@@ -2574,6 +2581,7 @@ void Ui::Impl::syncUploadPanel() {
         button->setVisible(shown[i]);
         button->setExcludeSubtreeFromTabOrder(!shown[i]);
         button->setFontSize(12 * scale);
+        button->label()->setFontWeight(themeUiFont().weight);
     }
     uploadContent->setGap(6 * scale);
     uploadContent->setPadding(8 * scale);
@@ -2951,6 +2959,7 @@ void Ui::Impl::rebuildMatches(std::string_view preferred) {
                                        "topic",
                                        "message-style:irc",
                                        "message-style:bubbles",
+                                       "message-style:stacked",
                                        "mute-buffer",
                                        "unmute-buffer",
                                        "archive-buffer",
@@ -2967,9 +2976,18 @@ void Ui::Impl::rebuildMatches(std::string_view preferred) {
                     {score, name, commandLabel(model, display, name) + "    [" + name + "]"});
         }
     } else {
+        paletteSources.clear();
         for (const auto &[id, buffer] : model.buffers) {
-            const auto label = buffer.target + "  ·  " + buffer.server;
-            const int score = ui_logic::fuzzy(query, label);
+            const auto caption = serverDisplayName(model, buffer.server);
+            paletteSources.push_back({id, buffer.target, std::string(caption)});
+            const auto label = buffer.kind == "server"
+                                   ? std::string(caption)
+                                   : buffer.target + "  ·  " + std::string(caption);
+            int score = ui_logic::fuzzy(query, label);
+            // Keep the existing target + routing-key search without exposing
+            // technical keys in the displayed result.
+            if (score <= -100000)
+                score = ui_logic::fuzzy(query, buffer.target + "  ·  " + buffer.server);
             if (score > -100000)
                 found.push_back({score, id, label});
         }
@@ -3010,6 +3028,7 @@ void Ui::Impl::rebuildPaletteRows() {
                                }});
         row->label()->setFontFamily(themeUiFont().family);
         row->label()->setFontFeatures(themeUiFont().features);
+        row->label()->setFontWeight(themeUiFont().weight);
         row->setFontSize(14 * scale);
         std::string_view icon = "terminal";
         if (commandMode)
@@ -3143,6 +3162,7 @@ void Ui::Impl::menu(Node &anchor, std::vector<ContextMenuEntry> entries,
     request.menuWidth = 260 * scale;
     request.maxMenuWidth = 440 * scale;
     request.fontSize = 14 * scale;
+    request.font = themeUiFont();
     request.maxVisibleOptions = 14;
     request.menu = std::move(entries);
     SelectPopupContext::DropdownCallbacks callbacks{};
@@ -3167,7 +3187,11 @@ void Ui::Impl::paneMenu(std::uint64_t id, Node &anchor, bool includeHiddenTools,
     const auto source = model.buffers.find(pane->second.buffer);
     if (source != model.buffers.end()) {
         ContextMenuEntry heading{};
-        heading.label = source->second.target + " · " + source->second.server;
+        heading.label = source->second.kind == "server" ? "Server log" : source->second.target;
+        const auto networkName = serverDisplayName(model, source->second.server);
+        if (!networkName.empty() &&
+            (source->second.kind == "server" || networkName != source->second.server))
+            heading.label.append(" · ").append(networkName);
         heading.icon = source->second.kind == "channel" ? "hash"
                        : source->second.kind == "query" ? "user"
                                                         : "server";
@@ -3234,15 +3258,20 @@ void Ui::Impl::paneMenu(std::uint64_t id, Node &anchor, bool includeHiddenTools,
                 menuLeaf(commands, buffer.archived ? "Unarchive" : "Archive",
                          buffer.archived ? "archive-off" : "archive",
                          prefix + (buffer.archived ? "unarchive-buffer" : "archive-buffer")));
-            const bool bubbles = messageBubbles(model.settings, buffer);
+            const auto layout = messageLayout(model.settings, buffer);
             ContextMenuEntry display{};
             display.label = "Message display";
             display.icon = "layout-list";
-            display.children.reserve(2);
+            display.children.reserve(3);
             display.children.push_back(menuRadio(commands, "Message bubbles", "messages",
-                                                 prefix + "message-style:bubbles", bubbles));
+                                                 prefix + "message-style:bubbles",
+                                                 layout == MessageLayout::Bubbles));
             display.children.push_back(menuRadio(commands, "Traditional IRC", "list",
-                                                 prefix + "message-style:irc", !bubbles));
+                                                 prefix + "message-style:irc",
+                                                 layout == MessageLayout::Irc));
+            display.children.push_back(menuRadio(commands, "Traditional · two-line", "layout-list",
+                                                 prefix + "message-style:stacked",
+                                                 layout == MessageLayout::Stacked));
             entries.push_back(std::move(display));
         }
         ContextMenuEntry history{};
@@ -3306,9 +3335,9 @@ void Ui::Impl::nickMenu(std::string_view buffer, std::string_view nick,
     relationship.label = "Relationship";
     relationship.icon = "users";
     relationship.children.reserve(2);
-    auto friendEntry = menuLeaf(commands, "Friend", "user-check", prefix + "friend");
+    auto friendEntry = menuLeaf(commands, "Friend", "star", prefix + "friend");
     friendEntry.checkmark = true;
-    friendEntry.toggleState = model.settings.friends.contains(identity) ? 1 : 0;
+    friendEntry.toggleState = isFriend(model, source->second.server, identity) ? 1 : 0;
     relationship.children.push_back(std::move(friendEntry));
     auto foolEntry = menuLeaf(commands, "Fool", "user-x", prefix + "fool");
     foolEntry.checkmark = true;
@@ -3463,6 +3492,12 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
                 view->second->transcript->scrollHalfPage(command == "scroll-up" ? -1 : 1);
         return;
     }
+    if (command == "beginning-of-buffer" || command == "end-of-buffer") {
+        if (!jumpOpen && !paletteOpen && !reactionTarget && !dialogs->active())
+            if (const auto view = views.find(workspace.focused); view != views.end())
+                view->second->transcript->scrollToBoundary(command == "end-of-buffer");
+        return;
+    }
     if (command == "copy-region") {
         if (!jumpOpen && !paletteOpen && !reactionTarget && !dialogs->active() &&
             (transcriptOwnsFocus() || (dispatcher && editors.ownsFocus(dispatcher->focusedArea()))))
@@ -3505,6 +3540,11 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         changeBuffer(command.substr(7));
         return;
     }
+    if (command == "conversation-back" || command == "conversation-forward") {
+        if (const auto pane = workspace.navigateHistory(command == "conversation-forward"))
+            focus(*pane);
+        return;
+    }
     if (command.starts_with("select-server:")) {
         selectServer(std::string_view(command).substr(14));
         return;
@@ -3530,7 +3570,7 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         else if (action == "friend" || action == "fool") {
             auto &set = action == "friend" ? model.settings.friends : model.settings.fools;
             const auto &server = model.buffers.at(buffer).server;
-            if (action == "fool" && isFool(model, server, nick)) {
+            if (action == "friend" ? isFriend(model, server, nick) : isFool(model, server, nick)) {
                 const auto network = model.networks.find(server);
                 const std::string_view mapping =
                     network == model.networks.end() ? std::string_view{"rfc1459"}
@@ -3539,9 +3579,7 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
                 std::erase_if(set, [&](const auto &entry) {
                     return irc::casefold(entry, mapping) == folded;
                 });
-            } else if (set.contains(nick))
-                set.erase(nick);
-            else
+            } else
                 set.insert(nick);
             queue(model, "save");
         } else if (action == "palette") {
@@ -3643,14 +3681,16 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         queue(model, "close_buffer", model.activeBuffer);
     else if (command == "quit")
         queue(model, "quit");
-    else if (command == "message-style:irc" || command == "message-style:bubbles") {
+    else if (command == "message-style:irc" || command == "message-style:bubbles" ||
+             command == "message-style:stacked") {
         const auto buffer = model.buffers.find(model.activeBuffer);
         if (buffer != model.buffers.end() &&
             (buffer->second.kind == "channel" || buffer->second.kind == "query")) {
-            if (command == "message-style:irc")
-                model.settings.ircChannels.insert(buffer->first);
+            if (command == "message-style:bubbles")
+                model.settings.messageLayouts.erase(buffer->first);
             else
-                model.settings.ircChannels.erase(buffer->first);
+                model.settings.messageLayouts[buffer->first] =
+                    command == "message-style:irc" ? MessageLayout::Irc : MessageLayout::Stacked;
             queue(model, "save");
         }
     } else if (command.starts_with("presence:")) {
@@ -3671,8 +3711,10 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
     } else if (command == "topic") {
         const auto buffer = model.buffers.find(model.activeBuffer);
         if (buffer != model.buffers.end()) {
-            model.status =
-                buffer->second.target + " · " + buffer->second.server + "\n" + buffer->second.topic;
+            model.status = (buffer->second.kind == "server" ? std::string("Server log")
+                                                            : buffer->second.target) +
+                           " · " + std::string(serverDisplayName(model, buffer->second.server)) +
+                           "\n" + buffer->second.topic;
             dialogs->open("topic");
         }
     } else if (auto found = workspace.panes.find(workspace.focused);
@@ -3722,8 +3764,8 @@ void Ui::Impl::refresh(bool panelResize) {
     drainPending();
     if (widthDrag && (jumpOpen || paletteOpen || dialogs->active()))
         retirePointerCapture();
-    if (!externalActive.empty() && model.activeBuffer != externalActive)
-        externalActive.clear();
+    if (!externalActive.empty() && model.buffers.contains(externalActive))
+        model.activeBuffer = externalActive;
     workspace.reconcile();
     if (!externalActive.empty() && model.buffers.contains(externalActive)) {
         // Core selection can land after a newer palette interaction; keep its query and focus.
@@ -3999,6 +4041,18 @@ void Ui::Impl::refresh(bool panelResize) {
         repairFocus();
     modeLine->sync(scale, navigationMode, chord);
     place(*modeLine, outer, height - statusHeight, std::max(0.f, width - 2 * outer), statusHeight);
+    if (paletteOpen && !commandMode) {
+        bool changed = paletteSources.size() != model.buffers.size();
+        auto source = paletteSources.begin();
+        for (auto buffer = model.buffers.begin(); !changed && buffer != model.buffers.end();
+             ++buffer, ++source)
+            changed = source->id != buffer->first || source->target != buffer->second.target ||
+                      source->caption != serverDisplayName(model, buffer->second.server);
+        if (changed) {
+            const std::string preferred = selected < matches.size() ? matches[selected].first : "";
+            rebuildMatches(preferred);
+        }
+    }
     place(*palette, 0, 0, width, height);
     place(*jump, 0, 0, width, height);
     const float paletteWidth = std::min(620 * scale, width - 20 * scale),
@@ -4011,17 +4065,21 @@ void Ui::Impl::refresh(bool panelResize) {
     palettePanel->setRadius(themeCornerRadius());
     paletteQuery->setFrameRadius(themeCornerRadius());
     if (paletteScale != scale || paletteFont != themeUiFont().family ||
-        paletteFeatures != themeUiFont().features) {
+        paletteFeatures != themeUiFont().features || paletteWeight != themeUiFont().weight) {
         paletteScale = scale;
         paletteFont = themeUiFont().family;
         paletteFeatures = themeUiFont().features;
+        paletteWeight = themeUiFont().weight;
         paletteQuery->setFontSize(16 * scale);
         paletteQuery->setFontFamily(paletteFont);
         paletteQuery->setFontFeatures(paletteFeatures);
+        paletteQuery->setFontWeight(paletteWeight);
         paletteTitle->setFontSize(18 * scale);
         paletteHelp->setFontSize(12 * scale);
         paletteTitle->setFontFamily(paletteFont);
         paletteHelp->setFontFamily(paletteFont);
+        paletteTitle->setFontWeight(paletteWeight);
+        paletteHelp->setFontWeight(paletteWeight);
         for (const auto &node : palettePanel->children())
             if (auto *column = dynamic_cast<Flex *>(node.get())) {
                 column->setGap(10 * scale);
@@ -4030,8 +4088,10 @@ void Ui::Impl::refresh(bool panelResize) {
         paletteList->setContentScale(scale);
         for (auto *row : paletteRows) {
             row->setFontSize(14 * scale);
-            if (row->label())
+            if (row->label()) {
                 row->label()->setFontFamily(paletteFont);
+                row->label()->setFontWeight(paletteWeight);
+            }
             row->setRadius(themeCornerRadius());
         }
     }
@@ -4247,7 +4307,8 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
     if (isConsumed() && !(paletteOpen && (event.sym == XKB_KEY_Up || event.sym == XKB_KEY_Down))) {
         if (const auto repeat = repeatCommands.find(keyId);
             repeat != repeatCommands.end() && !paletteOpen && !dialogs->active()) {
-            if (repeat->second == "scroll-up" || repeat->second == "scroll-down") {
+            if (repeat->second == "scroll-up" || repeat->second == "scroll-down" ||
+                repeat->second == "beginning-of-buffer" || repeat->second == "end-of-buffer") {
                 auto *focused = dispatcher ? dispatcher->focusedArea() : nullptr;
                 auto *input = focused ? dynamic_cast<Input *>(focused->textInputClient()) : nullptr;
                 if ((!editors.ownsFocus(focused) && !transcriptOwnsFocus()) ||
@@ -4255,7 +4316,8 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
                     return true;
             }
             if (repeat->second == "message-prev" || repeat->second == "message-next" ||
-                repeat->second == "scroll-up" || repeat->second == "scroll-down") {
+                repeat->second == "scroll-up" || repeat->second == "scroll-down" ||
+                repeat->second == "beginning-of-buffer" || repeat->second == "end-of-buffer") {
                 run(repeat->second);
                 refresh();
                 return true;
@@ -4327,19 +4389,28 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
         }
         return false;
     }
+    if (!dialogs->active())
+        if (const auto view = views.find(workspace.focused);
+            view != views.end() && view->second->transcript->handleTypingKey(event)) {
+            repeatCommands[keyId] = "@transcript";
+            return consume();
+        }
     bool composer = !dispatcher || editors.ownsFocus(dispatcher->focusedArea());
     const std::string full = chord.empty() ? keyStroke : chord + " " + keyStroke;
     bool prefix = false;
     for (const auto &[command, binding] : model.settings.bindings) {
-        const bool scrolling = command == "scroll-up" || command == "scroll-down";
+        const bool scrolling = command == "scroll-up" || command == "scroll-down" ||
+                               command == "beginning-of-buffer" || command == "end-of-buffer";
         const auto candidate = ui_logic::canonical(binding);
         if (candidate.empty() ||
             (!workspaceCommand(command) && !composer &&
              !((command == "copy-region" || scrolling) && transcriptOwnsFocus())) ||
             (command == "message-react" && !transcriptOwnsFocus()) ||
             (scrolling && dialogs->active()) ||
-            (dialogs->active() && (command == "message-prev" || command == "message-next" ||
-                                   command == "message-reply" || command == "message-react")))
+            (dialogs->active() &&
+             (command == "message-prev" || command == "message-next" ||
+              command == "message-reply" || command == "message-react" ||
+              command == "conversation-back" || command == "conversation-forward")))
             continue;
         if (candidate == full) {
             if (!synchronizeInput())
@@ -4702,9 +4773,13 @@ void Ui::execute(std::string command) {
     impl_->refresh();
 }
 void Ui::flush() {
+    const std::string externalActive =
+        impl_->model.activeBuffer != impl_->publishedActive ? impl_->model.activeBuffer : "";
     impl_->drainPending();
     impl_->editors.flush();
     const std::string previousBuffer = impl_->workspace.panes.at(impl_->workspace.focused).buffer;
+    if (!externalActive.empty() && impl_->model.buffers.contains(externalActive))
+        impl_->model.activeBuffer = externalActive;
     impl_->workspace.reconcile();
     impl_->pruneViews();
     if (const auto buffer = impl_->model.buffers.find(impl_->model.activeBuffer);

@@ -1,0 +1,240 @@
+#pragma once
+
+#include "config/config_types.h"
+#include "core/timer_manager.h"
+#include "notification.h"
+#include "security/storage_key_provider.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <optional>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+enum class NotificationEvent {
+  Added,
+  Updated,
+  Closed,
+};
+
+struct NotificationHistoryEntry {
+  Notification notification;
+  bool active = true;
+  bool seen = false;
+  std::optional<CloseReason> closeReason;
+  std::uint64_t eventSerial = 0;
+};
+
+constexpr int32_t kDefaultNotificationTimeout = 6000;
+
+// Upper bound on action pairs (key + label) kept per notification. Enforced once at ingress
+// in addOrReplace(); render sites clamp defensively against the same value.
+constexpr std::size_t kMaxNotificationActions = 6;
+
+// Freedesktop expire_timeout: 0 = persistent, -1 = server default, positive = milliseconds.
+// Normalize once at Notify ingress so manager timers and toast countdowns stay aligned.
+inline int32_t normalizeNotifyExpireTimeout(int32_t expireTimeout) noexcept {
+  if (expireTimeout == 0) {
+    return 0;
+  }
+  if (expireTimeout < 0) {
+    return kDefaultNotificationTimeout;
+  }
+  return expireTimeout;
+}
+
+struct NotificationRequest {
+  uint32_t replacesId = 0;
+  std::string appName;
+  std::string summary;
+  std::string body;
+  std::string sender;
+  Urgency urgency = Urgency::Normal;
+  int32_t timeout = kDefaultNotificationTimeout;
+  NotificationOrigin origin = NotificationOrigin::External;
+  NotificationDndPolicy dndPolicy = NotificationDndPolicy::Respect;
+  bool transient = false;
+  // Internal notifications are toast-only by default; set this for one-shot alerts (calendar
+  // reminders) whose whole value is lost if the toast is missed.
+  bool persistInHistory = false;
+  std::vector<std::string> actions;
+  std::optional<std::string> icon = std::nullopt;
+  bool iconIsAppIcon = false;
+  std::optional<NotificationImageData> imageData = std::nullopt;
+  std::optional<std::string> category = std::nullopt;
+  std::optional<std::string> desktopEntry = std::nullopt;
+  std::optional<uint32_t> forcedId = std::nullopt;
+};
+
+class NotificationManager {
+public:
+  NotificationManager() = default;
+
+  using EventCallback = std::function<void(const Notification&, NotificationEvent)>;
+  using ActionInvokeCallback =
+      std::function<void(uint32_t, const std::string&, const std::string&, const std::string& sender)>;
+  using CloseCallback = std::function<void(uint32_t, CloseReason, const std::string& sender)>;
+  using StateCallback = std::function<void()>;
+  using ReplyCallback =
+      std::function<void(uint32_t, const std::string&, const std::string&, const std::string& sender)>;
+
+  // Register a callback for notification events. Returns a token for removal.
+  int addEventCallback(EventCallback callback);
+  void removeEventCallback(int token);
+
+  // Adds a new notification or updates an existing one.
+  uint32_t addOrReplace(NotificationRequest request);
+
+  // Adopts a notification id assigned by an external server (e.g. KDE Plasma).
+  uint32_t adoptExternal(uint32_t id, NotificationRequest request);
+
+  // Adds an internal notification to the same store as external notifications.
+  uint32_t addInternal(
+      std::string appName, std::string summary, std::string body, Urgency urgency = Urgency::Normal,
+      int32_t timeout = kDefaultNotificationTimeout, std::optional<std::string> icon = std::nullopt,
+      std::optional<NotificationImageData> imageData = std::nullopt, std::optional<std::string> category = std::nullopt,
+      std::optional<std::string> desktopEntry = std::nullopt,
+      NotificationDndPolicy dndPolicy = NotificationDndPolicy::Respect
+  );
+
+  // Rewrites the body text of a live notification in place. Unlike addOrReplace it leaves the expiry,
+  // the filter verdict, and the history entry's position and seen flag untouched, so text that is
+  // refreshed repeatedly (a calendar reminder counting down to its event) does not keep shoving
+  // itself back to the top of the notification list or reset its own age. Returns false once the
+  // notification is no longer live, which is how such a caller learns to stop.
+  bool updateBody(uint32_t id, std::string body);
+
+  void setActionInvokeCallback(ActionInvokeCallback callback);
+  // Actions on internally generated notifications are handled in-process: there is no D-Bus client
+  // to receive ActionInvoked, so routing them to the external callback would signal into the void.
+  void setInternalActionCallback(ActionInvokeCallback callback);
+  void setCloseCallback(CloseCallback callback);
+  void setReplyCallback(ReplyCallback callback);
+  bool hasPendingDBusClose(uint32_t id) const noexcept;
+  [[nodiscard]] bool invokeAction(uint32_t id, const std::string& actionKey, bool closeAfterInvoke = true);
+  [[nodiscard]] bool invokeAction(
+      uint32_t id, const std::string& actionKey, const std::string& activationToken, bool closeAfterInvoke = true
+  );
+  // Passes non-blank reply text and the notification's D-Bus sender to the reply callback.
+  [[nodiscard]] bool invokeInlineReply(uint32_t id, const std::string& replyText, bool closeAfterInvoke = true);
+  [[nodiscard]] bool invokeInlineReply(
+      uint32_t id, const std::string& replyText, const std::string& activationToken, bool closeAfterInvoke = true
+  );
+
+  // Closes a notification by ID. Returns false if not found.
+  bool close(uint32_t id, CloseReason reason = CloseReason::ClosedByCall);
+
+  // Returns IDs of all notifications whose expiry_time has passed.
+  std::vector<uint32_t> expiredIds() const;
+
+  // Returns ms until the next expiry, or -1 if none are scheduled.
+  int nextExpiryTimeoutMs() const;
+
+  // Closes all expired notifications.
+  void processExpired();
+
+  // Pauses the expiry timer on a notification (clears its expiryTime). Used by the
+  // toast to freeze the auto-dismiss while the user hovers a card.
+  void pauseExpiry(uint32_t id);
+  // Resumes expiry by setting expiryTime = now + remainingMs.
+  void resumeExpiry(uint32_t id, int32_t remainingMs);
+
+  // All stored notifications.
+  const std::deque<Notification>& all() const noexcept;
+
+  // Recent notification history including closed notifications.
+  const std::deque<NotificationHistoryEntry>& history() const noexcept;
+  const NotificationHistoryEntry* findHistoryEntry(uint32_t id) const noexcept;
+  std::uint64_t changeSerial() const noexcept;
+  void removeHistoryEntry(uint32_t id, std::optional<CloseReason> dbusCloseReason = std::nullopt);
+  void clearHistory();
+  void setFilters(std::vector<NotificationFilterConfig> filters);
+  const std::vector<NotificationFilterConfig>& filters() const noexcept;
+  void setKeepDismissedInHistory(bool keep);
+  void setHistoryRetentionHours(int hours);
+  void setDoNotDisturb(bool enabled);
+  bool doNotDisturb() const noexcept;
+  bool toggleDoNotDisturb();
+  void setStateCallback(StateCallback callback);
+  void setSoundPlayer(class SoundPlayer* soundPlayer);
+
+  // Bar indicator: true when at least one notification was added since the user last
+  // viewed the notification history (control center notifications tab).
+  bool hasUnreadNotificationHistory() const noexcept;
+  void markNotificationHistorySeen();
+
+  // Secure existing files at startup; load history when its encryption key is ready.
+  void loadPersistedHistory();
+  void syncHistoryPersistence(security::StorageKeyProvider& provider);
+  bool hasEncryptedHistory() const;
+  bool historyNeedsRecovery() const noexcept { return m_historyNeedsRecovery; }
+  bool clearEncryptedHistoryForRecovery();
+  bool historyPersistenceReady() const noexcept { return m_historyWritable; }
+  void retryHistoryPersistence();
+  /// Writes pending history to disk immediately (e.g. shutdown).
+  void flushPersistedHistory();
+
+private:
+  void cleanupOldHistoryEntries();
+  void upsertHistory(const Notification& notification, bool active, std::optional<CloseReason> closeReason);
+  void markHistoryClosed(uint32_t id, CloseReason reason);
+  void rebuildHistoryIndex();
+  void schedulePersistHistory();
+  void persistHistoryToDisk();
+  void emitPendingDBusClose(uint32_t id, CloseReason reason);
+  // Live notification, or an expired one still awaiting its deferred NotificationClosed; nullptr otherwise.
+  const Notification* findInvokable(uint32_t id) const;
+  void dismissAfterInvoke(uint32_t id);
+  bool computeHasUnreadNotificationHistory() const noexcept;
+  void notifyUnreadStateChangedIfNeeded(bool previousUnreadState);
+  struct ExternalNotificationDispatch {
+    bool fullySuppress = false;
+    bool showToast = true;
+    bool saveHistory = true;
+    bool playSound = true;
+    bool bypassDnd = false;
+    bool disallowPermanent = false;
+    std::optional<std::int32_t> overrideDuration;
+  };
+  ExternalNotificationDispatch evaluateExternalDispatch(
+      NotificationOrigin origin, Urgency urgency, std::string_view appName, const std::optional<std::string>& category,
+      const std::optional<std::string>& desktopEntry, std::string_view summary, std::string_view body, bool transient,
+      bool persistInHistory
+  ) const;
+  uint32_t suppressExternal(std::string_view appName, Urgency urgency);
+
+  int m_historyRetentionHours = 0;
+  bool m_keepDismissedInHistory = true;
+  bool m_persistScheduled = false;
+  bool m_historyLoaded = false;
+  bool m_historyWritable = false;
+  bool m_historyNeedsRecovery = false;
+  bool m_historyCleared = false;
+  security::StorageKeyProvider* m_historyKeyProvider = nullptr;
+  std::optional<security::SecureKey> m_historyKey;
+  Timer m_historyRetentionTimer;
+
+  std::deque<Notification> m_notifications;
+  std::unordered_map<uint32_t, size_t> m_idToIndex;
+  std::unordered_set<uint32_t> m_suppressedIds;
+  std::vector<NotificationFilterConfig> m_filters;
+  /// Expired notifications with actions: NotificationClosed deferred until dismiss, action, or history removal.
+  /// Maps id -> D-Bus sender, so the deferred signal still reaches the notification's owner.
+  std::unordered_map<uint32_t, std::string> m_pendingDBusClose;
+  std::deque<NotificationHistoryEntry> m_history;
+  std::unordered_map<uint32_t, size_t> m_historyIndex;
+  std::vector<std::pair<int, EventCallback>> m_eventCallbacks;
+  ActionInvokeCallback m_actionInvokeCallback;
+  ActionInvokeCallback m_internalActionCallback;
+  CloseCallback m_closeCallback;
+  StateCallback m_stateCallback;
+  ReplyCallback m_replyCallback;
+  int m_nextCallbackToken{0};
+  uint32_t m_nextId{1};
+  std::uint64_t m_changeSerial{0};
+  bool m_doNotDisturb = false;
+  class SoundPlayer* m_soundPlayer = nullptr;
+};

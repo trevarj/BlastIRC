@@ -1,0 +1,264 @@
+#include "shell/overview/overview_launcher_capture.h"
+
+#include "compositors/compositor_detect.h"
+#include "compositors/compositor_platform.h"
+#include "compositors/niri/niri_runtime.h"
+#include "compositors/umbriel/umbriel_runtime.h"
+#include "core/input/key_modifiers.h"
+#include "core/input/key_symbols.h"
+#include "core/input/keybind_matcher.h"
+#include "core/log.h"
+#include "shell/panel/panel_manager.h"
+#include "shell/wayland/layer_surface.h"
+#include "util/string_utils.h"
+#include "wayland/wayland_connection.h"
+
+#include <nlohmann/json.hpp>
+#include <string>
+
+namespace {
+
+  constexpr Logger kLog("overview-launcher");
+
+  bool isLauncherTypingKey(const KeyboardEvent& event) {
+    if (!event.pressed || event.preedit) {
+      return false;
+    }
+    if ((event.modifiers & (KeyMod::Ctrl | KeyMod::Alt | KeyMod::Super)) != 0) {
+      return false;
+    }
+    return event.utf32 > 0x20U && event.utf32 != 0x7FU;
+  }
+
+} // namespace
+
+bool OverviewLauncherCapture::initialize(
+    WaylandConnection& wayland, RenderContext* renderContext, CompositorPlatform& platform, PanelManager& panelManager
+) {
+  if ((!compositors::isNiri() && !compositors::isUmbriel()) || !platform.tracksOverviewState()) {
+    return true;
+  }
+
+  m_wayland = &wayland;
+  m_renderContext = renderContext;
+  m_platform = &platform;
+  m_panelManager = &panelManager;
+  return true;
+}
+
+void OverviewLauncherCapture::setOpenLauncherCallback(OpenLauncherCallback callback) {
+  m_openLauncher = std::move(callback);
+}
+
+void OverviewLauncherCapture::setEnabled(bool enabled) {
+  if (m_enabled == enabled) {
+    return;
+  }
+  m_enabled = enabled;
+  sync();
+}
+
+bool OverviewLauncherCapture::shouldBeActive() const {
+  if (!m_enabled) {
+    return false;
+  }
+  if (m_platform == nullptr || m_panelManager == nullptr) {
+    return false;
+  }
+  if (!m_platform->hasOverviewState() || !m_platform->isOverviewOpen()) {
+    return false;
+  }
+  if (m_panelManager->isOpen() || m_panelManager->isPanelTransitionActive()) {
+    return false;
+  }
+  return true;
+}
+
+bool OverviewLauncherCapture::surfacesMatchOutputs() const {
+  if (m_wayland == nullptr) {
+    return m_instances.empty();
+  }
+  const auto& outputs = m_wayland->outputs();
+  if (m_instances.size() != outputs.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < outputs.size(); ++i) {
+    const auto* instance = m_instances[i].get();
+    if (instance == nullptr || instance->output != outputs[i].output || instance->surface == nullptr) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void OverviewLauncherCapture::sync() {
+  const bool overviewOpen = m_platform != nullptr && m_platform->hasOverviewState() && m_platform->isOverviewOpen();
+  if (m_launcherOpenedFromOverview) {
+    if (m_panelManager == nullptr || !m_panelManager->isOpenPanel("launcher")) {
+      m_launcherOpenedFromOverview = false;
+    } else if (!overviewOpen) {
+      m_launcherOpenedFromOverview = false;
+      destroySurfaces();
+      m_panelManager->closePanelById("launcher");
+      return;
+    }
+  }
+
+  if (!shouldBeActive()) {
+    destroySurfaces();
+    return;
+  }
+  if (!m_instances.empty() && surfacesMatchOutputs()) {
+    return;
+  }
+  destroySurfaces();
+  ensureSurfaces();
+}
+
+void OverviewLauncherCapture::onOutputChange() { sync(); }
+
+void OverviewLauncherCapture::ensureSurfaces() {
+  if (m_wayland == nullptr || m_renderContext == nullptr || !m_instances.empty()) {
+    return;
+  }
+
+  for (const auto& output : m_wayland->outputs()) {
+    if (!output.done || output.output == nullptr || !output.hasUsableGeometry()) {
+      continue;
+    }
+
+    auto config = LayerSurfaceConfig{
+        .nameSpace = "noctalia-overview-launcher",
+        .layer = LayerShellLayer::Overlay,
+        .anchor = LayerShellAnchor::Top | LayerShellAnchor::Left,
+        .width = 1,
+        .height = 1,
+        .exclusiveZone = -1,
+        .keyboard = LayerShellKeyboard::Exclusive,
+        .defaultWidth = 1,
+        .defaultHeight = 1,
+    };
+
+    auto inst = std::make_unique<Instance>();
+    inst->output = output.output;
+    inst->surface = std::make_unique<LayerSurface>(*m_wayland, std::move(config));
+    inst->surface->setRenderContext(m_renderContext);
+    inst->surface->setConfigureCallback([](std::uint32_t /*width*/, std::uint32_t /*height*/) {});
+    inst->surface->setClickThrough(true);
+
+    if (!inst->surface->initialize(output.output)) {
+      kLog.warn("failed to initialize overview type-to-launch capture surface on {}", output.connectorName);
+      continue;
+    }
+
+    m_instances.push_back(std::move(inst));
+  }
+}
+
+void OverviewLauncherCapture::destroySurfaces() { m_instances.clear(); }
+
+OverviewLauncherCapture::Instance* OverviewLauncherCapture::instanceForKeyboardSurface(wl_surface* surface) noexcept {
+  if (surface == nullptr) {
+    return nullptr;
+  }
+  for (auto& instance : m_instances) {
+    if (instance != nullptr && instance->surface != nullptr && instance->surface->wlSurface() == surface) {
+      return instance.get();
+    }
+  }
+  return nullptr;
+}
+
+bool OverviewLauncherCapture::sendOverviewAction(const char* actionName) const {
+  if (m_platform == nullptr || actionName == nullptr || actionName[0] == '\0') {
+    return false;
+  }
+  if (compositors::isUmbriel()) {
+    return m_platform->umbrielRuntime().requestAction(actionName);
+  }
+  if (compositors::isNiri()) {
+    return m_platform->niriRuntime().requestAction(nlohmann::json{{actionName, nlohmann::json::object()}});
+  }
+  return false;
+}
+
+bool OverviewLauncherCapture::handleOverviewKey(const KeyboardEvent& event) const {
+  if (!event.pressed || event.preedit) {
+    return false;
+  }
+  const bool isUmbriel = compositors::isUmbriel();
+
+  if (KeySymbol::isEnter(event.sym) || KeybindMatcher::matches(KeybindAction::Cancel, event.sym, event.modifiers)) {
+    const auto* action = isUmbriel ? "overview-toggle" : "ToggleOverview";
+    sendOverviewAction(action);
+    return true;
+  }
+  if (KeySymbol::isLeft(event.sym)) {
+    const auto* action = isUmbriel ? "window-focus-left" : "FocusColumnLeft";
+    sendOverviewAction(action);
+    return true;
+  }
+  if (KeySymbol::isRight(event.sym)) {
+    const auto* action = isUmbriel ? "window-focus-right" : "FocusColumnRight";
+    sendOverviewAction(action);
+    return true;
+  }
+  if (KeySymbol::isUp(event.sym)) {
+    const auto* action = isUmbriel ? "window-focus-or-workspace-up" : "FocusWorkspaceUp";
+    sendOverviewAction(action);
+    return true;
+  }
+  if (KeySymbol::isDown(event.sym)) {
+    const auto* action = isUmbriel ? "window-focus-or-workspace-down" : "FocusWorkspaceDown";
+    sendOverviewAction(action);
+    return true;
+  }
+
+  return false;
+}
+
+bool OverviewLauncherCapture::handleKeyboardEvent(const KeyboardEvent& event) {
+  if (m_panelManager != nullptr && (m_panelManager->isOpen() || m_panelManager->isPanelTransitionActive())) {
+    if (!m_instances.empty()) {
+      destroySurfaces();
+    }
+    return false;
+  }
+
+  if (m_instances.empty() || m_wayland == nullptr) {
+    return false;
+  }
+
+  Instance* const instance = instanceForKeyboardSurface(m_wayland->lastKeyboardSurface());
+  if (instance == nullptr) {
+    return false;
+  }
+
+  if (handleOverviewKey(event)) {
+    return true;
+  }
+
+  if (!isLauncherTypingKey(event) || !m_openLauncher) {
+    return true;
+  }
+
+  const std::string initialQuery = StringUtils::utf32ToUtf8(event.utf32);
+  if (initialQuery.empty()) {
+    return true;
+  }
+
+  // Open on the compositor's focused output. The exclusive-keyboard capture
+  // surface that received the keystroke is not reliably on the focused monitor
+  // (Umbriel can route it to a fixed output), so prefer the focus source and
+  // fall back to the surface's own output.
+  wl_output* target = instance->output;
+  if (m_platform != nullptr) {
+    if (wl_output* focused = m_platform->focusedInteractiveOutput(); focused != nullptr) {
+      target = focused;
+    }
+  }
+  m_openLauncher(initialQuery, target, {});
+  m_launcherOpenedFromOverview = m_panelManager != nullptr && m_panelManager->isOpenPanel("launcher");
+  sync();
+  return true;
+}

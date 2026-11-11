@@ -78,6 +78,11 @@ class PreviewService {
     static std::optional<PreviewRaster> raster(std::span<const std::uint8_t> bytes);
     static PreviewMetadata metadata(std::string_view html, std::string_view baseUrl,
                                     bool allowLocal = false);
+    // Canonical YouTube watch links use bounded official metadata, never embed HTML.
+    // The endpoint remains a Link request; its thumbnail requires separate Image consent.
+    static std::optional<std::string> youtubeMetadataUrl(std::string_view value);
+    static std::optional<PreviewMetadata> youtubeMetadata(std::string_view json,
+                                                          bool allowLocal = false);
 
   private:
     struct Impl;

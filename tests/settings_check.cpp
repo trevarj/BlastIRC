@@ -3,11 +3,14 @@
 #include "../src/theme/theme.hpp"
 #include "../src/ui/channel_avatar.hpp"
 #include "../src/ui/dialogs.hpp"
+#include "../src/ui/foundry_atlas_data.hpp"
+#include "../src/ui/foundry_avatar.hpp"
 #include "../src/ui/transcript.hpp"
 #include "../src/ui/ui.hpp"
 
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <core/input/key_modifiers.h>
 #include <core/text_clipboard.h>
@@ -18,26 +21,40 @@
 #include <fstream>
 #include <glib.h>
 #include <iterator>
+#include <linux/input-event-codes.h>
+#include <render/animation/animation_manager.h>
+#include <render/animation/motion_service.h>
+#include <render/codecs/codecs.h>
 #include <render/core/texture_manager.h>
+#include <render/scene/glyph_node.h>
 #include <render/scene/input_dispatcher.h>
 #include <render/text/cairo_text_renderer.h>
+#include <thread>
 #include <typeinfo>
 #include <ui/controls/button.h>
+#include <ui/controls/context_menu.h>
+#include <ui/controls/image.h>
 #include <ui/controls/input.h>
 #include <ui/controls/label.h>
 #include <ui/controls/scroll_view.h>
 #include <ui/controls/select.h>
+#include <ui/controls/select_popup_context.h>
 #include <ui/controls/slider.h>
 #include <ui/controls/toggle.h>
+#include <ui/palette.h>
+#include <ui/style.h>
 #include <wayland-client-protocol.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 namespace {
-// CPU-only native renderer: Pango supplies real text metrics; uploads retain handles only.
+// CPU-only native renderer: Pango supplies real metrics; RGBA image uploads retain pixels.
 class CpuTextureUploadSink final : public TextureManager {
   public:
     TextureHandle loadFromRgba(const std::uint8_t *data, int width, int height, bool) override {
-        return upload(data, width, height);
+        const auto handle = upload(data, width, height);
+        images.emplace_back(
+            handle.id, std::vector<std::uint8_t>(data, data + std::size_t(width) * height * 4));
+        return handle;
     }
     TextureHandle loadFromRaw(const std::uint8_t *data, std::size_t, int width, int height, int,
                               PixmapFormat, bool) override {
@@ -60,6 +77,7 @@ class CpuTextureUploadSink final : public TextureManager {
     void cleanup() override {}
     void abandonGpuResources() noexcept override {}
     void probeExtensions() override { std::abort(); }
+    std::vector<std::pair<TextureId, std::vector<std::uint8_t>>> images;
 
   private:
     std::uint32_t uploads = 0;
@@ -117,6 +135,12 @@ class PangoRenderer final : public Renderer {
     }
     TextureManager &textureManager() override { return textures; }
     float renderScale() const noexcept override { return 1.f; }
+    const std::vector<std::uint8_t> &pixels(const Image &image) const {
+        for (const auto &[id, bytes] : textures.images)
+            if (id == image.textureId())
+                return bytes;
+        std::abort();
+    }
 
   private:
     CpuTextureUploadSink textures;
@@ -275,6 +299,305 @@ void spellingControls(blast::Model &model, blast::Dialogs &dialogs, InputDispatc
     assert(model.settings.spellcheckLanguage == "auto");
 }
 
+void settingsTreeControls() {
+    using namespace blast;
+    Model model;
+    model.firstRun = false;
+    model.settings.bindings = defaultBindings();
+    model.settings.bindings["custom-action"] = "";
+    model.settings.cues["mention"] = {true, .5f, 1.f};
+    model.identities.push_back({"tree", "TreeNick", "treeuser", "Tree User", {}, {}, {}});
+    ServerConfig server;
+    server.name = "Tree network";
+    server.identity = "tree";
+    model.servers.push_back(server);
+    Theme theme;
+    theme.update(model);
+    PangoRenderer renderer;
+    InputDispatcher dispatcher;
+    Dialogs dialogs(model, [](std::string) {});
+    dispatcher.setSceneRoot(&dialogs);
+    dialogs.setInputDispatcher(dispatcher);
+    dialogs.open("settings");
+    const auto frame = [&](bool compact = false) {
+        dialogs.sync(compact ? 620 : 1200, 900, 1);
+        dialogs.layout(renderer);
+    };
+    frame(true);
+    auto *pickerArea = keyed(dialogs, "blastirc.settings.location");
+    auto *picker = dynamic_cast<Select *>(pickerArea->parent());
+    assert(picker);
+    frame();
+    auto *nav = keyed(dialogs, "blastirc.settings.categories");
+    const auto key = [&](std::uint32_t sym) {
+        dispatcher.setFocus(nav);
+        dispatcher.keyEvent(sym, 0, 0, true);
+        frame();
+    };
+    const std::array<std::vector<std::string>, 7> leaves{{
+        {"appearance.theme", "appearance.fonts", "appearance.spellcheck", "appearance.cursor",
+         "appearance.messages", "appearance.previews", "appearance.navigation"},
+        {"keyboard.messaging", "keyboard.cursor", "keyboard.editing", "keyboard.navigation",
+         "keyboard.other"},
+        {"chat.uploads", "chat.typing", "chat.people", "chat.colors", "chat.history"},
+        {"effects.general", "effects.sending", "effects.receiving", "effects.physics"},
+        {"sounds.playback", "sounds.cues"},
+        {"networks.saved", "networks.endpoint", "networks.authentication", "networks.identity",
+         "networks.channels", "networks.actions"},
+        {"identities.saved", "identities.profile"},
+    }};
+    for (std::size_t category = 0; category < leaves.size(); ++category) {
+        picker->setSelectedIndex(category);
+        frame();
+        key(XKB_KEY_Left);
+        assert(!find<InputArea>(dialogs, [&](const InputArea &area) {
+            return area.tabFocusKey() == "blastirc.settings.section." + leaves[category].front();
+        }));
+        key(XKB_KEY_Right);
+        for (const auto &id : leaves[category]) {
+            auto *area = keyed(dialogs, "blastirc.settings.section." + id);
+            auto *choice = dynamic_cast<Button *>(area->parent());
+            assert(choice);
+            press(dispatcher, *choice);
+            frame();
+            assert(choice->foregroundColor() == ::palette.onPrimary);
+            auto *root = dynamic_cast<Button *>(
+                keyed(dialogs, "blastirc.settings.category." + std::to_string(category))->parent());
+            assert(root && root->foregroundColor() == ::palette.onSurface);
+            const auto compactSelection = picker->selectedIndex();
+            assert(compactSelection >= 7 && dispatcher.focusedArea() == nav);
+            frame(true);
+            assert(picker->selectedIndex() == compactSelection &&
+                   dispatcher.focusedArea() == pickerArea);
+            frame();
+            assert(dispatcher.focusedArea() == nav);
+            key(XKB_KEY_Left);
+            assert(picker->selectedIndex() == category);
+        }
+    }
+    // Keyboard movement follows only visible entries and keeps the roving host as one Tab stop.
+    key(XKB_KEY_Home);
+    key(XKB_KEY_Left);
+    key(XKB_KEY_Down);
+    assert(picker->selectedIndex() == 1);
+    key(XKB_KEY_Right);
+    key(XKB_KEY_Right);
+    assert(picker->selectedIndex() >= 7);
+    key(XKB_KEY_Left);
+    assert(picker->selectedIndex() == 1);
+    key(XKB_KEY_Return);
+    key(XKB_KEY_End);
+    assert(dynamic_cast<Button *>(
+               keyed(dialogs, "blastirc.settings.section.identities.profile")->parent())
+               ->foregroundColor() == ::palette.onPrimary);
+
+    // Conditional controls retain their leaf and refresh the search index after rebuilds.
+    picker->setSelectedIndex(2);
+    frame();
+    key(XKB_KEY_Right);
+    press(dispatcher, *dynamic_cast<Button *>(
+                          keyed(dialogs, "blastirc.settings.section.chat.uploads")->parent()));
+    named<Select>(dialogs, "Default file host")
+        ->setSelectedIndex(std::size_t(UploadProvider::Custom));
+    frame();
+    assert(
+        dynamic_cast<Button *>(keyed(dialogs, "blastirc.settings.section.chat.uploads")->parent())
+            ->foregroundColor() == ::palette.onPrimary);
+    auto *conditionalQuery = named<Input>(dialogs, "Search settings");
+    edit(dispatcher, *conditionalQuery, "Custom HTTPS endpoint");
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    frame();
+    assert(named<Input>(dialogs, "Custom HTTPS endpoint") &&
+           dispatcher.focusedArea() == conditionalQuery->inputArea());
+    named<Select>(dialogs, "Default file host")
+        ->setSelectedIndex(std::size_t(UploadProvider::Litterbox));
+    frame();
+    edit(dispatcher, *conditionalQuery, "Custom HTTPS endpoint");
+    named<Select>(dialogs, "Matching settings")->setSelectedIndex(0);
+    assert(named<Select>(dialogs, "Matching settings")->selectedText().empty());
+    named<Select>(dialogs, "Default file host")
+        ->setSelectedIndex(std::size_t(UploadProvider::Soju));
+    frame();
+
+    // Managed children remove direct-network leaves; selection falls back to their root.
+    picker->setSelectedIndex(5);
+    frame();
+    press(dispatcher, *button(dialogs, "Add soju account"));
+    frame();
+    const auto accountIndex = model.servers.size() - 1;
+    const auto accountName = model.servers.back().name;
+    key(XKB_KEY_Right);
+    assert(keyed(dialogs, "blastirc.settings.section.networks.remote"));
+    press(dispatcher, *button(dialogs, "Add network"));
+    frame();
+    model.servers.back().sojuParent = accountName;
+    model.servers.back().sojuNetworkId = "tree-child";
+    auto *networks = named<Select>(dialogs, "Network");
+    networks->setSelectedIndex(0);
+    frame();
+    networks = named<Select>(dialogs, "Network");
+    press(dispatcher, *dynamic_cast<Button *>(
+                          keyed(dialogs, "blastirc.settings.section.networks.endpoint")->parent()));
+    networks->setSelectedIndex(model.servers.size() - 1);
+    frame();
+    assert(picker->selectedIndex() == 5 && named<Toggle>(dialogs, "Attach this network locally"));
+    assert(!find<InputArea>(dialogs, [](const InputArea &area) {
+        return area.tabFocusKey() == "blastirc.settings.section.networks.endpoint";
+    }));
+    named<Select>(dialogs, "Network")->setSelectedIndex(accountIndex);
+    frame();
+    // Keep the rest of this isolated fixture on its original direct profile.
+    model.servers.resize(1);
+    named<Select>(dialogs, "Network")->setSelectedIndex(0);
+    frame();
+
+    picker->setSelectedIndex(0);
+    frame();
+    constexpr std::array avatarIds{"sprite", "monogram", "initials", "none"};
+    for (std::size_t i = 0; i < avatarIds.size(); ++i) {
+        named<Select>(dialogs, "Avatar style")->setSelectedIndex(i);
+        assert(model.settings.avatarStyle == avatarIds[i]);
+    }
+    named<Select>(dialogs, "Avatar style")->setSelectedIndex(0);
+    constexpr std::array paletteIds{"THEME", "CLASSIC", "VIVID"};
+    for (std::size_t i = 0; i < paletteIds.size(); ++i) {
+        named<Select>(dialogs, "Nick palette")->setSelectedIndex(i);
+        assert(model.settings.nickPalette == paletteIds[i]);
+    }
+    picker->setSelectedIndex(4);
+    frame();
+    constexpr std::array pitchIds{"natural", "musical", "fixed"};
+    for (std::size_t i = 0; i < pitchIds.size(); ++i) {
+        named<Select>(dialogs, "Pitch variation")->setSelectedIndex(i);
+        assert(model.settings.pitchVariation == pitchIds[i]);
+    }
+    picker->setSelectedIndex(0);
+    frame();
+    auto *themeScale = named<Slider>(dialogs, "Interface scale");
+    auto *query = named<Input>(dialogs, "Search settings");
+    edit(dispatcher, *query, "UI font family");
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    frame();
+    assert(dispatcher.focusedArea() == query->inputArea());
+    assert(named<Input>(dialogs, "UI font family"));
+    assert(!find<Slider>(dialogs, [&](const Slider &control) { return &control == themeScale; }));
+    auto *results = named<Select>(dialogs, "Matching settings");
+    auto *resultsGroup = results->parent();
+    assert(resultsGroup->visible() && resultsGroup->participatesInLayout() &&
+           dispatcher.firstTabFocusUnder(resultsGroup));
+    edit(dispatcher, *query, "");
+    frame();
+    assert(!resultsGroup->visible() && !resultsGroup->participatesInLayout() &&
+           !dispatcher.firstTabFocusUnder(resultsGroup));
+    edit(dispatcher, *query, "retention");
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    frame();
+    assert(resultsGroup->visible() && resultsGroup->participatesInLayout() &&
+           dispatcher.firstTabFocusUnder(resultsGroup));
+    auto *retention = named<Input>(dialogs, "Retention days (1–3650)");
+    const auto lastValid = model.settings.retentionDays;
+    edit(dispatcher, *retention, "not-a-number");
+    picker->setSelectedIndex(0);
+    frame();
+    model.actions.clear();
+    press(dispatcher, *button(dialogs, "Save now"));
+    assert(model.actions.empty() && retention->invalid() &&
+           model.settings.retentionDays == lastValid);
+    edit(dispatcher, *query, "retention");
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    frame();
+    assert(named<Input>(dialogs, "Retention days (1–3650)") == retention &&
+           retention->value() == "not-a-number");
+    edit(dispatcher, *retention, "42");
+    assert(model.settings.retentionDays == 42 && !retention->invalid());
+    press(dispatcher, *button(dialogs, "Save now"));
+    assert(model.actions.size() == 1 && model.actions.back().type == "save");
+    dialogs.dismiss();
+    assert(model.settings.retentionDays == 42); // Close is not Undo.
+}
+
+void settingsTreeAnimatedSelection() {
+    using namespace blast;
+    auto &motion = MotionService::instance();
+    const bool priorEnabled = motion.enabled();
+    const float priorSpeed = motion.speed();
+    Model model;
+    model.firstRun = false;
+    model.settings.fx = FxLevel::Full;
+    model.settings.reducedMotion = false;
+    Theme theme;
+    theme.update(model);
+    motion.setSpeed(1);
+    AnimationManager animations;
+    PangoRenderer renderer;
+    InputDispatcher dispatcher;
+    Dialogs dialogs(model, [](std::string) {});
+    dialogs.setAnimationManager(&animations);
+    dispatcher.setSceneRoot(&dialogs);
+    dialogs.setInputDispatcher(dispatcher);
+    dialogs.open("settings");
+    const auto frame = [&] {
+        dialogs.sync(1200, 900, 1);
+        dialogs.layout(renderer);
+    };
+    frame();
+    auto *nav = keyed(dialogs, "blastirc.settings.categories");
+    auto *root = dynamic_cast<Button *>(keyed(dialogs, "blastirc.settings.category.0")->parent());
+    auto *fonts = dynamic_cast<Button *>(
+        keyed(dialogs, "blastirc.settings.section.appearance.fonts")->parent());
+    assert(root && fonts && motion.enabled());
+    const auto renderedColor = [](Color color) {
+        return std::array{std::lround(color.r * 255), std::lround(color.g * 255),
+                          std::lround(color.b * 255), std::lround(color.a * 255)};
+    };
+    const auto settle = [&] {
+        // Native animations advance from wall time, not the tick's delta argument.
+        std::this_thread::sleep_for(std::chrono::milliseconds(Style::animFast + 10));
+        animations.tick(0);
+        frame();
+    };
+    const auto fontsSelected = [&] {
+        assert(dispatcher.focusedArea() == nav);
+        assert(renderedColor(fonts->foregroundColor()) == renderedColor(::palette.onPrimary));
+        assert(renderedColor(root->foregroundColor()) != renderedColor(::palette.onPrimary));
+    };
+    const auto key = [&](std::uint32_t sym) {
+        dispatcher.keyEvent(sym, 0, 0, true);
+        dispatcher.keyEvent(sym, 0, 0, false);
+        frame();
+    };
+    dispatcher.setFocus(nav);
+    key(XKB_KEY_Right); // Theme & size.
+    key(XKB_KEY_Down);  // Fonts, before the previous transition completes.
+    assert(animations.hasActive());
+    settle();
+    fontsSelected();
+
+    // Leave the pointer over the parent while keyboard focus and selection move to its leaf.
+    float x = 0, y = 0;
+    Node::mapToScene(root->inputArea(), root->width() / 4, root->height() / 2, x, y);
+    dispatcher.pointerEnter(x, y, 1);
+    assert(dispatcher.pointerButton(x, y, BTN_LEFT, true, 2, 20, false));
+    assert(dispatcher.pointerButton(x, y, BTN_LEFT, false, 3, 30, false));
+    frame();
+    settle();
+    assert(renderedColor(root->foregroundColor()) == renderedColor(::palette.onPrimary));
+    key(XKB_KEY_Right);
+    key(XKB_KEY_Down);
+    settle();
+    fontsSelected();
+
+    motion.setEnabled(false);
+    key(XKB_KEY_Left);
+    key(XKB_KEY_Right);
+    key(XKB_KEY_Down);
+    fontsSelected();
+    animations.tick(0);
+    dialogs.setAnimationManager(nullptr);
+    motion.setSpeed(priorSpeed);
+    motion.setEnabled(priorEnabled);
+}
+
 void bindingGeometryControls() {
     using namespace blast;
     PangoRenderer renderer;
@@ -301,8 +624,9 @@ void bindingGeometryControls() {
         assert(families[0] != families[1]);
     }
 
-    constexpr std::array commands{"complete", "newline", "backward-delete", "backward-kill-word",
-                                  "switch-buffer"};
+    constexpr std::array commands{"complete",           "newline",       "backward-delete",
+                                  "backward-kill-word", "switch-buffer", "beginning-of-buffer",
+                                  "end-of-buffer"};
     struct Bounds {
         float x, y, width, height;
     };
@@ -349,6 +673,26 @@ void bindingGeometryControls() {
                 std::array<std::array<Bounds, 3>, commands.size()> rows;
                 for (std::size_t index = 0; index < commands.size(); ++index) {
                     const std::string command = commands[index];
+                    if (command == "beginning-of-buffer" || command == "end-of-buffer") {
+                        auto *binding = keyed(dialogs, "blastirc.settings.binding." + command);
+                        bool navigation = false;
+                        for (auto *node = binding->parent(); node; node = node->parent()) {
+                            const auto *heading = find<Label>(*node, [](const Label &label) {
+                                return label.text() == "Navigation" ||
+                                       label.text() == "Cursor movement";
+                            });
+                            if (heading) {
+                                navigation = heading->text() == "Navigation";
+                                break;
+                            }
+                        }
+                        assert(navigation);
+                        assert(find<Label>(dialogs, [&](const Label &label) {
+                            return label.text() == (command == "beginning-of-buffer"
+                                                        ? "Beginning of messages"
+                                                        : "End of messages");
+                        }));
+                    }
                     rows[index] = {bounds(*keyed(dialogs, "blastirc.settings.binding." + command)),
                                    bounds(*keyed(dialogs, "blastirc.settings.record." + command)),
                                    bounds(*keyed(dialogs, "blastirc.settings.reset." + command))};
@@ -456,6 +800,8 @@ void whoisProfileControls() {
     using namespace blast;
     Model model;
     model.firstRun = false;
+    codecs::installImageDecoder();
+    PangoRenderer renderer;
     model.buffers["conversation"].draft = "unsent 猫 draft";
     Theme theme;
     theme.update(model);
@@ -488,6 +834,10 @@ void whoisProfileControls() {
     assert(composer->composing());
     const auto composingState = composer->editingState();
     const auto sync = [&] { dialogs->sync(720, 480, 1); };
+    const auto layout = [&] {
+        sync();
+        dialogs->layout(renderer);
+    };
     auto &profile = model.whoisProfile;
     profile.requestId = "request-one";
     profile.server = "network";
@@ -571,10 +921,21 @@ void whoisProfileControls() {
     profile.records[0].signon = alice.signon;
     ++profile.revision;
     sync();
-    assert(find<Label>(*dialogs, [&](const Label &candidate) {
-        return candidate.text() == nativeAvatarInitials(alice.nick) &&
-               candidate.color() == nickColor(model, alice.nick, profile.server);
-    }));
+    layout();
+    auto *aliceAvatar = find<Image>(*dialogs, [](const Image &) { return true; });
+    assert(aliceAvatar && aliceAvatar->hasImage());
+    const auto expectAvatar = [&](const Image &image, std::string_view nick,
+                                  std::string_view mapping) {
+        assert(image.width() == 40 && image.height() == 40);
+        std::array<std::uint8_t, foundryAtlas::tileSize * foundryAtlas::tileSize * 4> expected{};
+        assert(composeFoundryAvatar(expected, nick, mapping));
+        assert(renderer.pixels(image) ==
+               std::vector<std::uint8_t>(expected.begin(), expected.end()));
+    };
+    expectAvatar(*aliceAvatar, alice.nick, "rfc1459");
+    const auto firstTexture = aliceAvatar->textureId();
+    layout();
+    assert(aliceAvatar->textureId() == firstTexture);
     assert(find<Label>(*dialogs, [&](const Label &candidate) {
         return candidate.text() == alice.nick && candidate.font().weight == FontWeight::Bold &&
                candidate.color() == nickColor(model, alice.nick, profile.server);
@@ -610,6 +971,49 @@ void whoisProfileControls() {
     assert(!find<Input>(*dialogs, [](const Input &candidate) {
         return candidate.inputArea()->tabFocusKey() == "blastirc.whois.loading";
     }));
+    layout();
+    auto *bobAvatar =
+        find<Image>(*dialogs, [&](const Image &image) { return &image != aliceAvatar; });
+    assert(bobAvatar && bobAvatar->hasImage());
+    expectAvatar(*bobAvatar, bob.nick, "rfc1459");
+    // Source-network mapping and record identity change without a WHOIS revision.
+    profile.records[0].nick = "[Alice^]";
+    model.networks[profile.server].caseMapping = "ascii";
+    model.networks[alice.server].caseMapping = "rfc1459";
+    layout();
+    expectAvatar(*aliceAvatar, "[Alice^]", "ascii");
+    const auto asciiPixels = renderer.pixels(*aliceAvatar);
+    model.networks[profile.server].caseMapping = "strict-rfc1459";
+    layout();
+    expectAvatar(*aliceAvatar, "[Alice^]", "strict-rfc1459");
+    assert(renderer.pixels(*aliceAvatar) != asciiPixels);
+    model.settings.avatarStyle = "monogram";
+    layout();
+    assert(!aliceAvatar->visible() && aliceAvatar->parent()->visible());
+    assert(find<Label>(*aliceAvatar->parent(), [](const Label &label) {
+        return label.text() == nativeAvatarInitials("[Alice^]");
+    }));
+    model.settings.avatarStyle = "initials";
+    layout();
+    assert(!aliceAvatar->visible() && aliceAvatar->parent()->participatesInLayout());
+    model.settings.avatarStyle = "none";
+    layout();
+    assert(!aliceAvatar->parent()->visible() && !aliceAvatar->parent()->participatesInLayout());
+    model.settings.avatarStyle = "sprite";
+    model.settings.avatars = false;
+    layout();
+    assert(!aliceAvatar->parent()->visible() && !aliceAvatar->parent()->participatesInLayout());
+    model.settings.avatars = true;
+    layout();
+    assert(aliceAvatar->visible() && aliceAvatar->hasImage());
+    expectAvatar(*aliceAvatar, "[Alice^]", "strict-rfc1459");
+    dialogs->rebindRenderer(renderer);
+    dialogs->invalidateGpuResources(renderer, 1);
+    layout();
+    assert(aliceAvatar->hasImage());
+    expectAvatar(*aliceAvatar, "[Alice^]", "strict-rfc1459");
+    assert(field(0, "host") == host && dispatcher.focusedArea() == host->inputArea() &&
+           host->editingStateMatches(selection));
     profile.error = "Server ended the request early";
     ++profile.revision;
     sync();
@@ -622,6 +1026,10 @@ void whoisProfileControls() {
     ++profile.revision;
     sync();
     assert(field(0, "nick")->value() == bob.nick && field(0, "host")->value() == bob.host);
+    layout();
+    auto *replacementAvatar = find<Image>(*dialogs, [](const Image &) { return true; });
+    assert(replacementAvatar && replacementAvatar->hasImage());
+    expectAvatar(*replacementAvatar, bob.nick, "strict-rfc1459");
     assert(dialogs->handleKey(stroke(XKB_KEY_Escape)));
     assert(!profile.open && !profile.loading && !dialogs->active());
     sync();
@@ -662,10 +1070,97 @@ void whoisProfileControls() {
     Input::setTextClipboard(previousClipboard);
 }
 
+void nativePopupFonts() {
+    class MenuHost final : public SelectPopupContext {
+      public:
+        DropdownRequest request;
+        DropdownCallbacks callbacks;
+        void openSelectDropdown(const DropdownRequest &value, DropdownCallbacks handlers) override {
+            request = value;
+            callbacks = std::move(handlers);
+        }
+        void closeSelectDropdown() override {
+            auto dismiss = std::move(callbacks.onDismiss);
+            callbacks = {};
+            if (dismiss)
+                dismiss();
+        }
+        bool isSelectDropdownOpen() const override { return bool(callbacks.onDismiss); }
+    } host;
+    PangoRenderer renderer;
+    Select select;
+    select.setOptions({"Wide popup option WWWWWiiii"});
+    select.setPopupContext(&host);
+    auto *trigger = find<Label>(select, [](const Label &) { return true; });
+    assert(trigger);
+    InputDispatcher dispatcher;
+    dispatcher.setSceneRoot(&select);
+    ContextMenuControl menu;
+    menu.setMenuWidth(600);
+    std::vector<ContextMenuControlEntry> entries(4);
+    entries[0].label = "Wide popup option WWWWWiiii";
+    entries[0].icon = "settings";
+    entries[1].label = "Disabled";
+    entries[1].enabled = false;
+    entries[2].label = "Heading";
+    entries[2].header = true;
+    entries[3].label = "Preview";
+    entries[3].markupPreview = "<b>Bold</b> preview";
+    menu.setEntries(entries);
+    char32_t iconCodepoint = 0;
+    for (const char *family : {"", "serif", "monospace"}) {
+        for (const int weight : {300, 400, 500, 600, 700, 400}) {
+            const TextFont font{static_cast<FontWeight>(weight), family, "tnum"};
+            trigger->setFontFamily(font.family);
+            trigger->setFontFeatures(font.features);
+            trigger->setFontWeight(font.weight);
+            select.layout(renderer);
+            const float x = select.width() / 2, y = select.height() / 2;
+            dispatcher.pointerEnter(x, y, 1);
+            assert(dispatcher.pointerButton(x, y, BTN_LEFT, true, 2, 20, false));
+            assert(dispatcher.pointerButton(x, y, BTN_LEFT, false, 3, 30, false));
+            assert(host.isSelectDropdownOpen() && host.request.font == font);
+            menu.setFont(host.request.font);
+            menu.layout(renderer);
+            for (const auto &entry : entries) {
+                auto expected = font;
+                if (entry.header)
+                    expected.weight = FontWeight::Bold;
+                const auto &text = entry.markupPreview.empty() ? entry.label : entry.markupPreview;
+                const auto *label =
+                    find<Label>(menu, [&](const Label &value) { return value.text() == text; });
+                assert(label && label->font() == expected);
+                auto measuredEntry = entry;
+                measuredEntry.icon.clear();
+                constexpr float scale = 1.25f;
+                const float expectedWidth =
+                    std::ceil(renderer
+                                  .measureText(text, Style::fontSizeCaption * scale, expected, 0, 1,
+                                               TextAlign::Start, entry.ellipsize,
+                                               !entry.markupPreview.empty())
+                                  .width) +
+                    28 * scale;
+                assert(ContextMenuControl::preferredWidth(renderer, {measuredEntry}, scale, false,
+                                                          font) == expectedWidth);
+            }
+            const auto *icon = find<GlyphNode>(menu, [](const GlyphNode &) { return true; });
+            assert(icon && icon->codepoint() != 0);
+            if (iconCodepoint)
+                assert(icon->codepoint() == iconCodepoint);
+            iconCodepoint = icon->codepoint();
+            host.closeSelectDropdown();
+        }
+    }
+    dispatcher.setSceneRoot(nullptr);
+}
+
 } // namespace
 
 void runSettingsCheck() {
     using namespace blast;
+    nativePopupFonts();
+    settingsTreeControls();
+    settingsTreeAnimatedSelection();
     bindingGeometryControls();
     bindingSearchRevealGeometry();
     Application app;
@@ -719,6 +1214,15 @@ void runSettingsCheck() {
     results->setSelectedIndex(0);
     sync();
     assert(named<Input>(dialogs, "UI font family"));
+    for (const char *name : {"UI font weight", "Message font weight"}) {
+        edit(dispatcher, *settingsQuery, name);
+        auto *matches = named<Select>(dialogs, "Matching settings");
+        matches->setSelectedIndex(0);
+        assert(matches->selectedText().find(name) != std::string::npos);
+        dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+        sync();
+        assert(named<Select>(dialogs, name));
+    }
     edit(dispatcher, *settingsQuery, "msg txt scl");
     named<Select>(dialogs, "Matching settings")->setSelectedIndex(0);
     assert(named<Select>(dialogs, "Matching settings")->selectedText().find("Message text scale") !=
@@ -818,6 +1322,38 @@ void runSettingsCheck() {
     assert(model.settings.cursorShape == "box" && model.settings.cursorEffect == "trail");
     assert(model.settings.cursorTrailDurationMs == 222 &&
            std::abs(model.settings.cursorTrailStrength - .31f) < .001f);
+    auto *uiWeight = named<Select>(dialogs, "UI font weight");
+    auto *messageWeight = named<Select>(dialogs, "Message font weight");
+    assert(uiWeight && messageWeight && uiWeight->selectedText() == "400" &&
+           messageWeight->selectedText() == "400");
+    for (std::size_t index = 0; index < 5; ++index) {
+        uiWeight->setSelectedIndex(index);
+        assert(model.settings.uiFontWeight == 300 + int(index) * 100 &&
+               model.settings.messageFontWeight == 400);
+        theme.update(model);
+        sync();
+    }
+    auto *ordinary = find<Label>(
+        dialogs, [](const Label &caption) { return caption.text() == "UI font weight"; });
+    auto *heading =
+        find<Label>(dialogs, [](const Label &caption) { return caption.text() == "Fonts"; });
+    // The category tree is hidden in this fixture's compact presentation.
+    // Exercise its explicit heading weight in the actual wide presentation.
+    dialogs.sync(1200, 900, 1);
+    auto *categoryRoot =
+        dynamic_cast<Button *>(keyed(dialogs, "blastirc.settings.category.0")->parent());
+    assert(ordinary && heading && categoryRoot);
+    assert(static_cast<int>(ordinary->font().weight) == 700);
+    uiWeight->setSelectedIndex(1);
+    messageWeight->setSelectedIndex(3);
+    theme.update(model);
+    sync();
+    dialogs.sync(1200, 900, 1);
+    assert(model.settings.uiFontWeight == 400 && model.settings.messageFontWeight == 600);
+    assert(static_cast<int>(ordinary->font().weight) == 400 &&
+           heading->font().weight == FontWeight::Bold &&
+           categoryRoot->label()->font().weight == FontWeight::Bold);
+    sync();
     auto *uiFamily = named<Input>(dialogs, "UI font family");
     auto *messageFamily = named<Input>(dialogs, "Message font family");
     const auto beforeUiFamily = model.settings.uiFont;
@@ -850,6 +1386,8 @@ void runSettingsCheck() {
     assert(model.settings.uiFont == "serif" &&
            named<Input>(dialogs, "UI font family")->value() == "serif" &&
            model.settings.messageFont == "monospace");
+    assert(named<Select>(dialogs, "UI font weight")->selectedText() == "400" &&
+           named<Select>(dialogs, "Message font weight")->selectedText() == "600");
 
     category(1);
     auto *record = keyed(dialogs, "blastirc.settings.record.complete");
@@ -1111,6 +1649,7 @@ void runSettingsCheck() {
            loaded.settings.previewMediaMaxSeconds == model.settings.previewMediaMaxSeconds);
     assert(loaded.settings.previewAllowLocal == model.settings.previewAllowLocal);
     assert(loaded.settings.uiFont == "serif" && loaded.settings.messageFont == "monospace");
+    assert(loaded.settings.uiFontWeight == 400 && loaded.settings.messageFontWeight == 600);
     assert(loaded.identities[0].nick == "RenamedNick" &&
            loaded.identities[1].nick == "OnlyOtherNick" &&
            loaded.servers[0].identity == "shared-renamed" &&
@@ -1226,6 +1765,28 @@ void runSettingsCheck() {
     const auto remoteCaption = catalog.sojuNetworks.at("remote-42").attributes.at("name");
     assert(named<Select>(dialogs, "Network")->selectedText() == remoteCaption &&
            model.servers.back().name == child.name);
+    const auto childIndex = model.servers.size() - 1;
+    const auto discoveredRemote = catalog.sojuNetworks.at("remote-42");
+    catalog.sojuNetworks.erase("remote-42");
+    sync();
+    assert(named<Select>(dialogs, "Network")->selectedText() == "Network" &&
+           named<Select>(dialogs, "Network")->selectedIndex() == childIndex &&
+           model.servers[childIndex].name == child.name);
+    catalog.sojuNetworks["remote-42"] = discoveredRemote;
+    sync();
+    assert(named<Select>(dialogs, "Network")->selectedText() == remoteCaption &&
+           named<Select>(dialogs, "Network")->selectedIndex() == childIndex);
+    catalog.sojuNetworks["remote-42"].attributes["name"] = "Live renamed network";
+    sync();
+    assert(named<Select>(dialogs, "Network")->selectedText() == "Live renamed network" &&
+           named<Select>(dialogs, "Network")->selectedIndex() == childIndex);
+    model.servers[childIndex].alias = "My personal network";
+    catalog.sojuNetworks["remote-42"].attributes["name"] = "Another catalog rename";
+    sync();
+    assert(named<Select>(dialogs, "Network")->selectedText() == "My personal network" &&
+           named<Select>(dialogs, "Network")->selectedIndex() == childIndex);
+    model.servers[childIndex].alias.clear();
+    catalog.sojuNetworks["remote-42"] = discoveredRemote;
     dialogs.open("edit-soju-network:" + child.name);
     sync();
     assert(named<Input>(dialogs, "Remote host")->value() == "irc.example" &&
@@ -1404,6 +1965,41 @@ void runSettingsCheck() {
     sync();
     assert(named<Select>(dialogs, "Network")->selectedText() == "Personal downstream alias" &&
            model.servers.back().name == captionChildB.name);
+    const auto previousActiveBuffer = model.activeBuffer;
+    const std::string topicId = captionChildB.name + "/#caption-topic";
+    auto &topicBuffer = model.buffers[topicId];
+    topicBuffer.server = captionChildB.name;
+    topicBuffer.target = "#caption-topic";
+    topicBuffer.kind = "channel";
+    topicBuffer.joined = true;
+    model.activeBuffer = topicId;
+    dialogs.open("topic");
+    sync();
+    auto *liveTopicTitle = find<Label>(dialogs, [](const Label &label) {
+        return label.text() == "#caption-topic · Personal downstream alias";
+    });
+    assert(liveTopicTitle);
+    model.servers.back().alias.clear();
+    sync();
+    assert(liveTopicTitle->text() == "#caption-topic · Renamed downstream");
+    model.networks[legacy.name].sojuNetworks[captionChildB.sojuNetworkId].attributes["name"] =
+        "Topic catalog rename";
+    sync();
+    assert(liveTopicTitle->text() == "#caption-topic · Topic catalog rename" &&
+           model.activeBuffer == topicId);
+    topicBuffer.kind = "server";
+    topicBuffer.target = captionChildB.name;
+    sync();
+    assert(liveTopicTitle->text() == "Server log · Topic catalog rename");
+    dialogs.open("topic");
+    sync();
+    assert(find<Label>(dialogs, [](const Label &label) {
+        return label.text() == "Server log · Topic catalog rename";
+    }));
+    model.servers.back().alias = "Personal downstream alias";
+    model.activeBuffer = previousActiveBuffer;
+    dialogs.open("server:" + captionChildB.name);
+    model.buffers.erase(topicId);
     // A literal alias may equal a generated disambiguation caption: identity is still index/key.
     ServerConfig captionChildC = captionChildA;
     captionChildC.name = "opaque-child-key-C";
@@ -1411,10 +2007,23 @@ void runSettingsCheck() {
     model.servers.push_back(captionChildC);
     model.networks[account.name].sojuNetworks[captionChildC.sojuNetworkId] = {
         captionChildC.sojuNetworkId, {{"name", remoteCaption}}};
+    dialogs.open("server:" + captionChildA.name);
+    sync();
+    assert(named<Select>(dialogs, "Network")->selectedText() ==
+           remoteCaption + " · " + account.alias + " (1)");
+    activate(dispatcher, *named<Toggle>(dialogs, "Attach this network locally"));
+    assert(model.actions.back().buffer == captionChildA.name);
+    named<Select>(dialogs, "Network")->setSelectedIndex(model.servers.size() - 1);
+    sync();
+    assert(named<Select>(dialogs, "Network")->selectedText() ==
+               remoteCaption + " · " + account.alias + " (2)" &&
+           named<Select>(dialogs, "Network")->selectedIndex() == model.servers.size() - 1);
+    activate(dispatcher, *named<Toggle>(dialogs, "Attach this network locally"));
+    assert(model.actions.back().buffer == captionChildC.name);
     ServerConfig literalCaption;
     literalCaption.name = "Literal caption profile";
     literalCaption.identity = model.identities.front().name;
-    literalCaption.alias = remoteCaption + " · " + account.alias + " [" + captionChildA.name + "]";
+    literalCaption.alias = remoteCaption + " · " + account.alias + " (1)";
     model.servers.push_back(literalCaption);
     dialogs.open("server:" + literalCaption.name);
     sync();

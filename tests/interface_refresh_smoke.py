@@ -4,6 +4,9 @@
 Run inside nix develop: python tests/interface_refresh_smoke.py BINARY --scope NAME.
 Each scope owns a fresh private compositor/profile; no desktop or production profile
 is reused. BLASTIRC_SMOKE_SCREENSHOT selects the artifact basename.
+The startup-history-sync scope holds genuine private Ergo history on the wire;
+it records cached-chat, pending-header, and released-history native evidence.
+The jump-bottom scope proves the zero-arrival native FAB click and resumed following.
 """
 import argparse
 import json
@@ -158,14 +161,16 @@ def run_smart_presence(ctx):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, add_help=False)
     parser.add_argument("--scope", required=True,
-                        choices=("badges", "typing", "fools", "transcript", "incoming", "uploads", "media",
+                        choices=("badges", "typing", "typing-bubble", "fools", "transcript", "incoming", "uploads", "media",
                                  "notifications", "commands", "replies", "chat-controls", "irc-polish",
                                  "spelling", "unread-divider", "smart-presence", "activity-blur",
-                                 "settings-refinements", "transcript-refinements", "topic-refinements",
+                                 "settings-tree", "settings-refinements", "transcript-refinements", "topic-refinements",
                                  "nick-popup", "whois-profile", "messaging-refinements",
                                  "cursor-affordances", "composer-affordances", "overlay-refinements",
                                  "activity-pins", "input-routing", "logo-alignment",
-                                 "minimum-height", "message-links", "typing-focus"))
+                                 "minimum-height", "message-links", "typing-focus", "mentions-unread",
+                                 "startup-history-sync", "jump-bottom", "buffer-boundaries",
+                                 "conversation-history", "soju-search-context"))
     options, remaining = parser.parse_known_args()
     if any(option in remaining for option in ("--probe", "--probes", "--layout-only", "--ime-only", "--raw-only")):
         parser.error("--scope selects the focused fixture; do not combine other GUI scopes")
@@ -208,7 +213,7 @@ def main():
     # Reuse the existing owned fixture and teardown, not a second GUI harness.
     gui.run_advanced_scope = run
     sys.argv = [sys.argv[0], *remaining, "--probe", "shell"]
-    gui.run()
+    gui.run(allow_focused_geometry=options.scope == 'typing-bubble')
 
 
 """Sections for interface_refresh_smoke.py; only owned gui_smoke fixture state is used.
@@ -233,7 +238,7 @@ import gui_smoke as gui
 import upload_soju_smoke as upload
 
 
-def _refresh_restart(ctx, section, values):
+def _refresh_restart(ctx, section, values, *, focus=None):
     """Set explicit private-fixture policy, then restart the real native consumer."""
     gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
     target = Path(ctx['destination']).with_name('refresh-before-' + section + '.bmp')
@@ -256,7 +261,10 @@ def _refresh_restart(ctx, section, values):
     proc, window = gui.launch_gui(ctx['binary'], screenshot, ctx['env'], ctx['args'].size, ctx['logs'])
     ctx.update(proc=proc, window=window, screenshot=screenshot)
     gui.wait_joins(ctx['observer'], ctx['channel'], (ctx['own_nick'], ctx['other_nick']))
-    gui.switch_buffer(ctx['channel'])
+    if focus is None:
+        gui.switch_buffer(ctx['channel'])
+    else:
+        _policy_focus(ctx, focus)
     upload.focus_composer(window)
     gui._composer_native(window, '', 0, 0)
 
@@ -692,6 +700,22 @@ def _refresh_media_close(ctx):
 
 
 def run_media(ctx):
+    import os
+    import sys
+    private = Path(ctx['destination']).with_name(Path(ctx['destination']).stem + '-media-link-exec')
+    private.mkdir(mode=0o700, exist_ok=False)
+    calls = private / 'calls.jsonl'
+    opener = private / 'xdg-open'
+    opener.write_text('#!' + sys.executable + '\n'
+        'import json, os, sys\n'
+        'fd = os.open(' + repr(str(calls)) + ', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)\n'
+        'os.write(fd, (json.dumps(sys.argv[1:]) + "\\n").encode())\n'
+        'os.close(fd)\n')
+    opener.chmod(0o700)
+    previous_env = dict(ctx['env'])
+    ctx['env'] = dict(previous_env, PATH=str(private) + os.pathsep + previous_env['PATH'])
+    ctx['cleanup'].callback(lambda: ctx.update(env=previous_env))
+    expected_launches = []
     # The owned compositor runtime has no physical audio server. Decode through
     # OpenAL's null device only in this synthetic fixture, never in production.
     ctx['env'] = dict(ctx['env'], ALSOFT_DRIVERS='null')
@@ -719,6 +743,16 @@ def run_media(ctx):
                   b'<meta name="description" content="Private generic page description">'
                   b'</head><body>Owned preview page</body></html>', 'text/html'),
         '/denied': (b'<html><title>RefusedPageMustNotRender</title></html>', 'text/html', 403),
+        '/failed': (b'Owned failed metadata response', 'text/html', 500),
+        '/automatic-page': (b'<html><head><title>Owned thumbnail control</title>'
+                            b'<meta property="og:image" content="/automatic-thumbnail.png">'
+                            b'</head></html>', 'text/html'),
+        '/automatic-thumbnail.png': (image_path.read_bytes(), 'image/png'),
+        '/automatic-noimage': (b'<html><title>No thumbnail</title></html>', 'text/html'),
+        '/automatic-broken': (b'<html><head><meta property="og:image" content="/broken.png">'
+                              b'</head></html>', 'text/html'),
+        '/broken.png': (b'Not a decoded image', 'image/png'),
+        '/off-page': (b'<html>Must never be requested</html>', 'text/html'),
         '/audio.wav': (audio_path.read_bytes(), 'audio/wav'),
         '/video.mp4': (video_path.read_bytes(), 'video/mp4')}))
     window = ctx['window']
@@ -747,7 +781,7 @@ def run_media(ctx):
         ctx['observer'].send(f"PRIVMSG {ctx['channel']} :{text}")
         ctx['expected_messages'].extend(ctx['channel_messages'](text, ctx['query_target']))
         gui.wait_messages(ctx['proc'], ctx['database_path'], ctx['expected_messages'])
-        gui.command('end-of-buffer', window=window)
+        upload.focus_composer(window)
         load_rect = gui.SESSION.until('native unloaded preview card', lambda:
             upload.label_rect(window, ctx['destination'], 'Load preview'))
         # Consent sits inside the thumbnail; keep its actual center for cached
@@ -954,66 +988,104 @@ def run_media(ctx):
         evidence.append(observed)
         upload.focus_composer(window)
         gui._composer_native(window, '', 0, 0)
-    # Generic pages retain the existing quiet tile. Consent activation exposes
-    # their real metadata through selectable Info, never a fake media player.
-    for name in ('page', 'denied'):
-        before = origin.snapshot()
-        text = 'Synthetic private page ' + origin.url + '/' + name
-        _policy_send(ctx, text, target=ctx['channel'])
-        gui.command('end-of-buffer', window=window)
-        load_rect = gui.SESSION.until('native unloaded private page card',
-            lambda: upload.label_rect(window, ctx['destination'], 'Load preview'))
-        gui.framed_keys(window, 'Left', 'Right')
-        assert origin.snapshot() == before, 'Page metadata fetched before native consent'
-        upload.click_label(window, ctx['destination'], 'Load preview')
-        requests = gui.SESSION.until('private page receives actual GET',
-            lambda: origin.snapshot()[len(before):])
-        assert requests and all(path == '/' + name for path, headers in requests), requests
-        assert all(not any(key.lower() in ('authorization', 'cookie', 'proxy-authorization')
-                          for key in headers) for path, headers in requests), requests
-        if name == 'page':
-            info = gui.SESSION.until('consented HTML opens native selectable Info with original source URL',
-                lambda: state if (state := gui.native_input_state(window))
-                and state.get('text', '').splitlines()
-                and state['text'].splitlines()[0] == origin.url + '/page' else None)
-            assert 'Type: Web page' in info['text'], info
-            assert 'Native HTML Metadata' in info['text'], info
-            assert 'Private generic page description' in info['text'], info
-            info_line_bytes = len(info['text'].splitlines()[0].encode('utf-8'))
-            gui.framed_keys(window, 'ctrl+Home', 'Right', 'ctrl+e')
-            info_eol = gui._composer_native(window, info['text'], info_line_bytes, info_line_bytes)
-            gui.framed_keys(window, 'ctrl+a', 'ctrl+c')
-            gui.SESSION.until('web-page Info copies exact native metadata',
-                lambda: gui.clipboard_text() == info['text'])
-            evidence.append({'asset': 'page', 'info_copied_text': info['text'],
-                             'anonymous_requests': len(requests), 'inline_expanded_card_required': False,
-                             'readonly_info_ctrl_e_line_end': info_eol})
-            gui.framed_keys(window, 'Escape')
-            evidence[-1]['caption'] = caption('page', load_rect[1], origin.url + '/page')
-            cached_requests = origin.snapshot()
-            gui.click(window, load_rect[0] + load_rect[2] / 2, load_rect[1] + load_rect[3] / 2)
-            cached_info = gui.SESSION.until('cached honest Link tile reopens native metadata Info',
-                lambda: state if (state := gui.native_input_state(window))
-                and state.get('text') == info['text'] else None)
-            assert origin.snapshot() == cached_requests, 'Cached Link Info unnecessarily refetched origin'
-            evidence[-1]['cached_info_text'] = cached_info['text']
-            evidence[-1]['cached_without_refetch'] = True
-            gui.framed_keys(window, 'Escape')
-        else:
-            def rejected_status():
-                words = _policy_words(ctx, 'preview-real-http-403')
-                codes = [box for word, box in words if word.strip(':.,') == '403']
-                labels = [box for word, box in words if word.casefold() == 'http']
-                if not codes or not any(abs(a[1] - b[1]) <= 5 for a in codes for b in labels):
-                    return False
-                assert not any('RefusedPageMustNotRender' in word for word, _ in words), words
-                return words
-            error_words = gui.SESSION.until('HTTP rejection preserves actual 403 in native error', rejected_status)
-            evidence.append({'asset': 'denied', 'http_status': 403,
-                             'native_error_words': error_words, 'anonymous_requests': len(requests)})
-            gui.framed_keys(window, 'Escape')
+    # The original URL, not a placeholder tile, owns HTML consent and copying.
+    marker_serial = 0
+    def html_rows(value, target):
+        nonlocal marker_serial
+        marker_serial += 1
+        colors = [(40 + marker_serial * 9, 145, 83),
+                  (145, 40 + marker_serial * 9, 183),
+                  (193, 123, 40 + marker_serial * 9)]
+        def marker(index):
+            color = ''.join(f'{part:02X}' for part in colors[index])
+            return '\x04' + color + ',' + color + 'MM\x0f'
+        _policy_send(ctx, marker(0) + ' ' + value + ' ' + marker(1), target=target)
+        _policy_send(ctx, marker(2) + ' Native HTML following row', target=target)
         upload.focus_composer(window)
-        gui._composer_native(window, '', 0, 0)
+        def boxes():
+            frame = gui.native_rgb_capture(window)
+            found = [_policy_box(ctx, color, image=frame) for color in colors]
+            return found if all(found) else None
+        found = gui.SESSION.until('native HTML source and following row markers', boxes)
+        assert abs(found[0][1] - found[1][1]) <= 1, ('HTML source unexpectedly wrapped', found)
+        return colors, found
+
+    def html_boxes(colors):
+        frame = gui.native_rgb_capture(window)
+        boxes = [_policy_box(ctx, color, image=frame) for color in colors]
+        assert all(boxes), ('HTML fixture source no longer visible', boxes)
+        return boxes
+
+    def no_html_card(colors, reference_gap):
+        boxes = html_boxes(colors)
+        gap = boxes[2][1] - boxes[0][1]
+        assert abs(gap - reference_gap) <= 1, (
+            'HTML without decoded thumbnail reserved a native card/gap', reference_gap, gap, boxes)
+        return {'native_boxes': boxes, 'row_gap': gap, 'reference_row_gap': reference_gap}
+
+    def url_menu(colors, label):
+        left, right, _ = html_boxes(colors)
+        point = ((left[2] + right[0]) / 2, (left[1] + left[3]) / 2)
+        popup = gui.open_native_popup(window, lambda: (
+            gui.move_pointer(window, *point),
+            gui.POINTER.button(True, code=273), gui.POINTER.button(False, code=273)))
+        popup['evidence_capture'] = str(gui.capture_native_popup(window, popup,
+            ctx['destination'], 'html-url-menu-' + label))
+        return popup
+
+    def menu_action(popup, label):
+        # Selected native rows invert their text colors; use the existing menu
+        # order, and prove the actions through clipboard/HTTPS results, not OCR.
+        keys = {'Copy text': (), 'Load preview': ('ctrl+n',)}[label]
+        gui.popup_keys(window, popup, 'Home', *keys, 'Return', root_changed=False)
+
+    def copy_url(colors, url, label):
+        gui.seed_clipboard('native-html-copy-sentinel-' + label, ctx['cleanup'])
+        popup = url_menu(colors, label)
+        menu_action(popup, 'Copy text')
+        gui.SESSION.until('native message copy retains exact original HTML URL bytes',
+            lambda: [word.encode('utf-8') for word in gui.clipboard_text().split()
+                     if word.startswith('https://')] == [url.encode('utf-8')])
+        left, right, _ = html_boxes(colors)
+        gui.click(window, (left[2] + right[0]) / 2, (left[1] + left[3]) / 2)
+        expected_launches.append([url])
+        gui.SESSION.until('original HTML URL reaches actual private xdg-open boundary',
+            lambda: calls.exists() and [json.loads(line) for line in calls.read_text().splitlines()]
+            == expected_launches)
+        return {'copied_source_contains_original_url': url, 'opened_original_url': url,
+                'native_menu_capture': popup['evidence_capture']}
+
+    _, reference = html_rows('Native HTML plain reference', ctx['channel'])
+    reference_gap = reference[2][1] - reference[0][1]
+    for name in ('page', 'denied', 'failed'):
+        before = origin.snapshot()
+        url = origin.url + '/' + name
+        colors, _ = html_rows(url, ctx['channel'])
+        observed = {'asset': name, 'mode': 'click',
+                    'before_consent': no_html_card(colors, reference_gap)}
+        observed.update(copy_url(colors, url, name + '-before'))
+        time.sleep(.6)
+        assert origin.snapshot() == before, 'HTML Click policy fetched before explicit consent'
+        popup = url_menu(colors, name + '-load')
+        menu_action(popup, 'Load preview')
+        gui.SESSION.until('owned HTML explicit request', lambda: origin.snapshot()[len(before):])
+        # Permit the real worker completion to return to the native event loop.
+        time.sleep(.6)
+        gui.framed_keys(window, 'Escape')
+        upload.focus_composer(window)
+        observed['after_negative'] = no_html_card(colors, reference_gap)
+        observed.update(copy_url(colors, url, name + '-negative'))
+        gui.framed_keys(window, 'Tab', 'shift+Tab', 'Left', 'Right')
+        time.sleep(.6)
+        requests = origin.snapshot()[len(before):]
+        assert [path for path, _ in requests] == ['/' + name], (
+            'Negative HTML result retried or fetched an unauthorized destination', requests)
+        assert all(not any(key.lower() in ('authorization', 'cookie', 'proxy-authorization')
+                           for key in headers) for _, headers in requests), requests
+        observed.update(request_paths=[path for path, _ in requests],
+                        requests_before_click=0, anonymous_headers_verified=True,
+                        negative_result_no_retry=True)
+        evidence.append(observed)
     if 'draft/message-redaction' in ctx['observer'].capabilities:
         retirement = []
         for choice, action in enumerate(('Info', 'Copy Link')):
@@ -1029,7 +1101,7 @@ def run_media(ctx):
                     'SELECT id FROM messages WHERE buffer=? AND text=?',
                     (ctx['channel_id'], text)).fetchone()
             assert message_id and not message_id.startswith('local:'), message_id
-            gui.command('end-of-buffer', window=window)
+            upload.focus_composer(window)
             box = gui.SESSION.until('retirement source honest consent thumbnail',
                 lambda: upload.label_rect(window, ctx['destination'], 'Load preview'))
             point = (box[0] + box[2] / 2, box[1] + box[3] / 2)
@@ -1074,9 +1146,132 @@ def run_media(ctx):
         evidence.append({'actual_wire_source_retirement': 'not exercised',
                          'limitation': 'Private IRC server does not advertise draft/message-redaction; '
                                        'no injected source retirement substitutes for this flow.'})
+    # Use the existing quiet query for policy restarts: old direct-media rows
+    # must not become an unrelated Automatic network workload.
+    _policy_focus(ctx, ctx['query_id'])
+    _refresh_restart(ctx, 'previews', dict(links='"automatic"', images='"automatic"', media='"click"',
+        allow_local='true', max_height='120', media_max_mib='16', media_max_seconds='60'),
+        focus=ctx['query_id'])
+    window = ctx['window']
+    _, reference = html_rows('Native automatic plain reference', ctx['own_nick'])
+    reference_gap = reference[2][1] - reference[0][1]
+    before = origin.snapshot()
+    url = origin.url + '/automatic-page'
+    colors, _ = html_rows(url, ctx['own_nick'])
+    def decoded_html_thumbnail():
+        frame = gui.native_rgb_capture(window)
+        items = gui.native_marker_components(frame,
+            gui.read_layout(ctx['preferences'])['conversation']['rect'], (231, 17, 193))
+        full = [item['bbox'] for item in items if item['full']]
+        if not full:
+            return None
+        box = max(full, key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
+        pixels = _policy_crop(frame, box)
+        matching = sum(max(abs(pixels[index + channel] - color)
+                           for channel, color in enumerate((231, 17, 193))) <= 2
+                       for index in range(0, len(pixels), 3))
+        return {'thumbnail_box': box, 'decoded_magenta_pixels': matching} if matching > 10000 else None
+    decoded = gui.SESSION.until('HTML og:image paints actual decoded magenta thumbnail',
+                                decoded_html_thumbnail)
+    decoded.update(copy_url(colors, url, 'automatic-valid'))
+    time.sleep(.6)
+    requests = origin.snapshot()[len(before):]
+    assert [path for path, _ in requests] == ['/automatic-page', '/automatic-thumbnail.png'], requests
+    assert all(not any(key.lower() in ('authorization', 'cookie', 'proxy-authorization')
+                       for key in headers) for _, headers in requests), requests
+    evidence.append(dict(decoded, asset='automatic-page', mode='automatic',
+                         request_paths=[path for path, _ in requests], anonymous_headers_verified=True))
+    for name, paths in (('automatic-noimage', ['/automatic-noimage']),
+                        ('automatic-broken', ['/automatic-broken', '/broken.png'])):
+        before = origin.snapshot()
+        url = origin.url + '/' + name
+        colors, _ = html_rows(url, ctx['own_nick'])
+        gui.SESSION.until('owned automatic negative HTML request chain', lambda:
+            len(origin.snapshot()[len(before):]) >= len(paths))
+        time.sleep(.6)
+        observed = no_html_card(colors, reference_gap)
+        observed.update(copy_url(colors, url, name))
+        gui.framed_keys(window, 'Tab', 'shift+Tab', 'Left', 'Right')
+        time.sleep(.6)
+        requests = origin.snapshot()[len(before):]
+        assert [path for path, _ in requests] == paths, ('Automatic negative retried', requests)
+        assert all(not any(key.lower() in ('authorization', 'cookie', 'proxy-authorization')
+                           for key in headers) for _, headers in requests), requests
+        evidence.append(dict(observed, asset=name, mode='automatic', request_paths=paths,
+                             anonymous_headers_verified=True, negative_result_no_retry=True))
+    _refresh_restart(ctx, 'previews', dict(links='"off"', images='"off"', media='"click"',
+        allow_local='true', max_height='120', media_max_mib='16', media_max_seconds='60'),
+        focus=ctx['query_id'])
+    window = ctx['window']
+    _, reference = html_rows('Native disabled plain reference', ctx['own_nick'])
+    reference_gap = reference[2][1] - reference[0][1]
+    before = origin.snapshot()
+    url = origin.url + '/off-page'
+    colors, _ = html_rows(url, ctx['own_nick'])
+    observed = no_html_card(colors, reference_gap)
+    observed.update(copy_url(colors, url, 'off'))
+    gui.framed_keys(window, 'Tab', 'shift+Tab', 'Left', 'Right')
+    time.sleep(.6)
+    assert origin.snapshot() == before, 'Off HTML policy made a preview request'
+    evidence.append(dict(observed, asset='off-page', mode='off',
+                         request_paths=[], native_context_opened_without_request=True))
     assert {path for path, headers in origin.snapshot()} == {
-        '/image.png', '/animation.gif', '/audio.wav', '/video.mp4', '/page', '/denied'}
-    return _refresh_return(ctx, 'media', evidence)
+        '/image.png', '/animation.gif', '/audio.wav', '/video.mp4', '/page', '/denied', '/failed',
+        '/automatic-page', '/automatic-thumbnail.png', '/automatic-noimage', '/automatic-broken',
+        '/broken.png'}
+    if os.environ.get('BLASTIRC_SMOKE_YOUTUBE') == '1':
+        # ponytail: reuse decoded-only HTML card geometry and native Info;
+        # remote JPEG colors and the current public title are not test fixtures.
+        public_ca = Path('/etc/ssl/certs/ca-certificates.crt')
+        assert os.access(public_ca, os.R_OK), 'YouTube opt-in requires readable platform public roots'
+        combined_ca = Path(ctx['lab'].root) / 'media-public-and-fixture-ca.pem'
+        with os.fdopen(os.open(combined_ca, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as bundle:
+            bundle.write(public_ca.read_bytes() + b'\n' + Path(ctx['lab'].ca_file).read_bytes())
+        ctx['env'] = dict(ctx['env'], SSL_CERT_FILE=str(combined_ca),
+                          NIX_SSL_CERT_FILE=str(combined_ca), CURL_CA_BUNDLE=str(combined_ca))
+        _refresh_restart(ctx, 'previews',
+            dict(links='"automatic"', images='"automatic"', media='"click"', allow_local='false',
+                 max_height='120', media_max_mib='16', media_max_seconds='60'),
+            focus=ctx['query_id'])
+        window = ctx['window']
+        _, reference = html_rows('Native public YouTube plain reference', ctx['own_nick'])
+        reference_gap = reference[2][1] - reference[0][1]
+        url = 'https://www.youtube.com/watch?v=PtS2EdUsMeo'
+        colors, _ = html_rows(url, ctx['own_nick'])
+        def youtube_card():
+            boxes = html_boxes(colors)
+            gap = boxes[2][1] - boxes[0][1]
+            return boxes if gap > reference_gap + 64 else None
+        boxes = gui.SESSION.until('public YouTube decoded-only native thumbnail card', youtube_card)
+        thumbnail_capture = str(gui.capture_window(window, Path(ctx['destination']),
+                                                   'media-public-youtube-thumbnail'))
+        point = (boxes[0][0] + 40, (boxes[0][3] + boxes[2][1]) / 2)
+        popup = gui.open_native_popup(window, lambda: (
+            gui.move_pointer(window, *point),
+            gui.POINTER.button(True, code=273), gui.POINTER.button(False, code=273)))
+        gui.popup_keys(window, popup, 'Home', 'Return')
+        info = gui.SESSION.until('public YouTube original URL and native metadata Info',
+            lambda: state if (state := gui.native_input_state(window))
+            and state.get('text', '').splitlines()
+            and state['text'].splitlines()[0] == url else None)
+        parts = info['text'].split('\n\n')
+        assert len(parts) >= 3 and parts[1].strip(), ('Missing actual YouTube title', info)
+        assert 'Type: Image' in info['text'] and re.search(
+            r'Dimensions: [1-9]\d* × [1-9]\d*', info['text']), info
+        assert '\nThumbnail URL: https://' in info['text'], info
+        evidence.append({'asset': 'public-youtube', 'internet_opt_in': True,
+                         'postedURL': url, 'metadata_title': parts[1],
+                         'native_info_text': info['text'],
+                         'thumbnail_capture': thumbnail_capture, 'native_boxes': boxes,
+                         'decoded_card_row_gap': boxes[2][1] - boxes[0][1],
+                         'plain_reference_row_gap': reference_gap,
+                         'links': 'automatic', 'images': 'automatic', 'media': 'click',
+                         'allow_local': False})
+        gui.framed_keys(window, 'Escape')
+        upload.focus_composer(window)
+        gui._composer_native(window, '', 0, 0)
+    return {**_refresh_return(ctx, 'media', evidence),
+            'private_fixture_only': os.environ.get('BLASTIRC_SMOKE_YOUTUBE') != '1'}
 
 
 import subprocess
@@ -1767,7 +1962,7 @@ def run_activity_blur(ctx):
                           redact=ctx['lab']._redact)
         ctx['expected_messages'].extend(ctx['channel_messages'](bodies[2], fool))
         gui.wait_messages(p, db, ctx['expected_messages'])
-        gui.command('end-of-buffer', window=w)
+        upload.focus_composer(w)
 
         def anchors():
             image = gui.native_rgb_capture(w)
@@ -2068,7 +2263,7 @@ def run_fools(ctx):
 
 
 def run_transcript(ctx):
-    """80 graphemes, both native row styles, unboxed inline nick, exact original copy."""
+    """80 graphemes, native row styles, unboxed inline nick, exact original copy."""
     _policy_focus(ctx, ctx['query_id'])
     gui.set_navigation(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
                        'hidden', 'policy-wrap-wide')
@@ -2081,7 +2276,7 @@ def run_transcript(ctx):
     raw = '\x042AB971,2AB971LEFTLEFT\x0f' + middle + '\x04B34FD5,B34FD5RGHTRGHT\x0f'
     _policy_send(ctx, raw)
     wrapping = {}
-    for style in ('bubbles', 'irc'):
+    for style in ('bubbles', 'irc', 'stacked'):
         gui.set_message_style(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
                               ctx['args'], ctx['destination'], ctx['query_id'], style,
                               label='policy-wrap-' + style)
@@ -2182,7 +2377,9 @@ def run_typing(ctx):
     assert _policy_wait_box(ctx, color) == anchor, 'Typing moved transcript/scroll anchor'
     assert gui.native_input_rectangle(w) == caret, 'Typing moved composer'
     active = gui.native_rgb_capture(w)
-    pill_box = (max(0, nick[0] - 8), max(0, nick[1] - 6), min(active['width'], nick[2] + 45), nick[3] + 8)
+    # Dots are a second line now; sample the real reserved footer, not the
+    # obsolete horizontal strip to the right of the nickname.
+    pill_box = (footer[0], footer[1], footer[0] + footer[2], footer[1] + footer[3])
     assert _policy_crop(before, pill_box) != _policy_crop(active, pill_box), 'Typing pill has no actual pixels'
     # The nickname's surrounding footer remains ordinary background: a filled
     # chip would alter these horizontal padding rows outside its visible ink.
@@ -2243,6 +2440,199 @@ def run_typing(ctx):
             'pill_rect': pill_box, 'pulse': pulse, 'suppression': suppression,
             'retained_early_frames': retained_typing_frames,
             'expiry_observed_seconds': expired_after, 'receive_disabled_visible': bool(pill())}
+
+def run_typing_bubble(ctx):
+    """Four genuine channel TAGMSG senders, shared tray and passive scene popup."""
+    from contextlib import ExitStack
+
+    p, w, prefs, db = ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path']
+    identity, channel = ctx['channel_id'], ctx['channel']
+    _policy_focus(ctx, identity)
+    _policy_chat(ctx, fools=[], receive=True)
+    _policy_effects(ctx, fx='off')
+    _policy_typing_cap(ctx)
+    # Keep names and the popup in the conversation, not duplicated in People.
+    gui.set_people(p, w, prefs, db, 'hidden')
+    names = ('Amber', 'Cedar', 'Maple', 'Birch')
+    color = (42, 185, 113)
+    evidence = []
+    with ExitStack() as stack:
+        peers = []
+        for nick in names:
+            peer = stack.enter_context(gui.fixtures.BootstrapClient(
+                dict(ctx['lab'].endpoints['direct'], nick=nick, username=nick),
+                ctx['lab'].ca_file, authenticate=False))
+            peer.send('CAP REQ :message-tags')
+            _, ack, _ = peer.wait(lambda command, params, prefix: command == 'CAP' and
+                                  ('ACK' in params or 'NAK' in params), timeout=15)
+            assert 'ACK' in ack and 'message-tags' in ack[-1].split(), ack
+            peer.send('JOIN ' + channel)
+            gui.receive_until(ctx['observer'], 'JOIN', [channel], nick,
+                              redact=ctx['lab']._redact)
+            peers.append(peer)
+
+        def typing(count):
+            for index, peer in enumerate(peers):
+                state = 'active' if index < count else 'done'
+                peer.send(f'@+typing={state} TAGMSG {channel}')
+                ctx['observer'].wait(
+                    lambda command, params, prefix, nick=names[index], state=state:
+                    command == 'TAGMSG' and params == [channel] and
+                    prefix.split('!', 1)[0] == nick and
+                    ctx['observer'].last_tags.get('+typing') == state, timeout=15)
+
+        _policy_send(ctx, '\x042AB971,2AB971ANCHORANCHOR\x0f typing tray anchor',
+                     target=channel)
+        wire_start = len(ctx['observer'].frames)
+        for style in ('bubbles', 'irc', 'stacked'):
+            typing(0)
+            gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'],
+                                  identity, style, label='typing-bubble-' + style)
+            empty_initial = gui._composer_native(w, '', 0, 0)
+            gui.type_text('private café draft')
+            draft = 'private café draft'
+            size = len(draft.encode('utf-8'))
+            initial = gui._composer_native(w, draft, size, size)
+            anchor = _policy_wait_box(ctx, color)
+            caret = initial['caret']
+            pane = gui.read_layout(prefs)['conversation']['rect']
+            footer = (pane[0], anchor[3] + 1, pane[2], caret[1] - anchor[3] - 1)
+            assert footer[3] > 0, (footer, anchor, caret)
+            phases = []
+
+            def stable(label):
+                assert _policy_wait_box(ctx, color) == anchor, (
+                    'Typing changed the actual message anchor', label)
+                assert gui._composer_native(w, draft, size, size) == initial, (
+                    'Typing changed native draft/caret/selection', label)
+                phases.append(label)
+
+            def footer_words(label):
+                return _policy_words(ctx, 'typing-bubble-' + style + '-' + label, footer)
+
+            typing(1)
+            single = gui.SESSION.until('one real typing identity in native tray', lambda:
+                next((box for text, box in footer_words('one')
+                      if text.rstrip(',').casefold() == names[0].casefold()), None))
+            stable('one')
+            typing(4)
+
+            def shared():
+                typing(4)  # Refresh real activity while native capture/OCR waits.
+                words = footer_words('many')
+                shown = [(text.rstrip(','), box) for text, box in words
+                         if text.rstrip(',').casefold() in {nick.casefold() for nick in names}]
+                # The representative wide scope must prove both names; cramped
+                # optional geometry may legitimately reserve room for fewer.
+                expected_counts = (2,) if pane[2] / ctx['args'].zoom >= 600 else (0, 1, 2)
+                overflow = [box for text, box in words
+                            if len(shown) in expected_counts and text == '+' + str(4 - len(shown))]
+                return (shown, overflow[0]) if overflow else None
+
+            shown, overflow = gui.SESSION.until('shared inline identities and exact remaining +N', shared)
+            stable('many')
+            tray_top = min([overflow[1], *(box[1] for _, box in shown)])
+            method = ctx['input_method']
+            assert method is not None, 'Focused scope requires its existing real NativeInputMethod'
+            gui.SESSION.until('native IME owns unchanged draft', lambda:
+                method.drain() is None and method.state['active'] and
+                method.state['surrounding'] == (draft, size, size))
+            trace = gui.GUI_DEBUG[w][1]
+            marker = trace.stat().st_size
+            method.transaction('猫', 3, 3)
+            gui.await_native_frame(w, marker,
+                re.compile(r'zwp_text_input_v3[@#]\d+\.preedit_string\('))
+            preedit = gui._composer_native(w, draft, size, size)
+            left, top, _, height = caret
+            glyph_box = (left + 2, top, preedit['caret'][0] - 2, top + height)
+            assert glyph_box[0] < glyph_box[2], (caret, preedit)
+            glyphs = _policy_crop(gui.native_rgb_capture(w), glyph_box)
+            passive_marker = trace.stat().st_size
+
+            def retained():
+                assert gui._composer_native(w, draft, size, size) == preedit
+                method.drain()
+                assert method.state['active'] and method.state['surrounding'] == (draft, size, size)
+                assert _policy_crop(gui.native_rgb_capture(w), glyph_box) == glyphs, \
+                    'Passive typing popup lost actual IME preedit glyphs'
+                assert _policy_wait_box(ctx, color) == anchor
+
+            def popup_words(label):
+                return _policy_words(ctx, 'typing-bubble-' + style + '-' + label,
+                                     (pane[0], pane[1], pane[2], tray_top - pane[1]))
+
+            def opened():
+                typing(4)
+                words = popup_words('popup')
+                found = {text.casefold(): box for text, box in words}
+                return words if {'typing', 'now', *(nick.casefold() for nick in names)} <= found.keys() else None
+
+            def closed(label):
+                return not any(text.casefold() == 'typing' for text, _ in popup_words(label))
+
+            gui.click(w, (overflow[0] + overflow[2]) / 2,
+                      (overflow[1] + overflow[3]) / 2)
+            popup = gui.SESSION.until('scene popup contains all four, including inline names', opened)
+            retained()
+            # Stay inside the scaled transcript's left edge, outside the list
+            # even when its panel occupies almost the entire narrow viewport.
+            metrics = gui.pane_metrics(gui.read_layout(prefs), ctx['args'].zoom)
+            gui.click(w, pane[0] + metrics['left'] + 4 * ctx['args'].zoom,
+                      pane[1] + pane[3] / 2)
+            gui.SESSION.until('outside transcript click dismisses typing popup',
+                              lambda: closed('dismissed'))
+            retained()
+            passive_trace = trace.read_bytes()[passive_marker:]
+            assert not re.search(rb'zwp_text_input_v3[@#]\d+\.disable\(', passive_trace), \
+                'Passive typing popup disabled the native Input'
+            assert not re.search(rb'get_popup\(new id xdg_popup', passive_trace), \
+                'Typing list requested a native dropdown instead of a scene popup'
+            marker = trace.stat().st_size
+            method.transaction('', 0, 0, committed='猫')
+            gui.await_native_frame(w, marker,
+                re.compile(r'zwp_text_input_v3[@#]\d+\.commit_string\('))
+            committed = gui._composer_native(w, draft + '猫', size + 3, size + 3)
+            typing(4)
+            gui.click(w, (overflow[0] + overflow[2]) / 2,
+                      (overflow[1] + overflow[3]) / 2)
+            gui.SESSION.until('reopened complete typing list before switch', opened)
+            _policy_focus(ctx, ctx['query_id'])
+            assert not any(text.casefold() == 'typing'
+                           for text, _ in _policy_words(ctx, 'typing-bubble-switched-' + style)), \
+                'Typing popup survived its source buffer switch'
+            _policy_focus(ctx, identity, expected=(draft + '猫', size + 3, size + 3))
+            gui.SESSION.until('returning to source does not reopen stale typing popup',
+                              lambda: closed('returned'))
+            gui.clear_draft()
+            empty_before_done = gui._composer_native(w, '', 0, 0)
+            assert empty_before_done == empty_initial, \
+                'Popup/switch changed the same empty-document native caret'
+            typing(0)
+            gui.SESSION.until('done clears all actual tray identities', lambda:
+                not any(text.rstrip(',').casefold() in {nick.casefold() for nick in names}
+                        or re.fullmatch(r'\+[234]', text) for text, _ in footer_words('done')))
+            assert _policy_wait_box(ctx, color) == anchor
+            empty_after_done = gui._composer_native(w, '', 0, 0)
+            assert empty_after_done == empty_before_done, \
+                'Done changed the same empty-document native caret'
+            evidence.append({'style': style, 'anchor': anchor, 'caret': caret,
+                'empty_initial': empty_initial, 'empty_before_done': empty_before_done,
+                'empty_after_done': empty_after_done,
+                'stable_phases': ['zero', *phases, 'done'], 'single': single,
+                'inline_names': shown, 'overflow': overflow, 'popup_words': popup,
+                'preedit': preedit, 'preedit_glyph_box': glyph_box, 'committed': committed,
+                'no_native_popup_or_input_disable': True,
+                'capture': str(_policy_capture(ctx, 'typing-bubble-final-' + style))})
+        assert not [frame for frame in ctx['observer'].frames[wire_start:]
+                    if frame['command'] == 'PRIVMSG' and
+                    frame['prefix'].split('!', 1)[0] == ctx['own_nick']], \
+            'Typing popup/draft/IME unexpectedly sent a real message'
+    return _refresh_return(ctx, 'typing-bubble', {
+        'eligible': names, 'phases': evidence,
+        'limitations': ['Native Wayland exposes Input ownership/caret, not scene nodes. '
+            'Existing native raster text recognition locates +2 and the read-only list; '
+            'scene avatar count, exact tray height, colors and surfaces belong to native C++ proofs.']})
+
 
 
 def run_incoming(ctx):
@@ -3563,7 +3953,7 @@ def run_irc_polish(ctx):
         ctx.update(proc=proc, window=window, screenshot=screenshot)
         gui.wait_joins(ctx['observer'], ctx['channel'], (ctx['own_nick'], ctx['other_nick']))
         _policy_focus(ctx, ctx['channel_id'])
-        gui.command('end-of-buffer', window=window)
+        upload.focus_composer(window)
         gui.move_pointer(window, 0, 0)
         boxes = [_policy_wait_box(ctx, rgb) for rgb in marker_colors]
         image = gui.native_rgb_capture(window)
@@ -3649,7 +4039,7 @@ def run_irc_polish(ctx):
         if index % 2 == 0:
             continue
         # Find the actual connected primary-fill nick chip, not an OCR word or
-        # presumed sender width. Its painted bbox anchors the 12px arrow cell.
+        # presumed sender width.
         components = gui.native_marker_components(final, (clock_right, top - 8 * scale,
             box[0] - clock_right - 4 * scale, bottom - top + 16 * scale), primary)
         chips = [item for item in components if item['bbox'][2] - item['bbox'][0] > 30 * scale
@@ -3657,30 +4047,8 @@ def run_irc_polish(ctx):
         assert len(chips) == 1, ('Missing unique own accent chip', components)
         left, ct, right, cb = chips[0]['bbox']
         assert pixel(final, left, ct) != primary and pixel(final, (left + right) // 2, ct) == primary, 'Own chip must be rounded'
-        arrow_right = right - round(6 * scale)
-        arrow_left = arrow_right - round(12 * scale)
-        arrow_top = round((ct + cb - 12 * scale) / 2)
-        arrow_cell = (arrow_left, arrow_top, arrow_right, arrow_top + round(12 * scale))
-        arrow_path = Path(ctx['destination']).with_name(
-            Path(ctx['destination']).stem + f'-irc-polish-own-arrow-{index}.png')
-        final_surface.crop(arrow_cell).save(arrow_path)
-        arrow_points = [(x, y) for y in range(arrow_top, arrow_top + round(12 * scale))
-                        for x in range(arrow_left, arrow_right)
-                        if on_primary_ink(pixel(final, x, y))]
-        assert len(arrow_points) >= 4 * scale, ('Missing on-primary outgoing arrow', index, arrow_points)
-        aw = max(x for x, y in arrow_points) - min(x for x, y in arrow_points) + 1
-        ah = max(y for x, y in arrow_points) - min(y for x, y in arrow_points) + 1
-        assert 4 * scale <= aw <= 12 * scale and 4 * scale <= ah <= 12 * scale, ('Arrow geometry', aw, ah)
-        # Arrow-up-right has top/right arms plus a lower-left diagonal, not a
-        # delivery tick. Require majority-covered on-primary ink in all three regions.
-        midx, midy = (arrow_left + arrow_right) / 2, arrow_top + 6 * scale
-        assert any(x >= midx and y < midy for x, y in arrow_points)
-        assert any(x < midx and y >= midy for x, y in arrow_points)
-        row_counts = collections.Counter(y for x, y in arrow_points)
-        column_counts = collections.Counter(x for x, y in arrow_points)
-        assert max(row_counts.values()) >= 3 * scale and max(column_counts.values()) >= 3 * scale, 'Outgoing arrow lacks top/right arms'
         name_ink = sum(on_primary_ink(pixel(final, x, y))
-                       for y in range(ct + 2, cb - 2) for x in range(left + round(6 * scale), arrow_left - round(4 * scale)))
+                       for y in range(ct + 2, cb - 2) for x in range(left + round(6 * scale), right - round(6 * scale)))
         assert name_ink >= 8 * scale, 'Own nickname lacks contrasting on-primary ink'
         # Former own stripe occupied exactly the first 2px of the dense surface.
         stripe = [pixel(final, x, y) for y in range(top, bottom)
@@ -3693,8 +4061,7 @@ def run_irc_polish(ctx):
         assert abs(left - expected_avatar_right - 6 * scale) <= 2, ('Avatar-to-chip gap must be 6px', left, expected_avatar_right)
         own_evidence.append({'row': index, 'chip': [left, ct, right, cb], 'primary_rgb': primary,
             'on_primary_rgb': foreground, 'contrast': contrast(primary, foreground),
-            'nickname_ink_pixels': name_ink, 'arrow_cell': arrow_cell, 'arrow_capture': str(arrow_path),
-            'arrow_ink_bounds': [aw, ah], 'arrow_ink_pixels': len(arrow_points), 'old_left_stripe_absent': True})
+            'nickname_ink_pixels': name_ink, 'old_left_stripe_absent': True})
     with sqlite3.connect(f'file:{ctx["database_path"]}?mode=ro', uri=True) as database:
         for text, stamp in zip(texts, timestamps):
             actual = database.execute('SELECT time,timestamp,sort_time FROM messages WHERE buffer=? AND text=?',
@@ -4348,7 +4715,12 @@ def run_unread_divider(ctx):
     })
 
 
-def run_settings_refinements(ctx):
+def run_settings_tree(ctx):
+    """Run only the native Settings tree workflow, with its normal restoration."""
+    return run_settings_refinements(ctx, tree_only=True)
+
+
+def run_settings_refinements(ctx, *, tree_only=False):
     """Real private Settings controls, native byte selections and actual editor commands."""
     w, p = ctx['window'], ctx['proc']
     prefs, db = Path(ctx['preferences']), ctx['database_path']
@@ -4373,12 +4745,28 @@ def run_settings_refinements(ctx):
             # same words. Restrict form captions below the visible search chrome.
             matching = upload.label_rect(w, destination, 'Matching settings',
                                          region=bounds, exact_caption=True)
-            if matching is None:
+            boundary = matching or upload.label_rect(w, destination, 'Search settings',
+                                                     region=bounds, exact_caption=True)
+            if boundary is None:
                 return None
             rx, ry, rw, rh = bounds
-            top = matching[1] + matching[3]
-            bounds = (rx, top, rw, ry + rh - top)
-        return upload.label_rect(w, destination, label, region=bounds, exact_caption=True)
+            top = boundary[1] + boundary[3]
+            if matching is None:
+                # Empty queries hide the whole results group; the body begins
+                # below the Search input's bounded native caption band instead.
+                top += max(56 * scale, 56)
+            # Exclude the new tree from detail-caption OCR; its adjacent rows
+            # are unrelated text columns, not part of the form's captions.
+            compact = rw < 760 * scale or rh < 440 * scale
+            inset = 0 if compact else 260 * scale  # panel padding + sidebar + body gap
+            bounds = (rx + inset, top, rw - inset, ry + rh - top)
+        box = upload.label_rect(w, destination, label, region=bounds, exact_caption=True)
+        if box is None and '–' in label:
+            # Tesseract renders the visible range dash as ASCII "-", as in
+            # "(1-3650)"; retain the entire exact caption rather than fuzzy OCR.
+            box = upload.label_rect(w, destination, label.replace('–', '-'),
+                                    region=bounds, exact_caption=True)
+        return box
 
     def field(label, expected=None):
         # Locate ordinary user-facing labels, never font names or technical IDs.
@@ -4392,10 +4780,8 @@ def run_settings_refinements(ctx):
         stop = y + height + max(56 * scale, 56)
         if following:
             next_box = caption_box(following)
-            if label.casefold() == 'search settings' and next_box is None:
-                next_box = gui.SESSION.until('native Search next caption boundary',
-                    lambda: caption_box(following))
-            stop = next_box[1] if next_box else ry + rh
+            if next_box is not None:
+                stop = next_box[1]
         def focused():
             state = gui.native_input_state(w)
             if state is None or state['caret'] is None:
@@ -4407,7 +4793,8 @@ def run_settings_refinements(ctx):
                 return False
             fresh_x, fresh_y, _, fresh_height = fresh_box
             next_box = caption_box(following) if following else None
-            fresh_stop = next_box[1] if next_box else region()[1] + region()[3]
+            fresh_stop = (next_box[1] if next_box is not None else
+                          fresh_y + fresh_height + max(56 * scale, 56))
             cx, cy, cw, ch = state['caret']
             if not (fresh_y + fresh_height <= cy < fresh_stop):
                 return False
@@ -4471,7 +4858,7 @@ def run_settings_refinements(ctx):
         x, y, width, height = layout['conversation']['rect']
         gui.click(w, x + metrics['left'] + 16 * scale,
                   y + height - metrics['padding_y'] - 16 * scale)
-        gui.command('end-of-buffer', window=w)
+        gui.framed_keys(w, 'ctrl+End')
 
     def close():
         upload.click_label(w, destination, 'Close', region=region())
@@ -4487,6 +4874,129 @@ def run_settings_refinements(ctx):
     ui_original, message_original = baseline['appearance']['ui_font'], baseline['appearance']['message_font']
     gui.open_settings(w, prefs)
     gui.wait_layout(p, prefs, ('settings',))
+
+    # Search must reach a leaf on a category that has not been visited. Keep an
+    # invalid native edit alive while the tree and compact selector hide it.
+    retention = baseline['history']['retention_days']
+    jump('retention days', 'unvisited-history', 'Retention days (1–3650)', str(retention))
+    replace('not-a-number', 'invalid-retention')
+    query('', 'clear-before-tree')
+    gui.settings_category(w, scale, 0)
+    gui.framed_keys(w, 'Right')
+    gui.move_pointer(w, 8, initial_size['HEIGHT'] - 8)
+    tree_root = capture('keyboard-root')
+    gui.framed_keys(w, 'Right', 'Down')  # Expanded first root -> second leaf (fonts).
+    gui.move_pointer(w, 8, initial_size['HEIGHT'] - 8)
+    gui.framed_keys(w, 'Tab', 'End')
+    gui._composer_native(w, ui_original, len(ui_original.encode('utf-8')),
+                         len(ui_original.encode('utf-8')))
+    gui.framed_keys(w, 'shift+Tab')
+    tree_leaf = capture('keyboard-font-leaf')
+    # Target the actual changed native row, without OCR of tree captions.
+    # Native detail-input proof above also lets the selection paint settle.
+    rx, ry, rw, rh = region()
+    with Image.open(tree_root) as root_image, Image.open(tree_leaf) as leaf_image:
+        crop = (round(rx + 40 * scale), round(ry + 60 * scale),
+                round(rx + 220 * scale), round(ry + rh - 72 * scale))
+        difference = ImageChops.difference(root_image.convert('RGB').crop(crop),
+                                          leaf_image.convert('RGB').crop(crop))
+        rows = [y for y in range(difference.height)
+                if difference.crop((0, y, difference.width, y + 1)).getbbox()]
+    assert rows, 'Native tree selection did not paint a leaf'
+    first = rows[-1]
+    while first - 1 in rows:
+        first -= 1
+    point = (crop[0] + (crop[2] - crop[0]) / 2,
+             crop[1] + (first + rows[-1]) / 2)
+    gui.framed_keys(w, 'Left', 'Left', 'Right')
+    gui.click(w, *point)
+    gui.framed_keys(w, 'Tab', 'End')
+    gui._composer_native(w, ui_original, len(ui_original.encode('utf-8')),
+                         len(ui_original.encode('utf-8')))
+    gui.framed_keys(w, 'shift+Tab', 'Left', 'Left', 'End', 'Home')
+    try:
+        gui.resize_panel_viewport(w, (round(680 * scale), round(620 * scale)))
+        gui.framed_keys(w, 'Tab')  # Compact selector -> Search, one nav tab stop.
+        gui._composer_native(w, '', 0, 0)
+        gui.settings_category(w, scale, 2, destination)
+        capture('compact-root-selected')
+        gui.framed_keys(w, 'shift+Tab')  # Search -> native location selector.
+        popup = gui.open_native_popup(w, lambda: gui.key('Return'))
+        gui.capture_native_popup(w, popup, destination, 'settings-refinements-compact-leaf-paths')
+        # The first seven options retain public root indices, followed by
+        # real leaves. Select the second leaf (fonts) through the native popup.
+        gui.popup_keys(w, popup, 'Home', *(['Down'] * 8), 'Return', root_changed=False)
+        gui.framed_keys(w, 'Tab')
+        gui._composer_native(w, '', 0, 0)
+        gui.framed_keys(w, 'Tab', 'End')
+        gui._composer_native(w, ui_original, len(ui_original.encode('utf-8')),
+                             len(ui_original.encode('utf-8')))
+        capture('compact-leaf-selected')
+        gui.framed_keys(w, 'shift+Tab')  # Return to Search before resizing.
+    finally:
+        gui.resize_panel_viewport(w, (initial_size['WIDTH'], initial_size['HEIGHT']))
+    jump('retention days', 'invalid-retained-after-navigation',
+         'Retention days (1–3650)', 'not-a-number')
+    # Correct only the real integer control, then require a fresh explicit Save
+    # write with a changed value; old preferences cannot satisfy this receipt.
+    corrected = retention + 1 if retention < 3650 else retention - 1
+    replace(str(corrected), 'retention-corrected')
+    assert save('tree-edit-saved')['history']['retention_days'] == corrected
+    field('Retention days (1–3650)', str(corrected))
+    replace(str(retention), 'retention-restored')
+    restored_tree = save('tree-edit-restored')
+    assert restored_tree['history'] == baseline['history']
+    evidence.append({'tree_pointer': point, 'tree_keyboard': ['Right', 'Down', 'Left', 'Home', 'End'],
+                     'unvisited_leaf_search': True, 'invalid_edit_survived_navigation': True,
+                     'compact_root_and_leaf': True, 'explicit_save_changed_and_restored': True,
+                     'retention_before': retention, 'retention_saved': corrected,
+                     'retention_restored': restored_tree['history']['retention_days']})
+    # Exercise the real weight Selects, including their separate native popup
+    # surfaces. Fresh saves prove each setting changes without changing its peer.
+    original_weights = tuple(baseline['appearance'][key]
+                             for key in ('ui_font_weight', 'message_font_weight'))
+
+    def choose_weight(caption, weight, label):
+        query(caption, label)
+        x, y, width, height = gui.SESSION.until('visible Settings selector ' + caption,
+                                              lambda: caption_box(caption))
+        popup = gui.open_native_popup(
+            w, lambda: gui.click(w, x + min(width / 2, 24 * scale),
+                                 y + height + 20 * scale))
+        gui.capture_native_popup(w, popup, destination, 'settings-weight-' + label)
+        gui.popup_keys(w, popup, 'Home', *(['Down'] * ((weight - 300) // 100)),
+                       'Return', root_changed=False)
+        capture('weight-' + label + '-live')
+
+    def weights_saved(label, expected):
+        saved = save(label)
+        appearance = saved['appearance']
+        actual = tuple(appearance[key] for key in ('ui_font_weight', 'message_font_weight'))
+        assert actual == expected, (label, actual, expected)
+        for key in ('ui_font', 'message_font', 'scale', 'message_scale'):
+            assert appearance[key] == baseline['appearance'][key], (label, key)
+        evidence.append({'native_weight_select': label, 'ui_weight': actual[0],
+                         'message_weight': actual[1], 'fresh_save': True})
+        return saved
+
+    choose_weight('UI font weight', 700, 'ui-bold')
+    weights_saved('ui-weight-saved', (700, original_weights[1]))
+    choose_weight('Message font weight', 300, 'message-light')
+    weights_saved('message-weight-saved', (700, 300))
+    choose_weight('UI font weight', original_weights[0], 'ui-restored')
+    weights_saved('ui-weight-restored', (original_weights[0], 300))
+    choose_weight('Message font weight', original_weights[1], 'message-restored')
+    restored_tree = weights_saved('weights-restored', original_weights)
+    if tree_only:
+        assert restored_tree['appearance'] == baseline['appearance']
+        assert restored_tree['bindings'] == baseline['bindings']
+        close()
+        upload.focus_composer(w)
+        gui._composer_native(w, '', 0, 0)
+        return {'scope': 'settings-tree', 'native_consumer': True,
+                'private_fixture_only': True, 'evidence': evidence, 'captures': captures,
+                'limitations': ['Geometry still requires focused visual inspection of the captured native rasters.',
+                                'The legacy font and command matrix remains in settings-refinements.']}
     # These are fuzzy subsequences of actual setting labels, not current values.
     jump('UI fnt fmly', 'ui-family', 'UI font family', ui_original)
     custom_ui = 'Private UI family Ω'
@@ -4571,7 +5081,7 @@ def run_settings_refinements(ctx):
     assert gui._composer_native(w, source, selected['cursor'], selected['anchor']) == selected
     evidence.append({'transpose_selection_preserved': selected})
     gui.framed_keys(w, 'ctrl+g')
-    gui.command('end-of-buffer', window=w)
+    gui.framed_keys(w, 'ctrl+End')
     gui._composer_native(w, source, source_end, source_end)
     gui.command('backward-kill-line', window=w)
     killed = gui._composer_native(w, '', 0, 0)
@@ -4625,7 +5135,7 @@ def run_settings_refinements(ctx):
             'private_fixture_only': True, 'evidence': evidence, 'captures': captures,
             'limitations': ['Row alignment/wrapping requires focused visual inspection of captured rasters.',
                 'No technical command/font OCR benchmark, result-order pin, source/hierarchy pin or model injection.',
-                'Invalid profile fields and IME composition are covered by existing native probes, not duplicated here.',
+                'Invalid profile fields and IME composition retain their existing native probes; this scope checks invalid history text across tree navigation.',
                 'Transpose uses a recorded binding; backward-kill-line/redo use the real command palette. Other configurable commands remain focused editor checks.']}
 
 
@@ -4660,7 +5170,7 @@ def run_transcript_refinements(ctx):
         return Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
 
     def observe(label, indices):
-        gui.command('end-of-buffer', window=w)
+        upload.focus_composer(w)
         gui.move_pointer(w, 0, 0)
         def settled():
             image = gui.native_rgb_capture(w)
@@ -4774,6 +5284,23 @@ def run_transcript_refinements(ctx):
         gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'], identity,
                               'irc', label='refinement-irc')
         _, _, wide, wide_rect, _ = observe('irc-wide', range(5))
+        gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'], identity,
+                              'stacked', label='refinement-stacked')
+        _, _, stacked, stacked_rect, stacked_frame = observe('stacked-wide', range(5))
+        assert stacked_rect == wide_rect, (stacked_rect, wide_rect)
+        assert max(b[0] for b in stacked) - min(b[0] for b in stacked) <= 2, stacked
+        # If adaptive IRC is inline at this width, forced stacked moves bodies
+        # left and gives every row a metadata line, including repeated senders.
+        if wide[0][0] > stacked[0][0] + 2:
+            assert all(s[0] < i[0] for s, i in zip(stacked, wide)), (stacked, wide)
+            assert all(stacked[n + 1][1] - stacked[n][1] > wide[n + 1][1] - wide[n][1]
+                       for n in range(3)), (stacked, wide)
+        stacked_frame['body_x_from_pane'] = [b[0] - stacked_rect[0] for b in stacked]
+        stacked_frame['metadata_visual_review'] = (
+            'Inspect metadata above every body at wide width, including repeated senders; '
+            'compare with adaptive IRC at the same width.')
+        gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'], identity,
+                              'irc', label='refinement-irc-restored')
         gui.resize_panel_viewport(w, (720, 960))
         _, _, compact, compact_rect, _ = observe('irc-compact-hidden-panes', range(5))
         same_client = gui.window_geometry(w)
@@ -4836,7 +5363,7 @@ def run_transcript_refinements(ctx):
         # Reply is a client tag, not an ISUPPORT capability. The actual sent
         # reply below must carry its source ID on the real observer wire.
         reply_evidence = []
-        for style in ('bubbles', 'irc'):
+        for style in ('bubbles', 'irc', 'stacked'):
             gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'], identity,
                                   style, label='refinement-reply-' + style)
             upload.focus_composer(w)
@@ -5530,28 +6057,11 @@ def run_messaging_refinements(ctx):
     activate_feed()
     for index in range(3):
         marker(index)
-    # The native source-context row is the jump target, not a raw synthetic ID.
+    # A first native body click jumps directly; no prior row selection or
+    # incidental network-label spelling is part of this consumer contract.
     query_marker = marker(1)
-    previous_marker = marker(2)
-    server_name = query.split('/', 1)[0]
-    observed_context = [box for text, box in rendered
-                        if ctx['query_target'].casefold() in text.casefold()
-                        or text.casefold() == server_name.casefold()]
-    assert observed_context, ('No earlier observed source-header ink bounds', rendered)
-    glyph_extent = query_marker[3] - query_marker[1]
-    context_width = max(box[2] for box in observed_context) - min(box[0] for box in observed_context)
-    header_left = query_marker[0] - glyph_extent / 2
-    header_top, header_bottom = previous_marker[3] + 1, query_marker[1]
-    assert header_top < header_bottom, (previous_marker, query_marker)
-    rows = upload.visible_words(w, Path(ctx['destination']), 'messaging-source-context-row',
-        region=(header_left, header_top, context_width + 2 * glyph_extent, header_bottom - header_top), psm=7)
-    feed_words = [(row['text'].strip(), (int(row['left']), int(row['top']),
-                  int(row['left']) + int(row['width']), int(row['top']) + int(row['height']))) for row in rows]
-    labels = [box for text, box in feed_words if text.casefold() == server_name.casefold()]
-    assert labels, ('No original network context label above query mention', feed_words)
-    source_label = max(labels, key=lambda box: box[3])
-    gui.click(w, (source_label[0] + source_label[2]) / 2,
-              (source_label[1] + source_label[3]) / 2)
+    gui.click(w, (query_marker[0] + query_marker[2]) / 2,
+              (query_marker[1] + query_marker[3]) / 2)
     source_state = gui.save_state(p, prefs, db)
     assert source_state[1] == (query,), ('Source context jumped to wrong buffer', source_state)
     marker(1)
@@ -5559,53 +6069,6 @@ def run_messaging_refinements(ctx):
     evidence.append({'phase': 'context-source-jump', 'selected': list(source_state[1]),
                      'original': [(row[0], row[1]) for row in source_rows if row[0] == query]})
 
-    _policy_focus(ctx, channel, expected=channel_edit)
-    nav_draft = draft
-    nav_bytes = len(nav_draft.encode('utf-8'))
-    nav_state = gui._composer_native(w, nav_draft, nav_bytes, nav_bytes)
-
-    def footer_point(newer):
-        current = gui.read_layout(prefs)
-        scale = current['scale']
-        x, y, width, height = current['conversation']['rect']
-        metrics = gui.pane_metrics(current, scale)
-        image = gui.native_rgb_capture(w)
-        native = Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
-        caret = gui.native_input_rectangle(w)
-        column, row = round(x + width - 200 * scale), round(caret[1] + caret[3] / 2)
-        canvas = native.getpixel((column, round(y + height / 2)))
-        assert native.getpixel((column, row)) != canvas
-        while row > y + metrics['top'] and native.getpixel((column, row)) != canvas:
-            row -= 1
-        bottom = row + 1 - metrics['padding_y'] - metrics['gap']
-        # Native public control dimensions; the actual Input paint supplies
-        # the vertical edge, so no fixed screen/composer height is assumed.
-        left = x + width - metrics['left'] - 148 * scale
-        footer_words = _policy_words(ctx, 'messaging-footer-count',
-                                     (left, bottom - 32 * scale, 136 * scale, 28 * scale))
-        count_text = ''.join(text for text, _ in footer_words)
-        assert re.search(r'@\s*2(?:\D|$)', count_text), (
-            'Actual source footer does not show exactly two readable mentions', footer_words)
-        return (left + (120 if newer else 16) * scale, bottom - 18 * scale)
-
-    def navigate(newer, expected, label):
-        gui.click(w, *footer_point(newer))
-        gui._composer_native(w, nav_draft, nav_bytes, nav_bytes)
-        assert gui.native_input_rectangle(w) == nav_state['caret'], 'Footer navigation moved composer'
-        gui.framed_keys(w, 'ctrl+r')
-        preview = _policy_words(ctx, label, _policy_reply_region(ctx, label))
-        assert any(expected.casefold() in text.casefold() for text, _ in preview), (
-            'Footer selected wrong original mention or wrapped at disabled end', label, preview)
-        gui.cancel_native_reply(w, ctx['destination'], label=label + '-cancel', expected_text=nav_draft)
-        evidence.append({'phase': label, 'preview': preview, 'draft': nav_draft})
-
-    # Starting without a cursor, Older chooses newest, then oldest; repeated
-    # endpoint clicks must not wrap. Newer traverses in the opposite direction.
-    navigate(False, 'ThirdSourceMention', 'messaging-footer-newest')
-    navigate(False, 'FirstSourceMention', 'messaging-footer-older')
-    navigate(False, 'FirstSourceMention', 'messaging-footer-older-disabled')
-    navigate(True, 'ThirdSourceMention', 'messaging-footer-newer')
-    navigate(True, 'ThirdSourceMention', 'messaging-footer-newer-disabled')
     evidence.append({'phase': 'explicit-show-copy-and-hidden-reply',
                      'clipboard': decoded, 'shown_preview': shown_preview,
                      'hidden_preview': hidden_preview, 'global_style_unchanged': 'hidden'})
@@ -5988,7 +6451,7 @@ def run_logo_alignment(ctx):
 
 
 def run_overlay_refinements(ctx):
-    """Real fixed reply/typing zone, message-sized Input, transparent history and /me."""
+    """Real unreserved reply overlap, fixed native Input, transparent history and /me."""
     p, w, prefs, db = ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path']
     identity = ctx['query_id']
     _policy_focus(ctx, identity)
@@ -5996,59 +6459,58 @@ def run_overlay_refinements(ctx):
     _policy_chat(ctx, fools=[], receive=True)
     _policy_typing_cap(ctx)
     gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'],
-                          identity, 'irc', label='overlay-font-reference')
-    # Actual retained wire rows make older history scrollable. Their swatch is
-    # deliberately wide enough to pass behind the empty right side of the card.
-    underlay_rgb = (179, 79, 213)
+                          identity, 'irc', label='overlay-history-style')
+    # Actual retained wire rows keep the followed newest row at the viewport bottom.
     for index in range(40):
         _policy_send(ctx, '\x04B34FD5,B34FD5' + 'H' * 60 + '\x0f ' + str(index), durable=False)
     gui.wait_messages(p, db, ctx['expected_messages'])
     source_body = '\x0419A7D3,19A7D3REPLYSOURCE\x0f ' + ('OverlayExcerpt café e\u0301 中 ' * 9)
     _policy_send(ctx, source_body)
     _policy_send(ctx, '\x042AB971,2AB971FONTANCHOR\x0f typesetter')
-    gui.command('end-of-buffer', window=w)
-    anchor = _policy_wait_box(ctx, (42, 185, 113))
-    source_marker = _policy_wait_box(ctx, (25, 167, 211))
+    upload.focus_composer(w)
     draft = 'typesetter'
-    input_start = gui._composer_native(w, '', 0, 0)['caret']
+    gui._composer_native(w, '', 0, 0)
     gui.type_text(draft)
     gui.framed_keys(w, 'Left', 'Right')
     size = len(draft.encode())
     before = gui._composer_native(w, draft, size, size)
-    # Full-window OCR swallowed the Input word into its control/caret shape.
-    # Compare native glyph bounds directly, using the real source swatch and
-    # compositor-reported Input start/end; no font sizes or screen coordinates.
-    from collections import Counter
-    font_frame = gui.native_rgb_capture(w)
-    def glyph_box(rectangle):
-        left, top, right, bottom = map(round, rectangle)
-        pixels = _policy_crop(font_frame, (left, top, right, bottom))
-        rgb = [tuple(pixels[index:index + 3]) for index in range(0, len(pixels), 3)]
-        plate = Counter(rgb).most_common(1)[0][0]
-        span = right - left
-        points = [(index % span, index // span) for index, value in enumerate(rgb)
-                  if max(abs(a - b) for a, b in zip(value, plate)) >= 24]
-        assert points, ('No actual native glyph ink inside measured region', rectangle, plate)
-        columns = sorted({point[0] for point in points})
-        end = columns[0]
-        for column in columns[1:]:
-            if column - end > max(2, (bottom - top) / 3):
-                break
-            end = column
-        # The first native word cluster excludes any far-right history
-        # scrollbar/border without assuming their width or clipping our word.
-        points = [(x, y) for x, y in points if x <= end]
-        return (left + min(x for x, _ in points), top + min(y for _, y in points),
-                left + end + 1, top + max(y for _, y in points) + 1)
-    conversation = gui.read_layout(prefs)['conversation']['rect']
-    glyphs = [
-        glyph_box((anchor[2], anchor[1], conversation[0] + conversation[2], anchor[3])),
-        glyph_box((input_start[0], input_start[1], before['caret'][0], input_start[1] + input_start[3])),
-    ]
-    dimensions = [(box[2] - box[0], box[3] - box[1]) for box in glyphs]
-    assert all(abs(a - b) <= 1 for a, b in zip(*dimensions)), (
-        'Native Input font does not match the actual MESSAGE font size', glyphs, dimensions)
-    layout_before = gui.read_layout(prefs)['conversation']['rect']
+    # The newest wide swatch crosses the card's text-free area without any scroll.
+    _policy_send(ctx, '\x04D37925,D37925' + 'H' * 60 + '\x0f newest overlay witness')
+    newest = _policy_wait_box(ctx, (211, 121, 37))
+    anchor = _policy_wait_box(ctx, (42, 185, 113))
+    source_marker = _policy_wait_box(ctx, (25, 167, 211))
+    markers = {'newest': ((211, 121, 37), newest),
+               'fontanchor': ((42, 185, 113), anchor),
+               'source': ((25, 167, 211), source_marker)}
+    captures = []
+
+    def overlap_observation(label, *, obscured=False):
+        native = gui._composer_native(w, draft, size, size)
+        rectangle = gui.read_layout(prefs)['conversation']['rect']
+        frame = gui.native_rgb_capture(w)
+        path = Path(ctx['destination']).with_name('overlay-overlap-' + label + '.png')
+        Image.frombytes('RGB', (frame['width'], frame['height']), frame['pixels']).save(path)
+        captures.append(str(path))
+        observed = {}
+        for name, (rgb, box) in markers.items():
+            roi = (box[0] - 1, box[1] - 1, box[2] - box[0] + 2, box[3] - box[1] + 2)
+            parts = gui.native_marker_components(frame, roi, rgb)
+            assert parts, ('Actual marker vanished; absence is not overlap evidence', label, name, box, str(path))
+            bounds = (min(item['bbox'][0] for item in parts), min(item['bbox'][1] for item in parts),
+                      max(item['bbox'][2] for item in parts), max(item['bbox'][3] for item in parts))
+            assert (box[0] <= bounds[0] < bounds[2] <= box[2]
+                    and box[1] <= bounds[1] < bounds[3] <= box[3]), (
+                'Actual marker moved outside its saved native ROI', label, name, box, parts, str(path))
+            if name == 'newest' or not obscured:
+                assert bounds == tuple(box), ('Actual marker geometry changed', label, name, box, parts, str(path))
+            if not obscured:
+                assert len(parts) == 1 and parts[0]['full'], (label, name, parts, str(path))
+            observed[name] = {'original_bbox': box, 'surviving_components': parts, 'saved_roi': roi}
+        return {'native_composer': native, 'conversation': rectangle,
+                'markers': observed, 'capture': str(path)}
+
+    closed = overlap_observation('before')
+    layout_before = closed['conversation']
     reply = gui.begin_native_reply(w, gui.read_layout(prefs), ctx['args'].zoom,
                                     Path(ctx['destination']), label='overlay-two-line-reply')
     gui._composer_native(w, draft, size, size)
@@ -6059,20 +6521,9 @@ def run_overlay_refinements(ctx):
     gui.SESSION.until('native pointer leaves the measured source swatch', lambda:
         re.search(r'wl_pointer[@#]\d+\.(?:motion|enter)\(',
                   gui.GUI_DEBUG[w][1].read_bytes()[pointer_offset:].decode(errors='replace')))
-    assert gui.native_input_rectangle(w) == before['caret'], 'Reply moved native Input'
-    assert _policy_wait_box(ctx, (42, 185, 113)) == anchor, 'Reply shifted the history viewport'
-    # Rich reply preserves the same cyan swatch. Resolve the original only
-    # inside its saved measured body ROI; do not require viewport-wide uniqueness.
-    source_marker = tuple(source_marker)
-    source_roi = (source_marker[0] - 1, source_marker[1] - 1,
-                  source_marker[2] - source_marker[0] + 2, source_marker[3] - source_marker[1] + 2)
-    def original_source_marker():
-        components = gui.native_marker_components(gui.native_rgb_capture(w), source_roi, (25, 167, 211))
-        return next((tuple(item['bbox']) for item in components
-                     if item['full'] and tuple(item['bbox']) == source_marker), False)
-    assert gui.SESSION.until('original rich source remains at its exact measured bbox',
-                             original_source_marker) == source_marker, 'Reply shifted its original source'
-    assert gui.read_layout(prefs)['conversation']['rect'] == layout_before
+    opened = overlap_observation('open', obscured=True)
+    assert opened['native_composer'] == closed['native_composer'], 'Reply changed native composer geometry/draft'
+    assert opened['conversation'] == layout_before, 'Reply changed conversation geometry'
     excerpt_region = _policy_reply_region(ctx, 'overlay-two-lines')
     preview_parts = [item['bbox'] for item in gui.native_marker_components(
         gui.native_rgb_capture(w), layout_before, (25, 167, 211))
@@ -6101,56 +6552,72 @@ def run_overlay_refinements(ctx):
     heading_words = _policy_words(ctx, 'overlay-heading-reference')
     heading = max((box for text, box in heading_words if text.casefold() == 'replying'
                    and box[3] < excerpt_region[1]), key=lambda box: box[3])
-    _policy_typing(ctx, 'active')
+    typing_top = round(max(box[3] for _, box in reply_words)) + 1
+    typing_box = (round(layout_before[0]), typing_top,
+                  round(layout_before[0] + layout_before[2]), round(before['caret'][1]))
+    assert typing_box[1] < typing_box[3], ('No measured typing band between reply and native Input', typing_box)
+    gui.move_pointer(w, layout_before[0] + layout_before[2] / 2, layout_before[1] + 1)
+
+    def typing_pixels():
+        return _policy_crop(gui.native_rgb_capture(w), typing_box)
+
+    def save_typing_pixels(label, pixels):
+        path = Path(ctx['destination']).with_name('overlay-typing-' + label + '.png')
+        Image.frombytes('RGB', (typing_box[2] - typing_box[0], typing_box[3] - typing_box[1]), pixels).save(path)
+        captures.append(str(path))
+        return str(path)
+
+    typing_baseline = typing_pixels()
+    typing_before_capture = save_typing_pixels('before', typing_baseline)
     def typing_visible():
-        words = _policy_words(ctx, 'overlay-typing-below-reply')
-        candidates = [box for text, box in words if text.casefold() == ctx['query_target'].casefold()
-                      and excerpts[0][3] < box[1] < box[3] < before['caret'][1]]
-        return candidates[-1] if candidates else False
-    typing = gui.SESSION.until('real typing nickname below the two-line reply and above Input', typing_visible)
+        _policy_typing(ctx, 'active')  # Keep genuine activity alive during native capture.
+        pixels = typing_pixels()
+        changed = [index // 3 for index in range(0, len(pixels), 3)
+                   if pixels[index:index + 3] != typing_baseline[index:index + 3]]
+        if not changed:
+            return False
+        width = typing_box[2] - typing_box[0]
+        bounds = (typing_box[0] + min(index % width for index in changed),
+                  typing_box[1] + min(index // width for index in changed),
+                  typing_box[0] + max(index % width for index in changed) + 1,
+                  typing_box[1] + max(index // width for index in changed) + 1)
+        assert typing_box[1] < bounds[1] < bounds[3] < typing_box[3], (
+            'Typing transition crosses the measured reply/Input boundaries', typing_box, bounds)
+        return {'measured_band': typing_box, 'changed_bbox': bounds, 'changed_pixels': len(changed),
+                'before_capture': typing_before_capture, 'active_capture': save_typing_pixels('active', pixels)}
+    typing = gui.SESSION.until('real TAGMSG paints the measured band below reply and above Input', typing_visible)
     assert gui.native_input_rectangle(w) == before['caret']
-    assert _policy_wait_box(ctx, (42, 185, 113)) == anchor, 'Typing shifted existing history'
+    overlap_observation('typing', obscured=True)
     assert gui._composer_native(w, draft, size, size)['caret'] == before['caret']
     _policy_typing(ctx, 'done')
-    gui.SESSION.until('real done removes overlay typing nickname', lambda: not typing_visible())
-    captures = [str(_policy_capture(ctx, 'overlay-fixed-two-lines'))]
+    def typing_restored():
+        pixels = typing_pixels()
+        return pixels if pixels == typing_baseline else False
+    typing_done = gui.SESSION.until('real done exactly restores the measured typing band', typing_restored)
+    typing['done_capture'] = save_typing_pixels('done', typing_done)
+    typing['done_restores_exact_baseline'] = True
+    captures.append(str(_policy_capture(ctx, 'overlay-fixed-two-lines')))
 
-    # Scroll retained content down through the overlay's empty header-right
-    # area. Exact real swatch pixels there prove history is painted behind a
-    # transparent card rather than clipped at an old reserved footer boundary.
-    x, y, width, height = gui.read_layout(prefs)['conversation']['rect']
-    sample_y = round((heading[1] + heading[3]) / 2)
-    sample_left, sample_right = round(heading[2] + 24), round(x + width - 64)
-    assert sample_left < sample_right
-    painted_behind, wheel_frames = None, []
-    gui.move_pointer(w, x + width / 2, y + height / 3)
-    for step in range(12):
-        offset = gui.GUI_DEBUG[w][1].stat().st_size
-        gui.POINTER.scroll(-1)
-        gui.await_native_frame(w, offset, re.compile(r'wl_pointer[@#]\d+\.axis\('))
-        frame = gui.native_rgb_capture(w, capture_timing=True)
-        longest = run = 0
-        for column in range(sample_left, sample_right):
-            start = (sample_y * frame['width'] + column) * 3
-            run = run + 1 if frame['pixels'][start:start + 3] == bytes(underlay_rgb) else 0
-            longest = max(longest, run)
-        wheel_frames.append({'step': step, 'matching_run': longest,
-                             'presentation_frames': frame['capture_timestamps']})
-        if longest >= 30:
-            painted_behind = {'y': sample_y, 'left': sample_left, 'right': sample_right,
-                              'matching_run': longest}
-            break
-    assert painted_behind, ('No actual retained history painted behind transparent reply overlay', wheel_frames)
-    captures.append(str(_policy_capture(ctx, 'overlay-transparent-history')))
-    focus_offset = gui.GUI_DEBUG[w][1].stat().st_size
-    gui.click(w, before['caret'][0] + before['caret'][2] / 2,
-              before['caret'][1] + before['caret'][3] / 2)
-    gui.await_native_frame(w, focus_offset,
-        re.compile(r'wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)'))
-    gui._composer_native(w, draft, size, size)
-    gui.cancel_native_reply(w, ctx['destination'], label='overlay-cancel', expected_text=draft)
+    # No wheel or navigation occurs between the followed newest row and this
+    # opening observation. Actual surviving RGB, not an absent/clipped marker,
+    # must occupy the real heading/excerpt band immediately.
+    card_band = (heading[1], max(box[3] for _, box in reply_words))
+    surviving = opened['markers']['newest']['surviving_components']
+    behind = [item for item in surviving
+              if max(item['bbox'][1], card_band[0]) < min(item['bbox'][3], card_band[1])]
+    assert behind, ('Followed newest actual marker does not occupy the open card band',
+                    newest, card_band, surviving, opened['capture'])
+    painted_behind = {'card_band': card_band, 'newest_marker': newest,
+                      'surviving_components_in_band': behind, 'wheel_required': False,
+                      'capture': opened['capture']}
+    cancelled = gui.cancel_native_reply(w, ctx['destination'], label='overlay-cancel', expected_text=draft)
+    captures.extend(cancelled['captures'])
+    closed_again = overlap_observation('cancel')
+    assert closed_again['native_composer'] == closed['native_composer'], \
+        'Real Cancel reply changed native composer geometry or draft'
+    assert closed_again['conversation'] == layout_before, 'Real Cancel reply changed conversation geometry'
     gui.clear_draft()
-    gui.command('end-of-buffer', window=w)
+    upload.focus_composer(w)
 
     # Compare native regular/italic glyph masks and paint outside the action
     # glyph band in both display modes; no copied font name, RGB or card size.
@@ -6179,7 +6646,7 @@ def run_overlay_refinements(ctx):
     for style in ('bubbles', 'irc'):
         gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'],
                               action_identity, style, label='overlay-action-' + style)
-        gui.command('end-of-buffer', window=w)
+        upload.focus_composer(w)
         words = _policy_words(ctx, 'overlay-action-' + style)
         bodies = sorted([box for text, box in words if text.casefold() == action_text.casefold()], key=lambda box: box[1])
         assert len(bodies) == 2, ('No actual regular/action native glyph pair', style, words)
@@ -6228,20 +6695,20 @@ def run_overlay_refinements(ctx):
                       for row in time_rows if re.search(r'\d:\d', row['text'])]
         assert timestamps, ('First action timestamp missing in its measured native band', style, time_rows)
         stamp = min(timestamps, key=lambda box: abs((box[1] + box[3] - action[1] - action[3]) / 2))
-        assert stamp[3] - stamp[1] < action[3] - action[1], ('Action timestamp is not smaller than body', stamp, action)
         stamp_ink, body_ink = _native_word_ink(ctx, stamp), _native_word_ink(ctx, action)
         assert stamp_ink['contrast'] < body_ink['contrast'], (
             'Action timestamp is not visually muted against its actual native plate', stamp_ink, body_ink)
         actions.append({'style': style, 'regular': regular, 'italic_action': action,
-                        'inline_actor': actor, 'small_timestamp': stamp,
+                        'inline_actor': actor, 'timestamp': stamp,
                         'timestamp_ink': stamp_ink, 'body_ink': body_ink})
         captures.append(str(_policy_capture(ctx, 'overlay-action-no-bubble-' + style)))
     logo = _probe_logo_alignment(ctx)
     return _refresh_return(ctx, 'overlay-refinements', {
-        'font_glyphs': glyphs, 'font_dimensions': dimensions, 'reply': reply,
+        'reply': reply,
         'two_line_excerpt': reply_words, 'typing_below_reply': typing,
         'input_caret_unchanged': before['caret'], 'history_anchor_unchanged': anchor,
-        'transparent_history': painted_behind, 'actual_wheel_frames': wheel_frames,
+        'transparent_history': painted_behind, 'actual_wheel_frames': [],
+        'overlap_before_open_cancel': [closed, opened, closed_again], 'real_cancel': cancelled,
         'actions': actions, 'rail_captures': logo['captures'], 'captures': captures,
         'logo_geometry': logo['geometry_contract']})
 
@@ -7219,6 +7686,979 @@ def run_typing_focus(ctx):
     return _refresh_return(ctx, 'typing-focus', {
         'before': draft, 'first_scalar': 'x', 'exact_once_native': handed_off,
         'registered_prefix_picker': picker, 'unchanged_draft_after_prefix': restored})
+
+
+def run_buffer_boundaries(ctx):
+    """Default M-</M-> on real loaded rows, with native editor and IME witnesses."""
+    import os
+
+    p, w = ctx['proc'], ctx['window']
+    prefs, db, identity = ctx['preferences'], ctx['database_path'], ctx['query_id']
+    destination = Path(ctx['destination'])
+    assert ctx['args'].zoom == 1 and ctx['args'].size == (1440, 940), ctx['args']
+    bindings = tomllib.loads(Path(prefs).read_text())['bindings']
+    assert bindings['beginning-of-buffer'] == 'M-<' and bindings['end-of-buffer'] == 'M->', bindings
+    with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as database:
+        assert database.execute('SELECT COUNT(*) FROM messages WHERE buffer=?', (identity,)).fetchone() == (0,), \
+            'The focused boundary scope requires its fresh private query'
+    nonce = os.urandom(4).hex()
+    first_rgb, source_rgb, tail_rgb, follow_rgb = (42, 185, 113), (25, 167, 211), (211, 121, 37), (211, 90, 145)
+    first = f'Boundary first \x042AB971,2AB971Astra{nonce}\x0f.'
+    _policy_send(ctx, first)
+    _policy_focus(ctx, identity)
+    for index in range(50):
+        _policy_send(ctx, f'Boundary {nonce} loaded row {index:02d}', durable=False)
+    source = f'Boundary reply source \x0419A7D3,19A7D3Astra{nonce}\x0f.'
+    _policy_send(ctx, source)
+    tail = f'Boundary newest \x04D37925,D37925Astra{nonce}\x0f.'
+    _policy_send(ctx, tail)
+    _policy_wait_box(ctx, tail_rgb)
+    source_marker = _policy_wait_box(ctx, source_rgb)
+    acknowledged = gui.wait_read_marker(p, db, identity)
+    assert acknowledged[3] == tail, acknowledged
+    layout = gui.read_layout(prefs)
+    reply = gui.begin_native_reply(w, layout, 1, destination, label='boundary-reply')
+    draft = 'Boundary café draft'
+    gui.type_text(draft)
+    size = len(draft.encode('utf-8'))
+    gui.framed_keys(w, 'ctrl+Home', 'ctrl+shift+End')
+    before = gui._composer_native(w, draft, size, 0)
+    # Reply is an unreserved transparent overlay: the newest body can overlap
+    # its heading. Keep the quote's cyan identity separate from both endpoints,
+    # and measure its actual swatch instead of OCR-ing overlapping heading text.
+    baseline = gui.native_rgb_capture(w)
+    swatches = [item for item in gui.native_marker_components(
+        baseline, layout['conversation']['rect'], source_rgb)
+        if item['full'] and item['bbox'][1] > source_marker[3]]
+    assert swatches, ('No actual native reply quote below its original source', source_marker, swatches)
+    quote_swatch = max(swatches, key=lambda item: item['bbox'][1])
+    qx, qy, qr, qb = quote_swatch['bbox']
+    excerpt = (qx - 1, qy - 1, qr - qx + 2, qb - qy + 2)
+    ex, ey, ew, eh = excerpt
+    # Endpoint colors never occur in the quote, so sample the full real pane;
+    # newest rows are allowed to occupy the active reply card's band.
+    transcript_sample = tuple(layout['conversation']['rect'])
+    quote_relative_box = [quote_swatch['bbox'][0] - ex, quote_swatch['bbox'][1] - ey,
+                          quote_swatch['bbox'][2] - ex, quote_swatch['bbox'][3] - ey]
+    reply_observations = []
+
+    def transcript_components(image, rgb):
+        return gui.native_marker_components(image, transcript_sample, rgb)
+
+    def transcript_box(rgb):
+        components = transcript_components(gui.native_rgb_capture(w), rgb)
+        return components[0]['bbox'] if len(components) == 1 and components[0]['full'] else None
+    debug = gui.GUI_DEBUG[w][1]
+    log_base = debug.stat().st_size
+    phases, captures = [], list(reply['captures'])
+
+    def unchanged_editor():
+        state = gui._composer_native(w, draft, size, 0)
+        assert state == before, ('Boundary changed native draft/selection/focus', before, state)
+        image = gui.native_rgb_capture(w)
+        assert (image['width'], image['height']) == (baseline['width'], baseline['height'])
+        # Compare only the quote's opaque swatch, not the transparent card background.
+        assert gui.native_marker_components(image, excerpt, source_rgb) == [quote_swatch], \
+            'Boundary changed the actual reply quote identity/geometry'
+        reply_observations.append({'native': state, 'quote_swatch': quote_swatch,
+                                   'quote_relative_box': quote_relative_box})
+        return state
+
+    def boundary(newest, label):
+        action = gui.framed_keys(w, 'alt+greater' if newest else 'alt+less')
+        rgb, absent = (tail_rgb, first_rgb) if newest else (first_rgb, tail_rgb)
+        previous = None
+
+        def painted():
+            nonlocal previous
+            image = gui.native_rgb_capture(w, capture_timing=True)
+            components = transcript_components(image, rgb)
+            box = components[0]['bbox'] if len(components) == 1 and components[0]['full'] else None
+            if not box or transcript_components(image, absent):
+                previous = None
+                return None
+            stable = box == previous
+            previous = box
+            return (box, image['capture_timestamps']) if stable else None
+
+        box, frames = gui.SESSION.until('actual default boundary reveals only its loaded endpoint', painted)
+        unchanged_editor()
+        capture = str(_policy_capture(ctx, 'buffer-boundary-' + label))
+        captures.append(capture)
+        phases.append({'label': label, 'keys': 'M->' if newest else 'M-<',
+                       'trace_offset': action, 'marker_box': box, 'presentation_frames': frames,
+                       'capture': capture})
+        return box
+
+    with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as database:
+        def retained():
+            return database.execute('SELECT seq,id,text FROM messages WHERE buffer=? ORDER BY seq',
+                                    (identity,)).fetchall()
+
+        loaded = retained()
+        assert len(loaded) == 53 and loaded[0][2] == first and loaded[-2][2] == source and loaded[-1][2] == tail, loaded
+        first_box = boundary(False, 'first-loaded')
+        # Repeating at the boundary must not expose older rows or change its geometry.
+        assert boundary(False, 'first-loaded-repeat') == first_box
+        assert retained() == loaded, 'Beginning changed the loaded real-wire history'
+        tail_box = boundary(True, 'newest')
+        assert retained() == loaded, 'End changed the loaded real-wire history'
+
+    # The real private input-method owns preedit; consumed chords need not paint.
+    method = ctx['input_method']
+    assert method is not None, 'buffer-boundaries requires the standard private input-method fixture'
+    method.drain()
+    assert method.state['active'], method.state
+
+    def preedit(text):
+        offset = debug.stat().st_size
+        serial = method.transaction(text, len(text), len(text))
+        event = re.compile(r'zwp_text_input_v3[@#]\d+\.preedit_string\("' + re.escape(text) + r'",')
+        gui.SESSION.until('actual application boundary preedit delivery', lambda:
+            event.search(debug.read_bytes()[offset:].decode(errors='replace')))
+        gui.await_native_frame(w, offset, event)
+        return serial
+
+    ime_serial = preedit('boundary-ime')
+    ime_state = gui.native_input_state(w)
+    ime_capture = str(_policy_capture(ctx, 'buffer-boundary-ime-before'))
+    cx, cy, cw, ch = ime_state['caret']
+    metrics = gui.pane_metrics(gui.read_layout(prefs), 1)
+    ime_bounds = (round(metrics['x'] + metrics['left'] + 8), round(cy + ch * .15),
+                  round(cx - 2), round(cy + ch * .7))
+    assert ime_bounds[0] < ime_bounds[2] and ime_bounds[1] < ime_bounds[3], ime_bounds
+    ime_pixels = _policy_crop(gui.native_rgb_capture(w), ime_bounds)
+    for chord in ('alt+less', 'alt+greater'):
+        offset = debug.stat().st_size
+        presses = gui.key(chord, trace=True)
+        release = re.compile(rf'wl_keyboard[@#]\d+\.key\(\d+,\s*\d+,\s*{presses[-1]},\s*0\)')
+        gui.SESSION.until('real consumed boundary chord release during IME', lambda:
+            release.search(debug.read_bytes()[offset:].decode(errors='replace')))
+        # Plus hover forces an actual paint without changing draft selection or focus.
+        targets = gui.composer_primary_targets(gui.read_layout(prefs), 1, ime_state['caret'])
+        gui.move_pointer(w, *targets['send'])
+        paint = debug.stat().st_size
+        gui.move_pointer(w, *targets['plus'])
+        gui.await_native_frame(w, paint, re.compile(r'wl_pointer[@#]\d+\.motion\('))
+        assert gui.native_input_state(w) == ime_state, 'Boundary chord changed native IME state'
+        assert _policy_crop(gui.native_rgb_capture(w), ime_bounds) == ime_pixels, \
+            'Boundary chord changed the actually painted preedit glyph band'
+        assert gui.SESSION.until('native transcript tail during IME', lambda: transcript_box(tail_rgb)) == tail_box, \
+            'IME boundary chord moved the transcript'
+        assert not transcript_box(first_rgb), 'IME boundary chord exposed first row'
+    ime_after = str(_policy_capture(ctx, 'buffer-boundary-ime-after'))
+    preedit('')
+    gui.move_pointer(w, 0, 0)
+    unchanged_editor()
+    follow = f'Boundary follow \x04D35A91,D35A91Astra{nonce}\x0f.'
+    _policy_send(ctx, follow)
+    previous_follow = None
+    def following_component():
+        nonlocal previous_follow
+        components = transcript_components(gui.native_rgb_capture(w), follow_rgb)
+        # The transparent reply heading can cut into the latest swatch. Require
+        # a real unique, stable RGB component, not a fully rectangular fill.
+        if len(components) != 1:
+            previous_follow = None
+            return False
+        component = components[0]
+        left, top, right, bottom = component['bbox']
+        if right - left < 24 or bottom - top < 6 or component['pixels'] <= 0:
+            previous_follow = None
+            return False
+        stable = component == previous_follow
+        previous_follow = component
+        return component if stable else False
+    followed = gui.SESSION.until('native transcript following visible stable arrival', following_component)
+    read = gui.wait_read_marker(p, db, identity)
+    assert read[3] == follow, read
+    unchanged_editor()
+    captures.extend((ime_capture, ime_after, str(_policy_capture(ctx, 'buffer-boundary-follow'))))
+    trace_path = destination.with_name(destination.stem + '-buffer-boundaries.wayland.log')
+    trace_path.write_text(ctx['lab']._redact(debug.read_bytes()[log_base:].decode(errors='replace')))
+    cancelled = gui.cancel_native_reply(w, destination, label='boundary-reply-still-active', expected_text=draft)
+    return _refresh_return(ctx, 'buffer-boundaries', {
+        'loaded_first': loaded[0], 'loaded_newest': loaded[-1], 'loaded_count': len(loaded),
+        'phases': phases, 'native_draft_selection': before, 'reply_excerpt_region': excerpt,
+        'transcript_marker_sample': transcript_sample,
+        'reply_quote_swatch': quote_swatch, 'reply_quote_relative_box': quote_relative_box,
+        'reply_source': source, 'reply_source_marker_before': source_marker,
+        'reply_preservation_observations': reply_observations,
+        'ime_glyph_bounds': ime_bounds,
+        'reply_still_active_cancel': cancelled, 'ime_serial': ime_serial,
+        'ime_state': ime_state, 'ime_chords': ['M-<', 'M->'],
+        'following_marker': followed, 'following_read': read, 'captures': captures,
+        'trace': str(trace_path), 'trace_base_offset': log_base,
+        'limits': ['Fresh fully loaded query; no remote-only history frontier or fetch-count claim.',
+                   'Dialog/menu/control precedence and stale-anchor cancellation remain native routing tests.',
+                   'Swatches prove actual endpoint visibility, not arbitrary message glyph fidelity.']})
+
+
+def run_jump_bottom(ctx):
+    """Real zero-arrival departure, native FAB boundary/click, and resumed following."""
+    import os
+
+    p, w = ctx['proc'], ctx['window']
+    prefs, db, identity = ctx['preferences'], ctx['database_path'], ctx['query_id']
+    assert ctx['args'].zoom == 1 and ctx['args'].size == (1440, 940), ctx['args']
+    _policy_focus(ctx, identity)
+    nonce = os.urandom(4).hex()
+    for index in range(50):
+        _policy_send(ctx, f'JB{nonce} history {index:02d}', durable=False)
+    tail_rgb, follow_rgb = (25, 167, 211), (211, 90, 145)
+    # Reuse the rectangular reading-proof swatch; leading J glyphs overhang it.
+    tail = f'Jump-bottom tail \x0419A7D3,19A7D3Astra{nonce}\x0f.'
+    _policy_send(ctx, tail)
+    acknowledged = gui.wait_read_marker(p, db, identity)
+    assert acknowledged[3] == tail, acknowledged
+    _policy_wait_box(ctx, tail_rgb)
+    draft = 'keep café draft'
+    gui.type_text(draft)
+    size = len(draft.encode('utf-8'))
+    before_input = gui._composer_native(w, draft, size, size)
+    layout = gui.read_layout(prefs)
+    x, y, width, height = layout['conversation']['rect']
+    # Short wire bodies leave this strip blank. Exclude the scrollbar gutter;
+    # the only new native ink here after departure must be the actual FAB.
+    region = (round(x + width - 110), round(y + 100),
+              round(x + width - 20), round(before_input['caret'][1]))
+
+    def park_pointer():
+        offset = gui.GUI_DEBUG[w][1].stat().st_size
+        gui.move_pointer(w, x + width / 2, max(1, y / 2))
+        gui.await_native_frame(w, offset, re.compile(r'wl_pointer[@#]\d+\.motion\('))
+
+    def strip():
+        image = gui.native_rgb_capture(w)
+        assert gui.read_layout(prefs) == layout, 'Native proof geometry changed'
+        return Image.frombytes('RGB', (image['width'], image['height']),
+                               image['pixels']).crop(region)
+
+    # Match the existing unread proof: exclude software cursor and hover ink.
+    park_pointer()
+    baseline = strip()
+    at_tail = str(_policy_capture(ctx, 'jump-bottom-tail'))
+    with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as database:
+        def retained():
+            return database.execute(
+                'SELECT seq,text FROM messages WHERE buffer=? ORDER BY seq', (identity,)).fetchall()
+
+        history = retained()
+        assert [row[1] for row in history[-51:-1]] == [
+            f'JB{nonce} history {index:02d}' for index in range(50)], history
+        gui.move_pointer(w, x + width / 2, y + height / 2)
+        offset = gui.GUI_DEBUG[w][1].stat().st_size
+        gui.POINTER.scroll(-32)
+        gui.await_native_frame(w, offset, re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
+
+        def departed():
+            image = gui.native_rgb_capture(w)
+            if gui.native_marker_components(image, layout['conversation']['rect'], tail_rgb):
+                return None
+            difference = ImageChops.difference(baseline, strip()).convert('L')
+            box = difference.point(lambda value: 255 if value > 24 else 0).getbbox()
+            if not box or not (28 <= box[2] - box[0] <= 52 and 28 <= box[3] - box[1] <= 52):
+                return None
+            return tuple(value + region[index % 2] for index, value in enumerate(box))
+
+        boundary = gui.SESSION.until('native right-side FAB ink with tail offscreen', departed)
+        assert boundary[0] > x + width - 100 and boundary[3] < before_input['caret'][1], boundary
+        expected_center_x = x + width - gui.pane_metrics(layout, 1)['left'] - 44
+        assert abs((boundary[0] + boundary[2]) / 2 - expected_center_x) <= 3, boundary
+        away = str(_policy_capture(ctx, 'jump-bottom-away-zero-arrivals'))
+        assert retained() == history, 'Messages arrived during the zero-unseen departure'
+        assert gui.wait_read_marker(p, db, identity) == acknowledged
+        gui._composer_native(w, draft, size, size)
+        offset = gui.GUI_DEBUG[w][1].stat().st_size
+        point = ((boundary[0] + boundary[2]) / 2, (boundary[1] + boundary[3]) / 2)
+        gui.click(w, *point)
+        gui.await_native_frame(w, offset,
+                               re.compile(r'wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)'))
+        restored_tail = _policy_wait_box(ctx, tail_rgb)
+        park_pointer()
+        gui.SESSION.until('FAB native ink disappears at restored tail',
+                          lambda: ImageChops.difference(baseline, strip()).getbbox() is None)
+        after_input = gui._composer_native(w, draft, size, size)
+        assert after_input == before_input, ('FAB changed native editor state', before_input, after_input)
+        assert retained() == history, 'Messages arrived before the zero-unseen click completed'
+        restored = str(_policy_capture(ctx, 'jump-bottom-restored'))
+
+    follow = f'Jump-bottom follow \x04D35A91,D35A91Astra{nonce}\x0f.'
+    _policy_send(ctx, follow)
+    followed = _policy_wait_box(ctx, follow_rgb)
+    read = gui.wait_read_marker(p, db, identity)
+    assert read[3] == follow, read
+    gui._composer_native(w, draft, size, size)
+    return _refresh_return(ctx, 'jump-bottom', {
+        'retained_history_rows': len(history), 'no_arrivals_before_click': True,
+        'acknowledged_before_departure': acknowledged, 'native_fab_boundary': boundary,
+        'actual_pointer_click': point, 'restored_tail_marker': restored_tail,
+        'followed_new_wire_marker': followed, 'followed_read_marker': read,
+        'unchanged_native_editor': after_input,
+        'captures': {'tail': at_tail, 'away_zero_arrivals': away, 'restored': restored,
+                     'following': str(_policy_capture(ctx, 'jump-bottom-following'))}})
+
+
+
+def run_mentions_unread(ctx):
+    """One real-wire unread/read transition, isolated from another conversation."""
+    p, w = ctx['proc'], ctx['window']
+    prefs, db = ctx['preferences'], ctx['database_path']
+    channel, query = ctx['channel_id'], ctx['query_id']
+    _policy_focus(ctx, query)
+    gui.wait_read_marker(p, db, query)
+    _policy_focus(ctx, channel)
+    _policy_send(ctx, 'Native unread navigation anchor', target=ctx['channel'])
+    acknowledged = gui.wait_read_marker(p, db, channel)
+    # Home in the real transcript explicitly leaves tail-follow mode, even
+    # when this small fixture's history fits without scrolling.
+    gui.framed_keys(w, 'ctrl+p')
+    gui.SESSION.until('transcript owns keyboard before Home',
+                      lambda: gui.native_input_state(w) is None)
+    gui.framed_keys(w, 'Home', 'ctrl+g')
+    gui._composer_native(w, '', 0, 0)
+    other_body = ctx['own_nick'] + ': Other conversation must stay unread'
+    _policy_send(ctx, other_body)
+    before = gui.save_state(p, prefs, db)
+    other_before = next(row for row in before[2] if row[0] == query)
+    assert other_before[1] > 0, ('Other conversation was not genuinely unread', other_before)
+
+    # Locate only the native navigator band, not cosmetic labels or timestamps.
+    layout = gui.read_layout(prefs)
+    scale = layout['scale']
+    x, y, width, height = layout['conversation']['rect']
+    metrics = gui.pane_metrics(layout, scale)
+    image = gui.native_rgb_capture(w)
+    native = Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
+    caret = gui.native_input_rectangle(w)
+    column, row = round(x + width - 200 * scale), round(caret[1] + caret[3] / 2)
+    canvas = native.getpixel((column, round(y + height / 2)))
+    assert native.getpixel((column, row)) != canvas, 'No native composer card boundary'
+    while row > y + metrics['top'] and native.getpixel((column, row)) != canvas:
+        row -= 1
+    bottom = row + 1 - metrics['padding_y'] - metrics['gap']
+    right = x + width - metrics['left'] - 26 * scale  # Scroll gutter + overlay margin.
+    region = (round(right - 44 * scale), round(bottom - 116 * scale),
+              round(44 * scale), round(84 * scale))
+    bounds = (region[0], region[1], region[0] + region[2], region[1] + region[3])
+    def park_pointer():
+        offset = gui.GUI_DEBUG[w][1].stat().st_size
+        gui.move_pointer(w, x + width / 2, max(1, y / 2))
+        gui.await_native_frame(w, offset, re.compile(r'wl_pointer[@#]\d+\.motion\('))
+
+    # Both captures must exclude the actual software cursor and hover state:
+    # the count click otherwise leaves the pointer inside the former pill.
+    park_pointer()
+    absent = _policy_crop(gui.native_rgb_capture(w), bounds)
+    body = '\x042D9BD9,2D9BD9NATIVEUNREAD\x0f ' + ctx['own_nick'] + ': Read only this conversation'
+    _policy_send(ctx, body, target=ctx['channel'])
+    pending = gui.save_state(p, prefs, db)
+    current_before = next(row for row in pending[2] if row[0] == channel)
+    assert current_before[1] == 1 and current_before[2] == acknowledged[0], (
+        'Nonfollowing real arrival did not retain its unread marker', acknowledged, current_before)
+    rows = upload.visible_words(w, Path(ctx['destination']), 'mentions-unread-count',
+                                region=region, psm=6)
+    counts = [item for item in rows if item['text'].strip() == '1']
+    assert len(counts) == 1, ('Native unread navigator must show one eligible mention', rows)
+    count = counts[0]
+    offset = gui.GUI_DEBUG[w][1].stat().st_size
+    gui.click(w, int(count['left']) + int(count['width']) / 2,
+              int(count['top']) + int(count['height']) / 2)
+    gui.await_native_frame(w, offset,
+        re.compile(r'wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)'))
+    read = gui.wait_read_marker(p, db, channel)
+    assert read[3] == body and read[0] != acknowledged[0], (acknowledged, read)
+    after = gui.save_state(p, prefs, db)
+    other_after = next(row for row in after[2] if row[0] == query)
+    assert other_after == other_before, ('Count click marked another conversation read', other_before, other_after)
+    park_pointer()
+    gui.SESSION.until('Core-zero hides the native navigator',
+        lambda: _policy_crop(gui.native_rgb_capture(w), bounds) == absent)
+
+    # Reuse the unique wire-painted body marker: a first plain feed-body click
+    # must jump to its source without first selecting it or opening a menu.
+    gui.command('global-mentions', window=w)
+    feed = gui.save_state(p, prefs, db)
+    assert feed[1] not in ((channel,), (query,)), feed
+    marker = _policy_wait_box(ctx, (45, 155, 217))
+    gui.click(w, (marker[0] + marker[2]) / 2, (marker[1] + marker[3]) / 2)
+    source = gui.save_state(p, prefs, db)
+    assert source[1] == (channel,), ('First feed-body click did not jump to original source', source)
+    _policy_wait_box(ctx, (45, 155, 217))
+    assert next(row for row in source[2] if row[0] == query) == other_before
+    return _refresh_return(ctx, 'mentions-unread', {
+        'before_read': current_before, 'core_read': read, 'other_unread_preserved': other_after,
+        'native_count': counts, 'navigator_hidden_at_core_zero': True,
+        'feed_body_source_jump': list(source[1]),
+        'capture': str(_policy_capture(ctx, 'mentions-unread-source-jump'))})
+
+
+class _StartupHistoryRelay:
+    """One private TLS connection; one event-loop thread owns all TLS I/O."""
+
+    def __init__(self, lab, target, endpoint='direct'):
+        import asyncio
+        import socket
+        self.asyncio = asyncio
+        self.target = target.casefold()
+        self.held = threading.Event()
+        self.release = threading.Event()
+        self.completed = threading.Event()
+        self.stopping = threading.Event()
+        self.errors = []
+        self.requests = []
+        self.tasks = set()
+        self.batch = None
+        self.loop = None
+        self.shutdown = None
+        self.listener = socket.socket()
+        self.listener.bind(('127.0.0.1', 0))
+        self.listener.listen(1)
+        self.port = self.listener.getsockname()[1]
+        self.server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.server_tls.load_cert_chain(lab.root / 'server.pem', lab.root / 'server.key')
+        self.client_tls = ssl.create_default_context(cafile=lab.ca_file)
+        self.endpoint = lab.endpoints[endpoint]
+        self.worker = threading.Thread(target=self._run, daemon=True)
+        self.worker.start()
+
+    def _run(self):
+        try:
+            self.asyncio.run(self._serve())
+        except BaseException as error:
+            if not self.stopping.is_set():
+                self.errors.append(error)
+        finally:
+            self.listener.close()
+
+    async def _serve(self):
+        self.loop = self.asyncio.get_running_loop()
+        self.shutdown = self.asyncio.Event()
+
+        def accepted(reader, writer):
+            task = self.asyncio.create_task(self._accept(reader, writer))
+            self.tasks.add(task)
+            task.add_done_callback(finished)
+
+        def finished(task):
+            self.tasks.discard(task)
+            if not task.cancelled():
+                error = task.exception()
+                if error is not None and not self.stopping.is_set():
+                    self.errors.append(error)
+
+        server = await self.asyncio.start_server(
+            accepted, sock=self.listener, ssl=self.server_tls, limit=16384,
+            ssl_handshake_timeout=5, ssl_shutdown_timeout=1)
+        try:
+            if self.stopping.is_set():
+                self.shutdown.set()
+            await self.shutdown.wait()
+        finally:
+            server.close()
+            pending = list(self.tasks)
+            for task in pending:
+                task.cancel()
+            await self.asyncio.gather(*pending, return_exceptions=True)
+            await server.wait_closed()
+
+    async def _accept(self, reader, writer):
+        writers = [writer]
+        relays = []
+        try:
+            if self.stopping.is_set():
+                return
+            upstream_reader, upstream_writer = await self.asyncio.wait_for(
+                self.asyncio.open_connection(
+                    self.endpoint['host'], self.endpoint['port'], ssl=self.client_tls,
+                    server_hostname=self.endpoint['host'], limit=16384,
+                    ssl_handshake_timeout=5, ssl_shutdown_timeout=1), timeout=5)
+            writers.append(upstream_writer)
+            relays = [
+                self.asyncio.create_task(self._relay(reader, upstream_writer, False)),
+                self.asyncio.create_task(self._relay(upstream_reader, writer, True)),
+            ]
+            done, _ = await self.asyncio.wait(relays, return_when=self.asyncio.FIRST_COMPLETED)
+            await self.asyncio.gather(*done)
+        finally:
+            for task in relays:
+                task.cancel()
+            await self.asyncio.gather(*relays, return_exceptions=True)
+            for connection in writers:
+                connection.close()
+            await self.asyncio.gather(
+                *(connection.wait_closed() for connection in writers), return_exceptions=True)
+
+    async def _relay(self, source, destination, server):
+        while not self.stopping.is_set():
+            frame = await source.readline()
+            if not frame:
+                return
+            if len(frame) > 16384 or not frame.endswith(b'\n'):
+                raise AssertionError('Private history relay received an invalid IRC frame')
+            line = frame.decode('utf-8', errors='replace').rstrip('\r\n')
+            tags = {}
+            if line.startswith('@'):
+                tag_text, line = line.split(' ', 1)
+                tags = dict(tag.partition('=')[::2] for tag in tag_text[1:].split(';'))
+            if line.startswith(':'):
+                line = line.split(' ', 1)[1]
+            parts = line.split()
+            if not server and len(parts) >= 3 and parts[0].upper() == 'CHATHISTORY':
+                if parts[2].casefold() == self.target:
+                    # Never retain authentication or unrelated client frames.
+                    self.requests.append(line)
+            if server and len(parts) >= 4 and parts[0].upper() == 'BATCH':
+                if (parts[1].startswith('+') and parts[2].casefold() == 'chathistory'
+                        and parts[3].lstrip(':').casefold() == self.target):
+                    assert self.requests, 'History batch preceded the actual GUI request'
+                    assert self.batch is None, 'Unexpected second target history batch'
+                    self.batch = parts[1][1:]
+            if (server and self.batch is not None and tags.get('batch') == self.batch
+                    and not self.held.is_set()):
+                self.held.set()
+                # ponytail: pause this direction, preserving nested wire-frame ordering.
+                if not await self.asyncio.to_thread(self.release.wait, 20):
+                    raise TimeoutError('Private history body was not released before its deadline')
+            destination.write(frame)
+            await destination.drain()
+            if server and self.batch is not None and parts[:2] == ['BATCH', '-' + self.batch]:
+                self.completed.set()
+
+    def ready(self, event):
+        if self.errors:
+            raise self.errors[0]
+        return event.is_set()
+
+    def close(self):
+        self.stopping.set()
+        self.release.set()
+        if self.loop is not None and self.shutdown is not None:
+            try:
+                self.loop.call_soon_threadsafe(self.shutdown.set)
+            except RuntimeError:
+                pass  # The owning loop already closed after a reported relay error.
+        self.worker.join(timeout=6)
+        assert not self.worker.is_alive(), 'Private history TLS relay did not stop'
+
+
+class _SojuSearchRelay(_StartupHistoryRelay):
+    """Pass real Soju traffic unchanged, recording only search/history requests."""
+
+    def __init__(self, lab, target):
+        super().__init__(lab, target, 'soju')
+
+    async def _relay(self, source, destination, server):
+        while not self.stopping.is_set():
+            frame = await source.readline()
+            if not frame:
+                return
+            if len(frame) > 16384 or not frame.endswith(b'\n'):
+                raise AssertionError('Invalid private Soju IRC frame')
+            if not server:
+                line = frame.decode('utf-8', errors='replace').rstrip('\r\n')
+                command = line.split(' ', 1)[1] if line.startswith('@') else line
+                if command.startswith(('SEARCH ', 'CHATHISTORY ')):
+                    self.requests.append(command)
+            destination.write(frame)
+            await destination.drain()
+
+
+def run_soju_search_context(ctx):
+    """Click a remote-only Soju search hit and inspect its real surrounding history."""
+    import os
+    import sqlite3
+
+    lab, observer = ctx['lab'], ctx['observer']
+    endpoint = lab.endpoints['soju']
+    channel = endpoint['channels'][0]
+    identity = 'Soju/' + channel
+    nonce = os.urandom(5).hex()
+    marker = 'CONTEXTNEEDLE' + nonce
+    colors = [(45, 155, 217), (42, 185, 113), (179, 79, 213)]
+    bodies = [
+        '\x042D9BD9,2D9BD9BEFORECONTEXT\x0f ' + nonce,
+        '\x042AB971,2AB971' + marker + '\x0f original message',
+        '\x04B34FD5,B34FD5AFTERCONTEXT\x0f ' + nonce,
+    ]
+    newer = ['Newer independent history ' + nonce + ' ' + str(i) for i in range(205)]
+    destination = Path(ctx['destination'])
+    config = Path(ctx['preferences']).with_name('config.toml')
+    relay = _SojuSearchRelay(lab, channel)
+    ctx['cleanup'].callback(relay.close)
+
+    # Populate the bouncer while this GUI has never connected to it. More than
+    # the client's 200-message page separates the old hit from LATEST.
+    guest = dict(lab.endpoints['peer'], nick='context' + nonce[:8])
+    with gui.fixtures.BootstrapClient(guest, lab.ca_file) as sender:
+        sender.send('JOIN ' + channel)
+        sender.wait(lambda command, params, prefix:
+                    command == 'JOIN' and params == [channel] and
+                    prefix.split('!', 1)[0] == guest['nick'])
+        for text in bodies + newer:
+            sender.send(f'PRIVMSG {channel} :{text}')
+            sender.wait(lambda command, params, prefix:
+                        command == 'PRIVMSG' and params == [channel, text] and
+                        prefix.split('!', 1)[0] == guest['nick'])
+            if text in bodies:
+                time.sleep(0.05)
+
+    gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
+    out, err = gui.finish_gui(ctx['proc'], ctx['window'], ctx['screenshot'],
+                              destination.with_name('soju-search-before-restart.bmp'), ctx['args'].size)
+    ctx['logs'].append(('soju-search-before-restart', out, err))
+    departed = {ctx['own_nick'], ctx['other_nick']}
+    while departed:
+        _, _, prefix = observer.wait(lambda command, params, prefix:
+            command == 'QUIT' and prefix.split('!', 1)[0] in departed, timeout=15)
+        departed.remove(prefix.split('!', 1)[0])
+    q = json.dumps
+    with config.open('a') as stream:
+        stream.write(
+            f'\n[[identity]]\nname = "soju-probe"\nnick = {q(endpoint["nick"])}\n'
+            f'username = {q(endpoint["username"])}\nrealname = "GUI search probe"\n'
+            f'password = {q(endpoint["password"])}\n'
+            f'[[server]]\nname = "Soju"\naddress = {q(endpoint["host"])}\n'
+            f'port = {relay.port}\ntls = {q(endpoint["tls"])}\nidentity = "soju-probe"\n'
+            f'sasl = {q(endpoint["sasl"])}\npassword = {q(endpoint["server_password"])}\n'
+            f'bouncer = {q(endpoint["bouncer"])}\nchannels = {q(endpoint["channels"])}\n')
+    screenshot = Path(ctx['screenshot']).with_name('soju-search-restart.bmp')
+    proc, window = gui.launch_gui(ctx['binary'], screenshot, ctx['env'], ctx['args'].size, ctx['logs'])
+    ctx.update(proc=proc, window=window, screenshot=screenshot)
+
+    def close_restarted_gui():
+        if not proc.native_debug_stream.closed:
+            gui.stop_group(proc)
+            out, err = gui.collect_gui(proc)
+            ctx['logs'].append(('soju-search-restart-cleanup', out, err))
+
+    ctx['cleanup'].callback(close_restarted_gui)
+    gui.wait_joins(observer, ctx['channel'], (ctx['own_nick'], ctx['other_nick']))
+
+    def rows(sql, params=()):
+        with sqlite3.connect(f'file:{ctx["database_path"]}?mode=ro', uri=True) as db:
+            return db.execute(sql, params).fetchall()
+
+    gui.wait_rows(proc, ctx['database_path'],
+                  'SELECT text FROM messages WHERE buffer=? AND text=?',
+                  (identity, newer[-1]), [(newer[-1],)])
+    _policy_focus(ctx, identity)
+    draft = 'Unsent Soju source draft ' + nonce
+    gui.type_text(draft)
+    gui._composer_native(window, draft, len(draft), len(draft))
+    gui.save_state(proc, ctx['preferences'], ctx['database_path'])
+    assert not rows('SELECT text FROM messages WHERE buffer=? AND text IN (?,?,?)',
+                    (identity, *bodies)), 'Old search context was already local'
+    assert rows('SELECT draft FROM buffers WHERE id=?', (identity,)) == [(draft,)]
+
+    gui.framed_keys(window, 'ctrl+s')
+    gui.type_text(marker)
+    gui.framed_keys(window, 'Return')
+    gui.SESSION.until('search result hides source composer', lambda: gui.native_input_state(window) is None)
+    result_box = _policy_wait_box(ctx, colors[1])
+    search_capture = str(_policy_capture(ctx, 'soju-search-remote-result'))
+    assert not rows('SELECT text FROM messages WHERE buffer=? AND text IN (?,?,?)',
+                    (identity, *bodies)), 'SEARCH inserted the original into source history'
+    point = ((result_box[0] + result_box[2]) / 2, (result_box[1] + result_box[3]) / 2)
+    click_offset = gui.GUI_DEBUG[window][1].stat().st_size
+    gui.click(window, *point)
+    gui.await_native_frame(window, click_offset,
+        re.compile(r'wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)'))
+    # The after-marker exists only in the source, not in the search result.
+    # Wait for the asynchronous jump to render before scrolling its viewport.
+    _policy_wait_box(ctx, colors[2])
+    _policy_wait_box(ctx, colors[1])
+    # Source jumps align the hit to the viewport top; reveal its preceding row
+    # with a real wheel event before requiring all three context markers.
+    x, y, width, height = gui.read_layout(ctx['preferences'])['conversation']['rect']
+    gui.move_pointer(window, x + width / 2, y + height / 2)
+    scroll_offset = gui.GUI_DEBUG[window][1].stat().st_size
+    gui.POINTER.scroll(-3)
+    gui.await_native_frame(window, scroll_offset,
+        re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
+    boxes = [_policy_wait_box(ctx, color) for color in colors]
+    assert all(a[3] < b[1] for a, b in zip(boxes, boxes[1:])), boxes
+    source = gui.save_state(proc, ctx['preferences'], ctx['database_path'])
+    assert source[1] == (identity,), ('Result click selected wrong source', source)
+    upload.focus_composer(window)
+    gui._composer_native(window, draft, len(draft), len(draft))
+    originals = rows('SELECT id,nick,text,time FROM messages WHERE buffer=? AND text IN (?,?,?) '
+                     'ORDER BY sort_time,time,seq', (identity, *bodies))
+    assert [row[2] for row in originals] == bodies and all(row[0] and row[3] for row in originals), originals
+    assert all(row[1] == guest['nick'] for row in originals), originals
+    assert rows('SELECT draft FROM buffers WHERE id=?', (identity,)) == [(draft,)]
+    requests = list(relay.requests)
+    assert any(line.startswith('SEARCH ') for line in requests), requests
+    around = [line for line in requests if line.startswith('CHATHISTORY AROUND ' + channel + ' timestamp=')]
+    assert around, ('No real timestamp-selected Soju AROUND request', requests)
+    return _refresh_return(ctx, 'soju-search-context', {
+        'source': identity, 'search_marker': marker, 'search_click': point,
+        'remote_only_before_click': True, 'newer_count': len(newer),
+        'requests': requests, 'originals': originals, 'source_boxes': boxes,
+        'source_draft': draft, 'source_selected': list(source[1]),
+        'captures': [search_capture, str(_policy_capture(ctx, 'soju-search-source-context'))]})
+
+
+def run_startup_history_sync(ctx):
+    """Actual cached native chat stays usable while a real Ergo batch is held open."""
+    destination = Path(ctx['destination'])
+    config = Path(ctx['preferences']).with_name('config.toml')
+    _policy_focus(ctx, ctx['channel_id'])
+    gui.expand_navigation(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'])
+    cached = 'CACHEDHISTORY retained native startup witness'
+    remote = 'REMOTEHISTORY actual offline Ergo startup witness'
+    _policy_send(ctx, cached, target=ctx['channel'])
+    gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
+    layout = gui.read_layout(ctx['preferences'])
+    x, y, width, height = layout['conversation']['rect']
+    header = (x, y, width, gui.pane_metrics(layout, ctx['args'].zoom)['header_minimum'])
+
+    def words(label, region):
+        return upload.visible_words(ctx['window'], destination, 'startup-history-' + label,
+                                    region=region, psm=11)
+
+    def tokens(items):
+        return {item['text'].casefold().strip('.,:;') for item in items}
+
+    baseline = words('idle-before', header)
+    assert upload.label_rect(ctx['window'], destination, 'CACHEDHISTORY',
+                             region=layout['conversation']['rect']), 'Cached wire witness is not painted'
+    baseline_capture = str(_policy_capture(ctx, 'startup-history-idle-before'))
+    out, err = gui.finish_gui(ctx['proc'], ctx['window'], ctx['screenshot'],
+        destination.with_name('startup-history-fixture-stop.bmp'), ctx['args'].size)
+    ctx['logs'].append(('startup-history-fixture-stop', out, err))
+    departed = {ctx['own_nick'], ctx['other_nick']}
+    while departed:
+        _, _, prefix = ctx['observer'].wait(lambda command, params, prefix:
+            command == 'QUIT' and prefix.split('!', 1)[0] in departed, timeout=15)
+        departed.remove(prefix.split('!', 1)[0])
+    _policy_send(ctx, remote, target=ctx['channel'], durable=False)
+    barrier = 'startup-history-offline-stored'
+    ctx['observer'].send('PING :' + barrier)
+    ctx['observer'].wait(lambda command, params, prefix:
+        command == 'PONG' and params[-1] == barrier, timeout=10)
+    original_config = config.read_text()
+    relay = _StartupHistoryRelay(ctx['lab'], ctx['channel'])
+    ctx['cleanup'].callback(relay.close)
+    endpoint = ctx['lab'].endpoints['direct']
+    profile = tomllib.loads(original_config)
+    local = [server for server in profile['server']
+             if server['name'] == 'Local' and server['port'] == endpoint['port']]
+    assert len(local) == 1, 'Private Local profile was not uniquely identified'
+    local[0]['port'] = relay.port
+    # Match gui_smoke's generated profile writer: JSON quotes TOML scalar/array values.
+    changed = ''.join(f'{key} = {json.dumps(value)}\n' for key, value in profile.items()
+                      if key not in ('identity', 'server'))
+    for section in ('identity', 'server'):
+        for table in profile[section]:
+            changed += f'\n[[{section}]]\n'
+            changed += ''.join(f'{key} = {json.dumps(value)}\n' for key, value in table.items())
+    assert tomllib.loads(changed) == profile, 'Private profile rewrite changed unrelated settings'
+    config.write_text(changed)
+    try:
+        screenshot = Path(ctx['screenshot']).with_name('startup-history-restart.bmp')
+        proc, window = gui.launch_gui(ctx['binary'], screenshot, ctx['env'], ctx['args'].size, ctx['logs'])
+        ctx.update(proc=proc, window=window, screenshot=screenshot)
+
+        def close_restarted_gui():
+            if not proc.native_debug_stream.closed:
+                gui.stop_group(proc)
+                out, err = gui.collect_gui(proc)
+                ctx['logs'].append(('startup-history-restart-cleanup', out, err))
+
+        ctx['cleanup'].callback(close_restarted_gui)
+        gui.SESSION.until('actual target CHATHISTORY body held after BATCH begin',
+                          lambda: relay.ready(relay.held))
+        started = time.monotonic()
+        # Mapping and wire receipt can precede the restarted surface's first paint.
+        def cached_frame():
+            relay.ready(relay.held)
+            observed = words('pending-conversation', layout['conversation']['rect'])
+            return observed if 'cachedhistory' in tokens(observed) else None
+
+        pending_words = gui.SESSION.until('cached native chat painted during actual history hold',
+                                         cached_frame)
+        assert 'cachedhistory' in tokens(pending_words), 'Pending history replaced the cached transcript'
+        assert 'remotehistory' not in tokens(pending_words), 'Held remote history body was painted early'
+        with sqlite3.connect(f"file:{ctx['database_path']}?mode=ro", uri=True) as database:
+            assert database.execute('SELECT 1 FROM messages WHERE buffer=? AND text=?',
+                (ctx['channel_id'], remote)).fetchall() == [], 'Held history body reached Core early'
+        pending_header = [item for item in pending_words if int(item['top']) < y + header[3]]
+        indication = tokens(pending_header) - tokens(baseline)
+        assert indication, 'Actual pending header added no visible history indication'
+        pending_capture = str(destination.with_name(
+            destination.stem + '-startup-history-pending-conversation-desktop.png'))
+        held_seconds = time.monotonic() - started
+    finally:
+        relay.release.set()
+        config.write_text(original_config)
+    gui.SESSION.until('original history BATCH end forwarded', lambda: relay.ready(relay.completed))
+    gui.wait_joins(ctx['observer'], ctx['channel'], (ctx['own_nick'], ctx['other_nick']))
+    gui.wait_messages(ctx['proc'], ctx['database_path'], ctx['expected_messages'])
+
+    def idle_header():
+        result = words('idle-after', header)
+        return result if not indication.intersection(tokens(result)) else None
+
+    final_header = gui.SESSION.until('native history indication retired after real batch end', idle_header)
+    assert upload.label_rect(ctx['window'], destination, 'REMOTEHISTORY',
+                             region=layout['conversation']['rect']), 'Actual history body is not painted'
+    final_capture = str(_policy_capture(ctx, 'startup-history-idle-after'))
+    return _refresh_return(ctx, 'startup-history-sync', {
+        'actual_requests': relay.requests, 'actual_held_batch': relay.batch,
+        'held_observation_seconds': held_seconds,
+        'cached_message': cached, 'remote_history_message': remote,
+        'dynamic_pending_header_tokens': sorted(indication),
+        'idle_header_tokens': sorted(tokens(final_header)), 'header_region': header,
+        'captures': [baseline_capture, pending_capture, final_capture],
+        'tls_upstream_verified_private_ca': True, 'unchanged_real_batch_end_released': True})
+
+
+def run_conversation_history(ctx):
+    """Native C-o/C-i history, independent drafts, Tab and private binding migration."""
+    p, w = ctx['proc'], ctx['window']
+    prefs, db = ctx['preferences'], ctx['database_path']
+    channel, query = ctx['channel_id'], ctx['query_id']
+    _policy_focus(ctx, channel)
+    _policy_focus(ctx, query)
+    _policy_focus(ctx, channel)
+    phases = []
+    drafts = {
+        channel: ('channel café draft', len('channel café'.encode()), len('channel café'.encode())),
+        query: ('private DM draft', len('private DM'), len('private DM')),
+    }
+
+    def selected(identity, label, expected=None):
+        expected = drafts[identity] if expected is None else expected
+        native = gui._composer_native(w, *expected)
+        state = gui.save_state(p, prefs, db)
+        assert state[1] == (identity,), (label, state)
+        assert gui.read_layout(prefs)['active_buffer'] == identity, (label, identity)
+        restored = gui._composer_native(w, *expected)
+        phases.append({'phase': label, 'selected': identity, 'native': native,
+                       'after_private_save': restored})
+        return restored
+
+    def write_draft(identity):
+        text, cursor, anchor = drafts[identity]
+        gui.type_text(text)
+        gui.framed_keys(w, 'Home', *(['Right'] * len(text.encode()[:cursor].decode())))
+        return gui._composer_native(w, text, cursor, anchor)
+
+    write_draft(channel)
+    gui.switch_buffer(ctx['query_target'])
+    upload.focus_composer(w)
+    gui._composer_native(w, '', 0, 0)
+    write_draft(query)
+    selected(query, 'normal-DM-visit')
+    gui.framed_keys(w, 'ctrl+o')
+    selected(channel, 'CtrlO-restores-channel-draft-and-caret')
+    gui.framed_keys(w, 'ctrl+i')
+    selected(query, 'CtrlI-restores-DM-draft-and-caret')
+    gui.framed_keys(w, 'ctrl+i')
+    selected(query, 'forward-boundary-keeps-DM')
+
+    # The switch picker owns these keys, not the workspace history consumer.
+    gui._open_native_palette('ctrl+x', 'b', window=w)
+    picker = gui._composer_native(w, '', 0, 0)
+    gui.framed_keys(w, 'ctrl+o', 'ctrl+i')
+    gui._composer_native(w, '', 0, 0)
+    gui.framed_keys(w, 'Escape', 'ctrl+g')
+    selected(query, 'picker-owns-history-chords')
+
+    method = ctx['input_method']
+    assert method is not None, 'conversation-history requires the owned native input method'
+    method.drain()
+    assert method.state['active'], method.state
+    debug = gui.GUI_DEBUG[w][1]
+
+    def preedit(text):
+        offset = debug.stat().st_size
+        serial = method.transaction(text, len(text), len(text))
+        event = re.compile(r'zwp_text_input_v3[@#]\d+\.preedit_string\("' + re.escape(text) + r'",')
+        gui.SESSION.until('actual history preedit delivery', lambda:
+                          event.search(debug.read_bytes()[offset:].decode(errors='replace')))
+        gui.await_native_frame(w, offset, event)
+        return serial
+
+    serial = preedit('history-ime')
+    ime_before = gui.native_input_state(w)
+    for chord in ('ctrl+o', 'ctrl+i'):
+        offset = debug.stat().st_size
+        presses = gui.key(chord, trace=True)
+        release = re.compile(rf'wl_keyboard[@#]\d+\.key\(\d+,\s*\d+,\s*{presses[-1]},\s*0\)')
+        gui.SESSION.until('native history chord release during preedit', lambda:
+                          release.search(debug.read_bytes()[offset:].decode(errors='replace')))
+        assert gui.native_input_state(w) == ime_before, (chord, gui.native_input_state(w))
+    preedit('')
+    selected(query, 'IME-owns-history-chords')
+
+    gui.framed_keys(w, 'ctrl+o')
+    selected(channel, 'back-after-modal-and-IME')
+    # A normal selection after Back abandons the old forward branch.
+    gui.switch_buffer(ctx['query_target'])
+    selected(query, 'normal-selection-after-back')
+    gui.framed_keys(w, 'ctrl+i')
+    selected(query, 'normal-selection-is-new-forward-boundary')
+    gui.clear_draft()
+    gui._composer_native(w, '', 0, 0)
+    gui.framed_keys(w, 'ctrl+o')
+    selected(channel, 'Back-still-reaches-channel')
+    gui.clear_draft()
+    gui._composer_native(w, '', 0, 0)
+
+    # Explicit Tab opens and accepts a nick completion; C-i above navigated instead.
+    prefix = ctx['query_target'][:-1]
+    gui.type_text(prefix)
+    gui._composer_native(w, prefix, len(prefix), len(prefix))
+    gui.framed_keys(w, 'Tab')
+    gui._composer_native(w, prefix, len(prefix), len(prefix))
+    gui.framed_keys(w, 'Return')
+    completed = ctx['query_target'] + ': '
+    completion = selected(channel, 'plain-Tab-completes-not-history',
+                          (completed, len(completed), len(completed)))
+    gui.clear_draft()
+    gui._composer_native(w, '', 0, 0)
+
+    bindings = tomllib.loads(Path(prefs).read_text())['bindings']
+    # Model an older private profile: custom prefix wins over the absent new default.
+    bindings.pop('conversation-back', None)
+    bindings.pop('conversation-forward', None)
+    bindings['search'] = 'C-o p'
+    _refresh_restart(ctx, 'bindings', {key: json.dumps(value) for key, value in bindings.items()})
+    p, w = ctx['proc'], ctx['window']
+    saved = gui.save_preferences(p, prefs, w)['bindings']
+    assert saved['search'] == 'C-o p' and saved['conversation-back'] == '', saved
+    assert saved['conversation-forward'] == 'C-i', saved
+    migrated = dict(saved)
+    upload.focus_composer(w)
+    gui._composer_native(w, '', 0, 0)
+    gui.switch_buffer(ctx['query_target'])
+    upload.focus_composer(w)
+    gui.framed_keys(w, 'ctrl+o', 'p')
+    gui._composer_native(w, '', 0, 0)
+    gui.framed_keys(w, 'Escape', 'ctrl+g')
+    selected(query, 'custom-prefix-search-preserved', ('', 0, 0))
+
+    saved.update({'conversation-back': 'C-x h', 'conversation-forward': ''})
+    _refresh_restart(ctx, 'bindings', {key: json.dumps(value) for key, value in saved.items()})
+    p, w = ctx['proc'], ctx['window']
+    saved = gui.save_preferences(p, prefs, w)['bindings']
+    assert saved['conversation-back'] == 'C-x h', saved
+    assert saved['conversation-forward'] == '' and saved['search'] == 'C-o p', saved
+    upload.focus_composer(w)
+    gui.switch_buffer(ctx['query_target'])
+    upload.focus_composer(w)
+    gui.framed_keys(w, 'ctrl+x', 'h')
+    selected(channel, 'custom-back-binding-after-restart', ('', 0, 0))
+    gui.framed_keys(w, 'ctrl+i')
+    selected(channel, 'explicit-disabled-forward-stays-disabled', ('', 0, 0))
+    return _refresh_return(ctx, 'conversation-history', {
+        'phases': phases, 'picker': picker, 'ime_serial': serial, 'ime_native': ime_before,
+        'plain_Tab_completion': completion, 'migrated_bindings': migrated,
+        'custom_and_disabled_bindings': saved,
+        'selection_evidence': 'native UTF-8 text/caret plus private saved active_buffer and layout',
+    })
 
 
 if __name__ == "__main__":

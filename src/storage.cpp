@@ -423,6 +423,8 @@ Settings defaults() {
     settings.bindings = {{"switch-buffer", "C-x b"},
                          {"execute-command", "M-x"},
                          {"jump-channel", "C-x j"},
+                         {"conversation-back", "C-o"},
+                         {"conversation-forward", "C-i"},
                          {"cancel", "C-g"},
                          {"search", "C-s"},
                          {"settings", "C-,"},
@@ -531,6 +533,11 @@ void validate(const Settings &settings) {
     range(settings.opacity, 0, 1, "appearance.opacity");
     range(settings.scale, .7f, 2.f, "appearance.scale");
     range(settings.messageScale, .7f, 2.f, "appearance.message_scale");
+    for (const auto &[weight, name] :
+         {std::pair{settings.uiFontWeight, "appearance.ui_font_weight"},
+          std::pair{settings.messageFontWeight, "appearance.message_font_weight"}})
+        if (weight != 300 && weight != 400 && weight != 500 && weight != 600 && weight != 700)
+            invalid(name, "300, 400, 500, 600, or 700");
     range(settings.masterVolume, 0, 1, "audio.master_volume");
     range(settings.gravity, -10000, 10000, "physics.gravity");
     range(settings.drag, 0, 1000, "physics.drag");
@@ -801,6 +808,8 @@ void parseSettings(const toml::table &document, Settings &settings) {
         field(*row, "message_scale", settings.messageScale);
         field(*row, "ui_font", settings.uiFont);
         field(*row, "message_font", settings.messageFont);
+        exactField(*row, "ui_font_weight", settings.uiFontWeight);
+        exactField(*row, "message_font_weight", settings.messageFontWeight);
         field(*row, "timestamps", settings.timestamps);
         field(*row, "avatars", settings.avatars);
         field(*row, "avatar_style", settings.avatarStyle);
@@ -818,9 +827,21 @@ void parseSettings(const toml::table &document, Settings &settings) {
         exactField(*row, "allow_local", settings.previewAllowLocal);
     }
     if (const auto *row = table(document, "presentation")) {
-        if (const auto *channels = row->get("irc_channels")) {
-            const auto ids = stringArray(*channels, "presentation.irc_channels");
-            settings.ircChannels = set<string>(ids.begin(), ids.end());
+        if (row->contains("message_layouts")) {
+            const auto *layouts = table(*row, "message_layouts");
+            for (const auto &[name, value] : *layouts) {
+                const auto token = value.value<string>();
+                const string key = "presentation.message_layouts." + string(name.str());
+                if (!token || (*token != "bubbles" && *token != "irc" && *token != "stacked"))
+                    invalid(key, "bubbles, irc, or stacked");
+                settings.messageLayouts[string(name.str())] = *token == "irc" ? MessageLayout::Irc
+                                                              : *token == "stacked"
+                                                                  ? MessageLayout::Stacked
+                                                                  : MessageLayout::Bubbles;
+            }
+        } else if (const auto *channels = row->get("irc_channels")) {
+            for (const auto &id : stringArray(*channels, "presentation.irc_channels"))
+                settings.messageLayouts[id] = MessageLayout::Irc;
         }
         if (const auto *pins = row->get("pinned_buffers")) {
             for (const auto &id : stringArray(*pins, "presentation.pinned_buffers"))
@@ -913,6 +934,15 @@ void parseSettings(const toml::table &document, Settings &settings) {
                    ui_logic::bindingConflicts("C-t", entry.second);
         }))
         settings.bindings.at("transpose-chars").clear();
+    for (const char *name : {"conversation-back", "conversation-forward"}) {
+        if (savedBindings && savedBindings->contains(name))
+            continue;
+        auto &binding = settings.bindings.at(name);
+        if (std::any_of(settings.bindings.begin(), settings.bindings.end(), [&](const auto &entry) {
+                return entry.first != name && ui_logic::bindingConflicts(binding, entry.second);
+            }))
+            binding.clear();
+    }
     stringMap(document, "nick_colors", settings.nickColors);
     if (const auto *row = table(document, "workspace")) {
         if (const auto *node = row->get("people_mode")) {
@@ -1003,7 +1033,7 @@ toml::table profileDocument(const Model &model) {
         {"schema_version", 1}, {"identity", std::move(identities)}, {"server", std::move(servers)}};
 }
 toml::table settingsDocument(const Settings &settings) {
-    toml::table cues, channels, bufferFools;
+    toml::table cues, channels, bufferFools, messageLayouts;
     for (const auto &[name, cue] : settings.cues)
         cues.insert(
             name,
@@ -1012,6 +1042,21 @@ toml::table settingsDocument(const Settings &settings) {
         channels.insert(name, presenceName(mode));
     for (const auto &[name, shown] : settings.bufferFools)
         bufferFools.insert(name, shown);
+    for (const auto &[name, layout] : settings.messageLayouts) {
+        switch (layout) {
+        case MessageLayout::Bubbles:
+            messageLayouts.insert(name, "bubbles");
+            break;
+        case MessageLayout::Irc:
+            messageLayouts.insert(name, "irc");
+            break;
+        case MessageLayout::Stacked:
+            messageLayouts.insert(name, "stacked");
+            break;
+        default:
+            invalid("presentation.message_layouts." + name, "a valid message layout");
+        }
+    }
     auto bindings = mapping(settings.bindings);
     for (const char *obsolete : {"style-modern", "style-glass", "style-hacker"})
         bindings.erase(obsolete);
@@ -1048,6 +1093,8 @@ toml::table settingsDocument(const Settings &settings) {
                                    {"message_scale", settings.messageScale},
                                    {"ui_font", settings.uiFont},
                                    {"message_font", settings.messageFont},
+                                   {"ui_font_weight", settings.uiFontWeight},
+                                   {"message_font_weight", settings.messageFontWeight},
                                    {"timestamps", settings.timestamps},
                                    {"avatars", settings.avatars},
                                    {"avatar_style", settings.avatarStyle},
@@ -1061,7 +1108,7 @@ toml::table settingsDocument(const Settings &settings) {
                                  {"media_max_mib", settings.previewMediaMaxMiB},
                                  {"allow_local", settings.previewAllowLocal},
                                  {"media_max_seconds", settings.previewMediaMaxSeconds}}},
-        {"presentation", toml::table{{"irc_channels", array(settings.ircChannels)},
+        {"presentation", toml::table{{"message_layouts", std::move(messageLayouts)},
                                      {"pinned_buffers", array(settings.pinnedBuffers)}}},
         {"composer", toml::table{{"spellcheck", settings.spellcheck},
                                  {"spellcheck_language", settings.spellcheckLanguage}}},

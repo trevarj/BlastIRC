@@ -214,6 +214,7 @@ int main(int argc, char **argv) {
         blast::Theme theme;
         theme.update(app.model);
         std::string fontFamily = blast::themeUiFont().family;
+        auto uiFontWeight = blast::themeUiFont().weight;
         render.setTextFontFamily(fontFamily);
         AnimationManager animations;
         blast::Window window(connection, opts.width, opts.height);
@@ -557,6 +558,10 @@ int main(int argc, char **argv) {
                     if (fontFamily != blast::themeUiFont().family) {
                         fontFamily = blast::themeUiFont().family;
                         render.setTextFontFamily(fontFamily);
+                        root.markLayoutDirty();
+                    }
+                    if (uiFontWeight != blast::themeUiFont().weight) {
+                        uiFontWeight = blast::themeUiFont().weight;
                         root.markLayoutDirty();
                     }
                     syncMinimumHeight();

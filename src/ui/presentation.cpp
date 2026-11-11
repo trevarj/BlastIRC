@@ -22,12 +22,19 @@ std::uint32_t minimumWindowHeight(Renderer &renderer) {
                   renderer.fontRowExtent(15.f * scale, themeUiFont()) / baseline});
     return static_cast<std::uint32_t>(std::ceil(480.f * magnification));
 }
-float typingIndicatorHeight(Renderer &renderer, float scale) {
-    return renderer.fontRowExtent(12 * scale, themeUiFont()) + 8 * scale;
+float typingIndicatorHeight(Renderer &renderer, float scale, float messageSize) {
+    return std::max(32 * scale,
+                    renderer.fontRowExtent(messageSize, themeMessageFont()) + 7 * scale) +
+           8 * scale;
+}
+MessageLayout messageLayout(const Settings &settings, const Buffer &buffer) {
+    if (buffer.kind != "channel" && buffer.kind != "query")
+        return MessageLayout::Irc;
+    const auto found = settings.messageLayouts.find(buffer.id);
+    return found == settings.messageLayouts.end() ? MessageLayout::Bubbles : found->second;
 }
 bool messageBubbles(const Settings &settings, const Buffer &buffer) {
-    return (buffer.kind == "channel" || buffer.kind == "query") &&
-           !settings.ircChannels.contains(buffer.id);
+    return messageLayout(settings, buffer) == MessageLayout::Bubbles;
 }
 float messageTextSize(const Settings &settings, const Buffer &buffer) {
     const float scale =

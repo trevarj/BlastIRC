@@ -39,16 +39,18 @@ struct ModeLine::Impl {
         float width = 0;
     };
     Model &model;
-    std::array<Group, 5> groups;
+    std::array<Group, 6> groups;
     std::vector<Unread> unread;
     size_t unreadCount = 0;
+    size_t historyRemaining = 0;
     decltype(Settings::fools) fools;
     bool foolUnread = false;
     float scale = 1;
     bool error = false;
 
     Impl(Node &owner, Model &model) : model(model) {
-        constexpr std::array icons{"user", "server", "plug-connected-x", "info-circle", "keyboard"};
+        constexpr std::array icons{"user",        "server",   "plug-connected-x",
+                                   "info-circle", "keyboard", "history"};
         for (size_t i = 0; i < groups.size(); ++i) {
             auto &g = groups[i];
             g = {child<Glyph>(owner), child<Label>(owner), child<Label>(owner)};
@@ -92,10 +94,8 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                                               : std::string_view{};
     const auto config = std::find_if(model.servers.begin(), model.servers.end(),
                                      [&](const auto &server) { return server.name == serverName; });
-    const std::string_view name = mentions ? std::string_view{"All networks"}
-                                  : config != model.servers.end() && !config->alias.empty()
-                                      ? std::string_view(config->alias)
-                                      : serverName;
+    const std::string_view name =
+        mentions ? std::string_view{"All networks"} : serverDisplayName(model, serverName);
     const std::string_view state = mentions ? "Read only"
                                    : net    ? std::string_view(net->state)
                                             : "Disconnected";
@@ -116,6 +116,15 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     text(*p.groups[3].label,
          p.error ? std::string_view(net->error) : std::string_view(model.status));
     text(*p.groups[4].label, keyHint);
+    const auto historyRemaining = static_cast<size_t>(
+        std::count_if(model.buffers.begin(), model.buffers.end(), [](const auto &entry) {
+            return entry.second.initialHistorySync != HistorySyncState::Idle;
+        }));
+    if (p.historyRemaining != historyRemaining) {
+        p.historyRemaining = historyRemaining;
+        text(*p.groups[5].label,
+             historyRemaining ? "History: " + std::to_string(historyRemaining) + " remaining" : "");
+    }
     p.groups[2].icon->setGlyph(mentions ? "at" : healthy ? "plug" : "plug-connected-x");
     p.groups[3].icon->setGlyph(p.error ? "alert-circle" : "info-circle");
     const auto &font = themeUiFont();
@@ -126,6 +135,8 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                 label->setFontFamily(font.family);
             if (label->font().features != font.features)
                 label->setFontFeatures(font.features);
+            if (label->font().weight != font.weight)
+                label->setFontWeight(font.weight);
             label->setFontSize(12 * p.scale);
         }
         const auto role = i == 2              ? (state == "Failed" || p.error ? "error"
@@ -164,12 +175,7 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                 entry.label = label;
             }
             auto &entry = p.unread[p.unreadCount++];
-            const auto config =
-                std::find_if(model.servers.begin(), model.servers.end(),
-                             [&](const auto &server) { return server.name == channel.server; });
-            const std::string_view name = config != model.servers.end() && !config->alias.empty()
-                                              ? std::string_view(config->alias)
-                                              : std::string_view(channel.server);
+            const std::string_view name = serverDisplayName(model, channel.server);
             const auto network = model.networks.find(channel.server);
             const std::string_view mapping = network == model.networks.end()
                                                  ? std::string_view{"rfc1459"}
@@ -247,6 +253,7 @@ void ModeLine::doLayout(Renderer &renderer) {
     // Reserve connection and feedback before optional identity/chord groups.
     float remaining = available - measure(2, std::min(available, 132 * p.scale));
     remaining -= measure(3, remaining);
+    remaining -= measure(5, std::min(remaining, 180 * p.scale));
     remaining -= measure(4, std::min(remaining, available * .25f));
     remaining -= measure(0, remaining * .5f);
     remaining -= measure(1, remaining);

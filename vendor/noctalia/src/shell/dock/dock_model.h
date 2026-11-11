@@ -1,0 +1,62 @@
+#pragma once
+
+#include "system/desktop_entry.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+class CompositorPlatform;
+struct DockConfig;
+struct ToplevelInfo;
+struct wl_output;
+
+namespace shell::dock {
+
+  struct DockItemModel {
+    DesktopEntry entry;
+    std::string idLower;
+    std::string startupWmClassLower;
+    // Compositor app id + WM class used to find windows (matches taskbar policy).
+    std::string windowLookupIdLower;
+    std::string windowLookupWmClassLower;
+    bool running = false;
+    bool active = false;
+    std::size_t instanceCount = 0;
+    std::size_t minimizedCount = 0;
+    bool allMinimized = false;
+  };
+
+  struct DockSnapshot {
+    wl_output* output = nullptr;
+    wl_output* filterOutput = nullptr;
+    std::string activeAppIdLower;
+    std::vector<DockItemModel> items;
+    std::uint64_t sourceSerial = 0;
+  };
+
+  struct DockModelDependencies {
+    CompositorPlatform& platform;
+    const DockConfig& config;
+    wl_output* output = nullptr;
+    const std::string& globalActiveIdLower;
+    const std::vector<DesktopEntry>& pinnedEntries;
+    std::uint64_t sourceSerial = 0;
+  };
+
+  wl_output* dockFilterOutput(const DockConfig& cfg, wl_output* instanceOutput);
+  std::string currentActiveEntryIdLower(const CompositorPlatform& platform);
+  bool refreshPinnedAppsIfNeeded(
+      const DockConfig& cfg, std::vector<std::string>& lastPinnedConfig, std::vector<DesktopEntry>& pinnedEntries,
+      std::uint64_t& modelSerial, std::uint64_t& entriesVersion
+  );
+  DockSnapshot buildDockSnapshot(DockModelDependencies deps);
+  bool sameDockItemSet(const DockSnapshot& a, const DockSnapshot& b);
+  std::vector<ToplevelInfo>
+  windowsForDockItem(CompositorPlatform& platform, const DockItemModel& item, wl_output* outputFilter);
+  std::vector<ToplevelInfo> windowsForDockItem(
+      CompositorPlatform& platform, std::string_view idLower, std::string_view wmClassLower, wl_output* outputFilter
+  );
+
+} // namespace shell::dock

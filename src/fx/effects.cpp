@@ -859,6 +859,7 @@ void Effects::draw(Model &model) {
                                         : std::string_view(model.settings.messageFont);
     if (p.font.family != family)
         p.font.family = family;
+    p.font.weight = themeMessageFont().weight;
     for (const auto &event : model.effects) {
         if (event.history)
             continue;

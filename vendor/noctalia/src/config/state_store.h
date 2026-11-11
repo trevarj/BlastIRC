@@ -1,0 +1,39 @@
+#pragma once
+
+#include "config/toml.h"
+
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+class StateStore {
+public:
+  StateStore() = default;
+  explicit StateStore(std::filesystem::path path);
+
+  void setPath(std::filesystem::path path);
+  void load();
+
+  const std::filesystem::path& path() const noexcept { return m_path; }
+  const std::string& parseError() const noexcept { return m_parseError; }
+  std::optional<bool> boolValue(std::string_view owner, std::string_view key) const;
+  std::optional<std::string> stringValue(std::string_view owner, std::string_view key) const;
+
+  bool ownerValid(std::string_view owner) const;
+  bool contains(std::string_view owner, std::string_view key) const;
+  std::optional<std::vector<std::string>> stringArrayValue(std::string_view owner, std::string_view key) const;
+  bool setStringArray(std::string_view owner, std::string_view key, const std::vector<std::string>& value);
+
+  bool setBool(std::string_view owner, std::string_view key, bool value);
+  bool setString(std::string_view owner, std::string_view key, std::string_view value);
+  bool clearOwner(std::string_view owner);
+
+private:
+  [[nodiscard]] bool write();
+
+  std::filesystem::path m_path;
+  toml::table m_state;
+  std::string m_parseError;
+};

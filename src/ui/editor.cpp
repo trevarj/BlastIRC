@@ -993,8 +993,6 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
                                                "forward-word",
                                                "beginning-of-line",
                                                "end-of-line",
-                                               "beginning-of-buffer",
-                                               "end-of-buffer",
                                                "previous-line",
                                                "next-line",
                                                "set-mark",
@@ -1798,6 +1796,7 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
     request.menuWidth = 240 * themeScale();
     request.maxMenuWidth = 420 * themeScale();
     request.fontSize = 14 * themeScale();
+    request.font = themeUiFont();
     request.maxVisibleOptions = 12;
     const std::weak_ptr<int> token = menuAlive;
     const auto generation = ++menuGeneration;
@@ -3477,8 +3476,9 @@ bool EditorStore::handleCompositionKey(std::uint32_t sym, std::uint32_t utf32,
         const auto full = pending ? view->compositionChord + " " + stroke : stroke;
         bool prefix = false, messagePrefix = false;
         for (const auto *command :
-             {"message-prev", "message-next", "message-reply", "message-react", "scroll-up",
-              "scroll-down", "paste", "yank", "transpose-chars", "backward-kill-line", "redo",
+             {"message-prev", "message-next", "message-reply", "message-react", "conversation-back",
+              "conversation-forward", "scroll-up", "scroll-down", "beginning-of-buffer",
+              "end-of-buffer", "paste", "yank", "transpose-chars", "backward-kill-line", "redo",
               "copy", "cut", "select-all"}) {
             const auto binding = store.model.settings.bindings.find(command);
             if (binding == store.model.settings.bindings.end())

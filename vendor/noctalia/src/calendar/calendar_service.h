@@ -1,0 +1,240 @@
+#pragma once
+
+#include "calendar/caldav_client.h"
+#include "calendar/calendar_credential_store.h"
+#include "calendar/calendar_types.h"
+#include "calendar/google_client.h"
+#include "calendar/google_oauth.h"
+#include "calendar/sync_failure.h"
+#include "config/config_types.h"
+#include "core/inotify/inotify.h"
+#include "security/storage_key_provider.h"
+
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <map>
+#include <optional>
+#include <poll.h>
+#include <set>
+#include <span>
+#include <string>
+#include <vector>
+
+class ConfigService;
+class HttpClient;
+class NotificationManager;
+namespace security {
+  class SecretStore;
+}
+
+// Background service that syncs configured online calendars (CalDAV directly, Google via the
+// api.noctalia.dev OAuth broker) and exposes a merged, read-only event snapshot. Modeled on
+// WeatherService: timer-driven via pollTimeoutMs()/tick(), durable credentials come from the
+// account's explicit source, and an encrypted disk cache provides last-known-good data across
+// restarts and network failures.
+class CalendarService {
+public:
+  using ChangeCallback = std::function<void()>;
+  using ChangeCallbackId = std::uint64_t;
+  enum class ConnectState : std::uint8_t { Idle, Pending, Success, Failed };
+  enum class CachePersistenceState : std::uint8_t {
+    Opening,
+    Ready,
+    Unavailable,
+    Cancelled,
+    DeniedOrLocked,
+    MissingKey,
+    RecoveryRequired,
+    BackendError,
+  };
+  enum class CredentialOperationResult : std::uint8_t {
+    Success,
+    MissingCredential,
+    Unavailable,
+    Cancelled,
+    DeniedOrLocked,
+    BackendError,
+    FileError,
+    ConfigError,
+    CleanupError,
+  };
+  using ConfigMutation = std::function<bool()>;
+  using CredentialOperationCallback = std::function<void(CredentialOperationResult)>;
+
+  CalendarService(
+      ConfigService& configService, HttpClient& httpClient, security::SecretStore& secretStore,
+      security::StorageKeyProvider& storageKeyProvider, NotificationManager* notifications = nullptr
+  );
+  ~CalendarService();
+
+  void initialize();
+  [[nodiscard]] ChangeCallbackId addChangeCallback(ChangeCallback callback);
+  void removeChangeCallback(ChangeCallbackId callbackId);
+  void setCredentialChangeCallback(ChangeCallback callback) { m_credentialChangeCallback = std::move(callback); }
+
+  int pollTimeoutMs() const;
+  void tick();
+  void addPollFds(std::vector<pollfd>& fds);
+  void dispatchPoll(const std::vector<pollfd>& fds, std::size_t startIdx);
+
+  bool enabled() const noexcept { return m_activeConfig.enabled; }
+  bool hasData() const noexcept { return m_snapshot.valid; }
+  const CalendarSnapshot& snapshot() const noexcept { return m_snapshot; }
+
+  // Start the Google OAuth Connect flow for a configured google account (opens a browser).
+  void connectGoogleAccount(const std::string& accountId, const std::string& activationToken = {});
+  void saveCalDavAccount(
+      const std::string& accountId, CalendarCredentialSource credentialSource, const std::string& passwordFile,
+      std::string password, ConfigMutation persistConfig, CredentialOperationCallback callback
+  );
+  void deleteAccount(const std::string& accountId, ConfigMutation removeConfig, CredentialOperationCallback callback);
+  void retryCredentialMigration();
+  void syncCachePersistence();
+  void retryCachePersistence();
+  [[nodiscard]] bool clearEncryptedCacheForRecovery();
+  // Schedule an immediate sync (used after saving CalDAV credentials).
+  void requestRefresh();
+  ConnectState connectState() const noexcept { return m_connect.state; }
+  const std::string& connectingAccountId() const noexcept { return m_connect.accountId; }
+  calendar::CredentialState credentialState() const noexcept { return m_credentials.state(); }
+  bool credentialMigrationPending() const noexcept { return m_credentials.migrationPending(); }
+  bool hasMissingRefreshTokens() const { return m_credentials.anyRefreshTokenMissing(); }
+  // What an account's Settings row shows, the same way for every account type: why its sync is failing and
+  // what fixes it, or when it last synced.
+  struct AccountStatus {
+    enum class Action : std::uint8_t {
+      Edit,      // in the account's settings
+      Retry,     // once the keyring holding its credentials is unlocked
+      Reconnect, // a Google account's authorization
+    };
+    enum class Phase : std::uint8_t {
+      Connecting,  // finding the calendars, or authorizing
+      Downloading, // the events
+    };
+    // While the account syncs.
+    std::optional<Phase> phase;
+    // Why its last sync failed.
+    std::optional<calendar::SyncFailure> failure;
+    std::optional<std::chrono::system_clock::time_point> lastSynced;
+    Action action = Action::Edit;
+  };
+  AccountStatus accountStatus(const CalendarConfig::Account& account) const;
+  // The status as one line, as the account's Settings row shows it.
+  std::string accountStatusText(const CalendarConfig::Account& account) const;
+  // Changes whenever an account's status does, so a view can refresh only then.
+  std::uint64_t syncStatusRevision() const noexcept { return m_syncStatusRevision; }
+  CachePersistenceState cachePersistenceState() const noexcept { return m_cachePersistenceState; }
+  bool cacheMigrationPending() const noexcept { return m_cacheMigrationPending; }
+  bool hasEncryptedCache() const;
+
+private:
+  struct ConnectFlow {
+    ConnectState state = ConnectState::Idle;
+    std::string accountId;
+    std::string pollToken;
+    bool inFlight = false;
+    std::uint64_t generation = 0;
+    std::chrono::steady_clock::time_point deadline;
+    std::chrono::steady_clock::time_point nextPollAt;
+  };
+
+  void onConfigReload();
+  void notifyChanged();
+  void startRefresh();
+  // `retainedSources` lists the calendars of the account that failed to load; their previous events are kept.
+  void accountDone(
+      const std::string& accountId, calendar::SyncFailure failure, std::vector<CalendarEvent> events,
+      const std::vector<std::string>& retainedSources = {}
+  );
+  // Records the account's latest failure, or its last successful sync.
+  void recordSyncResult(const std::string& accountId, calendar::SyncFailure failure);
+  void loadLastSynced();
+  void setSyncPhase(const std::string& accountId, AccountStatus::Phase phase);
+  void rebuildSnapshot();
+  void scheduleNextRefresh();
+
+  void fetchCalDav(const CalendarConfig::Account& account);
+  void lookupCalDavPassword(
+      const CalendarConfig::Account& account, calendar::CalendarCredentialStore::LookupCallback callback
+  );
+  void fetchIcs(const CalendarConfig::Account& account);
+  void fetchVdir(const CalendarConfig::Account& account);
+  void updateVdirWatches();
+  void fetchGoogle(const CalendarConfig::Account& account);
+  void refreshGoogleToken(
+      const std::string& accountId, std::function<void(calendar::SyncFailure failure, std::string accessToken)> cb
+  );
+  void googleFetchWithToken(
+      const std::string& accountId, const std::vector<std::string>& selectedCalendars, const std::string& accessToken,
+      bool allowRefreshRetry
+  );
+  void pollConnect();
+  void notifyGoogleConnectFailure(const std::string& body) const;
+  void notifyGoogleCredentialLocked() const;
+  void initializeCredentials();
+  calendar::CredentialMigration credentialMigration();
+  void storeGoogleTokens(
+      const std::string& accountId, calendar::OAuthTokens tokens,
+      std::function<void(security::SecretStoreStatus)> callback
+  );
+  void clearGoogleSession(const std::string& accountId);
+  static CredentialOperationResult operationResult(security::SecretStoreStatus status);
+
+  [[nodiscard]] bool loadCache();
+  [[nodiscard]] bool parseCache(std::span<const std::uint8_t> contents);
+  void saveCache();
+  static std::filesystem::path cacheFilePath();
+  static std::filesystem::path legacyCacheFilePath();
+  void setCachePersistenceState(CachePersistenceState state, bool migrationPending);
+
+  ConfigService& m_configService;
+  HttpClient& m_httpClient;
+  NotificationManager* m_notifications = nullptr;
+  CalendarConfig m_activeConfig;
+  std::vector<std::pair<ChangeCallbackId, ChangeCallback>> m_callbacks;
+  ChangeCallbackId m_nextCallbackId = 1;
+  ChangeCallback m_credentialChangeCallback;
+
+  calendar::GoogleOAuthBroker m_oauth;
+  calendar::GoogleClient m_google;
+  calendar::CalendarCredentialStore m_credentials;
+  security::StorageKeyProvider& m_storageKeyProvider;
+  std::optional<security::SecureKey> m_cacheKey;
+
+  struct GoogleSession {
+    std::string accessToken;
+    std::chrono::system_clock::time_point expiry;
+  };
+  std::map<std::string, GoogleSession> m_googleSessions;
+
+  CalendarSnapshot m_snapshot;
+  std::map<std::string, std::vector<CalendarEvent>> m_eventsByAccount;
+  std::chrono::steady_clock::time_point m_nextRefreshAt;
+  bool m_refreshing = false;
+  // Bumped on every config change; results of a refresh started under an older generation are dropped.
+  std::uint64_t m_refreshGeneration = 0;
+  std::uint64_t m_runningRefreshGeneration = 0;
+  bool m_credentialsInitialized = false;
+  bool m_initialized = false;
+  bool m_cacheWritable = false;
+  CachePersistenceState m_cachePersistenceState = CachePersistenceState::Opening;
+  bool m_cacheMigrationPending = false;
+  std::size_t m_pendingAccounts = 0;
+  bool m_googleCredentialLockedNotificationShown = false;
+  std::map<std::string, calendar::SyncFailure> m_lastFailures;
+  std::map<std::string, std::chrono::system_clock::time_point> m_lastSynced;
+  std::map<std::string, AccountStatus::Phase> m_syncPhases;
+  std::uint64_t m_syncStatusRevision = 0;
+  ConnectFlow m_connect;
+  calendar::CalDavClient m_caldav;
+  Inotify m_vdirInotify;
+  std::map<std::filesystem::path, int> m_watchedVdirPaths;
+  std::map<int, std::filesystem::path> m_watchedVdirWds;
+  std::chrono::steady_clock::time_point m_vdirDebounceUntil;
+  bool m_vdirDebouncePending = false;
+  struct VdirWorker;
+  std::shared_ptr<VdirWorker> m_vdirWorker;
+  std::map<std::string, std::vector<std::filesystem::path>> m_discoveredVdirPathsByAccount;
+};

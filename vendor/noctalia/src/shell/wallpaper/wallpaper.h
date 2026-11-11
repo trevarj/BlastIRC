@@ -1,0 +1,160 @@
+#pragma once
+
+#include "config/config_types.h"
+#include "render/core/shared_texture_cache.h"
+#include "shell/render/wallpaper_types.h"
+#include "shell/wallpaper/wallpaper_shuffle_state.h"
+#include "ui/signal.h"
+
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+class ConfigService;
+class IpcService;
+class RenderContext;
+class WaylandConnection;
+enum class ThemeMode : std::uint8_t;
+enum class WallpaperTransitionDirection;
+struct WallpaperInstance;
+struct PointerEvent;
+struct WaylandOutput;
+struct wl_surface;
+
+namespace noctalia::theme {
+  class ThemeService;
+}
+
+struct WallpaperChange {
+  std::string path;
+  std::string connector;
+};
+
+class Wallpaper {
+public:
+  Wallpaper();
+  ~Wallpaper();
+
+  bool initialize(
+      WaylandConnection& wayland, ConfigService* config, RenderContext* renderContext, SharedTextureCache* textureCache,
+      noctalia::theme::ThemeService* themeService = nullptr
+  );
+  void onOutputChange();
+  // Mark an output as driven by an external wallpaper source (e.g. an mpvpaper plugin):
+  // its Background surface is torn down so the external surface shows through. Runtime-only
+  // (not persisted) — it clears on restart and is re-asserted by the owner.
+  void setOutputExternallyManaged(const std::string& connector, bool managed);
+  [[nodiscard]] std::vector<WallpaperChange> onStateChange();
+  void onSecondTick();
+  // When automation next needs a tick to rotate, or nullopt while it cannot run.
+  // Lets the time source wake for the rotation interval instead of polling.
+  std::optional<std::chrono::system_clock::time_point> nextAutomationDeadline() const;
+  void onGpuResourcesInvalidated();
+  void registerIpc(IpcService& ipc);
+  // Apply and persist a wallpaper image. nullopt connector targets all connected
+  // outputs plus the default. Returns false if the path does not exist or the
+  // connector is unknown. Shared by the wallpaper-set IPC handler and plugin scripts.
+  bool applyWallpaperImage(const std::optional<std::string>& connector, const std::string& path);
+  void setAutomationGate(std::function<bool()> gate);
+  bool ownsSurface(wl_surface* surface) const noexcept;
+  bool onPointerEvent(const PointerEvent& event);
+
+  // Prefer a landscape image; otherwise use the first available image.
+  TextureHandle currentTexture() const;
+  // Path of currentTexture(); when no instance shows an image while wallpaper is enabled,
+  // falls back to the palette wallpaper path so consumers still show what drives colors.
+  std::string currentPath() const;
+
+  // Emits whenever the displayed wallpaper (path/texture) changes, including
+  // automation rotation and transition completion. Lets consumers pre-warm
+  // previews while their UI is closed.
+  Signal<>& changed() noexcept { return m_changed; }
+
+private:
+  enum class TransitionRedirect {
+    Unrelated,
+    AlreadyTargeting,
+    Redirected,
+  };
+
+  enum class PickWallpaper {
+    Random,
+    Previous,
+    Next,
+  };
+
+  enum class [[nodiscard]] SwitchOutcome {
+    Changed,     // at least one output was switched to a new wallpaper
+    NoChange,    // wallpapers were found but there was nothing new to switch to
+    Unavailable, // wallpaper disabled, target unknown, or no candidate images
+  };
+
+  const WallpaperInstance* currentInstance() const;
+  bool isConnectorKnown(std::string_view connector) const;
+  // Persist a resolved image path to a single connector, or to every connected
+  // output plus the default when no connector is given.
+  void applyResolvedWallpaper(const std::optional<std::string>& connector, const std::string& resolvedPath);
+  void reload();
+  void syncInstances();
+  void applyStartupAutomation(std::int64_t secondStamp);
+  void resetAutomationState();
+  void runAutomation(std::int64_t secondStamp);
+  bool automationAllowed() const noexcept;
+  SwitchOutcome switchWallpaperTo(PickWallpaper action, std::optional<std::string_view> connector = std::nullopt);
+  ThemeMode directoryThemeMode() const noexcept;
+  std::string pickRandomWallpaperPath(
+      const std::vector<std::string>& candidates, const std::string& currentPath, std::string_view scope,
+      std::string_view source
+  );
+  std::string pickAutomationWallpaperPath(
+      const WallpaperAutomationConfig& automation, std::vector<std::string> candidates, const std::string& currentPath,
+      std::string_view scope, std::string_view source
+  );
+  void createInstance(const WaylandOutput& output);
+  void loadWallpaper(WallpaperInstance& instance, const std::string& path);
+  void beginWallpaperChange(
+      WallpaperInstance& instance, const std::string& path, WallpaperSourceKind kind, SharedTextureCache::Lease image,
+      const Color& color
+  );
+  void onImageChanged(WallpaperInstance& instance);
+  static void cancelLoading(WallpaperInstance& instance);
+  TextureCoverage textureCoverage(const WallpaperInstance& instance) const;
+  // Re-targets every leased image of the instance after an output or fill mode change.
+  void refreshTextureCoverage(WallpaperInstance& instance);
+  TransitionRedirect redirectActiveTransition(WallpaperInstance& instance, const std::string& path);
+  void startTransition(WallpaperInstance& instance);
+  void startTransitionAnimation(WallpaperInstance& instance, float fromTime, WallpaperTransitionDirection direction);
+  void finishTransition(WallpaperInstance& instance);
+  void promotePendingWallpaper(WallpaperInstance& instance);
+  void discardPendingWallpaper(WallpaperInstance& instance);
+  void runQueuedWallpaper(WallpaperInstance& instance);
+  void updateRendererState(WallpaperInstance& instance);
+  void releaseInstanceTextures(WallpaperInstance& inst);
+
+  WaylandConnection* m_wayland = nullptr;
+  ConfigService* m_config = nullptr;
+  RenderContext* m_renderContext = nullptr;
+  SharedTextureCache* m_textureCache = nullptr;
+  noctalia::theme::ThemeService* m_themeService = nullptr;
+  bool m_wallpaperEnabled = false;
+  WallpaperConfig m_lastWallpaperConfig{};
+  bool m_syncedPickValid = false;
+  WallpaperTransition m_syncedTransition = WallpaperTransition::Fade;
+  TransitionParams m_syncedParams{};
+  std::int64_t m_lastAutomationSecondStamp = -1;
+  std::int64_t m_lastAutomationSwitchSecond = -1;
+  // Startup automation runs before instances exist, so onStateChange() cannot derive
+  // per-connector changes from them; it reports these instead.
+  std::vector<WallpaperChange> m_pendingStartupChanges;
+  std::function<bool()> m_automationGate;
+  wallpaper::ShuffleState m_shuffleState;
+  Signal<>::ScopedConnection m_paletteConn;
+  Signal<> m_changed;
+  std::vector<std::unique_ptr<WallpaperInstance>> m_instances;
+  std::unordered_set<std::string> m_externallyManagedOutputs;
+};

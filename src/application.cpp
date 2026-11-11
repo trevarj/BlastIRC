@@ -250,6 +250,7 @@ Application::Application() {
         reviseMessages(b);
         b.joined = false;
         b.loading = false;
+        b.initialHistorySync = HistorySyncState::Idle;
         b.typing.clear();
         b.nicks.clear();
         for (auto &m : b.messages)
@@ -486,6 +487,9 @@ void Application::renameBuffer(string oldId, string target) {
             }
         }
     };
+    if (searchJump_ && searchJump_->sourceBuffer == oldId)
+        cancelSearchJump();
+    std::erase_if(searchRequests_, [&](const auto &entry) { return entry.second.source == oldId; });
     if (model.bufferWillRename)
         model.bufferWillRename(oldId, id);
     if (oldId == id) {
@@ -616,6 +620,7 @@ void Application::renameBuffer(string oldId, string target) {
         }
         b.joined = b.joined || source.joined;
         b.loading = b.loading || source.loading;
+        b.initialHistorySync = std::max(b.initialHistorySync, source.initialHistorySync);
         b.muted = b.muted || source.muted;
         b.archived = b.archived && source.archived;
         b.target = target;
@@ -634,6 +639,7 @@ void Application::renameBuffer(string oldId, string target) {
     moveKey(gaps_);
     moveKey(model.settings.channelPresence);
     moveKey(model.settings.bufferFools);
+    moveKey(model.settings.messageLayouts);
     const bool pinsChanged =
         std::find(model.settings.pinnedBuffers.begin(), model.settings.pinnedBuffers.end(),
                   oldId) != model.settings.pinnedBuffers.end();
@@ -663,8 +669,6 @@ void Application::renameBuffer(string oldId, string target) {
                 destination.messages.push_back(std::move(row));
     }
     ++mentionsLiveRevision_;
-    if (model.settings.ircChannels.erase(oldId))
-        model.settings.ircChannels.insert(id);
     if (requestedHistory_.erase(oldId))
         requestedHistory_.insert(id);
     if (namesInProgress_.erase(oldId))
@@ -695,6 +699,9 @@ void Application::renameBuffer(string oldId, string target) {
             times.pop_front();
     }
     for (auto &[label, route] : activeHistory_)
+        if (route == oldId)
+            route = id;
+    for (auto &[label, route] : initialHistory_)
         if (route == oldId)
             route = id;
     for (auto &[command, origin] : commandOrigins_)
@@ -864,8 +871,6 @@ void Application::synchronizeSoju(const string &parent) {
             model.servers.push_back(std::move(created));
             child = std::prev(model.servers.end());
         }
-        const auto name = info.attributes.find("name");
-        child->alias = name == info.attributes.end() ? string{} : name->second;
         if (child->sojuEnabled && !client(child->name))
             attach.push_back(child->name);
     }
@@ -877,7 +882,7 @@ void Application::connect(string name, string origin) {
     auto config = std::find_if(model.servers.begin(), model.servers.end(),
                                [&](const auto &s) { return s.name == name; });
     if (config == model.servers.end()) {
-        report("Unknown server: " + name, name, origin);
+        report("Unknown server: " + string(serverDisplayName(model, name)), name, origin);
         return;
     }
     ServerConfig resolved = *config;
@@ -1357,6 +1362,18 @@ void Application::receive(Event e) {
     if (!e.history && (e.own || flag(e, "pending")) && failedSubmission(e.label))
         return;
     if (flag(e, "search")) {
+        const auto request = searchRequests_.find(e.server);
+        if (request == searchRequests_.end() || request->second.label != e.label ||
+            request->second.session != network.sessionGeneration)
+            return;
+        const auto *source = findBuffer(request->second.source);
+        const string target =
+            fold(e.server, e.target) == fold(e.server, network.nick) && !e.own && !e.nick.empty()
+                ? e.nick
+                : e.target;
+        if (!source || source->server != e.server || source->target != request->second.target ||
+            fold(e.server, target) != fold(e.server, source->target))
+            return;
         auto &results = buffer(e.server, "*search*", "search");
         Message m;
         m.id = e.id.empty() ? localId() : "search:" + fold(e.server, e.target) + ":" + e.id;
@@ -1364,6 +1381,15 @@ void Application::receive(Event e) {
         m.text = "[" + e.target + "] " + e.nick + ": " + e.text;
         m.time = e.time;
         m.timestamp = e.timestamp;
+        m.sourceBuffer = source->id;
+        m.sourceId = e.id;
+        m.sourceServer = source->server;
+        m.sourceTarget = source->target;
+        m.sourceText = e.text;
+        m.sourceReply = e.reply;
+        m.reply = e.reply;
+        m.action = e.type == "action";
+        m.own = e.own;
         m.arrival = model.now;
         m.history = true;
         m.presence = true;
@@ -1730,7 +1756,34 @@ void Application::reduce(const Event &input) {
             }
         return;
     }
-    if ((e.history || e.type == "history_end") && !flag(e, "search") && !e.label.empty()) {
+    if (!e.label.empty() && retiredSearchHistory_.contains(e.label))
+        return;
+    if (e.history && searchJump_ && e.label == searchJump_->label) {
+        auto &jump = *searchJump_;
+        if (e.server != jump.server || !findBuffer(jump.sourceBuffer) ||
+            n.sessionGeneration != jump.session)
+            return;
+        const auto *source = findBuffer(jump.sourceBuffer);
+        const string eventTarget =
+            fold(e.server, e.target) == fold(e.server, n.nick) && !e.own && !e.nick.empty()
+                ? e.nick
+                : e.target;
+        if (!source || source->server != jump.server || source->target != jump.target ||
+            fold(e.server, eventTarget) != fold(e.server, jump.target))
+            return;
+        const auto &row = jump.row;
+        if ((e.type == "message" || e.type == "action" || e.type == "notice") &&
+            (row.sourceId.empty() || row.sourceId == e.id) && e.nick == row.nick &&
+            e.text == row.sourceText && e.reply == row.sourceReply &&
+            (e.type == "action") == row.action && e.time == row.time) {
+            if (e.id.empty())
+                e.id = localId();
+            jump.matchedId = e.id;
+            ++jump.matches;
+        }
+    }
+    if ((e.history || e.type == "history_begin" || e.type == "history_end") && !flag(e, "search") &&
+        !e.label.empty()) {
         auto route = activeHistory_.find(e.label);
         if (route != activeHistory_.end())
             if (auto b = findBuffer(route->second))
@@ -1749,6 +1802,9 @@ void Application::reduce(const Event &input) {
         if (!tag(e, "nick").empty())
             n.nick = tag(e, "nick");
         if (e.text == "Connecting" || e.text == "Disconnected" || e.text == "Failed") {
+            if (searchJump_ && searchJump_->server == e.server)
+                cancelSearchJump();
+            searchRequests_.erase(e.server);
             ++n.sessionGeneration;
             if (model.whoisProfile.server == e.server)
                 finishWhois("Connection changed before WHOIS completed");
@@ -1794,11 +1850,20 @@ void Application::reduce(const Event &input) {
             std::erase_if(activeHistory_, [&](const auto &item) {
                 return item.second.starts_with(e.server + "/");
             });
+            std::erase_if(initialHistory_, [&](const auto &item) {
+                if (item.second.starts_with(e.server + "/"))
+                    promotedHistory_.erase(item.first);
+                if (item.second.starts_with(e.server + "/"))
+                    startedHistory_.erase(item.first);
+                return item.second.starts_with(e.server + "/");
+            });
+            historyPriorities_.erase(e.server);
             for (auto &[id, b] : model.buffers)
                 if (b.server == e.server) {
                     b.joined = false;
                     clearAvatar(b);
                     b.loading = false;
+                    b.initialHistorySync = HistorySyncState::Idle;
                     b.typing.clear();
                     b.nicks.clear();
                 }
@@ -1818,13 +1883,21 @@ void Application::reduce(const Event &input) {
                 n.sojuMutationError = "Soju server does not support network discovery";
             synchronizeSoju(e.server);
             for (const auto &s : model.servers)
-                if (s.name == e.server)
-                    for (const auto &target : s.channels)
+                if (s.name == e.server) {
+                    auto targets = s.channels;
+                    const auto active = findBuffer(model.activeBuffer);
+                    if (active && active->server == e.server)
+                        std::stable_partition(targets.begin(), targets.end(), [&](const auto &t) {
+                            return fold(e.server, t) == fold(e.server, active->target);
+                        });
+                    for (const auto &target : targets)
                         if (auto c = client(e.server))
                             c->command("JOIN " + target);
+                }
             for (auto &[id, b] : model.buffers)
-                if (b.server == e.server && b.kind == "query")
-                    requestHistory(b);
+                if (b.server == e.server &&
+                    (b.kind == "query" || (b.kind == "channel" && b.joined)))
+                    requestHistory(b, "", true);
         }
         auto &b = buffer(e.server, "*server*", "server");
         Message m;
@@ -1849,13 +1922,22 @@ void Application::reduce(const Event &input) {
                     clearAvatar(b);
         const bool hasHistory = n.caps.contains("draft/chathistory") ||
                                 n.caps.contains("chathistory") || zncPlayback(e.server);
+        if (searchJump_ && searchJump_->server == e.server &&
+            !n.caps.contains("draft/chathistory") && !n.caps.contains("chathistory")) {
+            cancelSearchJump();
+            report("Original message history is unavailable", e.server);
+        }
         const bool hasRead =
             n.caps.contains("draft/read-marker") || n.caps.contains("soju.im/read");
+        if (hadHistory && !hasHistory)
+            for (auto &[id, b] : model.buffers)
+                if (b.server == e.server)
+                    cancelHistory(b);
         if (n.state == "Ready")
             for (auto &[id, b] : model.buffers)
                 if (b.server == e.server && (b.joined || b.kind == "query")) {
                     if (!hadHistory && hasHistory)
-                        requestHistory(b);
+                        requestHistory(b, "", true);
                     if (!hadRead && hasRead && markerTime(b.readMarker) > 0)
                         if (auto c = client(e.server))
                             c->markRead(b.target, b.readMarker);
@@ -2219,6 +2301,18 @@ void Application::reduce(const Event &input) {
         e.target = e.nick;
     const bool searchBatch =
         (e.type == "history_begin" || e.type == "history_end") && tag(e, "direction") == "search";
+    if (searchBatch) {
+        const auto request = searchRequests_.find(e.server);
+        if (request == searchRequests_.end() || request->second.label != e.label ||
+            request->second.session != n.sessionGeneration)
+            return;
+    }
+    if (tag(e, "direction") == "around" &&
+        (!searchJump_ || searchJump_->label != e.label || searchJump_->server != e.server))
+        return;
+    if ((e.type == "history_begin" || e.type == "history_end") && flag(e, "initial") &&
+        !initialHistory_.contains(e.label))
+        return; // Closed/cancelled conversations must not be recreated by late batches.
     if (searchBatch)
         e.target = "*search*";
     auto &b = buffer(e.server, e.target.empty() ? "*server*" : e.target,
@@ -2226,11 +2320,17 @@ void Application::reduce(const Event &input) {
                      : e.target.empty() ? "server"
                                         : "");
     if (e.type == "history_begin") {
-        b.loading = true;
+        promotedHistory_.erase(e.label);
+        if (flag(e, "initial"))
+            startedHistory_.insert(e.label);
+        if (flag(e, "initial"))
+            b.initialHistorySync = HistorySyncState::Loading;
+        else
+            b.loading = true;
         if (!e.label.empty())
             activeHistory_[e.label] = b.id;
         auto gap = gaps_.find(b.id);
-        if (tag(e, "direction") == "after" && gap != gaps_.end()) {
+        if (flag(e, "initial") && tag(e, "direction") == "after" && gap != gaps_.end()) {
             gap->second.active = true;
             gap->second.received = 0;
             gap->second.next.clear();
@@ -2239,11 +2339,50 @@ void Application::reduce(const Event &input) {
         return;
     }
     if (e.type == "history_end") {
-        b.loading = false;
+        const bool initial = initialHistory_.erase(e.label) != 0;
+        const bool promoted = promotedHistory_.erase(e.label) != 0;
+        startedHistory_.erase(e.label);
         if (!e.label.empty())
             activeHistory_.erase(e.label);
+        b.loading = std::any_of(activeHistory_.begin(), activeHistory_.end(), [&](const auto &v) {
+            return v.second == b.id && !initialHistory_.contains(v.first);
+        });
+        if (searchBatch)
+            searchRequests_.erase(e.server);
+        if (searchJump_ && e.label == searchJump_->label) {
+            const auto jump = *searchJump_;
+            cancelSearchJump();
+            const auto *source = findBuffer(jump.sourceBuffer);
+            const auto *search = findBuffer(jump.searchBuffer);
+            const auto *original = sourceMessage(model, jump.sourceBuffer, jump.matchedId);
+            const bool rowPresent =
+                search && std::any_of(search->messages.begin(), search->messages.end(),
+                                      [&](const Message &row) {
+                                          return row.id == jump.row.id &&
+                                                 row.sourceBuffer == jump.sourceBuffer &&
+                                                 row.sourceId == jump.row.sourceId &&
+                                                 row.sourceText == jump.row.sourceText &&
+                                                 row.sourceReply == jump.row.sourceReply &&
+                                                 row.nick == jump.row.nick &&
+                                                 row.time == jump.row.time;
+                                      });
+            if (tag(e, "error").empty() && !flag(e, "cancelled") && jump.matches == 1 && source &&
+                source->server == jump.server && source->target == jump.target &&
+                n.sessionGeneration == jump.session && model.activeBuffer == jump.searchBuffer &&
+                rowPresent && original && original->nick == jump.row.nick &&
+                original->text == jump.row.sourceText && original->reply == jump.row.sourceReply &&
+                original->time == jump.row.time && original->action == jump.row.action) {
+                jumpSource(jump.sourceBuffer, jump.matchedId);
+            } else if (tag(e, "error").empty() && !flag(e, "cancelled")) {
+                report("Original message not found in history", jump.server);
+            }
+        }
+        if (promoted && flag(e, "cancelled")) {
+            return; // Keep its gap/backlog; the freed slot goes to the newly viewed buffer.
+        }
         auto gap = gaps_.find(b.id);
-        if (tag(e, "direction") == "after" && gap != gaps_.end()) {
+        if (initial && tag(e, "direction") == "after" && gap != gaps_.end() &&
+            (gap->second.label.empty() || gap->second.label == e.label)) {
             auto &g = gap->second;
             int limit = 200;
             const auto value = tag(e, "limit");
@@ -2268,20 +2407,23 @@ void Application::reduce(const Event &input) {
                 g.next.clear();
                 g.active = false;
                 g.received = 0;
-                if (auto c = client(b.server)) {
-                    c->history(b.target, "after=" + g.cursor);
-                    b.loading = true;
-                }
+                enqueueHistory(b, "after=" + g.cursor, true);
             } else {
                 gaps_.erase(gap);
-                if (!tag(e, "error").empty())
-                    if (auto c = client(b.server)) {
-                        c->history(b.target);
-                        b.loading = true;
-                    }
+                if (!tag(e, "error").empty() && !flag(e, "cancelled") && !flag(e, "rejected") &&
+                    model.networks[b.server].state == "Ready")
+                    enqueueHistory(b, "", true);
             }
         }
-        if (!tag(e, "error").empty())
+        if (initial && std::none_of(initialHistory_.begin(), initialHistory_.end(),
+                                    [&](const auto &v) { return v.second == b.id; })) {
+            b.initialHistorySync = HistorySyncState::Idle;
+            if (!tag(e, "error").empty()) {
+                requestedHistory_.erase(b.id);
+                gaps_.erase(b.id);
+            }
+        }
+        if (!tag(e, "error").empty() && !flag(e, "cancelled"))
             report("History: " + tag(e, "error"), e.server);
         return;
     }
@@ -2346,7 +2488,7 @@ void Application::reduce(const Event &input) {
                 nick->account.clear();
             if (e.own) {
                 b.joined = true;
-                requestHistory(b);
+                requestHistory(b, "", true);
             }
         }
         if (tag(e, "batch-type") == "netjoin") {
@@ -2371,6 +2513,7 @@ void Application::reduce(const Event &input) {
         }
         if (!e.history && fold(e.server, victim) == fold(e.server, n.nick)) {
             b.joined = false;
+            cancelHistory(b);
             clearAvatar(b);
             for (auto &s : model.servers)
                 if (s.name == e.server)
@@ -2589,36 +2732,181 @@ string Application::historyCursor(const Buffer &b, const string &cursor) const {
     }
     return after ? "after=" + selector : selector;
 }
-void Application::requestHistory(Buffer &b, const string &before) {
-    if (b.kind != "channel" && b.kind != "query")
+vector<string> Application::historyOrder(const string &server) const {
+    vector<const Buffer *> pending;
+    for (const auto &[id, b] : model.buffers)
+        if (b.server == server && b.initialHistorySync != HistorySyncState::Idle)
+            pending.push_back(&b);
+    const auto &pins = model.settings.pinnedBuffers;
+    auto pin = [&](const Buffer &b) { return std::find(pins.begin(), pins.end(), b.id); };
+    std::stable_sort(pending.begin(), pending.end(), [&](const Buffer *a, const Buffer *b) {
+        if ((a->id == model.activeBuffer) != (b->id == model.activeBuffer))
+            return a->id == model.activeBuffer;
+        const bool lowA = a->muted || a->archived, lowB = b->muted || b->archived;
+        if (lowA != lowB)
+            return !lowA;
+        if (pin(*a) != pin(*b))
+            return pin(*a) < pin(*b);
+        if ((a->unread > 0) != (b->unread > 0))
+            return a->unread > 0;
+        return chatActivityBefore(*a, *b);
+    });
+    vector<string> order;
+    // Slot zero is always the viewed target, even without pending initial work.
+    const auto active = model.buffers.find(model.activeBuffer);
+    order.push_back(active != model.buffers.end() && active->second.server == server
+                        ? active->second.target
+                        : "");
+    for (const auto *b : pending)
+        if (b->target != order.front())
+            order.push_back(b->target);
+    return order;
+}
+void Application::enqueueHistory(Buffer &b, const string &cursor, bool initial) {
+    auto c = client(b.server);
+    if (!c)
         return;
-    if (auto c = client(b.server)) {
-        const auto &caps = model.networks[b.server].caps;
-        const bool playback = zncPlayback(b.server);
-        if (caps.contains("draft/chathistory") || caps.contains("chathistory") || playback) {
-            if (before.empty()) {
-                if (!requestedHistory_.insert(b.id).second)
-                    return;
-                auto tail =
-                    std::find_if(b.messages.rbegin(), b.messages.rend(), [&](const auto &m) {
-                        return !m.presence && !m.pending &&
-                               (!m.time.empty() || (!playback && !m.id.starts_with("local:") &&
-                                                    !m.id.starts_with("local-")));
-                    });
-                if (tail != b.messages.rend()) {
-                    auto &gap = gaps_[b.id];
-                    gap.cursor = !tail->id.starts_with("local:") && !tail->id.starts_with("local-")
-                                     ? historyCursor(b, tail->id)
-                                     : "timestamp=" + tail->time;
-                    c->history(b.target, "after=" + gap.cursor);
-                    b.loading = true;
-                    return;
-                }
+    const auto label = localId();
+    activeHistory_[label] = b.id; // Include queued foreground requests, not just begun batches.
+    if (initial) {
+        initialHistory_[label] = b.id;
+        if (b.initialHistorySync == HistorySyncState::Idle)
+            b.initialHistorySync = HistorySyncState::Queued;
+    } else
+        b.loading = true;
+    try {
+        c->history(b.target, cursor, label, initial);
+    } catch (const std::exception &e) {
+        activeHistory_.erase(label);
+        initialHistory_.erase(label);
+        if (initial) {
+            b.initialHistorySync = HistorySyncState::Idle;
+            gaps_.erase(b.id);
+            requestedHistory_.erase(b.id);
+        }
+        b.loading = std::any_of(activeHistory_.begin(), activeHistory_.end(), [&](const auto &v) {
+            return v.second == b.id && !initialHistory_.contains(v.first);
+        });
+        report("History: " + string(e.what()), b.server);
+    }
+}
+void Application::cancelHistory(Buffer &b) {
+    if (b.initialHistorySync != HistorySyncState::Idle)
+        if (auto c = client(b.server))
+            try {
+                c->cancelInitialHistory(b.target);
+            } catch (const std::exception &e) {
+                report("History: " + string(e.what()), b.server);
             }
-            c->history(b.target, historyCursor(b, before));
-            b.loading = true;
+    std::erase_if(activeHistory_, [&](const auto &v) {
+        if (v.second == b.id)
+            promotedHistory_.erase(v.first);
+        if (v.second == b.id)
+            startedHistory_.erase(v.first);
+        return v.second == b.id && initialHistory_.contains(v.first);
+    });
+    std::erase_if(initialHistory_, [&](const auto &v) { return v.second == b.id; });
+    b.initialHistorySync = HistorySyncState::Idle;
+    requestedHistory_.erase(b.id);
+    gaps_.erase(b.id);
+}
+void Application::scheduleHistory() {
+    for (const auto &[server, c] : clients_) {
+        if (model.networks[server].state != "Ready")
+            continue;
+        const auto order = historyOrder(server);
+        if (historyPriorities_[server] != order) {
+            try {
+                c->prioritizeHistory(order);
+                historyPriorities_[server] = order;
+            } catch (const std::exception &e) {
+                // These requests have not reached the worker, so a rejected scheduling
+                // handoff must retire their planned state just like a history enqueue.
+                for (auto &[id, b] : model.buffers)
+                    if (b.server == server && b.initialHistorySync != HistorySyncState::Idle &&
+                        std::none_of(initialHistory_.begin(), initialHistory_.end(),
+                                     [&](const auto &v) { return v.second == id; })) {
+                        b.initialHistorySync = HistorySyncState::Idle;
+                        requestedHistory_.erase(id);
+                        gaps_.erase(id);
+                    }
+                report("History: " + string(e.what()), server);
+                continue;
+            }
+        }
+        size_t admitted = 0;
+        for (const auto &[label, id] : initialHistory_)
+            if (const auto *b = findBuffer(id); b && b->server == server)
+                ++admitted;
+        const auto viewed = findBuffer(model.activeBuffer);
+        if (admitted >= 16 && viewed && viewed->server == server &&
+            viewed->initialHistorySync != HistorySyncState::Idle &&
+            std::none_of(initialHistory_.begin(), initialHistory_.end(),
+                         [&](const auto &v) { return v.second == viewed->id; })) {
+            // Only unsent work can yield its admission slot; never preempt a wire batch.
+            for (auto target = order.rbegin(); target != order.rend(); ++target) {
+                auto queued = std::find_if(
+                    initialHistory_.begin(), initialHistory_.end(), [&](const auto &v) {
+                        const auto *b = findBuffer(v.second);
+                        return b && b->server == server && b->target == *target &&
+                               !startedHistory_.contains(v.first);
+                    });
+                if (queued == initialHistory_.end())
+                    continue;
+                try {
+                    if (promotedHistory_.insert(queued->first).second)
+                        c->cancelInitialHistory(*target);
+                } catch (const std::exception &e) {
+                    promotedHistory_.erase(queued->first);
+                    report("History: " + string(e.what()), server);
+                }
+                break;
+            }
+        }
+        for (const auto &target : order) {
+            if (admitted >= 16)
+                break;
+            auto b = std::find_if(model.buffers.begin(), model.buffers.end(), [&](const auto &v) {
+                return v.second.server == server && v.second.target == target;
+            });
+            if (b == model.buffers.end() ||
+                b->second.initialHistorySync == HistorySyncState::Idle ||
+                std::any_of(initialHistory_.begin(), initialHistory_.end(),
+                            [&](const auto &v) { return v.second == b->first; }))
+                continue;
+            auto &buffer = b->second;
+            const auto gap = gaps_.find(buffer.id);
+            enqueueHistory(buffer, gap == gaps_.end() ? "" : "after=" + gap->second.cursor, true);
+            ++admitted;
         }
     }
+}
+void Application::requestHistory(Buffer &b, const string &before, bool initial) {
+    const auto &n = model.networks[b.server];
+    if ((b.kind != "channel" && b.kind != "query") || n.state != "Ready" ||
+        (b.kind == "channel" && !b.joined) || !client(b.server))
+        return;
+    const bool playback = zncPlayback(b.server);
+    if (!n.caps.contains("draft/chathistory") && !n.caps.contains("chathistory") && !playback)
+        return;
+    if (!initial) {
+        enqueueHistory(b, historyCursor(b, before), false);
+        return;
+    }
+    if (!requestedHistory_.insert(b.id).second)
+        return;
+    auto tail = std::find_if(b.messages.rbegin(), b.messages.rend(), [&](const auto &m) {
+        return !m.presence && !m.pending &&
+               (!m.time.empty() ||
+                (!playback && !m.id.starts_with("local:") && !m.id.starts_with("local-")));
+    });
+    if (tail != b.messages.rend()) {
+        auto &gap = gaps_[b.id];
+        gap.cursor = !tail->id.starts_with("local:") && !tail->id.starts_with("local-")
+                         ? historyCursor(b, tail->id)
+                         : "timestamp=" + tail->time;
+    }
+    b.initialHistorySync = HistorySyncState::Queued;
 }
 void Application::clear(Buffer *b) {
     if (savingAllowed_)
@@ -2631,6 +2919,9 @@ void Application::clear(Buffer *b) {
             report(e.what(), b ? b->server : "");
             return;
         }
+    if (searchJump_ &&
+        (!b || searchJump_->sourceBuffer == b->id || searchJump_->searchBuffer == b->id))
+        cancelSearchJump();
     ++mentionsLiveRevision_;
     if (!b || model.pendingSourceJump.buffer == b->id) {
         model.pendingSourceJump.buffer.clear();
@@ -2672,7 +2963,7 @@ void Application::send(Buffer &b, const string &text, const string &reply, bool 
     auto *c = client(b.server);
     if (!c || model.networks[b.server].state != "Ready") {
         restoreDraft(b, recovered, true);
-        report("Not connected to " + b.server, b.server, origin);
+        report("Not connected to " + string(serverDisplayName(model, b.server)), b.server, origin);
         return;
     }
     if (b.kind != "channel" && b.kind != "query") {
@@ -2928,14 +3219,18 @@ void Application::command(Buffer &b, const string &input) {
     if (name == "MESSAGESTYLE") {
         const auto style = lower(args);
         if ((b.kind != "channel" && b.kind != "query") ||
-            (!style.empty() && style != "irc" && style != "bubbles")) {
-            report("Usage: /messagestyle [bubbles|irc] (in a conversation)", b.server, b.id);
+            (!style.empty() && style != "irc" && style != "bubbles" && style != "stacked")) {
+            report("Usage: /messagestyle [bubbles|irc|stacked] (in a conversation)", b.server,
+                   b.id);
             return;
         }
-        if (style == "irc" || (style.empty() && !model.settings.ircChannels.contains(b.id)))
-            model.settings.ircChannels.insert(b.id);
+        auto &layouts = model.settings.messageLayouts;
+        const auto current = layouts.find(b.id);
+        if (style == "bubbles" || (style.empty() && current != layouts.end() &&
+                                   current->second != MessageLayout::Bubbles))
+            layouts.erase(b.id);
         else
-            model.settings.ircChannels.erase(b.id);
+            layouts[b.id] = style == "stacked" ? MessageLayout::Stacked : MessageLayout::Irc;
         save();
         return;
     }
@@ -2966,13 +3261,13 @@ void Application::command(Buffer &b, const string &input) {
         }
         auto &query = buffer(b.server, target);
         model.activeBuffer = query.id;
-        requestHistory(query);
+        requestHistory(query, "", true);
         if (!text.empty())
             send(query, text, {}, false, b.id);
         return;
     }
     if (!c) {
-        report("Not connected to " + b.server, b.server, b.id);
+        report("Not connected to " + string(serverDisplayName(model, b.server)), b.server, b.id);
         return;
     }
     if (name == "BOUNCER") {
@@ -3081,6 +3376,17 @@ void Application::command(Buffer &b, const string &input) {
         enqueueCommand(b, "WHOIS " + target);
         return;
     }
+    if (name == "SEARCH") {
+        const auto [target, query] = word(args);
+        if (target.empty() || query.empty() || target.size() > 512 || args.size() > 4096 ||
+            target.front() == ':' || target.find_first_of(", \t") != string::npos) {
+            report("Usage: /search target query", b.server, b.id);
+            return;
+        }
+        auto &source = buffer(b.server, target);
+        action({"search", source.id, query, {}});
+        return;
+    }
     if (name == "RAW" || name == "QUOTE") {
         if (!args.empty())
             enqueueCommand(b, args);
@@ -3108,6 +3414,12 @@ void Application::dispatchActions() {
     nextAction_ = 0;
 }
 void Application::action(const Action &a) {
+    if (a.type == "search-jump") {
+        jumpSearch(a.buffer, a.text);
+        return;
+    }
+    if (a.type == "source-jump" || a.type == "global-mentions")
+        cancelSearchJump();
     if (a.type == "global-mentions") {
         refreshMentions();
         model.activeBuffer = GlobalMentionsBufferId;
@@ -3380,7 +3692,7 @@ void Application::action(const Action &a) {
         }
         auto &query = buffer(b->server, a.text, "query");
         model.activeBuffer = query.id;
-        requestHistory(query);
+        requestHistory(query, "", true);
         return;
     }
     if (a.type == "whois") {
@@ -3447,7 +3759,7 @@ void Application::action(const Action &a) {
                                        [](const auto &m) { return !m.time.empty(); });
             remote = oldest == b->messages.end() ? string{} : "timestamp=" + oldest->time;
         }
-        requestHistory(*b, remote);
+        requestHistory(*b, remote, false);
         return;
     }
     if (a.type == "search") {
@@ -3460,7 +3772,15 @@ void Application::action(const Action &a) {
             b = source;
         }
         const string query = lower(a.text), source = b->id, name = b->server;
+        cancelSearchJump();
+        if (const auto previous = searchRequests_.find(name); previous != searchRequests_.end())
+            activeHistory_.erase(previous->second.label);
+        searchRequests_.erase(name);
         auto &results = buffer(name, "*search*", "search");
+        results.loading =
+            std::any_of(activeHistory_.begin(), activeHistory_.end(), [&](const auto &v) {
+                return v.second == results.id && !initialHistory_.contains(v.first);
+            });
         results.searchSource = source;
         reviseMessages(results);
         results.messages.clear();
@@ -3484,7 +3804,15 @@ void Application::action(const Action &a) {
                     lower(m.text).find(query) == string::npos || results.messages.size() >= limit)
                     return;
                 Message row = m;
+                if (m.presence || m.pending)
+                    return;
                 row.id = "search:" + fold(name, b->target) + ":" + m.id;
+                row.sourceBuffer = source;
+                row.sourceId = m.id;
+                row.sourceServer = name;
+                row.sourceTarget = b->target;
+                row.sourceText = m.text;
+                row.sourceReply = m.reply;
                 row.pending = false;
                 row.sendStatus = SendStatus::None;
                 row.presence = true;
@@ -3498,8 +3826,17 @@ void Application::action(const Action &a) {
             for (const auto &m : b->messages)
                 match(m);
             const auto &caps = model.networks[name].caps;
-            if (c && caps.contains("soju.im/search") && !unsafeLine(a.text))
-                c->command("/search " + b->target + " " + a.text);
+            if (c && caps.contains("soju.im/search") && !unsafeLine(a.text)) {
+                const auto label = localId();
+                searchRequests_[name] = {label, source, name, b->target,
+                                         model.networks[name].sessionGeneration};
+                try {
+                    c->search(b->target, a.text, label);
+                } catch (const std::exception &error) {
+                    searchRequests_.erase(name);
+                    report("Search: " + string(error.what()), name);
+                }
+            }
         }
         model.activeBuffer = results.id;
         return;
@@ -3558,6 +3895,21 @@ void Application::action(const Action &a) {
                 ++group;
         }
         gaps_.erase(id);
+        if (searchJump_ && (searchJump_->sourceBuffer == id || searchJump_->searchBuffer == id))
+            cancelSearchJump();
+        std::erase_if(searchRequests_, [&](const auto &entry) {
+            if (entry.second.source != id && !(b->kind == "search" && entry.first == b->server))
+                return false;
+            activeHistory_.erase(entry.second.label);
+            for (auto &[bufferId, results] : model.buffers)
+                if (results.kind == "search" && results.server == entry.first)
+                    results.loading = std::any_of(
+                        activeHistory_.begin(), activeHistory_.end(), [&](const auto &v) {
+                            return v.second == bufferId && !initialHistory_.contains(v.first);
+                        });
+            return true;
+        });
+        cancelHistory(*b);
         namesCache_.erase(id);
         namesInProgress_.erase(id);
         std::erase_if(activeHistory_, [&](const auto &item) { return item.second == id; });
@@ -3661,6 +4013,25 @@ void Application::refreshMentions() {
         merge(source);
     for (const auto &[id, live] : model.buffers)
         merge(live);
+    set<string> searchedSources;
+    if (savingAllowed_)
+        for (const auto &[id, results] : model.buffers) {
+            if (results.kind != "search")
+                continue;
+            for (const auto &row : results.messages) {
+                if (row.sourceBuffer.empty() || sources.contains(row.sourceBuffer) ||
+                    !searchedSources.insert(row.sourceBuffer).second)
+                    continue;
+                try {
+                    auto source = storage_.sourceBuffer(row.sourceBuffer);
+                    if (source && source->server == row.sourceServer &&
+                        source->target == row.sourceTarget)
+                        sources.emplace(row.sourceBuffer, std::move(*source));
+                } catch (const std::exception &error) {
+                    report(error.what(), results.server);
+                }
+            }
+        }
     const auto cutoff = epoch() - int64_t(std::max(0, model.settings.retentionDays)) * 86400;
     auto older = [](const Message &a, const Message &b) {
         const auto at = a.orderingTimestamp > 0 ? a.orderingTimestamp : a.timestamp;
@@ -3746,6 +4117,117 @@ void Application::refreshMentions() {
     mentionsStorageRevision_ = storage_.revision();
     mentionsBuiltRevision_ = mentionsLiveRevision_;
     mentionsNetworkKey_ = std::move(networkKey);
+}
+
+void Application::cancelSearchJump() {
+    if (!searchJump_)
+        return;
+    const auto label = searchJump_->label;
+    const auto source = searchJump_->sourceBuffer;
+    retiredSearchHistory_.insert(label);
+    searchJump_.reset();
+    activeHistory_.erase(label);
+    if (auto *b = findBuffer(source))
+        b->loading = std::any_of(activeHistory_.begin(), activeHistory_.end(), [&](const auto &v) {
+            return v.second == source && !initialHistory_.contains(v.first);
+        });
+}
+
+void Application::jumpSearch(const string &searchId, const string &rowId) {
+    cancelSearchJump();
+    const auto *search = findBuffer(searchId);
+    if (!search || search->kind != "search")
+        return;
+    const auto rowIt = std::find_if(search->messages.begin(), search->messages.end(),
+                                    [&](const Message &row) { return row.id == rowId; });
+    if (rowIt == search->messages.end())
+        return;
+    const Message row = *rowIt;
+    auto *liveSource = findBuffer(row.sourceBuffer);
+    std::optional<Buffer> durableSource;
+    if (!liveSource && savingAllowed_)
+        durableSource = storage_.sourceBuffer(row.sourceBuffer);
+    const Buffer *source = liveSource ? liveSource : durableSource ? &*durableSource : nullptr;
+    if (!source) {
+        const auto unsaved = unsavedSources_.find(row.sourceBuffer);
+        if (unsaved != unsavedSources_.end())
+            source = &unsaved->second;
+    }
+    if (!source) {
+        const auto retained = model.mentionSources.find(row.sourceBuffer);
+        if (retained != model.mentionSources.end())
+            source = &retained->second;
+    }
+    if (!source || source->server != search->server || source->server != row.sourceServer ||
+        source->target != row.sourceTarget ||
+        (source->kind != "channel" && source->kind != "query") || row.deleted || row.pending ||
+        row.nick.empty())
+        return;
+    if (isFool(model, source->server, row.nick) &&
+        effectiveFoolDisplay(model.settings, source->id, source->target) == FoolDisplay::Hidden)
+        return;
+    if (model.settings.retentionDays > 0 && row.timestamp > 0 &&
+        row.timestamp < epoch() - int64_t(model.settings.retentionDays) * 86400)
+        return;
+    if (!row.sourceId.empty() &&
+        std::any_of(source->messages.begin(), source->messages.end(), [&](const Message &message) {
+            return message.id == row.sourceId && message.deleted;
+        }))
+        return;
+    std::optional<Message> stored;
+    const Message *original =
+        row.sourceId.empty() ? nullptr : sourceMessage(model, source->id, row.sourceId);
+    if (const auto unsaved = unsavedSources_.find(source->id); unsaved != unsavedSources_.end())
+        for (const auto &message : unsaved->second.messages)
+            if (message.id == row.sourceId) {
+                if (message.deleted)
+                    return;
+                if (!original)
+                    original = &message;
+                break;
+            }
+    if (!original && savingAllowed_ && !row.sourceId.empty()) {
+        stored = storage_.message(source->id, row.sourceId);
+        if (stored)
+            original = &*stored;
+    }
+    if (original) {
+        if (!original->deleted && !original->presence && !original->pending &&
+            original->nick == row.nick && original->text == row.sourceText &&
+            original->reply == row.sourceReply && original->action == row.action)
+            jumpSource(source->id, row.sourceId);
+        else
+            report("Original message no longer matches search result", source->server);
+        return;
+    }
+    if (!liveSource) {
+        report("Original message history is unavailable", source->server);
+        return;
+    }
+    auto *c = client(source->server);
+    const auto &network = model.networks[source->server];
+    if (!c || network.state != "Ready" ||
+        (!network.caps.contains("chathistory") && !network.caps.contains("draft/chathistory")) ||
+        (source->kind == "channel" && !source->joined)) {
+        report("Original message history is unavailable", source->server);
+        return;
+    }
+    const auto label = localId();
+    searchJump_ = SearchJump{label,          searchId, source->id, source->server,
+                             source->target, {},       row,        network.sessionGeneration,
+                             model.now,      0};
+    activeHistory_[label] = source->id;
+    liveSource->loading = true;
+    try {
+        const string id = row.sourceId.starts_with("local:") || row.sourceId.starts_with("local-")
+                              ? string{}
+                              : row.sourceId;
+        c->historyAround(source->target, id, row.time, label);
+    } catch (const std::exception &error) {
+        const string server = source->server;
+        cancelSearchJump();
+        report("History: " + string(error.what()), server);
+    }
 }
 
 void Application::jumpSource(const string &id, const string &messageId) {
@@ -3862,6 +4344,7 @@ void Application::jumpSource(const string &id, const string &messageId) {
         model.activeBuffer = id;
         model.pendingSourceJump.buffer = id;
         model.pendingSourceJump.message = messageId;
+        sourceJumpProtectedUntil_ = model.now;
         ++model.pendingSourceJump.revision;
     } catch (const std::exception &error) {
         report(error.what());
@@ -3904,17 +4387,17 @@ void Application::trim() {
         Buffer *oldest = nullptr;
         int64_t when = std::numeric_limits<int64_t>::max();
         for (auto &[id, b] : model.buffers)
-            if (b.kind != "search" && b.kind != "mentions" && !b.messages.empty()) {
+            if (b.kind != "search" && b.kind != "mentions" && !b.messages.empty() &&
+                !(searchJump_ && searchJump_->sourceBuffer == id) &&
+                !(model.pendingSourceJump.buffer == id && model.now <= sourceJumpProtectedUntil_)) {
                 const auto at = b.messages.front().timestamp;
                 if (!oldest || at < when) {
                     oldest = &b;
                     when = at;
                 }
             }
-        if (!oldest) {
-            messageCount_ = 0;
+        if (!oldest)
             break;
-        }
         if (changed.insert(oldest->id).second)
             reviseMessages(*oldest);
         pending_.erase(oldest->id + "\n" + oldest->messages.front().id);
@@ -4047,10 +4530,19 @@ void Application::tick(double now) {
                     }
     }
     typingEnabled_ = model.settings.typingSend;
+    if (searchJump_ &&
+        (model.activeBuffer != searchJump_->searchBuffer || now - searchJump_->started >= 120)) {
+        const bool timedOut = now - searchJump_->started >= 120;
+        const string server = searchJump_->server;
+        cancelSearchJump();
+        if (timedOut)
+            report("History: request timed out", server);
+    }
     drainClients();
     dispatchActions();
     // Drain local echoes already produced by the worker; later ticks collect the rest.
     drainClients();
+    scheduleHistory();
     updateAvatars();
     for (auto i = pending_.begin(); i != pending_.end();) {
         auto b = findBuffer(i->second.buffer);

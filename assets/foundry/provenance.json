@@ -1,0 +1,174 @@
+{
+  "method": "Pillow procedural raster; art/script GPT-6 Astra",
+  "version": 1,
+  "status": "User-approved Foundry Bomb direction",
+  "references": [
+    "output/imagegen/blastirc-A7-charcoal-inset.png",
+    "output/imagegen/blastirc-A6-duotone.png",
+    "output/imagegen/blastirc-A5-industrial.png"
+  ],
+  "identity": "SHA-256 of foundry-concept-1: plus IRC-casefolded nick; default RFC1459 ASCII/punctuation folding; non-ASCII UTF-8 unchanged; finite combinations can collide",
+  "trait_counts": {
+    "body": 4,
+    "palette": 6,
+    "fuse": 4,
+    "spark": 3,
+    "accessory": 5,
+    "marking": 4
+  },
+  "render": "Each component drawn at 3x then Lanczos resized to straight-alpha RGBA 96x96; source-over fuse, body, accessory, mark at 96px",
+  "atlas": {
+    "file": "atlas.png",
+    "width": 1536,
+    "height": 480,
+    "tile_size": 96,
+    "columns": 16,
+    "tile_count": 74,
+    "layout": {
+      "fuse": {
+        "offset": 0,
+        "count": 12
+      },
+      "body": {
+        "offset": 12,
+        "count": 24
+      },
+      "accessory": {
+        "offset": 36,
+        "count": 30
+      },
+      "mark": {
+        "offset": 66,
+        "count": 8
+      }
+    }
+  },
+  "indices": {
+    "fuse": "fuse*3+spark",
+    "body": "body*6+palette",
+    "accessory": "accessory*6+palette",
+    "mark": "(accessory == 1 ? 1 : 0)*4+marking"
+  },
+  "examples": [
+    {
+      "nick": "trev",
+      "seed": "eebc77dc31c129c3d3d00b525d3e4d07ff1fbc23fe59c9ba2289fab0996edf1b",
+      "body": 2,
+      "palette": 2,
+      "fuse": 3,
+      "spark": 1,
+      "accessory": 4,
+      "marking": 1
+    },
+    {
+      "nick": "ash",
+      "seed": "cd38bac798200647b8e3f8c1288b781c8b09320999d80d8b47856fa8c6483fdc",
+      "body": 1,
+      "palette": 2,
+      "fuse": 2,
+      "spark": 1,
+      "accessory": 2,
+      "marking": 0
+    },
+    {
+      "nick": "cedar",
+      "seed": "bcc4d59cef3a1061c052a16db9489a382774fabf0154155eae279bfdc0474c96",
+      "body": 0,
+      "palette": 4,
+      "fuse": 1,
+      "spark": 0,
+      "accessory": 4,
+      "marking": 2
+    },
+    {
+      "nick": "ember",
+      "seed": "adf1a06f02f6a95931c21a9bf8f4cf55c1098cf445a6ceb38c16e8642d388baa",
+      "body": 1,
+      "palette": 1,
+      "fuse": 0,
+      "spark": 0,
+      "accessory": 2,
+      "marking": 2
+    },
+    {
+      "nick": "flux",
+      "seed": "33f19dc6cc0b36edbd9404dc6f1ca204b5973937fcaeb667a297778b3a54e725",
+      "body": 3,
+      "palette": 1,
+      "fuse": 1,
+      "spark": 0,
+      "accessory": 4,
+      "marking": 3
+    },
+    {
+      "nick": "moss",
+      "seed": "94ff6fcfab7279b57487bdcfad4ad31251820e5ea53d906856adb926b769d34d",
+      "body": 0,
+      "palette": 3,
+      "fuse": 3,
+      "spark": 0,
+      "accessory": 1,
+      "marking": 2
+    },
+    {
+      "nick": "nova",
+      "seed": "2646b7ad932d8fdd982be8fa35e51ed060b9abb9c38e92c54eb966d3397dcf6d",
+      "body": 2,
+      "palette": 4,
+      "fuse": 3,
+      "spark": 2,
+      "accessory": 2,
+      "marking": 1
+    },
+    {
+      "nick": "pixel",
+      "seed": "ff8dcd2a71f83b9077cd3a3141b8cc41f8b8825318a67dfe40b1b4d07d3a4f7f",
+      "body": 3,
+      "palette": 3,
+      "fuse": 1,
+      "spark": 0,
+      "accessory": 3,
+      "marking": 0
+    },
+    {
+      "nick": "quark",
+      "seed": "f5a2ef5904d2eaeda84aa0e0fd16737d8589aafec5792de423941b6f626492af",
+      "body": 1,
+      "palette": 0,
+      "fuse": 3,
+      "spark": 2,
+      "accessory": 4,
+      "marking": 2
+    },
+    {
+      "nick": "rust",
+      "seed": "8c8b55d37abce61063311441a34bfd7125a2994d609e13b06867b478b7f26427",
+      "body": 0,
+      "palette": 1,
+      "fuse": 1,
+      "spark": 1,
+      "accessory": 2,
+      "marking": 0
+    },
+    {
+      "nick": "spark",
+      "seed": "0501f9694985a57bfffec32ed68db45be853fda4bc4dad9fa61cf9bade137262",
+      "body": 1,
+      "palette": 1,
+      "fuse": 1,
+      "spark": 0,
+      "accessory": 3,
+      "marking": 1
+    },
+    {
+      "nick": "willow",
+      "seed": "631258fda282658a4d4fb07c2ed38440f919f1cb2ac776253fd2a75e6350b7ab",
+      "body": 3,
+      "palette": 0,
+      "fuse": 0,
+      "spark": 1,
+      "accessory": 2,
+      "marking": 2
+    }
+  ]
+}

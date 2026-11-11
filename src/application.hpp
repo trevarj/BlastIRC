@@ -57,6 +57,17 @@ class Application {
         size_t received = 0;
         bool active = false;
     };
+    struct SearchJump {
+        string label, searchBuffer, sourceBuffer, server, target, matchedId;
+        Message row;
+        uint64_t session = 0;
+        double started = 0;
+        size_t matches = 0;
+    };
+    struct SearchRequest {
+        string label, source, server, target;
+        uint64_t session = 0;
+    };
     struct PresenceGroup {
         double started = 0;
         bool joins = false, explicitBatch = false, emitted = false;
@@ -81,6 +92,12 @@ class Application {
     map<string, HistoryGap> gaps_;
     map<string, double> failedLabels_, failedSubmissions_;
     map<string, string> activeHistory_;
+    map<string, string> initialHistory_;
+    map<string, vector<string>> historyPriorities_;
+    set<string> promotedHistory_, startedHistory_;
+    map<string, SearchRequest> searchRequests_;
+    std::optional<SearchJump> searchJump_;
+    set<string> retiredSearchHistory_;
     map<string, CommandOrigin> commandOrigins_;
     set<string> namesInProgress_, requestedHistory_;
     map<string, set<string>> sojuCatalogSeen_;
@@ -107,6 +124,9 @@ class Application {
     map<string, Buffer> unsavedSources_;
     void refreshMentions();
     void jumpSource(const string &, const string &);
+    void jumpSearch(const string &, const string &);
+    void cancelSearchJump();
+    double sourceJumpProtectedUntil_ = -1;
     double lastSave_ = 0, lastPrune_ = -30;
     string fold(const string &server, const string &value) const;
     bool channel(const string &server, const string &target) const;
@@ -156,7 +176,11 @@ class Application {
     bool markRead(Buffer &);
     string historyCursor(const Buffer &, const string &) const;
     bool zncPlayback(const string &server) const;
-    void requestHistory(Buffer &, const string &before = "");
+    void requestHistory(Buffer &, const string &before, bool initial);
+    vector<string> historyOrder(const string &server) const;
+    void scheduleHistory();
+    void enqueueHistory(Buffer &, const string &cursor, bool initial);
+    void cancelHistory(Buffer &);
     void trim();
     void clear(Buffer *);
 };

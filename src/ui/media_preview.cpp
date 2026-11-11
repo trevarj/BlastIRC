@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <render/codecs/codecs.h>
 #include <render/core/image_decoder.h>
 #include <render/core/image_resize.h>
@@ -28,6 +29,7 @@
 #include <ui/controls/label.h>
 #include <ui/controls/select_popup_context.h>
 #include <ui/controls/slider.h>
+#include <utility>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 namespace blast {
@@ -95,20 +97,20 @@ void labelStyle(Label &label, float scale) {
     label.setFontSize(13 * scale);
     label.setColor(themeForegroundColor("on_surface"));
 }
-bool loadRaster(Image &image, Renderer &renderer, const PreviewAsset &asset, int target = 0) {
+std::optional<DecodedRasterImage> readRaster(const PreviewAsset &asset, int target) {
     if (!asset.bytes || asset.bytes > 32ULL * 1024 * 1024)
-        return false;
+        return std::nullopt;
     std::ifstream input(asset.path, std::ios::binary | std::ios::ate);
     if (!input || input.tellg() != static_cast<std::streamoff>(asset.bytes))
-        return false;
+        return std::nullopt;
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(asset.bytes));
     input.seekg(0);
     if (!input.read(reinterpret_cast<char *>(bytes.data()), bytes.size()))
-        return false;
+        return std::nullopt;
     auto raster = PreviewService::raster(bytes);
     if (!raster || !raster->width || !raster->height ||
         static_cast<std::uint64_t>(raster->width) * raster->height > 16ULL * 1024 * 1024)
-        return false;
+        return std::nullopt;
     auto decoded = [&]() -> std::expected<DecodedRasterImage, std::string> {
         if (raster->extension != ".gif")
             return decodeRasterImage(bytes.data(), bytes.size());
@@ -125,7 +127,7 @@ bool loadRaster(Image &image, Renderer &renderer, const PreviewAsset &asset, int
           (raster->extension == ".jpg" && decoded->width == static_cast<int>(raster->height) &&
            decoded->height == static_cast<int>(raster->width))) ||
         decoded->pixels.size() != static_cast<std::uint64_t>(decoded->width) * decoded->height * 4)
-        return false;
+        return std::nullopt;
     if (target > 0 && std::max(decoded->width, decoded->height) > target) {
         const double factor =
             static_cast<double>(target) / std::max(decoded->width, decoded->height);
@@ -133,11 +135,16 @@ bool loadRaster(Image &image, Renderer &renderer, const PreviewAsset &asset, int
         const int h = std::max(1, static_cast<int>(decoded->height * factor));
         auto resized = resizeToRgba(decoded->pixels.data(), decoded->width, decoded->height,
                                     ResizeSourceLayout::Rgba, w, h);
-        return !resized.empty() && image.setSourceRaw(renderer, resized.data(), resized.size(), w,
-                                                      h, 0, PixmapFormat::RGBA);
+        if (resized.empty())
+            return std::nullopt;
+        return DecodedRasterImage{std::move(resized), w, h};
     }
-    return image.setSourceRaw(renderer, decoded->pixels.data(), decoded->pixels.size(),
-                              decoded->width, decoded->height, 0, PixmapFormat::RGBA);
+    return std::move(*decoded);
+}
+bool loadRaster(Image &image, Renderer &renderer, const PreviewAsset &asset, int target = 0) {
+    auto decoded = readRaster(asset, target);
+    return decoded && image.setSourceRaw(renderer, decoded->pixels.data(), decoded->pixels.size(),
+                                         decoded->width, decoded->height, 0, PixmapFormat::RGBA);
 }
 std::string clockText(double seconds) {
     const auto n = static_cast<unsigned>(std::max(0., std::isfinite(seconds) ? seconds : 0.));
@@ -156,6 +163,9 @@ struct MediaPreviewController::Impl {
         double duration = 0;
         std::shared_ptr<const PreviewAsset> asset;
         std::uint64_t ticket = 0, assetRevision = 0;
+        std::optional<DecodedRasterImage> thumbnail;
+        std::uint64_t decodedRevision = 0;
+        bool confirmedLink = false;
         bool pending = false, fetched = false, automaticAllowed = true, needsConsent = false;
         PreviewKind requestedKind = PreviewKind::Link;
         std::uint64_t lastUse = 0;
@@ -363,6 +373,7 @@ struct MediaPreviewController::Impl {
     std::shared_ptr<const PreviewAsset> overlayAsset;
     std::uint64_t directSourceId = 0;
     bool showingInfo = false;
+    bool decodeChanged = false;
     using Policy = std::tuple<PreviewMode, PreviewMode, PreviewMode, int, int, int, bool>;
     Policy policy;
     explicit Impl(Model &m, Node &root, std::string caBundle)
@@ -471,6 +482,8 @@ struct MediaPreviewController::Impl {
             if (oldest != entries.end()) {
                 oldest->second.asset.reset();
                 oldest->second.assetRevision = 0;
+                oldest->second.thumbnail.reset();
+                oldest->second.decodedRevision = 0;
                 oldest->second.fetched = false;
                 continue;
             }
@@ -666,6 +679,7 @@ void MediaPreviewController::invalidate() {
     s.service.cancelAll();
     s.tickets.clear();
     s.entries.clear();
+    s.decodeChanged = false;
     s.close(false);
     s.policy = s.currentPolicy();
     for (const auto &weak : s.cardPins)
@@ -749,6 +763,25 @@ float MediaPreviewController::measure(Renderer &renderer, std::uint64_t id, floa
     auto it = s.entries.find(id);
     if (it == s.entries.end() || s.mode(it->second.kind) == PreviewMode::Off || width <= 0)
         return 0;
+    auto &entry = it->second;
+    if (entry.kind == PreviewKind::Link)
+        return 0;
+    if (entry.confirmedLink) {
+        if (entry.kind != PreviewKind::Image || !entry.asset || entry.pending ||
+            entry.needsConsent || !entry.error.empty())
+            return 0;
+        if (entry.decodedRevision != entry.assetRevision) {
+            entry.decodedRevision = entry.assetRevision;
+            entry.thumbnail =
+                readRaster(*entry.asset, std::clamp(static_cast<int>(240 * scale), 64, 512));
+            if (!entry.thumbnail) {
+                entry.error = "Image decode failed.";
+                s.decodeChanged = true;
+            }
+        }
+        if (!entry.thumbnail)
+            return 0;
+    }
     const auto &raster = it->second.raster;
     const float thumbWidth = std::min(width, 320 * scale);
     const float limit = std::clamp(s.model.settings.previewMaxHeight, 64, 240) * scale;
@@ -781,13 +814,41 @@ bool MediaPreviewController::replacesUrl(std::uint64_t id) const {
     if (it == impl_->entries.end() || impl_->mode(it->second.kind) == PreviewMode::Off)
         return false;
     const auto &entry = it->second;
-    if (!entry.error.empty() || entry.pending || entry.needsConsent)
+    if (entry.confirmedLink || !entry.error.empty() || entry.pending || entry.needsConsent)
         return false;
     if (entry.kind == PreviewKind::Image)
         return entry.asset && entry.raster.width && entry.raster.height;
     if (entry.kind == PreviewKind::Audio || entry.kind == PreviewKind::Video)
         return static_cast<bool>(entry.asset);
-    return entry.kind == PreviewKind::Link && entry.fetched;
+    return false;
+}
+bool MediaPreviewController::canLoadPreview(std::uint64_t id, std::string_view url) const {
+    const auto &s = *impl_;
+    if (s.policy != s.currentPolicy())
+        return false;
+    const auto it = s.entries.find(id);
+    if (it == s.entries.end())
+        return false;
+    const auto &entry = it->second;
+    if (entry.original != url || entry.pending || entry.asset ||
+        (entry.kind != PreviewKind::Link && !entry.confirmedLink &&
+         entry.requestedKind != PreviewKind::Link))
+        return false;
+    if (entry.needsConsent)
+        return s.mode(entry.kind) == PreviewMode::Click;
+    if (!entry.error.empty())
+        return false;
+    if (entry.kind == PreviewKind::Link && entry.fetched && !entry.imageUrl.empty())
+        return s.mode(PreviewKind::Link) != PreviewMode::Off &&
+               s.mode(PreviewKind::Image) == PreviewMode::Click;
+    return entry.kind == PreviewKind::Link && s.mode(entry.kind) == PreviewMode::Click &&
+           !entry.fetched && !entry.attemptedKinds;
+}
+bool MediaPreviewController::loadPreview(std::uint64_t id, std::string_view url) {
+    if (!canLoadPreview(id, url))
+        return false;
+    impl_->activate(id);
+    return true;
 }
 std::string_view MediaPreviewController::error(std::uint64_t id) const {
     auto it = impl_->entries.find(id);
@@ -795,6 +856,8 @@ std::string_view MediaPreviewController::error(std::uint64_t id) const {
 }
 void MediaPreviewController::update(float width, float height, float scale) {
     auto &s = *impl_;
+    if (std::exchange(s.decodeChanged, false))
+        s.notify();
     if (s.policy != s.currentPolicy()) {
         invalidate();
         s.notify();
@@ -820,9 +883,13 @@ void MediaPreviewController::update(float width, float height, float scale) {
             entry.error = "Unsupported preview content type.";
         if (!result.metadata.title.empty())
             entry.title = std::move(result.metadata.title);
-        if (result.kind == PreviewKind::Link)
+        if (result.kind == PreviewKind::Link) {
+            entry.confirmedLink = true;
             entry.imageUrl = std::move(result.metadata.imageUrl);
+        }
         entry.asset = std::move(result.asset);
+        entry.thumbnail.reset();
+        entry.decodedRevision = 0;
         entry.raster = std::move(result.raster);
         if (!result.metadata.description.empty())
             entry.description = std::move(result.metadata.description);
@@ -999,6 +1066,7 @@ struct MediaPreviewCard::Impl {
             pointer ? std::optional<std::uint32_t>(pointer->serial) : std::nullopt;
         request.menuWidth = 200 * scale;
         request.fontSize = 14 * scale;
+        request.font = themeUiFont();
         ContextMenuEntry info;
         info.label = "Info";
         info.value = 0;
@@ -1095,9 +1163,24 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
     s.background->setRadius(themeCornerRadius());
     if (entry.asset && entry.kind == PreviewKind::Image && s.shownRevision != entry.assetRevision) {
         s.image->clear(renderer);
-        if (!loadRaster(*s.image, renderer, *entry.asset,
-                        std::clamp(static_cast<int>(240 * scale), 64, 512)))
+        const bool loaded =
+            entry.confirmedLink
+                ? entry.thumbnail &&
+                      s.image->setSourceRaw(renderer, entry.thumbnail->pixels.data(),
+                                            entry.thumbnail->pixels.size(), entry.thumbnail->width,
+                                            entry.thumbnail->height, 0, PixmapFormat::RGBA)
+                : loadRaster(*s.image, renderer, *entry.asset,
+                             std::clamp(static_cast<int>(240 * scale), 64, 512));
+        if (!loaded) {
             entry.error = "Image decode failed.";
+            if (entry.confirmedLink) {
+                controller.decodeChanged = true;
+                s.thumbnailAction->setSize(0, 0);
+                setSize(width(), 0);
+                setVisible(false);
+                setHitTestVisible(false);
+            }
+        }
         s.shownRevision = entry.assetRevision;
     }
     const bool thumb = entry.kind == PreviewKind::Image && entry.asset && entry.raster.width &&

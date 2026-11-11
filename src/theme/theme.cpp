@@ -169,6 +169,8 @@ void apply(const Settings &settings) {
         uiFont.family = uiFamily;
     if (messageFont.family != messageFamily)
         messageFont.family = messageFamily;
+    uiFont.weight = static_cast<FontWeight>(settings.uiFontWeight);
+    messageFont.weight = static_cast<FontWeight>(settings.messageFontWeight);
     userScale = std::isfinite(settings.scale) ? std::clamp(settings.scale, .7f, 2.f) : 1.f;
     messageScale =
         std::isfinite(settings.messageScale) ? std::clamp(settings.messageScale, .7f, 2.f) : 1.f;

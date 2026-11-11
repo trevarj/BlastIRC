@@ -1447,13 +1447,219 @@ void avatarSmoke(SSL_CTX *context, const Identity &identity, const fs::path &cer
     }
 }
 
+void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled) {
+    WirePeer peer(context);
+    NetworkClient client(server(peer.port), identity);
+    vector<Event> events;
+    registerClient(peer, client, events, identity,
+                   "message-tags batch draft/chathistory soju.im/search draft/channel-rename" +
+                       string(labeled ? " labeled-response" : ""));
+    auto admitted = [&] {
+        client.command("PING :history-admitted");
+        peer.expect("PING", {"history-admitted"});
+    };
+    auto request = [&](const string &target, const string &id, bool initial) {
+        client.history(target, "", id, initial);
+    };
+    auto wire = [&](const string &target, const string &id) {
+        const auto message = peer.expect("CHATHISTORY", {"LATEST", target, "*", "200"});
+        require(labeled ? message.tags.contains("label") && message.tags.at("label") == id
+                        : !message.tags.contains("label"),
+                "History wire label lost caller correlation");
+        const auto index = waitEvent(client, events, 0, [&](const Event &e) {
+            return e.type == "history_begin" && e.label == id;
+        });
+        require(events[index].target == target, "History begin lost target");
+    };
+    unsigned batch = 0;
+    auto finish = [&](const string &target, const string &id) {
+        const string name = "history-check-" + std::to_string(++batch);
+        peer.send(string(labeled ? "@label=" + id + " " : "") + ":server BATCH +" + name +
+                  " chathistory " + target + "\r\n:server BATCH -" + name);
+        const auto index = waitEvent(client, events, 0, [&](const Event &e) {
+            return e.type == "history_end" && e.label == id;
+        });
+        require(tag(events[index], "error").empty() && tag(events[index], "count") == "0",
+                "Empty history batch did not complete normally");
+    };
+    // AROUND uses the server's advertised reference types and page limit, while
+    // retaining the same request correlation on labeled and unlabeled servers.
+    peer.send(":server 005 " + identity.nick + " CHATHISTORY=17 MSGREFTYPES=timestamp :supported");
+    waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "network" && tag(e, "kind") == "isupport" &&
+               tag(e, "MSGREFTYPES") == "timestamp";
+    });
+    client.historyAround("#around", "selected-id", "2026-11-01T12:00:00Z", "around-time");
+    const auto around = peer.expect(
+        "CHATHISTORY", {"AROUND", "#around", "timestamp=2026-11-01T12:00:00.000Z", "17"});
+    require(labeled ? around.tags.contains("label") && around.tags.at("label") == "around-time"
+                    : !around.tags.contains("label"),
+            "AROUND wire label lost caller correlation");
+    const auto aroundBegin = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "history_begin" && e.label == "around-time";
+    });
+    require(events[aroundBegin].target == "#around" &&
+                tag(events[aroundBegin], "direction") == "around" &&
+                tag(events[aroundBegin], "initial").empty(),
+            "AROUND begin lost foreground routing");
+    peer.send(string(labeled ? "@label=around-time " : "") +
+              ":server BATCH +around-check chathistory #around\r\n"
+              "@batch=around-check;msgid=selected-id :Peer!u@h PRIVMSG #around :selected\r\n"
+              ":server BATCH -around-check");
+    const auto aroundEnd = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "history_end" && e.label == "around-time";
+    });
+    require(tag(events[aroundEnd], "direction") == "around" &&
+                tag(events[aroundEnd], "count") == "1" && tag(events[aroundEnd], "error").empty(),
+            "AROUND completion lost direction or result count");
+    peer.send(":server 005 " + identity.nick + " CHATHISTORY=200 MSGREFTYPES=msgid :supported");
+    waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "network" && tag(e, "kind") == "isupport" &&
+               tag(e, "MSGREFTYPES") == "msgid";
+    });
+    client.historyAround("#around", "selected-id", "2026-11-01T12:00:00Z", "around-id");
+    peer.expect("CHATHISTORY", {"AROUND", "#around", "msgid=selected-id", "200"});
+    peer.send(string(labeled ? "@label=around-id " : "") +
+              ":server FAIL CHATHISTORY INVALID_PARAMS #around :history denied");
+    const auto aroundFailure = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "history_end" && e.label == "around-id";
+    });
+    require(tag(events[aroundFailure], "direction") == "around" &&
+                tag(events[aroundFailure], "error") == "history denied",
+            "AROUND failure lost correlation");
+    client.historyAround("#around", "", "2026-11-01T12:00:00Z", "around-invalid");
+    const auto aroundInvalid = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "history_end" && e.label == "around-invalid";
+    });
+    require(tag(events[aroundInvalid], "direction") == "around" &&
+                tag(events[aroundInvalid], "rejected") == "1" &&
+                !tag(events[aroundInvalid], "error").empty(),
+            "Unsupported AROUND selector was not rejected");
+    // Fill active slots so ranking changes operate only on pending work.
+    const int active = labeled ? 16 : 1;
+    for (int i = 0; i < active; ++i) {
+        const string id = "held-" + std::to_string(i);
+        request("#" + id, id, true);
+        wire("#" + id, id);
+    }
+    request("#a", "initial-a", true);
+    request("#b", "initial-b", true);
+    request("#c", "initial-c", true);
+    request("#foreground", "foreground", false);
+    client.command("SEARCH #search needle");
+    request("#cancel", "canceled", true);
+    client.cancelInitialHistory("#foreground");
+    client.cancelInitialHistory("#cancel");
+    client.prioritizeHistory({"#c", "#a", "#b"});
+    admitted();
+    const auto canceled = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "history_end" && e.label == "canceled";
+    });
+    require(tag(events[canceled], "initial") == "1" && tag(events[canceled], "cancelled") == "1" &&
+                !tag(events[canceled], "error").empty(),
+            "Queued cancellation did not retire its initial request");
+    finish("#held-0", "held-0");
+    wire("#c", "initial-c");
+    client.cancelInitialHistory("#c");
+    client.prioritizeHistory({"#b", "#a", "#c"});
+    admitted();
+    peer.send(":server RENAME #b #renamed-b\r\n:server RENAME #c #renamed-c");
+    peer.fence();
+    finish("#renamed-c", "initial-c");
+    wire("#renamed-b", "initial-b");
+    finish("#renamed-b", "initial-b");
+    wire("#foreground", "foreground");
+    const auto foregroundBegin = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "history_begin" && e.label == "foreground";
+    });
+    require(tag(events[foregroundBegin], "initial").empty(),
+            "Foreground history was marked initial");
+    peer.send(string(labeled ? "@label=foreground " : "") +
+              ":server FAIL CHATHISTORY INVALID_PARAMS #foreground :history denied");
+    const auto denied = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "history_end" && e.label == "foreground";
+    });
+    require(tag(events[denied], "error") == "history denied" &&
+                tag(events[denied], "initial").empty() && tag(events[denied], "rejected").empty(),
+            "Protocol history failure lost correlation or retry semantics");
+    const auto search = peer.expect("SEARCH", {"in=#search;text=needle;limit=100"});
+    const auto searchBegin = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "history_begin" && e.target == "#search";
+    });
+    const string searchId = events[searchBegin].label;
+    require(!searchId.empty() && tag(events[searchBegin], "initial").empty() &&
+                tag(events[searchBegin], "direction") == "search",
+            "Generic search did not stay foreground");
+    require(!labeled || search.tags.at("label") == searchId, "Search label mismatch");
+    finish("#search", searchId);
+    wire("#a", "initial-a");
+    // Hold the last request while exercising the 128-pending bound.
+    client.history("invalid target", "after=msgid=cursor", "invalid-initial", true);
+    client.history("#invalid", "bad cursor", "invalid-foreground", false);
+    for (int i = 0; i < 128; ++i)
+        request("#queued-" + std::to_string(i), "queued-" + std::to_string(i), true);
+    request("#overflow", "overflow-initial", true);
+    request("#overflow", "overflow-foreground", false);
+    admitted();
+    for (const string id :
+         {"invalid-initial", "invalid-foreground", "overflow-initial", "overflow-foreground"}) {
+        const auto index = waitEvent(client, events, 0, [&](const Event &e) {
+            return e.type == "history_end" && e.label == id;
+        });
+        const string direction = id == "invalid-initial"      ? "after"
+                                 : id == "invalid-foreground" ? "before"
+                                                              : "latest";
+        require(!tag(events[index], "error").empty() && tag(events[index], "rejected") == "1" &&
+                    (tag(events[index], "initial") == "1") == id.ends_with("-initial") &&
+                    tag(events[index], "direction") == direction,
+                "Rejected history lost request metadata");
+    }
+    client.stop();
+    bool stoppedRejected = false;
+    try {
+        client.history("#stopped", "after=msgid=cursor", "stopped-initial", true);
+    } catch (const std::runtime_error &) {
+        stoppedRejected = true;
+    }
+    require(stoppedRejected, "Stopped-client history enqueue did not throw");
+    collect(client, events);
+    require(std::none_of(events.begin(), events.end(),
+                         [](const Event &e) { return e.label == "stopped-initial"; }),
+            "Unadmitted history request emitted a duplicate terminal event");
+    for (int i = 0; i < 128; ++i) {
+        const string id = "queued-" + std::to_string(i);
+        require(std::count_if(events.begin(), events.end(),
+                              [&](const Event &e) {
+                                  return e.type == "history_end" && e.label == id &&
+                                         e.target == "#" + id && tag(e, "initial") == "1" &&
+                                         tag(e, "direction") == "latest" &&
+                                         !tag(e, "error").empty();
+                              }) == 1,
+                "Disconnect did not retire queued history exactly once");
+    }
+    require(std::count_if(events.begin(), events.end(),
+                          [](const Event &e) {
+                              return e.type == "history_end" && e.label == "initial-a" &&
+                                     !tag(e, "error").empty() && tag(e, "initial") == "1";
+                          }) == 1,
+            "Disconnect did not retire active initial history");
+    require(std::none_of(events.begin(), events.end(),
+                         [](const Event &e) {
+                             return e.type == "error" &&
+                                    (e.label.starts_with("invalid-") ||
+                                     e.label.starts_with("overflow-") || e.label == "canceled" ||
+                                     e.label == "foreground");
+                         }),
+            "History rejection emitted duplicate generic diagnostics");
+}
+
 void playbackChecks(SSL_CTX *context, const Identity &identity) {
     WirePeer peer(context);
     NetworkClient client(server(peer.port, "", "znc"), identity);
     vector<Event> events;
     registerClient(peer, client, events, identity,
                    "message-tags batch server-time znc.in/playback");
-    client.history("#playback", "after=timestamp=2026-11-05T00:00:00.123Z");
+    client.history("#playback", "after=timestamp=2026-11-05T00:00:00.123Z", "playback-after", true);
     peer.expect("ZNC", {"*playback", "PLAY #playback 1793836800.123"});
     peer.send(":server BATCH +playback znc.in/playback #playback");
     peer.send("@batch=playback;time=2026-11-05T00:00:01.250Z;msgid=playback-message "
@@ -1463,7 +1669,8 @@ void playbackChecks(SSL_CTX *context, const Identity &identity) {
         return event.type == "history_end" && event.target == "#playback";
     })];
     const string historyLabel = end.label;
-    require(!historyLabel.empty() && tag(end, "error").empty() && tag(end, "count") == "1" &&
+    require(historyLabel == "playback-after" && tag(end, "initial") == "1" &&
+                tag(end, "error").empty() && tag(end, "count") == "1" &&
                 tag(end, "direction") == "after" && tag(end, "batch") == "playback",
             "ZNC playback did not complete its history request");
     require(std::any_of(events.begin(), events.end(),
@@ -1483,7 +1690,7 @@ void playbackChecks(SSL_CTX *context, const Identity &identity) {
                         }),
             "Real ZNC batch message was not delivered as historical");
     const auto from = events.size();
-    client.history("#missing");
+    client.history("#missing", "", "playback-missing", false);
     peer.expect("ZNC", {"*playback", "PLAY #missing 0"});
     peer.send(":server 401 " + identity.nick + " *playback :No such nick");
     const auto &rejected = events[waitEvent(client, events, from, [](const Event &event) {
@@ -1495,12 +1702,14 @@ void playbackChecks(SSL_CTX *context, const Identity &identity) {
     peer.send(":server CAP " + identity.nick + " DEL :znc.in/playback");
     peer.fence();
     const auto unsupportedFrom = events.size();
-    client.history("#unsupported");
+    client.history("#unsupported", "", "playback-unsupported", true);
     const auto &unsupported =
         events[waitEvent(client, events, unsupportedFrom, [](const Event &event) {
             return event.type == "history_end" && event.target == "#unsupported";
         })];
-    require(tag(unsupported, "error") == "Server does not advertise history playback",
+    require(unsupported.label == "playback-unsupported" && tag(unsupported, "initial") == "1" &&
+                tag(unsupported, "rejected") == "1" &&
+                tag(unsupported, "error") == "Server does not advertise history playback",
             "ZNC without the native playback capability was treated as supported");
     peer.fence(); // No module command may precede this PONG without the capability.
     client.stop();
@@ -2186,6 +2395,9 @@ int main(int argc, char **argv) {
         blockedSentChecks(context.get(), identity, true, false, true);
         phase = "channel metadata / postponed synchronization";
         preReadyMetadataChecks(context.get(), identity);
+        phase = "history ranking / correlated admission / disconnect cleanup";
+        historyQueueChecks(context.get(), identity, false);
+        historyQueueChecks(context.get(), identity, true);
         metadataChecks(context.get(), identity);
         metadataLookupChecks(context.get(), identity);
         phase = "ZNC playback";

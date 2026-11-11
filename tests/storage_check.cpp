@@ -29,9 +29,11 @@ static void mode(const fs::path &file, unsigned expected) {
 }
 static void presentation(const Settings &actual, const Settings &expected) {
     assert(actual.sendMotion == expected.sendMotion && actual.sendReveal == expected.sendReveal &&
-           actual.ircChannels == expected.ircChannels && actual.uiFont == expected.uiFont &&
+           actual.messageLayouts == expected.messageLayouts && actual.uiFont == expected.uiFont &&
            actual.messageFont == expected.messageFont);
     assert(actual.scale == expected.scale && actual.messageScale == expected.messageScale);
+    assert(actual.uiFontWeight == expected.uiFontWeight &&
+           actual.messageFontWeight == expected.messageFontWeight);
     assert(actual.incomingMotion == expected.incomingMotion &&
            actual.incomingReveal == expected.incomingReveal &&
            actual.incomingDurationMs == expected.incomingDurationMs &&
@@ -1059,6 +1061,70 @@ static void presenceInheritancePreferences(const fs::path &config) {
         assert(failed && contents(config / "settings.toml") == preferences);
     }
 }
+static void conversationBindingPreferences(const fs::path &config) {
+    {
+        std::ofstream output(config / "settings.toml");
+        output << "schema_version = 1\n";
+    }
+    map<string, string> defaults;
+    {
+        Storage storage;
+        Model model;
+        storage.load(model);
+        defaults = model.settings.bindings;
+        assert(defaults.at("conversation-back") == "C-o");
+        assert(defaults.at("conversation-forward") == "C-i");
+    }
+    struct Case {
+        string source, back, forward;
+        map<string, string> retained;
+    };
+    const Case cases[] = {
+        {"", "C-o", "C-i", {}},
+        {"toggle-navigation = 'C-o'\n", "", "C-i", {{"toggle-navigation", "C-o"}}},
+        {"toggle-navigation = ' c-O '\n", "", "C-i", {{"toggle-navigation", " c-O "}}},
+        {"toggle-navigation = ' c-O   X '\n", "", "C-i", {{"toggle-navigation", " c-O   X "}}},
+        {"toggle-navigation = 'C-i'\n", "C-o", "", {{"toggle-navigation", "C-i"}}},
+        {"toggle-navigation = ' c-I '\n", "C-o", "", {{"toggle-navigation", " c-I "}}},
+        {"toggle-navigation = ' c-I   X '\n", "C-o", "", {{"toggle-navigation", " c-I   X "}}},
+        {"toggle-navigation = 'C-oops'\n", "C-o", "C-i", {{"toggle-navigation", "C-oops"}}},
+        {"conversation-back = ''\nconversation-forward = ''\n", "", "", {}},
+        {"conversation-back = 'M-o'\nconversation-forward = 'M-i'\n", "M-o", "M-i", {}},
+        {"conversation-back = ' c-O   X '\ntoggle-navigation = 'C-o'\n",
+         " c-O   X ",
+         "C-i",
+         {{"toggle-navigation", "C-o"}}},
+        {"conversation-forward = ' c-I   X '\ntoggle-navigation = 'C-i'\n",
+         "C-o",
+         " c-I   X ",
+         {{"toggle-navigation", "C-i"}}},
+        {"conversation-back = 'C-i x'\n", "C-i x", "", {}},
+        {"conversation-forward = 'C-o x'\n", "", "C-o x", {}},
+        {"conversation-back = 'C-i'\nconversation-forward = 'C-o'\n", "C-i", "C-o", {}}};
+    for (const auto &test : cases) {
+        {
+            std::ofstream output(config / "settings.toml");
+            output << "schema_version = 1\n[appearance]\nopacity = 0.5\n"
+                      "[bindings]\nuser-command = 'M-F12'\n"
+                   << test.source;
+        }
+        auto expected = defaults;
+        expected.at("conversation-back") = test.back;
+        expected.at("conversation-forward") = test.forward;
+        expected["user-command"] = "M-F12";
+        for (const auto &[name, chord] : test.retained)
+            expected[name] = chord;
+        for (int reopen = 0; reopen < 2; ++reopen) {
+            Storage storage;
+            Model model;
+            storage.load(model);
+            assert(model.settings.bindings == expected);
+            assert(model.settings.opacity == .5f);
+            if (reopen == 0)
+                storage.save(model);
+        }
+    }
+}
 static void messageBindingPreferences(const fs::path &config) {
     struct Case {
         string source;
@@ -1803,6 +1869,8 @@ int main() {
             storage.load(expected);
             assert(expected.firstRun && expected.servers.at(0).tls);
             assert(expected.settings.bindings.at("search") == "C-s");
+            assert(expected.settings.bindings.at("conversation-back") == "C-o" &&
+                   expected.settings.bindings.at("conversation-forward") == "C-i");
             assert(expected.settings.sendMotion == SendMotion::Flight &&
                    expected.settings.sendReveal == SendReveal::Pixels);
             assert(expected.settings.incomingMotion == SendMotion::None &&
@@ -1825,7 +1893,7 @@ int main() {
                    expected.settings.cursorTrailStrength == .20f);
             assert(expected.settings.peopleMode == SidebarMode::Hidden);
             assert(expected.settings.opacity == 1.f && !expected.settings.transparency &&
-                   expected.settings.ircChannels.empty());
+                   expected.settings.messageLayouts.empty());
             storage.save(expected); // Closing an unfinished wizard preserves preferences only.
             assert(!fs::exists(config / "config.toml") && fs::exists(config / "settings.toml"));
             Model unfinished;
@@ -1872,6 +1940,8 @@ int main() {
             s.maxMessages = 3;
             s.uiFont = "UI test font";
             s.messageFont = "message test font";
+            s.uiFontWeight = 300;
+            s.messageFontWeight = 700;
             s.nickPalette = "VIVID";
             s.avatarStyle = "initials";
             s.themeSource = "builtin";
@@ -1882,7 +1952,8 @@ int main() {
             s.friends = {"alice", "bob"};
             s.fools = {"mallory"};
             s.channelPresence["Libera/#a"] = PresenceMode::All;
-            s.ircChannels = {"Libera/#a", "Other/#a"};
+            s.messageLayouts = {{"Libera/#a", MessageLayout::Irc},
+                                {"Other/#a", MessageLayout::Irc}};
             s.pinnedBuffers = {"Other/#a", "Libera/#a"};
             s.workspace = {{"focused", "2"},
                            {"1", "Libera/#b"},
@@ -1985,14 +2056,15 @@ int main() {
             assert(a.pinnedBuffers == e.pinnedBuffers);
             assert(a.fx == e.fx && a.presence == e.presence && a.opacity == e.opacity &&
                    a.scale == e.scale && a.masterVolume == e.masterVolume);
-            assert(a.transparency == e.transparency && a.ircChannels == e.ircChannels &&
-                   !a.ircChannels.contains("Libera/#b"));
+            assert(a.transparency == e.transparency && a.messageLayouts == e.messageLayouts &&
+                   !a.messageLayouts.contains("Libera/#b"));
             assert(a.gravity == e.gravity && a.drag == e.drag && a.shake == e.shake &&
                    a.reducedMotion == e.reducedMotion && a.sound == e.sound);
             assert(a.typingSend == e.typingSend && a.typingReceive == e.typingReceive &&
                    a.timestamps == e.timestamps && a.avatars == e.avatars);
             assert(a.uiFont == e.uiFont && a.messageFont == e.messageFont &&
                    a.nickPalette == e.nickPalette && a.avatarStyle == e.avatarStyle);
+            assert(a.uiFontWeight == e.uiFontWeight && a.messageFontWeight == e.messageFontWeight);
             assert(a.themeSource == e.themeSource && a.pitchVariation == e.pitchVariation &&
                    a.retentionDays == 0 && a.maxMessages == 3);
             assert(a.bindings == e.bindings && a.nickColors == e.nickColors &&
@@ -2184,6 +2256,7 @@ int main() {
         }
         const string originalConfig = contents(config / "config.toml");
         messageBindingPreferences(config);
+        conversationBindingPreferences(config);
         presenceInheritancePreferences(config);
         peopleModePreferences(config);
         spellingPreferences(config);
@@ -2238,7 +2311,7 @@ int main() {
             Storage storage;
             storage.load(legacy);
             assert(!legacy.firstRun && legacy.settings.opacity == .5f);
-            assert(!legacy.settings.transparency && legacy.settings.ircChannels.empty());
+            assert(!legacy.settings.transparency && legacy.settings.messageLayouts.empty());
             assert(legacy.settings.scale == 1.f && legacy.settings.messageScale == 1.f);
             assert(!legacy.settings.bindings.contains("split-below") &&
                    !legacy.settings.bindings.contains("close-pane") &&
@@ -2283,9 +2356,11 @@ int main() {
                        legacy.settings.workspace == expected.settings.workspace);
                 assert(legacy.settings.sendMotion == SendMotion::Flight &&
                        legacy.settings.sendReveal == SendReveal::Pixels);
-                assert(legacy.settings.ircChannels == expected.settings.ircChannels &&
+                assert(legacy.settings.messageLayouts == expected.settings.messageLayouts &&
                        legacy.settings.uiFont == "Legacy UI font" &&
                        legacy.settings.messageFont == "Legacy message font");
+                assert(legacy.settings.uiFontWeight == 400 &&
+                       legacy.settings.messageFontWeight == 400);
             }
             auto &s = legacy.settings;
             for (SidebarMode mode :
@@ -2306,12 +2381,38 @@ int main() {
                 assert(actual.settings.opacity == .5f &&
                        contents(config / "config.toml") == originalConfig);
                 const string saved = contents(config / "settings.toml");
+                assert(saved.find("irc_channels") == string::npos &&
+                       saved.find("message_layouts") != string::npos);
                 assert(!std::regex_search(
                     saved,
                     std::regex(
                         R"((^|\n)[ \t]*(style|blur|refraction|flow|glow|scanlines)[ \t]*=)")));
                 assert(saved.find("glass") == string::npos && saved.find("hacker") == string::npos);
             }
+        }
+        // Canonical layouts take precedence over legacy input and round-trip all three tokens.
+        {
+            std::ofstream output(config / "settings.toml");
+            output << "[presentation]\nirc_channels = ['legacy/ignored']\n"
+                      "[presentation.message_layouts]\n"
+                      "'Libera/#a' = 'stacked'\n'Other/#a' = 'irc'\n'Explicit/#b' = 'bubbles'\n";
+        }
+        {
+            Storage storage;
+            Model layouts;
+            storage.load(layouts);
+            assert(layouts.settings.messageLayouts.size() == 3 &&
+                   layouts.settings.messageLayouts.at("Libera/#a") == MessageLayout::Stacked &&
+                   layouts.settings.messageLayouts.at("Other/#a") == MessageLayout::Irc &&
+                   layouts.settings.messageLayouts.at("Explicit/#b") == MessageLayout::Bubbles &&
+                   !layouts.settings.messageLayouts.contains("legacy/ignored"));
+            storage.save(layouts);
+            const auto saved = contents(config / "settings.toml");
+            assert(saved.find("irc_channels") == string::npos &&
+                   saved.find("message_layouts") != string::npos);
+            Model reopened;
+            storage.load(reopened);
+            assert(reopened.settings.messageLayouts == layouts.settings.messageLayouts);
         }
         // Every motion/reveal pairing is independently decoded and survives save/restart.
         for (const auto &[motionToken, motion] :
@@ -2365,6 +2466,24 @@ int main() {
                    !actual.settings.foolUnread && actual.settings.messageWrapColumns == 80);
             assert(contents(config / "settings.toml") == source);
         }
+        for (bool ui : {true, false})
+            for (int weight : {300, 400, 500, 600, 700}) {
+                const string key = ui ? "ui_font_weight" : "message_font_weight";
+                {
+                    std::ofstream output(config / "settings.toml");
+                    output << "[appearance]\n" << key << " = " << weight << '\n';
+                }
+                Storage storage;
+                Model configured;
+                storage.load(configured);
+                assert(configured.settings.uiFontWeight == (ui ? weight : 400) &&
+                       configured.settings.messageFontWeight == (ui ? 400 : weight));
+                storage.save(configured);
+                Model reopened;
+                storage.load(reopened);
+                presentation(reopened.settings, configured.settings);
+                assert(contents(config / "config.toml") == originalConfig);
+            }
         // New absent fields preserve defaults; all supported policies round-trip independently.
         for (int style = 0; style < 4; ++style) {
             for (const auto motion : {SendMotion::None, SendMotion::Rise, SendMotion::Pop,
@@ -2394,6 +2513,24 @@ int main() {
             }
         }
         for (const string source : {"fool_display = 'unknown'",
+                                    "ui_font_weight = 299",
+                                    "ui_font_weight = 401",
+                                    "ui_font_weight = 800",
+                                    "ui_font_weight = 400.0",
+                                    "ui_font_weight = '400'",
+                                    "ui_font_weight = true",
+                                    "ui_font_weight = nan",
+                                    "ui_font_weight = inf",
+                                    "ui_font_weight = []",
+                                    "message_font_weight = 0",
+                                    "message_font_weight = 650",
+                                    "message_font_weight = 701",
+                                    "message_font_weight = 400.0",
+                                    "message_font_weight = '400'",
+                                    "message_font_weight = false",
+                                    "message_font_weight = nan",
+                                    "message_font_weight = -inf",
+                                    "message_font_weight = {}",
                                     "fool_display = 1",
                                     "fool_unread = 1",
                                     "fool_unread = 'false'",
@@ -2536,6 +2673,22 @@ int main() {
         }
         // Invalid in-memory preferences must fail before either configuration file is replaced.
         const string validSettings = contents(config / "settings.toml");
+        for (bool ui : {true, false})
+            for (int weight : {-1, 0, 299, 350, 401, 650, 701, 800}) {
+                Storage storage;
+                Model invalid = legacy;
+                (ui ? invalid.settings.uiFontWeight : invalid.settings.messageFontWeight) = weight;
+                bool failed = false;
+                try {
+                    storage.save(invalid);
+                } catch (const std::runtime_error &error) {
+                    failed = string(error.what())
+                                 .find(ui ? "appearance.ui_font_weight"
+                                          : "appearance.message_font_weight") != string::npos;
+                }
+                assert(failed && contents(config / "config.toml") == originalConfig &&
+                       contents(config / "settings.toml") == validSettings);
+            }
         for (float scale :
              {.69f, 2.01f, std::numeric_limits<float>::infinity(),
               -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
@@ -2863,6 +3016,11 @@ int main() {
             {"[appearance]\nsend_reveal = false\n", "send_reveal"},
             {"[presentation]\nirc_channels = 'Libera/#a'\n", "presentation.irc_channels"},
             {"[presentation]\nirc_channels = ['Libera/#a', false]\n", "presentation.irc_channels"},
+            {"[presentation]\nmessage_layouts = []\n", "message_layouts"},
+            {"[presentation.message_layouts]\n'a' = false\n", "presentation.message_layouts.a"},
+            {"[presentation.message_layouts]\n'a' = 'IRC'\n", "presentation.message_layouts.a"},
+            {"[presentation.message_layouts]\n'a' = ''\n", "presentation.message_layouts.a"},
+            {"[presentation.message_layouts]\n'a' = 'other'\n", "presentation.message_layouts.a"},
             {"[appearance]\nopacity = 0.25\n[workspace]\npeople_visible = 'true'\n",
              "people_visible"},
             {"[workspace]\npeople_visible = 1\n", "people_visible"},

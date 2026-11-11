@@ -1,0 +1,159 @@
+#pragma once
+
+#include "config/config_types.h"
+#include "core/ui_phase.h"
+#include "render/scene/node.h"
+#include "shell/wayland/layer_surface.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+
+class AnimationManager;
+class InputArea;
+class Renderer;
+
+class Panel {
+public:
+  virtual ~Panel() = default;
+
+  virtual void create() = 0;
+  void layout(Renderer& renderer, float width, float height) {
+    UiPhaseScope layoutPhase(UiPhase::Layout);
+    doLayout(renderer, width, height);
+  }
+  void update(Renderer& renderer) {
+    UiPhaseScope updatePhase(UiPhase::Update);
+    doUpdate(renderer);
+  }
+  // Runs with the panel surface's render target current, so GPU uploads are allowed.
+  virtual void onFrameTick(float deltaMs, Renderer& renderer) {
+    (void)deltaMs;
+    (void)renderer;
+  }
+  virtual void onOpen(std::string_view context) { (void)context; }
+  virtual void onClose() {}
+  virtual void onIconThemeChanged() {}
+  virtual void scrollFocusedInputIntoView(InputArea* area) { (void)area; }
+  virtual bool isContextActive(std::string_view context) const {
+    (void)context;
+    return false;
+  }
+  virtual bool handleGlobalKey(std::uint32_t sym, std::uint32_t modifiers, bool pressed, bool preedit) {
+    (void)sym;
+    (void)modifiers;
+    (void)pressed;
+    (void)preedit;
+    return false;
+  }
+  virtual bool dismissTransientUi() { return false; }
+  virtual bool deferExternalRefresh() const { return false; }
+  virtual bool deferPointerRelayout() const { return false; }
+
+  virtual float preferredWidth() const = 0;
+  virtual float preferredHeight() const = 0;
+  // Span the output's available extent on this axis (floating panels only). The
+  // surface is dual-anchored with a requested size of 0 so the compositor
+  // assigns the size, subtracting every exclusive zone on the output; the
+  // preferred size is then only the fallback if no size is ever assigned.
+  virtual bool fillsWidth() const noexcept { return false; }
+  virtual bool fillsHeight() const noexcept { return false; }
+  // Content-fitted height: the panel shows at its content's height plus padding, up to
+  // preferredHeight(), which becomes the maximum. The surface is sized for that maximum
+  // once at open and only the visible card inside it follows the content, because
+  // resizing a layer surface blanks it for a frame on most compositors.
+  virtual bool fitsContentHeight() const noexcept { return false; }
+  // Natural height of the content laid out at `contentWidth`, without padding. Called
+  // after layout() and only when fitsContentHeight() is true; may leave the content laid
+  // out at that height, so the caller lays it out again.
+  virtual float measureContentHeight(Renderer& renderer, float contentWidth) {
+    (void)renderer;
+    (void)contentWidth;
+    return 0.0F;
+  }
+  virtual bool hasDecoration() const { return true; }
+  virtual LayerShellLayer layer() const { return LayerShellLayer::Top; }
+  virtual std::string_view panelLayerToken() const { return {}; }
+  // Keyboard focus policy. `None` means the panel never takes keyboard focus, so the
+  // app the user is typing into keeps it — that also rules out outside-click
+  // dismissal, which needs either the click shield (it would swallow the click meant
+  // for the app) or a compositor focus grab (it takes the keyboard). OnDemand vs
+  // Exclusive only decides whether the panel takes focus on open, and only on the
+  // detached path of a compositor without focus-grab support; see
+  // resolvePanelKeyboardPlan in panel_manager.cpp.
+  virtual LayerShellKeyboard keyboardMode() const { return LayerShellKeyboard::OnDemand; }
+  virtual InputArea* initialFocusArea() const { return nullptr; }
+  // Dynamic focus: consumed (returned once, then cleared) by PanelManager after
+  // each update/layout pass. Lets content that arrives or changes after the
+  // scene build request keyboard focus (e.g. a plugin input with focus = true).
+  [[nodiscard]] virtual InputArea* takePendingFocusArea() { return nullptr; }
+  // Panel placement policy. `Attached` anchors the panel surface to a suitable
+  // bar edge; `Floating` opens detached and uses panelScreenPosition().
+  virtual PanelPlacement panelPlacement() const noexcept { return PanelPlacement::Floating; }
+  // Screen position (one of kPanelPositions): pins a floating panel; aligns an attached
+  // panel when it lies on the bar's edge. Plugin panels override; built-in panels resolve
+  // through shell.panel.*_position in PanelManager.
+  virtual std::string panelScreenPosition() const { return "auto"; }
+  virtual bool panelOpenNearClick() const { return false; }
+  // For attached panels: which bar edge to attach to when more than one bar exists on
+  // the target output. Returned value must outlive the call (use a string literal).
+  virtual std::string_view preferredAttachedBarPosition() const noexcept { return "top"; }
+  // For attached panels: when true (default), the panel's background opacity tracks the
+  // host bar's `backgroundOpacity` config and updates live. When false, the panel uses
+  // attachedBackgroundOpacityOverride() instead — useful for panels whose contents need
+  // a fixed alpha for legibility (e.g. wallpaper thumbnails).
+  virtual bool inheritsBarBackgroundOpacity() const noexcept { return true; }
+  virtual float attachedBackgroundOpacityOverride() const noexcept { return 1.0F; }
+  // For floating/detached panels: when set, overrides the global shell.panel.transparency_mode
+  // background opacity with a custom alpha.
+  virtual std::optional<float> detachedBackgroundOpacityOverride() const noexcept { return std::nullopt; }
+  virtual bool wantsCloseAnimation() const noexcept { return true; }
+  virtual bool dismissOnOutsideClick() const { return true; }
+  virtual bool ignorePointerEvent() const { return false; }
+  // True to live in PersistentPanelHost instead of PanelManager's single active
+  // slot: opening another panel leaves it on screen, and only an explicit toggle
+  // or close dismisses it.
+  virtual bool isPersistent() const noexcept { return false; }
+
+  Node* root() const noexcept { return m_root ? m_root.get() : m_rootPtr; }
+  float contentScale() const noexcept { return m_contentScale; }
+  float panelCardOpacity() const noexcept { return m_panelCardOpacity; }
+
+  void setContentScale(float scale) noexcept { m_contentScale = scale; }
+  void setPendingOpenContext(std::string_view context) { m_pendingOpenContext = std::string(context); }
+  std::string_view pendingOpenContext() const noexcept { return m_pendingOpenContext; }
+  void setPanelCardOpacity(float opacity) noexcept {
+    const float clamped = std::clamp(opacity, 0.0F, 1.0F);
+    if (m_panelCardOpacity == clamped) {
+      return;
+    }
+    m_panelCardOpacity = clamped;
+    onPanelCardOpacityChanged(clamped);
+  }
+
+  std::unique_ptr<Node> releaseRoot() {
+    m_rootPtr = m_root.get();
+    return std::move(m_root);
+  }
+
+  virtual void setAnimationManager(AnimationManager* mgr) noexcept { m_animations = mgr; }
+
+protected:
+  float scaled(float value) const noexcept { return value * m_contentScale; }
+  void setRoot(std::unique_ptr<Node> root) { m_root = std::move(root); }
+  void clearReleasedRoot() noexcept { m_rootPtr = nullptr; }
+  virtual void onPanelCardOpacityChanged(float opacity) { (void)opacity; }
+  virtual void doLayout(Renderer& renderer, float width, float height) = 0;
+  virtual void doUpdate(Renderer& renderer) { (void)renderer; }
+
+  float m_contentScale = 1.0F;
+  float m_panelCardOpacity = 1.0F;
+  std::string m_pendingOpenContext;
+  AnimationManager* m_animations = nullptr;
+
+private:
+  std::unique_ptr<Node> m_root;
+  Node* m_rootPtr = nullptr;
+};

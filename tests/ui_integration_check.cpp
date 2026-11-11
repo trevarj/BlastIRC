@@ -41,6 +41,7 @@
 #include <ui/controls/scroll_view.h>
 #include <ui/controls/select.h>
 #include <ui/controls/select_popup_context.h>
+#include <ui/controls/spinner.h>
 #include <ui/palette.h>
 #include <utility>
 #include <variant>
@@ -223,6 +224,16 @@ InputArea *areaWithKey(Node &node, std::string_view key) {
         return area;
     for (const auto &child : node.children())
         if (auto *area = areaWithKey(*child, key))
+            return area;
+    return nullptr;
+}
+
+InputArea *followNewestControl(Node &node) {
+    if (auto *area = dynamic_cast<InputArea *>(&node);
+        area && area->tabFocusKey().ends_with(":follow-newest"))
+        return area;
+    for (const auto &child : node.children())
+        if (auto *area = followNewestControl(*child))
             return area;
     return nullptr;
 }
@@ -675,6 +686,30 @@ void retainedBufferStateCheck(bool directMessage, blast::SidebarMode peoplePrefe
             ui.root().layout(renderer);
             unchanged();
         }
+        model.settings.uiFont = model.settings.messageFont = "DejaVu Serif";
+        for (const int messageWeight : {400, 700, 400})
+            for (const int uiWeight : {400, 700, 400}) {
+                model.settings.uiFontWeight = uiWeight;
+                model.settings.messageFontWeight = messageWeight;
+                theme.update(model);
+                ui.update(720, minimumWindowHeight(renderer), 1);
+                ui.root().layout(renderer);
+                unchanged();
+                assert(static_cast<int>(themeUiFont().weight) == uiWeight);
+                assert(static_cast<int>(themeMessageFont().weight) == messageWeight);
+                for (std::size_t i = 0; i < inputs.size(); ++i) {
+                    auto *text = labelWithText(*inputs[i], drafts[i]);
+                    assert(text && text->font() == themeMessageFont());
+                    assert(renderer
+                               .measureText(text->text(), text->fontSize(), text->font(), 0, 0,
+                                            TextAlign::Start, TextEllipsize::End, false)
+                               .width ==
+                           renderer
+                               .measureText(drafts[i], text->fontSize(), themeMessageFont(), 0, 0,
+                                            TextAlign::Start, TextEllipsize::End, false)
+                               .width);
+                }
+            }
         model.settings.uiFont.clear();
         model.settings.messageFont.clear();
         model.settings.scale = 1;
@@ -1919,6 +1954,188 @@ void queuedServerLogPaletteCheck() {
     assert(setenv("XDG_DATA_HOME", dataHome.c_str(), 1) == 0);
 }
 
+void sojuDisplayNameConsumerCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    const std::string childKey = "soju-managed-opaque-42";
+    const std::string childId = childKey + "/#label-proof";
+    ServerConfig parent;
+    parent.name = "label-account";
+    parent.alias = "Bouncer account";
+    parent.sojuAccount = true;
+    parent.bouncer = "soju";
+    model.servers.push_back(parent);
+    ServerConfig child;
+    child.name = childKey;
+    child.sojuParent = parent.name;
+    child.sojuNetworkId = "42";
+    child.bouncer = "soju:42";
+    model.servers.push_back(child);
+    auto &buffer = model.buffers[childId];
+    buffer.id = childId;
+    buffer.server = childKey;
+    buffer.target = "#label-proof";
+    buffer.kind = "channel";
+    buffer.joined = true;
+    buffer.topic = "A live catalog must not change this conversation's identity.";
+    model.networks[childKey].name = childKey;
+    model.networks[childKey].state = "Ready";
+    model.networks[childKey].nick = "Me";
+    model.settings.workspace["native_navigation_mode"] = "expanded";
+    model.settings.workspace["soju-group:" + parent.name] = "expanded";
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    WindowActions actions{};
+    actions.synchronizeLayout = [&] {
+        frame();
+        return true;
+    };
+    ui.setWindowActions(std::move(actions));
+    ui.execute("buffer:" + childId);
+    frame();
+    const auto consumers = [&](std::string_view caption, bool allowElidedHeader = false) {
+        assert(model.activeBuffer == childId && buffer.id == childId && buffer.server == childKey);
+        assert(model.settings.workspace.at("selected_server") == childKey);
+        auto *placeholder =
+            visibleLabelContaining(ui.root(), "Message #label-proof · " + std::string(caption));
+        assert(placeholder);
+        Node *editor = placeholder->parent();
+        while (editor && !dynamic_cast<Input *>(editor))
+            editor = editor->parent();
+        auto *input = dynamic_cast<Input *>(editor);
+        assert(input && input->value().empty() && visible(*input));
+        auto *header = headerFor(*input);
+        // Expanded navigation owns network identity; the header chip is shown
+        // only once navigation is compact/hidden.
+        assert(!visibleLabelContaining(*header, caption));
+        ui.execute("toggle-navigation");
+        frame();
+        assert(model.settings.workspace.at("native_navigation_mode") == "compact");
+        if (!visibleLabelContaining(*header, caption)) {
+            assert(allowElidedHeader);
+            const auto captionChip = [&](auto &&self, Node &node) -> Label * {
+                if (!visible(node))
+                    return nullptr;
+                if (auto *label = dynamic_cast<Label *>(&node); label && label->hasTooltip()) {
+                    const auto content = label->tooltipContent();
+                    if (const auto *text = std::get_if<std::string>(&content);
+                        text && *text == caption)
+                        return label;
+                }
+                for (const auto &child : node.children())
+                    if (auto *label = self(self, *child))
+                        return label;
+                return nullptr;
+            };
+            auto *chip = captionChip(captionChip, *header);
+            assert(chip && !chip->text().empty() &&
+                   chip->text().find(childKey) == std::string::npos);
+        }
+        assert(!visibleLabelContaining(*header, childKey));
+        ui.execute("toggle-navigation");
+        ui.execute("toggle-navigation");
+        frame();
+        assert(model.settings.workspace.at("native_navigation_mode") == "expanded");
+        auto *rail = areaWithKey(ui.root(), "server:" + childKey);
+        assert(rail && visible(*rail) && labelWithText(*rail, caption));
+        const auto railHint = rail->tooltipContent();
+        const auto *railText = std::get_if<std::string>(&railHint);
+        assert(railText && railText->find(caption) != std::string::npos &&
+               railText->find(childKey) == std::string::npos);
+        auto *row = areaWithKey(ui.root(), "buffer:" + childId);
+        assert(row && visible(*row));
+        const auto rowHint = row->tooltipContent();
+        const auto *rowText = std::get_if<std::string>(&rowHint);
+        assert(rowText && rowText->find("#label-proof\n" + std::string(caption) + "\n") == 0 &&
+               rowText->find(childKey) == std::string::npos);
+        auto *line = visibleNode<ModeLine>(ui.root());
+        assert(line && visibleLabelContaining(*line, caption));
+    };
+    consumers("Network");
+
+    // A filtered-out buffer must enter an already-open palette on catalog arrival
+    // and again on rename, without another query edit or a buffer revision change.
+    for (const std::string caption : {"Aurora network", "Borealis network"}) {
+        ui.execute("buffer:" + std::string(edgeBuffers[0]));
+        frame();
+        ui.execute("switch-buffer");
+        frame();
+        auto *query = dispatcher.focusedArea()
+                          ? dynamic_cast<Input *>(dispatcher.focusedArea()->textInputClient())
+                          : nullptr;
+        assert(query && visible(*query) && query->value().empty());
+        assert(visibleLabelContaining(*query, "Find a conversation…"));
+        assert(query->insertText(caption));
+        frame();
+        const auto document = query->editingState();
+        const std::string result = "#label-proof  ·  " + caption;
+        assert(!visibleLabelContaining(ui.root(), result));
+        model.networks[parent.name].sojuNetworks["42"].attributes["name"] = caption;
+        frame();
+        assert(visible(*query) && dispatcher.focusedArea() == query->inputArea() &&
+               query->editingStateMatches(document) && query->value() == caption);
+        assert(visibleLabelContaining(ui.root(), result));
+        assert(model.servers.back().alias.empty() && buffer.messagesRevision == 0);
+        hostKey(ui, dispatcher, XKB_KEY_Return);
+        frame();
+        assert(!visible(*query));
+        consumers(caption);
+    }
+
+    ui.execute("topic");
+    frame();
+    auto *dialogs = visibleNode<Dialogs>(ui.root());
+    assert(dialogs && visibleLabelContaining(*dialogs, "#label-proof · Borealis network"));
+    assert(model.status == "#label-proof · Borealis network\n" + buffer.topic);
+    model.servers.back().alias = "My personal network";
+    frame();
+    assert(visibleLabelContaining(*dialogs, "#label-proof · My personal network"));
+    assert(!visibleLabelContaining(*dialogs, "Borealis network"));
+    model.networks[parent.name].sojuNetworks["42"].attributes["name"] = "Remote renamed again";
+    frame();
+    assert(model.servers.back().alias == "My personal network");
+    assert(visibleLabelContaining(*dialogs, "#label-proof · My personal network"));
+    hostKey(ui, dispatcher, XKB_KEY_Escape);
+    frame();
+    consumers("My personal network", true);
+
+    for (const std::string &search :
+         {std::string("My personal network"), "#label-proof " + childKey}) {
+        ui.execute("buffer:" + std::string(edgeBuffers[0]));
+        frame();
+        ui.execute("switch-buffer");
+        frame();
+        auto *query = dispatcher.focusedArea()
+                          ? dynamic_cast<Input *>(dispatcher.focusedArea()->textInputClient())
+                          : nullptr;
+        assert(query && visible(*query) && query->value().empty());
+        assert(visibleLabelContaining(*query, "Find a conversation…"));
+        assert(query->insertText(search));
+        frame();
+        auto *result = visibleLabelContaining(ui.root(), "#label-proof  ·  My personal network");
+        assert(result && result->text() == "#label-proof  ·  My personal network");
+        assert(result->text().find(childKey) == std::string::npos);
+        assert(!visibleLabelContaining(ui.root(), "Remote renamed again"));
+        hostKey(ui, dispatcher, XKB_KEY_Return);
+        frame();
+        assert(!visible(*query) && model.activeBuffer == childId);
+        consumers("My personal network", true);
+    }
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
 void sojuFoldConsumerCheck() {
     using namespace blast;
     Storage storage;
@@ -2418,6 +2635,122 @@ void railReadAllCheck() {
     dispatcher.setSceneRoot(nullptr);
 }
 
+void initialHistoryConsumerCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    auto &buffer = model.buffers.at(edgeBuffers[0]);
+    buffer.kind = "channel";
+    buffer.joined = true;
+    Message cached;
+    cached.id = "cached-initial-history";
+    cached.nick = "Peer";
+    cached.text = "Retained conversation https://example.invalid/cached-history";
+    cached.time = "2026-11-07T12:34:56Z";
+    cached.history = true;
+    buffer.messages.push_back(cached);
+    ++buffer.messagesRevision;
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    const auto frame = [&](float width = 1600.f) {
+        ui.update(width, 900, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    auto *input = inputWithText(ui.root(), edgeDrafts[0]);
+    assert(input && visible(*input));
+    auto *header = headerFor(*input);
+    // Status is independent of the identity subtree, which Expanded navigation hides.
+    InputArea *historyArea = nullptr;
+    for (const auto &child : header->children())
+        if (auto *area = dynamic_cast<InputArea *>(child.get()))
+            for (const auto &item : area->children())
+                if (dynamic_cast<Spinner *>(item.get()))
+                    historyArea = area;
+    assert(historyArea);
+    const float headerHeight = header->height();
+    const auto status = [&] { return visibleNode<Label>(*historyArea); };
+    auto *spinner = visibleNode<Spinner>(*header);
+    assert(!spinner && !status());
+    buffer.loading = true; // Manual history/search activity is not initial synchronization.
+    frame();
+    assert(!status() && !visibleNode<Spinner>(*header));
+    for (const auto navigation :
+         {SidebarMode::Expanded, SidebarMode::Compact, SidebarMode::Hidden}) {
+        for (const auto state :
+             {HistorySyncState::Queued, HistorySyncState::Loading, HistorySyncState::Idle}) {
+            buffer.initialHistorySync = state;
+            frame();
+            assert(header->height() == headerHeight);
+            auto *label = status();
+            assert(bool(label) == (state != HistorySyncState::Idle));
+            if (label) {
+                assert(!label->text().empty() && label->width() > 0 && label->height() > 0);
+                assert(label->x() >= 0 && label->x() + label->width() <= historyArea->width() + 1);
+                assert(label->y() >= 0 &&
+                       label->y() + label->height() <= historyArea->height() + 1);
+            }
+            spinner = visibleNode<Spinner>(*header);
+            assert(bool(spinner) == (state == HistorySyncState::Loading));
+            assert(!spinner || !spinner->spinning()); // Reduced motion retains legible status.
+            auto *retained =
+                areaWithTooltip(*paneFor(*input), "https://example.invalid/cached-history");
+            assert(retained && visible(*retained));
+            assert(visibleCount<TranscriptView>(ui.root()) == 1);
+            assert(visibleCount<Sidebar>(ui.root()) == int(navigation != SidebarMode::Hidden));
+            assert(buffer.messages.size() == 1 && buffer.messages.front().id == cached.id);
+        }
+        ui.execute("toggle-navigation");
+        frame();
+    }
+    buffer.initialHistorySync = HistorySyncState::Loading;
+    frame(360);
+    assert(header->height() == headerHeight && visible(*historyArea));
+    assert(historyArea->width() >= 12 && visibleNode<Spinner>(*historyArea));
+    assert(historyArea->hasTooltip());
+    const auto narrowTooltip = historyArea->tooltipContent();
+    const auto *narrowCaption = std::get_if<std::string>(&narrowTooltip);
+    assert(narrowCaption && !narrowCaption->empty());
+    buffer.initialHistorySync = HistorySyncState::Idle;
+    frame();
+    auto *line = visibleNode<ModeLine>(ui.root());
+    assert(line);
+    auto &background = model.buffers.at(edgeBuffers[1]);
+    background.initialHistorySync = HistorySyncState::Queued;
+    frame();
+    auto *remaining = visibleLabelContaining(*line, "1");
+    assert(remaining && !status());
+    buffer.initialHistorySync = HistorySyncState::Loading;
+    frame();
+    assert(visible(*remaining) && remaining->text().find("2") != std::string::npos);
+    const auto tooltipContent = remaining->tooltipContent();
+    const auto *tooltip = std::get_if<std::string>(&tooltipContent);
+    assert(tooltip && *tooltip == remaining->text());
+    buffer.initialHistorySync = background.initialHistorySync = HistorySyncState::Idle;
+    frame();
+    assert(!visible(*remaining) && !status());
+    model.settings.reducedMotion = false;
+    buffer.initialHistorySync = HistorySyncState::Loading;
+    frame();
+    spinner = visibleNode<Spinner>(*header);
+    assert(spinner && spinner->spinning());
+    ui.execute("buffer:" + std::string(edgeBuffers[1]));
+    frame();
+    assert(!visible(*header) && !spinner->spinning());
+    buffer.initialHistorySync = HistorySyncState::Idle;
+    frame();
+    ui.execute("buffer:" + std::string(edgeBuffers[0]));
+    frame();
+    assert(visible(*header) && !status() && !spinner->spinning());
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
 void statusIdentityCheck() {
     using namespace blast;
     auto model = edgeModel();
@@ -2483,7 +2816,7 @@ void statusIdentityCheck() {
     model.status.clear();
     line.setSize(1200, 30);
     frame();
-    assert(visibleLabelContaining(line, "test"));
+    assert(visibleLabelContaining(line, "Network"));
     assert(visibleLabelContaining(line, "Disconnected"));
     assert(!visibleLabelContaining(line, "UnrelatedLiveNick"));
     // A serverless global view has no single network connection or nick to report.
@@ -3148,6 +3481,72 @@ void sidebarActivityPinsCheck() {
     order({2, 3, 0, 1}); // Unpin rejoins its actual activity position.
     click(dispatcher, *rows[1]);
     assert(commands.back() == "buffer:" + std::string(ids[1]));
+
+    // Live relationship changes reorder the native rows, not just their menu actions.
+    model.settings.friends = {"PERSON"};
+    frame();
+    order({2, 1, 3, 0});
+    auto *friends = visibleLabelContaining(sidebar, "Friends");
+    assert(friends && pointerPoint(*rows[2])[1] < pointerPoint(*friends)[1] &&
+           pointerPoint(*friends)[1] < pointerPoint(*rows[1])[1]);
+    model.settings.pinnedBuffers = {ids[1], ids[2]};
+    frame();
+    order({1, 2, 3, 0});
+    assert(!visibleLabelContaining(sidebar, "Friends")); // A pinned friend has no second row.
+    const auto countRows = [&](auto &&self, Node &node, std::string_view key) -> int {
+        int count = 0;
+        if (auto *area = dynamic_cast<InputArea *>(&node);
+            area && visible(*area) && area->tabFocusKey() == key)
+            ++count;
+        for (const auto &child : node.children())
+            count += self(self, *child, key);
+        return count;
+    };
+    assert(countRows(countRows, sidebar, "buffer:" + std::string(ids[1])) == 1);
+    model.settings.friends.insert("VISITOR");
+    frame();
+    order({1, 2, 3, 0});
+    friends = visibleLabelContaining(sidebar, "Friends");
+    assert(friends && pointerPoint(*rows[2])[1] < pointerPoint(*friends)[1] &&
+           pointerPoint(*friends)[1] < pointerPoint(*rows[3])[1]);
+
+    model.settings.pinnedBuffers = {ids[2]};
+    model.settings.friends = {"pal{"};
+    model.buffers.at(ids[1]).target = "Pal[";
+    model.networks["one"].caseMapping = "rfc1459";
+    frame();
+    order({2, 1, 3, 0});
+    model.networks["one"].caseMapping = "ascii";
+    frame();
+    order({2, 3, 0, 1});
+    assert(!visibleLabelContaining(sidebar, "Friends"));
+    model.networks["one"].caseMapping = "rfc1459";
+    frame();
+    order({2, 1, 3, 0});
+    model.buffers.at(ids[1]).target = "Stranger";
+    frame();
+    order({2, 3, 0, 1}); // Same buffer ID, renamed query target is no longer a friend.
+    model.settings.friends = {"Stranger", "visitor"};
+    frame();
+    order({2, 3, 1, 0}); // Friends retain their activity comparator within the partition.
+
+    auto *search = inputWithText(sidebar, "");
+    assert(search);
+    search->setValue("Stranger");
+    frame();
+    assert(visible(*rows[0]) && visible(*rows[1]));
+    assert(!visible(*rows[2]) && !visible(*rows[3])); // Neither pins nor friends bypass search.
+    assert(pointerPoint(*rows[0])[1] < pointerPoint(*rows[1])[1]);
+    assert(countRows(countRows, sidebar, "buffer:" + std::string(ids[0])) == 1);
+    search->setValue("");
+    auto *dms = areaWithKey(sidebar, "sidebar-filter:dms");
+    assert(dms && visible(*dms));
+    click(dispatcher, *dms);
+    frame();
+    assert(visible(*rows[0]) && !visible(*rows[2]));
+    assert(pointerPoint(*rows[0])[1] < pointerPoint(*rows[3])[1] &&
+           pointerPoint(*rows[3])[1] < pointerPoint(*rows[1])[1]);
+    assert(countRows(countRows, sidebar, "buffer:" + std::string(ids[0])) == 1);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -3523,10 +3922,13 @@ void sidebarArchiveControlsCheck() {
 void queuedPaneCommandCheck(bool rename) {
     using namespace blast;
     enum class Intent { History, Read, Style, Presence, Close };
-    const std::array cases{
-        std::pair{"Load older messages", Intent::History}, std::pair{"Mark read", Intent::Read},
-        std::pair{"Traditional IRC", Intent::Style}, std::pair{"Hidden", Intent::Presence},
-        std::pair{"Close buffer", Intent::Close}};
+    const std::array cases{std::pair{"Load older messages", Intent::History},
+                           std::pair{"Mark read", Intent::Read},
+                           std::pair{"Traditional IRC", Intent::Style},
+                           std::pair{"Traditional · two-line", Intent::Style},
+                           std::pair{"Message bubbles", Intent::Style},
+                           std::pair{"Hidden", Intent::Presence},
+                           std::pair{"Close buffer", Intent::Close}};
     auto model = edgeModel();
     Clipboard clipboard;
     Theme theme;
@@ -3560,6 +3962,18 @@ void queuedPaneCommandCheck(bool rename) {
         assert(menu.open && model.activeBuffer == origin);
         frame();
         assert(menu.open && model.activeBuffer == edgeBuffers[1]);
+        const auto display = std::find_if(
+            menu.request.menu.begin(), menu.request.menu.end(),
+            [](const ContextMenuEntry &entry) { return entry.label == "Message display"; });
+        assert(display != menu.request.menu.end() && display->children.size() == 3);
+        const auto selected = model.settings.messageLayouts.find(origin);
+        const auto layout = selected == model.settings.messageLayouts.end() ? MessageLayout::Bubbles
+                                                                            : selected->second;
+        const std::array expected{MessageLayout::Bubbles, MessageLayout::Irc,
+                                  MessageLayout::Stacked};
+        for (std::size_t i = 0; i < expected.size(); ++i)
+            assert(display->children[i].radio &&
+                   display->children[i].toggleState == (layout == expected[i] ? 1 : 0));
         const auto firstAction = model.actions.size();
         menu.select(label);
         if (rename && intent == Intent::History) {
@@ -3585,8 +3999,13 @@ void queuedPaneCommandCheck(bool rename) {
             targeted("read");
             break;
         case Intent::Style:
-            assert(model.settings.ircChannels.contains(origin));
-            assert(!model.settings.ircChannels.contains(edgeBuffers[1]));
+            if (std::string_view(label) == "Message bubbles")
+                assert(!model.settings.messageLayouts.contains(origin));
+            else
+                assert(model.settings.messageLayouts.at(origin) ==
+                       (std::string_view(label) == "Traditional IRC" ? MessageLayout::Irc
+                                                                     : MessageLayout::Stacked));
+            assert(!model.settings.messageLayouts.contains(edgeBuffers[1]));
             break;
         case Intent::Presence:
             assert(model.settings.channelPresence.at(origin) == PresenceMode::Hidden);
@@ -3603,6 +4022,73 @@ void queuedPaneCommandCheck(bool rename) {
         assert(inputWithText(ui.root(), edgeDrafts[0]) == input && visible(*input));
         assert(input == originInput && input->editingStateMatches(originState));
     }
+    hostKey(ui, dispatcher, XKB_KEY_x, KeyMod::Alt);
+    frame();
+    for (const char ch : std::string_view("message-style:stacked"))
+        hostKey(ui, dispatcher, ch, 0, ch);
+    frame();
+    hostKey(ui, dispatcher, XKB_KEY_Return);
+    frame();
+    assert(model.settings.messageLayouts.at(origin) == MessageLayout::Stacked);
+    assert(!model.settings.messageLayouts.contains(edgeBuffers[1]));
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
+void peopleFriendOrderingCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    model.settings.peopleMode = SidebarMode::Expanded;
+    auto &buffer = model.buffers.at(edgeBuffers[0]);
+    buffer.kind = "channel";
+    buffer.joined = true;
+    buffer.nicks = {{.name = "Zoe[", .account = {}, .prefix = {}},
+                    {.name = "Carl", .account = {}, .prefix = {}},
+                    {.name = "Zed", .account = {}, .prefix = "@"},
+                    {.name = "Bea", .account = {}, .prefix = "+"},
+                    {.name = "Amy", .account = {}, .prefix = {}},
+                    {.name = "Aaron", .account = {}, .prefix = "@"}};
+    model.settings.friends = {"zOE{", "AMY", "zed"};
+    model.networks["test"].caseMapping = "rfc1459";
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    const auto order = [&](std::array<std::string_view, 6> expected) {
+        auto *people = areaWithKey(ui.root(), "people-members");
+        assert(people && visible(*people));
+        InputArea *previous = nullptr;
+        for (const auto name : expected) {
+            auto *row = memberRow(*people, name);
+            assert(row && visible(*row));
+            if (previous)
+                assert(pointerPoint(*previous)[1] < pointerPoint(*row)[1]);
+            previous = row;
+        }
+    };
+    frame();
+    order({"@Zed", "Amy", "Zoe[", "@Aaron", "+Bea", "Carl"});
+    model.settings.friends.erase("AMY");
+    frame();
+    order({"@Zed", "Zoe[", "@Aaron", "+Bea", "Amy", "Carl"});
+    model.networks["test"].caseMapping = "ascii";
+    frame();
+    order({"@Zed", "@Aaron", "+Bea", "Amy", "Carl", "Zoe["});
+    model.networks["test"].caseMapping = "rfc1459";
+    frame();
+    order({"@Zed", "Zoe[", "@Aaron", "+Bea", "Amy", "Carl"});
+    model.settings.friends.clear();
+    frame();
+    order({"@Aaron", "@Zed", "+Bea", "Amy", "Carl", "Zoe["});
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -4472,16 +4958,9 @@ void deferredSettingsTouchGeometryCheck() {
         frame();
         auto *dialogs = visibleNode<Dialogs>(ui.root());
         assert(dialogs && dialogs->settingsOpen());
-        auto *keyboardLabel = labelWithText(*dialogs, "Keyboard");
-        assert(keyboardLabel && visible(*keyboardLabel));
-        Button *keyboard = nullptr;
-        for (Node *node = keyboardLabel; node; node = node->parent())
-            if (auto *button = dynamic_cast<Button *>(node)) {
-                keyboard = button;
-                break;
-            }
-        assert(keyboard);
-        click(dispatcher, *keyboard->inputArea());
+        auto *keyboard = areaWithKey(*dialogs, "blastirc.settings.category.1");
+        assert(keyboard && visible(*keyboard) && dynamic_cast<Button *>(keyboard->parent()));
+        click(dispatcher, *keyboard);
         frame();
         auto *area = areaWithKey(ui.root(), "blastirc.settings.binding.complete");
         assert(area && visible(*area) && !area->passiveTouchPress());
@@ -4683,6 +5162,109 @@ void deferredSettingsTouchGeometryCheck() {
         dispatcher.setFocus(nullptr);
         dispatcher.setSceneRoot(nullptr);
     }
+}
+
+void typingOverflowFocusCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    model.settings.typingReceive = true;
+    auto &buffer = model.buffers.at(edgeBuffers[0]);
+    for (const auto *nick : {"TypingAlice", "TypingBob", "TypingCarol", "TypingDave"})
+        buffer.typing[nick] = model.now;
+    for (int i = 0; i < 40; ++i) {
+        Message message;
+        message.id = message.text = "Typing overflow history " + std::to_string(i);
+        message.nick = "HistoryPeer";
+        buffer.messages.push_back(std::move(message));
+    }
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    MenuHost menu;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    ui.root().setPopupContext(&menu);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    auto *input = inputWithText(ui.root(), edgeDrafts[0]);
+    assert(input && visible(*input));
+    auto selected = input->editingState();
+    selected.current.cursorPos = 8;
+    selected.current.selectionAnchor = 2;
+    input->restoreEditingState(selected);
+    dispatcher.setFocus(input->inputArea());
+    input->textInputApplyEdit({.commitText = {},
+                               .preeditText = "猫",
+                               .preeditCursorBegin = 3,
+                               .preeditCursorEnd = 3,
+                               .hasPreedit = true});
+    frame();
+    const auto composing = input->editingState();
+    const auto undo = composing.history->undo, redo = composing.history->redo;
+    const auto actions = model.actions.size(), messages = buffer.messages.size();
+    const std::string composerKey(input->inputArea()->tabFocusKey());
+    const auto paneKey = composerKey.substr(9, composerKey.rfind(':') - 9);
+    auto *overflow = areaWithKey(ui.root(), "transcript:" + paneKey + ":typing-overflow");
+    assert(overflow && visible(*overflow));
+    const auto unchanged = [&] {
+        assert(dispatcher.focusedArea() == input->inputArea() && input->composing());
+        assert(input->editingStateMatches(composing));
+        assert(composing.history->undo == undo && composing.history->redo == redo);
+        assert(buffer.draft == edgeDrafts[0] && model.activeBuffer == buffer.id);
+        assert(model.actions.size() == actions && buffer.messages.size() == messages);
+        assert(!menu.open && menu.request.menu.empty() && menu.request.options.empty());
+    };
+    click(dispatcher, *overflow);
+    frame();
+    auto *last = labelWithText(ui.root(), "TypingDave");
+    assert(last && visible(*last));
+    ScrollView *list = nullptr;
+    for (auto *node = last->parent(); node; node = node->parent())
+        if (auto *candidate = dynamic_cast<ScrollView *>(node)) {
+            list = candidate;
+            break;
+        }
+    assert(list && labelWithText(*list, "TypingAlice") && labelWithText(*list, "TypingBob") &&
+           labelWithText(*list, "TypingCarol"));
+    unchanged();
+    click(dispatcher, *overflow);
+    frame();
+    assert(!labelWithText(ui.root(), "TypingDave") ||
+           !visible(*labelWithText(ui.root(), "TypingDave")));
+    unchanged();
+    // Explicit keyboard ownership exercises Ui routing ahead of global chat paging/cancel.
+    input->textInputResetPreedit();
+    auto *transcript = visibleNode<TranscriptView>(*paneFor(*input));
+    auto *history = transcript ? visibleNode<ScrollView>(*transcript) : nullptr;
+    assert(history && history->maxScrollOffset() > 0);
+    history->setScrollOffset(0);
+    frame();
+    const float historyOffset = history->scrollOffset();
+    dispatcher.setFocus(overflow);
+    const auto keyboardDocument = input->editingState();
+    hostKey(ui, dispatcher, XKB_KEY_Return);
+    frame();
+    assert(labelWithText(ui.root(), "TypingDave") &&
+           visible(*labelWithText(ui.root(), "TypingDave")));
+    for (const auto sym : std::array<std::uint32_t, 2>{XKB_KEY_Page_Down, XKB_KEY_Escape}) {
+        assert(ui.handleKey({.sym = sym, .pressed = true}));
+        ui.handleKey({.sym = sym, .pressed = false});
+        frame();
+        assert(std::abs(history->scrollOffset() - historyOffset) < .1f);
+        assert(input->editingStateMatches(keyboardDocument) && buffer.draft == edgeDrafts[0]);
+        assert(model.actions.size() == actions && buffer.messages.size() == messages);
+    }
+    assert(!labelWithText(ui.root(), "TypingDave") ||
+           !visible(*labelWithText(ui.root(), "TypingDave")));
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
 }
 
 void ordinaryTypingFocusCheck() {
@@ -5169,8 +5751,7 @@ void alphaForegroundCheck() {
                 auto *badge = labelWithText(*row, "7");
                 assert(badge && visible(*badge));
                 auto *rowTitle = labelWithText(*row, unread.target);
-                auto *rowSubtitle = labelWithText(*row, "Pinned");
-                assert(rowTitle && rowSubtitle);
+                assert(rowTitle);
                 const auto checkRow = [&](const InputArea &owner) {
                     assert(owner.parent());
                     for (const auto &sibling : owner.parent()->children()) {
@@ -5196,7 +5777,7 @@ void alphaForegroundCheck() {
                         assert(caption->height() + .5f >= metrics.layoutHeight);
                         assert(caption->height() + .5f >=
                                renderer.fontRowExtent(caption->fontSize(), caption->font()));
-                        if (caption == rowTitle || caption == rowSubtitle || caption == badge) {
+                        if (caption == rowTitle || caption == badge) {
                             assert(caption->x() >= 0 && caption->y() >= 0 &&
                                    caption->x() + caption->width() <= owner.width() + .5f &&
                                    caption->y() + caption->height() <= owner.height() + .5f);
@@ -5287,11 +5868,9 @@ void alphaForegroundCheck() {
                     assert(visible(*badge) && visible(*serverBadge) && visible(*accountBadge));
                 };
                 auto *caption = labelWithText(*row, unread.target);
-                auto *subtitle = labelWithText(*row, "Pinned");
-                assert(caption && subtitle && visible(*caption) && visible(*subtitle));
+                assert(caption && visible(*caption));
                 assert(caption->y() >= 2 * scale);
-                assert(subtitle->y() >= caption->y() + caption->height());
-                assert(subtitle->y() + subtitle->height() + 2 * scale <= row->height() + .5f);
+                assert(caption->y() + caption->height() + 2 * scale <= row->height() + .5f);
                 checkCountHeight();
                 const auto checkHovered = [&](InputArea &area, const Label &label, Color fill) {
                     const auto point = pointerPoint(area);
@@ -5311,8 +5890,33 @@ void alphaForegroundCheck() {
                     model.activeBuffer = origin;
                     frame();
                 };
+                const auto checkMuted = [&](const Label &label, Color unmutedFill) {
+                    const auto count = unread.unread;
+                    const auto marker = unread.readMarker;
+                    const std::string text(label.text());
+                    const Color unmutedInk = label.color();
+                    unread.muted = true;
+                    frame();
+                    const Color mutedFill = themeForegroundColor("surface_container_highest");
+                    assert(mutedFill != unmutedFill);
+                    assert(relativeLuminance(mutedFill) < relativeLuminance(unmutedFill));
+                    assert(label.color() ==
+                           withAlpha(themePairedForeground(
+                                         mutedFill, themeForegroundColor("on_surface_variant")),
+                                     1.f));
+                    checkBadge(*row, label, mutedFill);
+                    checkHovered(*row, label, mutedFill);
+                    checkSelected(label, mutedFill);
+                    assert(visible(label) && label.text() == text);
+                    assert(unread.unread == count && unread.readMarker == marker);
+                    unread.muted = false;
+                    frame();
+                    assert(label.color() == unmutedInk && label.text() == text);
+                    checkBadge(*row, label, unmutedFill);
+                };
                 checkSelected(*badge, ::palette.primary);
                 checkHovered(*row, *badge, ::palette.primary);
+                checkMuted(*badge, ::palette.primary);
                 checkHovered(*server, *serverBadge, ::palette.primary);
                 checkHovered(*accountRow, *accountBadge, ::palette.primary);
                 unread.readMarker.clear();
@@ -5323,6 +5927,7 @@ void alphaForegroundCheck() {
                 checkBadge(*row, *expandedMention, ::palette.error);
                 checkHovered(*row, *expandedMention, ::palette.error);
                 checkSelected(*expandedMention, ::palette.error);
+                checkMuted(*expandedMention, ::palette.error);
                 unread.readMarker = "local:sidebar-mention";
                 unread.unread = 7;
                 frame();
@@ -5339,6 +5944,7 @@ void alphaForegroundCheck() {
                 checkBadge(*row, *badge, ::palette.primary);
                 checkHovered(*row, *badge, ::palette.primary);
                 checkSelected(*badge, ::palette.primary);
+                checkMuted(*badge, ::palette.primary);
                 checkCountHeight();
                 unread.unread = 100;
                 frame();
@@ -5347,6 +5953,7 @@ void alphaForegroundCheck() {
                 assert(capped && serverCapped && visible(*capped) && visible(*serverCapped));
                 checkBadge(*row, *capped, ::palette.primary);
                 checkBadge(*server, *serverCapped, ::palette.primary);
+                checkMuted(*capped, ::palette.primary);
                 unread.unread = 7;
                 frame();
                 const float fg = relativeLuminance(badge->color());
@@ -5374,6 +5981,7 @@ void alphaForegroundCheck() {
                 checkBadge(*row, *mentionBadge, ::palette.error);
                 checkHovered(*row, *mentionBadge, ::palette.error);
                 checkSelected(*mentionBadge, ::palette.error);
+                checkMuted(*mentionBadge, ::palette.error);
                 serverBadge = labelWithText(*server, "8");
                 assert(serverBadge && visible(*serverBadge));
                 checkBadge(*server, *serverBadge, ::palette.error);
@@ -5801,6 +6409,7 @@ void halfPageChatKeysCheck() {
     using namespace blast;
     auto model = edgeModel();
     model.networks.at("test").state = "Ready";
+    model.networks.at("test").caps = {"message-tags"};
     auto &buffer = model.buffers.at(edgeBuffers[0]);
     for (int i = 0; i < 100; ++i) {
         Message message;
@@ -5881,6 +6490,47 @@ void halfPageChatKeysCheck() {
         page(XKB_KEY_Page_Up, -1);
         page(XKB_KEY_Page_Down, 1);
     }
+    // Buffer boundaries navigate loaded messages, never the selected native draft.
+    assert(model.settings.bindings.at("beginning-of-buffer") == "M-<");
+    assert(model.settings.bindings.at("end-of-buffer") == "M->");
+    const auto historyActions = [&] {
+        return std::count_if(model.actions.begin(), model.actions.end(),
+                             [](const Action &action) { return action.type == "history"; });
+    };
+    const auto historyBefore = historyActions();
+    const auto boundary = [&](std::uint32_t sym, bool newest) {
+        hostKey(ui, dispatcher, sym, KeyMod::Alt);
+        frame();
+        assert(std::abs(scroll->scrollOffset() - (newest ? scroll->maxScrollOffset() : 0.f)) < 1.f);
+        unchanged();
+        assert(historyActions() == historyBefore);
+    };
+    boundary(XKB_KEY_less, false);
+    boundary(XKB_KEY_greater, true);
+    // Held navigation is consumed on the same route instead of editing the draft.
+    for (int i = 0; i < 2; ++i) {
+        assert(ui.handleKey({.sym = XKB_KEY_less, .modifiers = KeyMod::Alt, .pressed = true}));
+        frame();
+        assert(scroll->scrollOffset() < 1.f);
+        unchanged();
+    }
+    assert(ui.handleKey({.sym = XKB_KEY_less, .modifiers = KeyMod::Alt, .pressed = false}));
+    boundary(XKB_KEY_greater, true);
+    // Multi-stroke custom bindings and disabled bindings retain their normal semantics.
+    model.settings.bindings["beginning-of-buffer"] = "C-x <";
+    model.settings.bindings["end-of-buffer"] = "";
+    hostKey(ui, dispatcher, 'x', KeyMod::Ctrl);
+    hostKey(ui, dispatcher, XKB_KEY_less);
+    frame();
+    assert(scroll->scrollOffset() < 1.f);
+    unchanged();
+    hostKey(ui, dispatcher, XKB_KEY_greater, KeyMod::Alt);
+    frame();
+    assert(scroll->scrollOffset() < 1.f);
+    unchanged();
+    model.settings.bindings["beginning-of-buffer"] = "M-<";
+    model.settings.bindings["end-of-buffer"] = "M->";
+    boundary(XKB_KEY_greater, true);
     // Held keys use the same command path, without falling through to draft editing.
     scroll->setScrollOffset(scroll->maxScrollOffset());
     frame();
@@ -5925,6 +6575,14 @@ void halfPageChatKeysCheck() {
     frame();
     assert(std::abs(scroll->scrollOffset() - (beforeUnbound - half)) < 1.f);
     assert(dispatcher.focusedArea() == keyboard && input->editingStateMatches(state));
+    hostKey(ui, dispatcher, XKB_KEY_less, KeyMod::Alt);
+    frame();
+    assert(scroll->scrollOffset() < 1.f && dispatcher.focusedArea() == keyboard &&
+           input->editingStateMatches(state));
+    hostKey(ui, dispatcher, XKB_KEY_greater, KeyMod::Alt);
+    frame();
+    assert(std::abs(scroll->scrollOffset() - scroll->maxScrollOffset()) < 1.f &&
+           dispatcher.focusedArea() == keyboard && input->editingStateMatches(state));
     // The upload control is intentionally hidden for a nonempty draft. Use a real
     // visible pane control without changing the draft to manufacture a toolbar.
     model.settings.bindings["scroll-up"] = "PRIOR";
@@ -5934,6 +6592,8 @@ void halfPageChatKeysCheck() {
     assert(dispatcher.focusedArea() == more);
     const float beforeControl = scroll->scrollOffset();
     hostKey(ui, dispatcher, XKB_KEY_Page_Up);
+    hostKey(ui, dispatcher, XKB_KEY_less, KeyMod::Alt);
+    hostKey(ui, dispatcher, XKB_KEY_greater, KeyMod::Alt);
     frame();
     assert(dispatcher.focusedArea() == more);
     assert(scroll->scrollOffset() == beforeControl && input->editingStateMatches(state));
@@ -5943,8 +6603,35 @@ void halfPageChatKeysCheck() {
     auto *dialogs = visibleNode<Dialogs>(ui.root());
     assert(dialogs && dialogs->settingsOpen());
     hostKey(ui, dispatcher, XKB_KEY_Page_Up);
+    hostKey(ui, dispatcher, XKB_KEY_less, KeyMod::Alt);
+    hostKey(ui, dispatcher, XKB_KEY_greater, KeyMod::Alt);
     frame();
     assert(scroll->scrollOffset() == beforeControl && input->editingStateMatches(state));
+    auto *settingsSearch = areaWithKey(*dialogs, "blastirc.settings.search");
+    auto *settingsInput =
+        settingsSearch ? dynamic_cast<Input *>(settingsSearch->textInputClient()) : nullptr;
+    assert(settingsInput);
+    settingsInput->setValue("navigation");
+    auto settingsState = settingsInput->editingState();
+    settingsState.current.cursorPos = 5;
+    settingsState.current.selectionAnchor = 2;
+    settingsInput->restoreEditingState(settingsState);
+    dispatcher.setFocus(settingsSearch);
+    frame();
+    settingsState = settingsInput->editingState();
+    hostKey(ui, dispatcher, XKB_KEY_less, KeyMod::Alt);
+    hostKey(ui, dispatcher, XKB_KEY_greater, KeyMod::Alt);
+    frame();
+    assert(settingsInput->editingStateMatches(settingsState) &&
+           dispatcher.focusedArea() == settingsSearch && scroll->scrollOffset() == beforeControl &&
+           input->editingStateMatches(state));
+    hostKey(ui, dispatcher, XKB_KEY_Home, KeyMod::Ctrl);
+    assert(settingsInput->cursorPosition() == 0 && settingsInput->selectionAnchor() == 0);
+    hostKey(ui, dispatcher, XKB_KEY_End, KeyMod::Ctrl);
+    assert(settingsInput->cursorPosition() == settingsInput->value().size() &&
+           settingsInput->selectionAnchor() == settingsInput->value().size() &&
+           scroll->scrollOffset() == beforeControl && input->editingStateMatches(state));
+    settingsInput->setValue("");
     model.status = "Cancel this transient feedback";
     hostKey(ui, dispatcher, 'g', KeyMod::Ctrl);
     frame();
@@ -5974,6 +6661,12 @@ void halfPageChatKeysCheck() {
     };
     composingKey(XKB_KEY_Page_Up);
     composingKey(XKB_KEY_Page_Down);
+    composingKey(XKB_KEY_less, KeyMod::Alt);
+    composingKey(XKB_KEY_greater, KeyMod::Alt);
+    model.settings.bindings["beginning-of-buffer"] = "C-x <";
+    composingKey('x', KeyMod::Ctrl);
+    composingKey(XKB_KEY_less);
+    model.settings.bindings["beginning-of-buffer"] = "M-<";
     model.settings.bindings["scroll-up"] = "C-u";
     composingKey('u', KeyMod::Ctrl);
     auto *status = visibleNode<ModeLine>(ui.root());
@@ -5993,6 +6686,36 @@ void halfPageChatKeysCheck() {
     assert(input->editingState().history->undo == compositionUndo &&
            input->editingState().history->redo == compositionRedo);
     assert(buffer.draft == edgeDrafts[0] && dispatcher.focusedArea() == input->inputArea());
+    // A message reply and selected draft survive both boundaries and a later arrival.
+    hostKey(ui, dispatcher, 'p', KeyMod::Ctrl);
+    frame();
+    hostKey(ui, dispatcher, 'r', KeyMod::Ctrl);
+    frame();
+    auto *cancelReply = composerControl(*paneFor(*input), ":reply-cancel");
+    assert(cancelReply && visible(*cancelReply) && dispatcher.focusedArea() == input->inputArea());
+    const auto replyDraft = input->editingState();
+    const auto replyUndo = replyDraft.history->undo, replyRedo = replyDraft.history->redo;
+    for (const auto sym : {XKB_KEY_less, XKB_KEY_greater}) {
+        hostKey(ui, dispatcher, sym, KeyMod::Alt);
+        frame();
+        assert(input->editingStateMatches(replyDraft) && visible(*cancelReply) &&
+               replyDraft.history->undo == replyUndo && replyDraft.history->redo == replyRedo &&
+               dispatcher.focusedArea() == input->inputArea());
+        assert(std::abs(scroll->scrollOffset() -
+                        (sym == XKB_KEY_less ? 0.f : scroll->maxScrollOffset())) < 1.f);
+    }
+    Message arrival;
+    arrival.id = "boundary-follow-arrival";
+    arrival.nick = "Peer";
+    arrival.text = "Newest message after returning to follow";
+    arrival.time = "2026-11-07T12:35:56Z";
+    arrival.timestamp = 200;
+    buffer.messages.push_back(std::move(arrival));
+    ++buffer.messagesRevision;
+    frame();
+    assert(std::abs(scroll->scrollOffset() - scroll->maxScrollOffset()) < 1.f &&
+           input->editingStateMatches(replyDraft) && visible(*cancelReply) &&
+           dispatcher.focusedArea() == input->inputArea());
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -6237,7 +6960,8 @@ void focusedUnreadTransitionCheck(
     frame();
     assert(buffer.unread == 1 && buffer.readMarker == marker);
     assert(readRequests() == initialReads);
-    assert(visible(*areaWithTooltip(*transcript, "Follow the newest messages")));
+    auto *follow = followNewestControl(*transcript);
+    assert(follow && visible(*follow));
     // Returning to a focused window hides the divider, not the durable unread data.
     ui.setWindowActive(true);
     frame();
@@ -6326,11 +7050,29 @@ void renameArrivalCheck(
         if (auto *candidate = dynamic_cast<ScrollView *>(child.get()))
             scroll = candidate;
     assert(scroll && scroll->maxScrollOffset() > 0);
+    auto *follow = followNewestControl(*transcript);
+    assert(follow && !visible(*follow));
     scroll->setScrollOffset(scroll->maxScrollOffset() * .5f);
     frame();
     assert(scroll->scrollOffset() > 0 && scroll->maxScrollOffset() - scroll->scrollOffset() > 1);
-    auto *follow = areaWithTooltip(*transcript, "Follow the newest messages");
-    assert(follow && !visible(*follow));
+    assert(visible(*follow));
+    dispatcher.setFocus(input->inputArea());
+    static_cast<TextInputClient &>(*input).textInputApplyEdit({.commitText = "",
+                                                               .preeditText = "compose",
+                                                               .preeditCursorBegin = 7,
+                                                               .preeditCursorEnd = 7,
+                                                               .hasPreedit = true});
+    frame();
+    const auto composing = input->editingState();
+    click(dispatcher, *follow);
+    frame();
+    assert(!visible(*follow) && scroll->maxScrollOffset() - scroll->scrollOffset() <= 1);
+    assert(dispatcher.focusedArea() == input->inputArea() && input->composing() &&
+           input->editingStateMatches(composing));
+    static_cast<TextInputClient &>(*input).textInputResetPreedit();
+    scroll->setScrollOffset(scroll->maxScrollOffset() * .5f);
+    frame();
+    assert(visible(*follow));
 
     Message incoming;
     incoming.id = activeSource ? "premerge-source-live" : "premerge-destination-live";
@@ -6354,7 +7096,10 @@ void renameArrivalCheck(
             break;
         }
     assert(followButton && followButton->enabled());
-    const auto &caption = followButton->label()->text();
+    const auto followHint = follow->tooltipContent();
+    const auto *captionText = std::get_if<std::string>(&followHint);
+    assert(captionText);
+    const auto &caption = *captionText;
     const auto digit = caption.find_first_of("0123456789");
     assert(digit != std::string::npos);
     int count = 0;
@@ -6412,7 +7157,6 @@ void pinnedCurrentSendCheck() {
     frame();
     assert(model.settings.workspace.at("selected_server") == "foreign");
     assert(model.activeBuffer == origin && visible(*current) && visible(*name));
-    assert(visibleLabelContaining(*current, model.buffers.at(origin).server));
     auto *send = composerControl(*input->parent(), ":send");
     assert(send && visible(*send));
     dispatcher.setFocus(send);
@@ -7112,6 +7856,20 @@ void messageReplyCheck() {
     using namespace blast;
     for (const bool tagged : {true, false}) {
         auto model = messageActionModel();
+        // Keep the body marker separate from nick-token styling: native text is fragmented.
+        model.buffers.at(model.activeBuffer).messages[1].text =
+            "ReplyTailBody real conversation message";
+        // Overflow from the first frame: reply must cover real tail text, not an empty history.
+        auto &replyMessages = model.buffers.at(model.activeBuffer).messages;
+        for (int i = 0; i < 48; ++i) {
+            Message message{};
+            message.id = "reply-baseline-" + std::to_string(i);
+            message.nick = "BaselinePeer";
+            message.text = "Reply baseline history " + std::to_string(i);
+            message.time = "2026-11-07T12:30:00Z";
+            replyMessages.insert(replyMessages.begin(), std::move(message));
+        }
+        ++model.buffers.at(model.activeBuffer).messagesRevision;
         const std::string origin = model.activeBuffer, draft = model.buffers.at(origin).draft;
         const std::string otherId = "test/#reply-other";
         auto &other = model.buffers[otherId];
@@ -7170,6 +7928,39 @@ void messageReplyCheck() {
         assert(history && historyScroll);
         const auto originalTarget = history->selectedMessage();
         assert(originalTarget && originalTarget->nick == "NewestPeer");
+        const auto bounds = [](const Node &node) {
+            std::array<float, 4> result{};
+            Node::transformedBounds(&node, result[0], result[1], result[2], result[3]);
+            return result;
+        };
+        const auto latestBounds = [&] {
+            TextNode *found = nullptr;
+            const auto visit = [&](auto &&self, Node &node) -> void {
+                if (!visible(node))
+                    return;
+                if (auto *text = dynamic_cast<TextNode *>(&node);
+                    text && text->text().contains("ReplyTailBody"))
+                    found = text;
+                for (const auto &child : node.children())
+                    self(self, *child);
+            };
+            visit(visit, *history);
+            assert(found);
+            const auto measured = renderer.measureText(
+                found->text(), found->fontSize(), found->font(), found->maxWidth(),
+                found->maxLines(), found->textAlign(), found->ellipsize(), found->useMarkup());
+            const auto rect = bounds(*found);
+            assert(measured.inkRight > measured.inkLeft && measured.inkBottom > measured.inkTop);
+            return std::array<float, 4>{rect[0] + measured.inkLeft, rect[1] + measured.inkTop,
+                                        rect[0] + measured.inkRight, rect[1] + measured.inkBottom};
+        };
+        Node *composer = input;
+        auto *pane = paneFor(*input);
+        while (composer->parent() != pane)
+            composer = composer->parent();
+        const auto composerBounds = bounds(*composer), inputBounds = bounds(*input);
+        const auto latestBeforeReply = latestBounds();
+        const float contentViewportHeight = historyScroll->contentViewportHeight();
         const float historyHeight = history->height(), viewportHeight = historyScroll->height();
         const float historyOffset = historyScroll->scrollOffset();
         const float historyMaximum = historyScroll->maxScrollOffset();
@@ -7178,15 +7969,19 @@ void messageReplyCheck() {
                    std::abs(historyScroll->height() - viewportHeight) < .5f &&
                    std::abs(viewportHeight - historyHeight) < .5f &&
                    std::abs(historyScroll->scrollOffset() - historyOffset) < .5f &&
-                   std::abs(historyScroll->maxScrollOffset() - historyMaximum) < .5f);
+                   std::abs(historyScroll->maxScrollOffset() - historyMaximum) < .5f &&
+                   std::abs(historyScroll->contentViewportHeight() - contentViewportHeight) < .5f);
+            const auto latest = latestBounds(), currentComposer = bounds(*composer),
+                       currentInput = bounds(*input);
+            for (std::size_t i = 0; i < latest.size(); ++i) {
+                assert(std::abs(latest[i] - latestBeforeReply[i]) < .5f);
+                assert(std::abs(currentComposer[i] - composerBounds[i]) < .5f);
+                assert(std::abs(currentInput[i] - inputBounds[i]) < .5f);
+            }
         };
         hostKey(ui, dispatcher, 'r', KeyMod::Ctrl);
         frame();
         assert(dispatcher.focusedArea() == input->inputArea());
-        Node *composer = input;
-        auto *pane = paneFor(*input);
-        while (composer->parent() != pane)
-            composer = composer->parent();
         auto *cancelReply = composerControl(*pane, ":reply-cancel");
         assert(cancelReply);
         stableHistory();
@@ -7217,11 +8012,6 @@ void messageReplyCheck() {
                authorStyle.contains("foreground=\"" +
                                     formatRgbHex(nickColor(model, source->nick, buffer.server)) +
                                     "\""));
-        const auto bounds = [](const Node &node) {
-            std::array<float, 4> result{};
-            Node::transformedBounds(&node, result[0], result[1], result[2], result[3]);
-            return result;
-        };
         const auto within = [&](const Node &node, const Node &owner) {
             const auto child = bounds(node), parent = bounds(owner);
             assert(child[2] > child[0] && child[3] > child[1]);
@@ -7231,6 +8021,9 @@ void messageReplyCheck() {
         within(*card, *pane);
         within(*card, *history);
         assert(bounds(*card)[3] <= bounds(*composer)[1] + .5f);
+        const auto latestUnderCard = latestBounds(), activeCard = bounds(*card);
+        assert(latestUnderCard[0] < activeCard[2] && latestUnderCard[2] > activeCard[0] &&
+               latestUnderCard[1] < activeCard[3] && latestUnderCard[3] > activeCard[1]);
         for (const Node *node : std::array<const Node *, 3>{heading, excerpt, cancelReply})
             within(*node, *card);
         const auto headingBounds = bounds(*heading), excerptBounds = bounds(*excerpt),
@@ -7376,6 +8169,41 @@ void messageReplyCheck() {
         frame();
         assert(historyScroll->maxScrollOffset() > historyScroll->height() * 2);
         assert(visible(*cancelReply) && dispatcher.focusedArea() == input->inputArea());
+        for (const bool following : {true, false}) {
+            historyScroll->setScrollOffset(historyScroll->maxScrollOffset() -
+                                           (following ? 0.f : 24.f));
+            frame();
+            const float offset = historyScroll->scrollOffset(),
+                        maximum = historyScroll->maxScrollOffset(),
+                        viewport = historyScroll->contentViewportHeight();
+            const auto latest = latestBounds(), editor = bounds(*input),
+                       composerRect = bounds(*composer);
+            for (const bool replying : {false, true, false, true}) {
+                if (replying)
+                    assert(history->replyToMessage(*originalTarget));
+                else
+                    click(dispatcher, *cancelReply);
+                frame();
+                assert(visible(*cancelReply) == replying &&
+                       std::abs(historyScroll->scrollOffset() - offset) < .5f &&
+                       std::abs(historyScroll->maxScrollOffset() - maximum) < .5f &&
+                       std::abs(historyScroll->height() - viewportHeight) < .5f &&
+                       std::abs(historyScroll->contentViewportHeight() - viewport) < .5f &&
+                       input->editingStateMatches(before) && live.draft == draft);
+                const auto current = latestBounds(), currentEditor = bounds(*input),
+                           currentComposer = bounds(*composer);
+                for (std::size_t i = 0; i < latest.size(); ++i) {
+                    assert(std::abs(current[i] - latest[i]) < .5f);
+                    assert(std::abs(currentEditor[i] - editor[i]) < .5f);
+                    assert(std::abs(currentComposer[i] - composerRect[i]) < .5f);
+                }
+                if (replying && following) {
+                    const auto band = bounds(*card);
+                    assert(current[0] < band[2] && current[2] > band[0] && current[1] < band[3] &&
+                           current[3] > band[1]);
+                }
+            }
+        }
         const float beforeHistoryScroll = historyScroll->scrollOffset();
         for (int i = 0; i < 4; ++i) {
             hostKey(ui, dispatcher, XKB_KEY_Page_Up);
@@ -7661,6 +8489,446 @@ void messagingSourceControlsCheck() {
     dispatcher.setSceneRoot(nullptr);
 }
 
+void conversationHistoryNativeCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    auto &channel = model.buffers.at(edgeBuffers[0]);
+    channel.kind = "channel";
+    channel.joined = true;
+    channel.nicks = {{.name = "HistoryPeer", .account = {}, .prefix = ""}};
+    model.networks["test"].caps = {"message-tags"};
+    for (int i = 0; i < 80; ++i) {
+        Message message;
+        message.id = "history-" + std::to_string(i);
+        message.nick = "HistoryPeer";
+        message.text = "Retain this conversation's scroll and reply target " + std::to_string(i);
+        message.time = "2026-11-07T12:34:56Z";
+        channel.messages.push_back(std::move(message));
+    }
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    std::array<Input *, 4> inputs{};
+    std::array<Input::EditingState, 4> states;
+    std::array<Input::EditHistory, 4> histories;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        ui.execute("buffer:" + std::string(edgeBuffers[i]));
+        frame();
+        inputs[i] = inputWithText(ui.root(), edgeDrafts[i]);
+        assert(inputs[i] && visible(*inputs[i]));
+        dispatcher.setFocus(inputs[i]->inputArea());
+        // Deletion separates typing groups; undo the final insertion while retaining
+        // the earlier insertion/deletion as independently undoable native edits.
+        hostKey(ui, dispatcher, '!', KeyMod::Shift, '!');
+        hostKey(ui, dispatcher, XKB_KEY_BackSpace);
+        hostKey(ui, dispatcher, '?', KeyMod::Shift, '?');
+        assert(inputs[i]->value() != edgeDrafts[i]);
+        hostKey(ui, dispatcher, 'z', KeyMod::Ctrl);
+        assert(inputs[i]->value() == edgeDrafts[i]);
+        auto state = inputs[i]->editingState();
+        state.current.cursorPos = 3;
+        state.current.selectionAnchor = 1;
+        inputs[i]->restoreEditingState(state);
+        frame();
+        states[i] = inputs[i]->editingState();
+        histories[i] = *states[i].history;
+        assert(!histories[i].undo.empty() && !histories[i].redo.empty());
+    }
+    const auto at = [&](std::size_t index) {
+        assert(model.activeBuffer == edgeBuffers[index]);
+        assert(inputWithText(ui.root(), edgeDrafts[index]) == inputs[index]);
+        assert(visible(*inputs[index]) && dispatcher.focusedArea() == inputs[index]->inputArea());
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            assert(inputs[i]->editingStateMatches(states[i]));
+            assert(states[i].history->undo == histories[i].undo &&
+                   states[i].history->redo == histories[i].redo);
+            assert(model.buffers.at(edgeBuffers[i]).draft == edgeDrafts[i]);
+        }
+    };
+    const auto travel = [&](bool forward, std::size_t index) {
+        hostKey(ui, dispatcher, forward ? XKB_KEY_i : XKB_KEY_o, KeyMod::Ctrl);
+        frame();
+        at(index);
+    };
+    at(3);
+    // Repainting, reselecting the same row and shutdown persistence add no visits.
+    for (int i = 0; i < 3; ++i) {
+        ui.execute("buffer:" + std::string(edgeBuffers[3]));
+        frame();
+        ui.flush();
+    }
+    travel(false, 2);
+    travel(false, 1);
+    travel(false, 0);
+    travel(false, 0);
+    hostKey(ui, dispatcher, 'p', KeyMod::Ctrl);
+    frame();
+    auto *transcript = visibleNode<TranscriptView>(*paneFor(*inputs[0]));
+    auto *scroll = transcript ? visibleNode<ScrollView>(*transcript) : nullptr;
+    assert(transcript && scroll && transcript->selectedMessage());
+    hostKey(ui, dispatcher, 'r', KeyMod::Ctrl);
+    frame();
+    auto *reply = composerControl(*paneFor(*inputs[0]), ":reply-cancel");
+    assert(reply && visible(*reply));
+    scroll->setScrollOffset(scroll->maxScrollOffset() / 2);
+    frame();
+    const auto offset = scroll->scrollOffset();
+    assert(scroll->maxScrollOffset() > 0);
+    travel(true, 1);
+    travel(false, 0);
+    assert(visible(*reply) && visibleNode<TranscriptView>(*paneFor(*inputs[0])) == transcript);
+    assert(std::abs(scroll->scrollOffset() - offset) < .5f);
+    travel(true, 1);
+    // Selecting a new destination after Back replaces, rather than appends to, Forward.
+    click(dispatcher, *areaWithKey(ui.root(), "buffer:" + std::string(edgeBuffers[3])));
+    assert(model.activeBuffer == edgeBuffers[1]);
+    ui.flush();
+    frame();
+    at(3);
+    travel(true, 3);
+    travel(false, 1);
+    travel(false, 0);
+    travel(true, 1);
+    travel(true, 3);
+    // Tab remains completion, not the physical Ctrl+i history chord.
+    ui.execute("buffer:" + std::string(edgeBuffers[0]));
+    frame();
+    assert(inputs[0]->replaceRange(0, inputs[0]->value().size(), "HistoryP"));
+    dispatcher.setFocus(inputs[0]->inputArea());
+    hostKey(ui, dispatcher, XKB_KEY_Tab);
+    frame();
+    // Literal nickname completion opens its candidates before Tab accepts one.
+    assert(model.activeBuffer == edgeBuffers[0] && inputs[0]->value() == "HistoryP" &&
+           dispatcher.focusedArea() == inputs[0]->inputArea());
+    hostKey(ui, dispatcher, XKB_KEY_Tab);
+    frame();
+    assert(model.activeBuffer == edgeBuffers[0] && inputs[0]->value().find("HistoryPeer") == 0);
+    hostKey(ui, dispatcher, XKB_KEY_o, KeyMod::Ctrl);
+    frame();
+    assert(model.activeBuffer == edgeBuffers[3]);
+    hostKey(ui, dispatcher, XKB_KEY_i, KeyMod::Ctrl);
+    frame();
+    assert(model.activeBuffer == edgeBuffers[0] && visible(*inputs[0]));
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
+void conversationHistorySelectionCheck(bool flushAdmission) {
+    using namespace blast;
+    const std::string configHome = std::getenv("XDG_CONFIG_HOME");
+    const std::string dataHome = std::getenv("XDG_DATA_HOME");
+    const auto isolated = std::filesystem::path(configHome) / "conversation-history";
+    assert(setenv("XDG_CONFIG_HOME", isolated.c_str(), 1) == 0);
+    assert(setenv("XDG_DATA_HOME", isolated.c_str(), 1) == 0);
+    {
+        Application app;
+        app.model = edgeModel();
+        auto &model = app.model;
+        for (auto &server : model.servers)
+            server.sojuEnabled = false;
+        ServerConfig remote;
+        remote.name = "history-remote";
+        remote.host = "example.invalid";
+        remote.sojuEnabled = false;
+        model.servers.push_back(remote);
+        auto &remoteBuffer = model.buffers["history-remote/Peer"];
+        remoteBuffer.id = "history-remote/Peer";
+        remoteBuffer.server = remote.name;
+        remoteBuffer.target = "Peer";
+        remoteBuffer.kind = "query";
+        remoteBuffer.draft = "remote retained draft";
+        model.settings.workspace["last_buffer:" + remote.name] = remoteBuffer.id;
+        auto &utility = model.buffers["test/history-search"];
+        utility.id = "test/history-search";
+        utility.server = "test";
+        utility.kind = "search";
+        utility.target = "history-search";
+        Clipboard clipboard;
+        Theme theme;
+        theme.update(model);
+        InputDispatcher dispatcher;
+        PangoRenderer renderer;
+        Ui ui(model, clipboard);
+        dispatcher.setSceneRoot(&ui.root());
+        ui.setInputDispatcher(dispatcher);
+        ui.setWindowActive(true);
+        const auto frame = [&] {
+            ui.update(1600, 1000, 1);
+            ui.root().layout(renderer);
+        };
+        frame();
+        auto *origin = inputWithText(ui.root(), edgeDrafts[0]);
+        assert(origin);
+        const auto state = origin->editingState();
+        // Choose the actual painted Avy hint, not a copy of its key assignment.
+        hostKey(ui, dispatcher, 'x', KeyMod::Ctrl);
+        hostKey(ui, dispatcher, 'j', 0, 'j');
+        frame();
+        auto *jump = areaWithKey(ui.root(), "channel-jump");
+        auto *sidebar = visibleNode<Sidebar>(ui.root());
+        assert(jump && visible(*jump) && sidebar);
+        std::string keys;
+        for (const auto &hint : sidebar->hintRects())
+            if (hint.buffer == edgeBuffers[1]) {
+                auto *label = paintedHintAt(*jump, hint);
+                assert(label);
+                keys = label->text();
+            }
+        assert(!keys.empty());
+        for (const char key : keys)
+            hostKey(ui, dispatcher, key, 0, key);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[1]);
+        // Switch-buffer's real palette selects an existing conversation.
+        hostKey(ui, dispatcher, 'x', KeyMod::Ctrl);
+        hostKey(ui, dispatcher, 'b', 0, 'b');
+        frame();
+        auto *query = dispatcher.focusedArea()
+                          ? dynamic_cast<Input *>(dispatcher.focusedArea()->textInputClient())
+                          : nullptr;
+        assert(query && query != origin && visible(*query));
+        for (const char key : std::string_view("third"))
+            hostKey(ui, dispatcher, key, 0, key);
+        frame();
+        hostKey(ui, dispatcher, XKB_KEY_Return);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[2]);
+        ui.execute("buffer:" + utility.id);
+        frame();
+        assert(model.activeBuffer == utility.id);
+        hostKey(ui, dispatcher, 'o', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[2]);
+        hostKey(ui, dispatcher, 'o', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[1]);
+        hostKey(ui, dispatcher, 'i', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[2]);
+        // A queued native row click must not overwrite a newer Core selection.
+        auto *queuedRow = areaWithKey(ui.root(), "buffer:" + std::string(edgeBuffers[3]));
+        assert(queuedRow && visible(*queuedRow));
+        click(dispatcher, *queuedRow);
+        assert(model.activeBuffer == edgeBuffers[2]);
+        // The real Core action changes activeBuffer before Ui sees it.
+        model.actions.push_back({"query", edgeBuffers[2], "HistoryCorePeer", ""});
+        app.tick(1);
+        // Core casefolds stable IDs while preserving the displayed query target.
+        const std::string coreBuffer = "test/historycorepeer";
+        assert(model.activeBuffer == coreBuffer);
+        assert(model.buffers.at(coreBuffer).target == "HistoryCorePeer" &&
+               model.buffers.at(coreBuffer).kind == "query");
+        if (flushAdmission)
+            ui.flush();
+        else
+            frame();
+        assert(model.activeBuffer == coreBuffer);
+        frame();
+        ui.flush();
+        hostKey(ui, dispatcher, 'o', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[3]);
+        auto *queuedInput = inputWithText(ui.root(), edgeDrafts[3]);
+        assert(queuedInput && visible(*queuedInput) &&
+               dispatcher.focusedArea() == queuedInput->inputArea());
+        hostKey(ui, dispatcher, 'o', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[2]);
+        hostKey(ui, dispatcher, 'i', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[3]);
+        hostKey(ui, dispatcher, 'i', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == coreBuffer);
+        hostKey(ui, dispatcher, 'i', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == coreBuffer);
+        hostKey(ui, dispatcher, 'o', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[3]);
+        hostKey(ui, dispatcher, 'o', KeyMod::Ctrl);
+        frame();
+        hostKey(ui, dispatcher, 'o', KeyMod::Ctrl);
+        frame();
+        hostKey(ui, dispatcher, 'o', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[0] && visible(*origin) &&
+               origin->editingStateMatches(state));
+        auto *rail = areaWithKey(ui.root(), "server:history-remote");
+        assert(rail && visible(*rail));
+        click(dispatcher, *rail);
+        frame();
+        auto *remoteInput = inputWithText(ui.root(), remoteBuffer.draft);
+        assert(model.activeBuffer == remoteBuffer.id && remoteInput && visible(*remoteInput));
+        hostKey(ui, dispatcher, 'o', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == edgeBuffers[0] &&
+               dispatcher.focusedArea() == origin->inputArea() &&
+               origin->editingStateMatches(state));
+        hostKey(ui, dispatcher, 'i', KeyMod::Ctrl);
+        frame();
+        assert(model.activeBuffer == remoteBuffer.id && visible(*remoteInput) &&
+               dispatcher.focusedArea() == remoteInput->inputArea());
+        dispatcher.setFocus(nullptr);
+        dispatcher.setSceneRoot(nullptr);
+    }
+    assert(setenv("XDG_CONFIG_HOME", configHome.c_str(), 1) == 0);
+    assert(setenv("XDG_DATA_HOME", dataHome.c_str(), 1) == 0);
+}
+
+void conversationHistoryOwnershipCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    ui.execute("buffer:" + std::string(edgeBuffers[1]));
+    frame();
+    auto *input = inputWithText(ui.root(), edgeDrafts[1]);
+    assert(input);
+    dispatcher.setFocus(input->inputArea());
+    static_cast<TextInputClient &>(*input).textInputApplyEdit({.commitText = {},
+                                                               .preeditText = "猫",
+                                                               .preeditCursorBegin = 3,
+                                                               .preeditCursorEnd = 3,
+                                                               .hasPreedit = true});
+    const auto composing = input->editingState();
+    for (const auto key : {XKB_KEY_o, XKB_KEY_i})
+        hostKey(ui, dispatcher, key, KeyMod::Ctrl);
+    frame();
+    assert(model.activeBuffer == edgeBuffers[1] && input->composing() &&
+           input->editingStateMatches(composing) && dispatcher.focusedArea() == input->inputArea());
+    static_cast<TextInputClient &>(*input).textInputResetPreedit();
+    const auto state = input->editingState();
+    for (const auto command : {"search", "settings"}) {
+        ui.execute(command);
+        frame();
+        auto *dialogs = visibleNode<Dialogs>(ui.root());
+        assert(dialogs && dialogs->active());
+        auto *focus = dispatcher.focusedArea();
+        for (const auto key : {XKB_KEY_o, XKB_KEY_i})
+            hostKey(ui, dispatcher, key, KeyMod::Ctrl);
+        frame();
+        assert(dialogs->active() && model.activeBuffer == edgeBuffers[1] &&
+               dispatcher.focusedArea() == focus && input->editingStateMatches(state));
+        if (std::string_view(command) == "settings") {
+            auto *keyboard = areaWithKey(*dialogs, "blastirc.settings.category.1");
+            assert(keyboard);
+            click(dispatcher, *keyboard);
+            frame();
+            auto *record = areaWithKey(*dialogs, "blastirc.settings.record.complete");
+            assert(record && visible(*record));
+            const auto originalComplete = model.settings.bindings.at("complete");
+            click(dispatcher, *record);
+            frame();
+            assert(record->capturesAllKeys());
+            hostKey(ui, dispatcher, XKB_KEY_o, KeyMod::Ctrl);
+            hostKey(ui, dispatcher, XKB_KEY_i, KeyMod::Ctrl);
+            assert(record->capturesAllKeys() &&
+                   model.settings.bindings.at("complete") == originalComplete);
+            hostKey(ui, dispatcher, XKB_KEY_Return, KeyMod::Ctrl);
+            frame();
+            assert(model.settings.bindings.at("complete") == "c-o c-i" &&
+                   !record->capturesAllKeys());
+            assert(model.activeBuffer == edgeBuffers[1] && input->editingStateMatches(state));
+            ui.execute("settings");
+        } else
+            hostKey(ui, dispatcher, XKB_KEY_Escape);
+        frame();
+    }
+    hostKey(ui, dispatcher, XKB_KEY_o, KeyMod::Ctrl);
+    frame();
+    assert(model.activeBuffer == edgeBuffers[0]);
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
+void conversationHistoryMissingBindingsCheck() {
+    using namespace blast;
+    // Constructor migration must respect exact and longer-prefix owners in either direction.
+    for (const auto chord : {"C-o", "c-O x", "C-i", "c-I x"}) {
+        auto model = edgeModel();
+        model.settings.bindings.erase("conversation-back");
+        model.settings.bindings.erase("conversation-forward");
+        model.settings.bindings["settings"] = chord;
+        Clipboard clipboard;
+        Theme theme;
+        theme.update(model);
+        InputDispatcher dispatcher;
+        PangoRenderer renderer;
+        Ui ui(model, clipboard);
+        dispatcher.setSceneRoot(&ui.root());
+        ui.setInputDispatcher(dispatcher);
+        ui.setWindowActive(true);
+        const auto frame = [&] {
+            ui.update(1600, 1000, 1);
+            ui.root().layout(renderer);
+        };
+        frame();
+        ui.execute("buffer:" + std::string(edgeBuffers[1]));
+        frame();
+        const bool back = std::string_view(chord).find_first_of("oO") != std::string_view::npos;
+        assert(model.settings.bindings.at(back ? "conversation-back" : "conversation-forward")
+                   .empty());
+        assert(model.settings.bindings.at(back ? "conversation-forward" : "conversation-back") ==
+               (back ? "C-i" : "C-o"));
+        assert(model.settings.bindings.at("settings") == chord);
+        hostKey(ui, dispatcher, back ? XKB_KEY_o : XKB_KEY_i, KeyMod::Ctrl);
+        if (std::string_view(chord).ends_with(" x"))
+            hostKey(ui, dispatcher, 'x', 0, 'x');
+        frame();
+        auto *dialogs = visibleNode<Dialogs>(ui.root());
+        assert(dialogs && dialogs->settingsOpen() && model.activeBuffer == edgeBuffers[1]);
+        dispatcher.setFocus(nullptr);
+        dispatcher.setSceneRoot(nullptr);
+    }
+    for (const bool back : {false, true}) {
+        const auto present = back ? "conversation-forward" : "conversation-back";
+        const auto missing = back ? "conversation-back" : "conversation-forward";
+        const auto prefix = back ? "C-o x" : "C-i x";
+        for (const auto custom : {"", "C-x h", prefix}) {
+            auto model = edgeModel();
+            model.settings.bindings[present] = custom;
+            model.settings.bindings.erase(missing);
+            model.settings.bindings["settings"] = prefix;
+            Clipboard clipboard;
+            Ui ui(model, clipboard);
+            assert(model.settings.bindings.at(present) == custom);
+            assert(model.settings.bindings.at(missing).empty());
+        }
+        // The customized new command alone can own the missing default's prefix.
+        auto model = edgeModel();
+        model.settings.bindings[present] = prefix;
+        model.settings.bindings.erase(missing);
+        Clipboard clipboard;
+        Ui ui(model, clipboard);
+        assert(model.settings.bindings.at(present) == prefix);
+        assert(model.settings.bindings.at(missing).empty());
+    }
+}
+
 } // namespace
 
 void runModalFocusRemapChecks(
@@ -7690,18 +8958,26 @@ void runTranscriptLinkFocusCheck(
 
 void runUiIntegrationCheck() {
     codecs::installImageDecoder();
+    conversationHistoryNativeCheck();
+    conversationHistorySelectionCheck(false);
+    conversationHistorySelectionCheck(true);
+    conversationHistoryOwnershipCheck();
+    conversationHistoryMissingBindingsCheck();
     minimumWindowHeightCheck();
     sidebarConversationFilterCheck();
     sidebarArchiveControlsCheck();
     sidebarActivityPinsCheck();
+    peopleFriendOrderingCheck();
     activityReorderAvySourceIdentityCheck();
     messagingSourceControlsCheck();
     pinnedCurrentSendCheck();
     sidebarAvatarCheck();
     statusIdentityCheck();
+    initialHistoryConsumerCheck();
     railReadAllCheck();
     serverLogConsumerCheck();
     queuedServerLogPaletteCheck();
+    sojuDisplayNameConsumerCheck();
     sojuFoldConsumerCheck();
     titlebarGeometryCheck();
     staleUploadHostMenuCheck();
@@ -7713,6 +8989,7 @@ void runUiIntegrationCheck() {
     selectedServerAvyCheck();
     tightSearchFocusCheck();
     ordinaryTypingFocusCheck();
+    typingOverflowFocusCheck();
     channelTopicCheck();
     queuedBufferMergeCheck(false);
     queuedBufferMergeCheck(true);

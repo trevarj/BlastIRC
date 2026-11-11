@@ -505,7 +505,7 @@ void run() {
             [&](const Event &e) { return liveMessage(e, token + " history-boundary"); },
             "history pagination boundary is acknowledged by server");
         const size_t start = primary->events.size();
-        primary->client.history(channel);
+        primary->client.history(channel, "", token + "-latest", false);
         const Event latestEnd = waitEvent(
             *primary, peer.get(), start,
             [&](const Event &e) { return e.type == "history_end" && e.target == channel; },
@@ -548,7 +548,7 @@ void run() {
             cursor = "timestamp=" + historicalBoundary->time;
         }
         const size_t olderStart = primary->events.size();
-        primary->client.history(channel, cursor);
+        primary->client.history(channel, cursor, token + "-older", false);
         const Event olderEnd = waitEvent(
             *primary, peer.get(), olderStart,
             [&](const Event &e) { return e.type == "history_end" && e.target == channel; },
@@ -627,7 +627,7 @@ void run() {
                  "optional external playback module is not advertised");
         } else {
             const size_t start = primary->events.size();
-            primary->client.history(channel);
+            primary->client.history(channel, "", token + "-znc", false);
             const auto completed = waitEvent(
                 *primary, peer.get(), start,
                 [&](const Event &e) { return e.type == "history_end" && e.target == channel; },
@@ -658,7 +658,7 @@ void run() {
             *primary, peer.get(), [&] { return primary->ready; }, "bouncer downstream reconnects");
         primary->client.command("JOIN " + channel);
         if (primary->has("draft/chathistory"))
-            primary->client.history(channel);
+            primary->client.history(channel, "", token + "-reconnect", true);
         waitEvent(
             *primary, peer.get(), 0,
             [&](const Event &e) {

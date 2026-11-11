@@ -29,6 +29,8 @@ class MediaPreviewController {
     bool ready(std::uint64_t messageId = 0) const;
     std::string_view error(std::uint64_t messageId = 0) const;
     bool replacesUrl(std::uint64_t messageId) const;
+    bool canLoadPreview(std::uint64_t messageId, std::string_view originalUrl) const;
+    bool loadPreview(std::uint64_t messageId, std::string_view originalUrl);
     void close();
     void invalidate();
     void retainMessages(std::span<const std::uint64_t>);

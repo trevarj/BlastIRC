@@ -1421,13 +1421,17 @@ def composer_targets(window, layout, zoom):
     """Locate the fixed primary row through actual first-line native caret geometry.
 
     These ordinary menu/Send consumers begin and end without a selection or
-    active preedit. Native beginning/end commands preserve their end-of-document
-    editing position; shape/trail/selection probes must not use this locator.
+    active preedit. Native Ctrl+Home/End preserve their end-of-document editing
+    position; shape/trail/selection probes must not use this locator.
     """
-    command("beginning-of-buffer", window=window)
+    metrics = pane_metrics(layout, zoom)
+    x, y, width, height = layout["conversation"]["rect"]
+    click(window, x + metrics["left"] + 16 * zoom,
+          y + height - metrics["padding_y"] - 16 * zoom)
+    framed_keys(window, "ctrl+Home")
     SESSION.until("native composer first-line caret", lambda: native_input_rectangle(window) is not None)
     caret = native_input_rectangle(window)
-    command("end-of-buffer", window=window)
+    framed_keys(window, "ctrl+End")
     result = composer_primary_targets(layout, zoom, caret)
     geometry = window_geometry(window)
     for name in ("plus", "send"):
@@ -1603,6 +1607,7 @@ def framed_keys(window, *keys):
     await_native_frame(window, marker,
                        re.compile(rf"wl_keyboard[@#]\d+\.key\(\d+,\s*\d+,\s*{final},\s*1\)"),
                        presses.count(final))
+    return marker
 
 
 
@@ -1926,8 +1931,8 @@ def set_message_style(proc, window, preferences, database_path, args, destinatio
     before = save_state(proc, preferences, database_path)
     assert before[1] == (buffer,), before
     settings = tomllib.loads(preferences.read_text())
-    overrides = set(settings["presentation"]["irc_channels"])
-    current = "irc" if buffer in overrides else "bubbles"
+    overrides = dict(settings["presentation"]["message_layouts"])
+    current = overrides.get(buffer, "bubbles")
     if current != mode:
         channel = database_buffer_kind(database_path, buffer) == "channel"
         layout = read_layout(preferences)
@@ -1935,13 +1940,16 @@ def set_message_style(proc, window, preferences, database_path, args, destinatio
         popup = open_title_menu(window, actions)
         # Message display precedes the stable Presence/History/Details/Close tail.
         open_native_submenu(window, popup, 4, from_end=True)
-        popup_keys(window, popup, "Home", *(["Down"] * (mode == "irc")), "Return")
-        overrides.add(buffer) if mode == "irc" else overrides.discard(buffer)
-        wait_preference(proc, preferences, "presentation", "irc_channels", sorted(overrides))
+        popup_keys(window, popup, "Home", *(["Down"] * ("bubbles", "irc", "stacked").index(mode)), "Return")
+        if mode == "bubbles":
+            overrides.pop(buffer, None)
+        else:
+            overrides[buffer] = mode
+        wait_preference(proc, preferences, "presentation", "message_layouts", overrides)
     after = save_state(proc, preferences, database_path)
     assert_same_state("Changing message display preserves conversations/drafts/read state", before, after)
     capture_window(window, destination, label)
-    return sorted(overrides)
+    return overrides
 
 
 def database_buffer_kind(path, buffer):
@@ -2378,10 +2386,11 @@ def wait_preference(proc, path, section, name, value):
 
 
 def settings_category(window, zoom, index, destination=None):
-    """Select a category with an empty query, from category or Search focus.
+    """Select a root category with an empty query, from navigation or Search.
 
-    Compact callers land on Search so their next Tab reaches the first detail
-    control, as it does from wide category navigation.
+    Collapse roots while walking the wide tree so expanded descendants cannot
+    change the public root indices. Compact callers land on Search so their
+    next Tab reaches the first detail control, just as wide navigation does.
     """
     assert 0 <= index < 7, index
     bounds = window_geometry(window)
@@ -2399,7 +2408,7 @@ def settings_category(window, zoom, index, destination=None):
         popup_keys(window, popup, "Home", *(["Down"] * index), "Return", root_changed=False)
         framed_keys(window, "Tab")
     else:
-        framed_keys(window, "Home", *(["Down"] * index))
+        framed_keys(window, "Home", "Left", *(["Down", "Left"] * index))
 
 
 def settings_select(window, index):
@@ -2707,6 +2716,17 @@ def probe_reading_anchor(proc, window, preferences, database_path, args, destina
         confirmed = marker(rgb, reference=component)
         return confirmed, str(path)
 
+    def paint_barrier():
+        # Hover changes paint only: no draft/selection edit or transcript following.
+        state = native_input_state(window)
+        assert state is not None and state["caret"] is not None, state
+        targets = composer_primary_targets(layout, 1, state["caret"])
+        move_pointer(window, *targets["send"])
+        offset = debug_path.stat().st_size
+        move_pointer(window, *targets["plus"])
+        await_native_frame(window, offset, re.compile(r"wl_pointer[@#]\d+\.motion\("))
+        assert native_input_state(window) == state, "Paint barrier changed native draft selection"
+
 
     def frontier():
         return database.execute("SELECT COALESCE(MAX(seq),0) FROM messages").fetchone()[0]
@@ -2758,16 +2778,12 @@ def probe_reading_anchor(proc, window, preferences, database_path, args, destina
         tail_text = text
         wait_messages(proc, database_path, expected_messages)
         exact_append(sequence, appended)
-        # A native no-edit command forces a later owned-surface paint without a
-        # removed hover toolbar, extra wheel input or transcript geometry change.
-        command("end-of-buffer", window=window)
+        paint_barrier()
         after, after_png = screenshot("reading-scrolled-after-append", anchor_rgb, reference=before)
         # Message rows persist on arrival; buffers.unread is a Core Save
         # snapshot. Await actual autosave without changing follow/read state.
         save_preferences(proc, preferences, window)
-        # This later actual command/frame follows the synchronous Core Save;
-        # it neither edits the empty draft nor changes transcript following.
-        command("end-of-buffer", window=window)
+        paint_barrier()
         marker(anchor_rgb, reference=after)
         saved_read, unread = database.execute(
             "SELECT read_marker,unread FROM buffers WHERE id=?", (channel_id,)).fetchone()
@@ -2795,7 +2811,7 @@ def probe_reading_anchor(proc, window, preferences, database_path, args, destina
         follow_rows = send(follow_text)
         wait_messages(proc, database_path, expected_messages)
         exact_append(sequence, follow_rows)
-        command("end-of-buffer", window=window)
+        paint_barrier()
         followed, follow_png = screenshot("reading-bottom-follow-append", follow_rgb)
         follow_read = wait_read_marker(proc, database_path, channel_id)
         assert follow_read[3] == follow_text and follow_read[2] and not follow_read[2].startswith("local:"), follow_read
@@ -2839,7 +2855,7 @@ def probe_transcript_surfaces(proc, window, preferences, database_path, args, de
     added_caps = []
     start = len(expected_messages)
     presence_changed = False
-    original_mode = "irc" if query_id in settings["presentation"]["irc_channels"] else "bubbles"
+    original_mode = settings["presentation"]["message_layouts"].get(query_id, "bubbles")
     display_changed = False
 
     def photo(label):
@@ -3305,7 +3321,7 @@ def probe_settings_categories(proc, window, preferences, config, database_path, 
                 # Exercise the ACTUAL rebound prefix and mode line outside the
                 # recorder; a screenshot of the binding field is not that proof.
                 framed_keys(window, "ctrl+g")
-                command("end-of-buffer", window=window)
+                framed_keys(window, "ctrl+End")
                 draft_end = len(original_draft.encode("utf-8"))
                 _composer_native(window, original_draft, draft_end, draft_end)
                 framed_keys(window, "F12")
@@ -3448,13 +3464,11 @@ def probe_settings_categories(proc, window, preferences, config, database_path, 
             assert preferences.read_bytes() == preference_bytes, "Failed native save changed preferences"
             assert database.execute(buffer_query).fetchall() == original_buffers
             framed_keys(window, "ctrl+g")
-            command("end-of-buffer", window=window)
+            framed_keys(window, "ctrl+End")
             end = len(original_draft.encode("utf-8"))
             observe_native_input(window, destination, "settings-failed-save-original-conversation-draft",
                                  original_draft, end, end)
-            command("beginning-of-buffer", window=window)
-            command("set-mark", window=window)
-            command("end-of-buffer", window=window)
+            framed_keys(window, "ctrl+Home", "ctrl+shift+End")
             command("kill-region", window=window)
             seed_clipboard(outgoing_text, cleanup)
             framed_keys(window, "ctrl+v")
@@ -3711,8 +3725,8 @@ def probe_avy_cancel(proc, window, preferences, database_path, args, destination
 def saved_workspace_intent(settings, remaps=None):
     remaps = remaps or {}
     return {**settings,
-            "presentation": {**settings["presentation"], "irc_channels": sorted(
-                remaps.get(value, value) for value in settings["presentation"]["irc_channels"])},
+            "presentation": {**settings["presentation"], "message_layouts": {
+                remaps.get(key, key): value for key, value in settings["presentation"]["message_layouts"].items()}},
             "presence": {**settings["presence"], "channels": {
                 remaps.get(key, key): value for key, value in settings["presence"]["channels"].items()}},
             "workspace": {
@@ -3765,7 +3779,7 @@ def probe_flat_refresh(proc, window, preferences, database_path, args, destinati
             assert layout["active_buffer"] == identity, layout
             text = current_drafts[identity]
             end = len(text.encode("utf-8"))
-            action = command("end-of-buffer", window=window)
+            action = framed_keys(window, "ctrl+End")
             return observe_native_input(window, destination, label, text, end, end,
                                         after_action=action)
 
@@ -3801,7 +3815,7 @@ def probe_flat_refresh(proc, window, preferences, database_path, args, destinati
         capture_window(window, destination, "refresh-global-selection-restored")
         normal = tomllib.loads(preferences.read_text())
         assert_workspace(normal, query_id, baseline[0]["people_mode"])
-        normal_action = command("end-of-buffer", window=window)
+        normal_action = framed_keys(window, "ctrl+End")
         normal_input = observe_native_input(
             window, destination, "refresh-before-rename", original_draft, end, end,
             after_action=normal_action)
@@ -3867,7 +3881,7 @@ def probe_flat_refresh(proc, window, preferences, database_path, args, destinati
                     window, destination, "refresh-renamed-undo",
                     original_draft, end, end)
                 current_draft = original_draft
-        restore_action = command("end-of-buffer", window=window)
+        restore_action = framed_keys(window, "ctrl+End")
         save_state(proc, preferences, database_path)
         restored = tomllib.loads(preferences.read_text())
         assert saved_workspace_intent(restored) == saved_workspace_intent(normal), (normal, restored)
@@ -4300,7 +4314,7 @@ def probe_reply_paste(proc, window, prefs, db, args, dest, observer, *, query_id
         wait_rows(proc, db, "SELECT draft FROM buffers WHERE id=?", (query_id,), [(original,)])
         # A Core save may precede the next native layout.
         # Bind this baseline to the following command's completed, painted state.
-        original_action = command("end-of-buffer", window=window)
+        original_action = framed_keys(window, "ctrl+End")
         original_state = observe_native_input(window, dest, "reply-saved-original-caret",
                                               original, length, length, after_action=original_action)
         evidence["native_states"]["original_saved"] = original_state
@@ -4959,7 +4973,8 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
     bindings = baseline['bindings'].copy()
     for name, value in (('execute-command', 'M-x'), ('backward-char', 'C-b'),
                         ('forward-char', 'C-f'), ('set-mark', 'C-SPC'),
-                        ('end-of-buffer', 'M->'), ('settings', 'C-,')):
+                        ('beginning-of-buffer', 'M-<'), ('end-of-buffer', 'M->'),
+                        ('settings', 'C-,')):
         assert bindings[name] == value, (name, bindings[name], value)
     assert baseline['appearance']['scale'] == 1
     before_cursor = baseline['cursor'].copy()
@@ -5051,7 +5066,7 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
         framed_keys(window, 'ctrl+Home', 'ctrl+shift+End')
         state(len(encoded), 0)
         command('set-mark', window=window)
-        command('end-of-buffer', window=window)
+        framed_keys(window, 'ctrl+End')
         return state(len(encoded), len(encoded))
 
     def restore_selection():
@@ -5572,7 +5587,7 @@ def probe_menu_reachability(proc, window, preferences, database_path, args, dest
             'root': ['navigation', 'search', 'toggle-people', 'message-display',
                      'presence', 'history', 'topic', 'close-buffer'],
             'navigation': ['switch-buffer', 'jump-channel', 'toggle-navigation'],
-            'message-display': ['message-style:bubbles', 'message-style:irc'],
+            'message-display': ['message-style:bubbles', 'message-style:irc', 'message-style:stacked'],
             'presence': ['presence:global', 'presence:all', 'presence:smart', 'presence:hidden'],
             'history': ['load-history', 'mark-read']},
         'original_geometry': original_geometry, 'original_native_input': initial_input,
@@ -6164,7 +6179,7 @@ def probe_shell_interactions(proc, window, preferences, database_path, args, des
         # Composer at its known end caret, without replacing its durable draft.
         cx, cy, cw, ch = native["caret"]
         click(window, cx + cw / 2, cy + ch / 2)
-        command("end-of-buffer", window=window)
+        framed_keys(window, "ctrl+End")
         move_pointer(window, 0, 0)
         hidden_rail = native_rgb_capture(window)
         left, top = round(x + padding), round(point[1] - extent / 2)
@@ -6183,7 +6198,7 @@ def probe_shell_interactions(proc, window, preferences, database_path, args, des
         report["captures"].append(str(capture_window(window, destination, "shell-rail-global-read")))
     finally:
         database.close()
-    command("end-of-buffer", window=window)
+    framed_keys(window, "ctrl+End")
     retained()
     report["limits"] = "PNGs record real member/status rendering; native checks own glyph/color semantics. Drag-end disk persistence is observed; this scope does not restart."
     destination.with_name(destination.stem + "-shell-interactions.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -6402,7 +6417,7 @@ def run_advanced_scope(*, proc, window, binary, env, screenshot, logs, preferenc
                 "SELECT * FROM messages WHERE presence=0 ORDER BY seq").fetchall() == cursor_history, "Restart changed non-presence history"
             # Draft bytes and preferences are stored; cursor/anchor/undo stacks
             # are NOT. Position explicitly, then capture the restarted editor.
-            command("end-of-buffer", window=window)
+            framed_keys(window, "ctrl+End")
             editor = observe_native_input(
                 window, destination, "cursor-restart-actual-editor", draft, end, end)
             open_settings(window, preferences)
@@ -6439,7 +6454,7 @@ def run_advanced_scope(*, proc, window, binary, env, screenshot, logs, preferenc
                         "restarted_editor": editor, "restarted_selected_controls": controls,
                         "original_cursor_preferences_restored": True,
                         "limits": "Only stored draft/history/preferences persistence is asserted; "
-                                  "the restarted caret was explicitly moved to end-of-buffer. "
+                                  "the restarted caret was explicitly moved with native Ctrl+End. "
                                   "No cursor/selection/undo-stack restart persistence claim."}
 
         wait_messages(proc, database_path, expected_messages)
@@ -6501,12 +6516,12 @@ def run_advanced_scope(*, proc, window, binary, env, screenshot, logs, preferenc
         database.close()
 
 
-def run():
+def run(*, allow_focused_geometry=False):
     global SESSION, POINTER, CHANNEL_ID, QUERY_ID
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", nargs="?", type=Path, default=ROOT / "build-native/blastirc")
-    parser.add_argument("--message-style", choices=("bubbles", "irc"), default="bubbles",
-                        help="initial per-conversation display; both modes are restarted in the full smoke")
+    parser.add_argument("--message-style", choices=("bubbles", "irc", "stacked"), default="bubbles",
+                        help="initial per-conversation display; modes are restarted in the full smoke")
     parser.add_argument("--zoom", type=float, default=1,
                         help="user zoom in private test preferences (.7..2; default: 1)")
     parser.add_argument("--size", type=window_size, default=(1440, 940), metavar="WIDTHxHEIGHT",
@@ -6528,7 +6543,7 @@ def run():
     args = parser.parse_args()
     if not math.isfinite(args.zoom) or not .7 <= args.zoom <= 2:
         parser.error("--zoom must be finite and between .7 and 2")
-    if (args.probes or args.probe) and (args.size != (1440, 940) or args.zoom != 1):
+    if (args.probes or args.probe) and not allow_focused_geometry and (args.size != (1440, 940) or args.zoom != 1):
         parser.error("--probes and --probe require the representative 1440x940, zoom 1 layout")
     if sum((args.layout_only, args.ime_only, args.raw_only, args.probes, bool(args.probe))) > 1:
         parser.error("--layout-only, --ime-only, --raw-only, --probes and --probe are distinct verification scopes")
@@ -6569,8 +6584,10 @@ def run():
         preferences.write_text(
             f'[appearance]\nscale = {args.zoom}\ntheme_source = "auto"\n'
             f'reduced_motion = {str(args.reduced_motion).lower()}\n'
-            '[presentation]\n'
-            f'irc_channels = {q([channel_id, "Local/guiobserver"] if args.message_style == "irc" else [])}\n'
+            '[presentation.message_layouts]\n'
+            + (f'{q(channel_id)} = {q(args.message_style)}\n'
+               f'{q("Local/guiobserver")} = {q(args.message_style)}\n'
+               if args.message_style != "bubbles" else '')
         )
         preferences.chmod(0o600)
         palette_bytes = None
@@ -6777,11 +6794,9 @@ def run():
                     print("Focused native surface/Send wire checks passed; inspect the capture for two complete history lines.", flush=True)
                     return
                 if args.probes:
-                    command("end-of-buffer", window=window)
+                    framed_keys(window, "ctrl+End")
                     observe_native_input(window, destination, "caret-focused-edit", "abcXYZ", 6, 6)
-                command("beginning-of-buffer")
-                key("ctrl+space")
-                command("end-of-buffer", window=window if args.probes else None)
+                framed_keys(window, "ctrl+Home", "ctrl+shift+End")
                 if args.probes:
                     observe_native_input(window, destination, "native-selected-text", "abcXYZ", 6, 0)
                 seed_clipboard("native-copy-sentinel", cleanup)
@@ -7007,7 +7022,11 @@ def run():
                 capture_window(window, destination, "filter-empty")
                 assert_same_state("Empty filter", baseline,
                                   save_state(proc, preferences, database_path))
-                command("end-of-buffer", window=window)
+                metrics = pane_metrics(layout, args.zoom)
+                x, y, width, height = layout["conversation"]["rect"]
+                click(window, x + metrics["left"] + 16 * args.zoom,
+                      y + height - metrics["padding_y"] - 16 * args.zoom)
+                framed_keys(window, "ctrl+End")
                 pinned_state = _composer_native(window, pinned_draft, len(pinned_draft), len(pinned_draft))
                 click(window, *composer_primary_targets(layout, args.zoom, pinned_state["caret"])["send"])
                 receive("PRIVMSG", [query_target, pinned_draft], own_nick)
@@ -7128,11 +7147,11 @@ def run():
                 original_channel_draft = channel_draft
                 previous_active, previous_people = query_id, "hidden"
                 previous_navigation = "expanded"
-                presentation_expected = settings["presentation"]["irc_channels"]
+                presentation_expected = settings["presentation"]["message_layouts"]
                 restart_evidence = []
                 for phase in ("people-visible", "query-suppressed", "channel-return", "people-compact",
                               "compact-query-suppressed", "compact-channel-return", "people-hidden",
-                              "message-irc", "message-bubbles", "final"):
+                              "message-irc", "message-stacked", "message-bubbles", "final"):
                     screenshot = tmp / (phase + ".bmp")
                     stdout = stderr = None
                     proc, window = launch_gui(binary, screenshot, env, args.size, logs)
@@ -7140,7 +7159,7 @@ def run():
                     restored = tomllib.loads(preferences.read_text())
                     assert_workspace(restored, previous_active, previous_people)
                     assert restored["workspace"]["native_navigation_mode"] == previous_navigation, restored
-                    assert restored["presentation"]["irc_channels"] == presentation_expected, restored
+                    assert restored["presentation"]["message_layouts"] == presentation_expected, restored
                     assert_saved_buffers(database_path, [
                         (channel_id, "Local", channel, "channel", channel_draft),
                         (query_id, "Local", query_target, "query", private_draft),
@@ -7154,8 +7173,8 @@ def run():
                     if phase != "people-hidden":
                         resize_panel_viewport(window, (max(args.size[0], math.ceil(1300 * args.zoom)),
                                                        max(args.size[1], math.ceil(700 * args.zoom))))
-                    if phase in ("message-bubbles", "final"):
-                        mode = "irc" if phase == "message-bubbles" else "bubbles"
+                    if phase in ("message-stacked", "message-bubbles", "final"):
+                        mode = {"message-stacked": "irc", "message-bubbles": "stacked", "final": "bubbles"}[phase]
                         save_state(proc, preferences, database_path)
                         capture_window(window, destination, "channel-" + mode + "-after-restart")
                     if phase == "people-visible":
@@ -7221,12 +7240,12 @@ def run():
                             capture_window(window, destination, "people-overflow-menu")
                             select_native_menu(window, popup, (2,))
                         active_buffer, people = channel_id, "hidden"
-                    elif phase in ("message-irc", "message-bubbles"):
+                    elif phase in ("message-irc", "message-stacked", "message-bubbles"):
                         mode = phase.removeprefix("message-")
                         presentation_expected = set_message_style(
                             proc, window, preferences, database_path, args, destination,
                             channel_id, mode, label="channel-" + mode + "-before-restart")
-                        assert (query_id in presentation_expected) == (args.message_style == "irc"), presentation_expected
+                        assert presentation_expected.get(query_id, "bubbles") == args.message_style, presentation_expected
                         text = f"Channel {mode}: genuine refreshed display row."
                         observer.send(f"PRIVMSG {channel} :{text}")
                         expected_messages.extend(channel_messages(text, query_target))

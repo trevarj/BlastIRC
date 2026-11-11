@@ -1,5 +1,7 @@
 <div align="center"><img src="assets/icon.png" alt="BlastIRC" width="192"></div>
 
+<div align="center"><img src="assets/screenshot.png" alt="BlastIRC running on Wayland" width="768"></div>
+
 # BLAST IRC
 
 A native IRCv3 client for x86_64 Linux and Wayland; X11 and Xwayland are not supported.

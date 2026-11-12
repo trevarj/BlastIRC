@@ -1984,6 +1984,7 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
     const std::weak_ptr<int> token = menuAlive;
     const auto generation = ++menuGeneration;
     menuOpen = true;
+    updateCompletion();
     popup->openSelectDropdown(
         request,
         {
@@ -1996,6 +1997,7 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
                         return;
                     menuOpen = false;
                     ++menuGeneration;
+                    updateCompletion();
                     if (index >= operations.size() || buffer != source || pane.buffer != source ||
                         !owner.model.buffers.contains(source) || !visibleInScene(*this))
                         return;
@@ -2029,8 +2031,10 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
                 },
             .onDismiss =
                 [this, token, generation] {
-                    if (!token.expired() && generation == menuGeneration)
+                    if (!token.expired() && generation == menuGeneration) {
                         menuOpen = false;
+                        updateCompletion();
+                    }
                 },
         });
 }
@@ -2350,8 +2354,8 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
         owner.overlayHost && owner.emojiPopup && owner.dispatcher &&
         owner.dispatcher->focusedArea() == input->inputArea() && !input->composing() &&
         input->cursorPosition() == input->selectionAnchor() && buffer == pane.buffer &&
-        owner.model.buffers.contains(buffer) && !formattingOpen && visibleInScene(*this) &&
-        owner.overlayHost->width() > 0 && owner.overlayHost->height() > 0;
+        owner.model.buffers.contains(buffer) && !formattingOpen && !menuOpen &&
+        visibleInScene(*this) && owner.overlayHost->width() > 0 && owner.overlayHost->height() > 0;
     if (literalCompletion && owner.commandOwner == this && eligible &&
         commandRevision == revision && input->cursorPosition() == commandEnd) {
         placeCompletion();

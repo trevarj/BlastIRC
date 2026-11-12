@@ -8938,11 +8938,13 @@ void wordPredictionBindingsCheck() {
     model.settings.spellcheckLanguage = "en_US";
     model.buffers.at(edgeBuffers[0]).draft = "accommodatio";
     Clipboard clipboard;
+    MenuHost menu;
     Theme theme;
     theme.update(model);
     InputDispatcher dispatcher;
     PangoRenderer renderer;
     Ui ui(model, clipboard);
+    ui.root().setPopupContext(&menu);
     dispatcher.setSceneRoot(&ui.root());
     ui.setInputDispatcher(dispatcher);
     ui.setWindowActive(true);
@@ -8983,6 +8985,18 @@ void wordPredictionBindingsCheck() {
     assert(composer->value() == "accommodatio" &&
            composer->textInputState().surroundingText == "accommodatio" &&
            composer->displayProjection() && composer->displayProjection()->text == "accommodatio");
+    hostKey(ui, dispatcher, XKB_KEY_Menu);
+    assert(menu.open && menu.callbacks.onDismiss && !ghost());
+    frame();
+    assert(!ghost() && composer->editingStateMatches(cold) && cold.history->undo == undo &&
+           cold.history->redo == redo);
+    auto dismiss = menu.callbacks.onDismiss;
+    menu.closeSelectDropdown();
+    dismiss();
+    frame();
+    awaitGhost();
+    assert(composer->editingStateMatches(cold) && cold.history->undo == undo &&
+           cold.history->redo == redo && model.buffers.at(edgeBuffers[0]).draft == "accommodatio");
     hostKey(ui, dispatcher, XKB_KEY_Tab);
     frame();
     assert(composer->value() == "accommodation" &&

@@ -270,7 +270,7 @@ std::string WordCompletion::complete(std::string_view before, std::string_view p
     auto general = prior.lower_bound(folded);
     auto local = state_->local.lower_bound(folded);
     std::string_view best;
-    double score = 0, runnerUp = 0, total = 0;
+    double score = 0;
     while ((general != prior.end() && general->first.starts_with(folded)) ||
            (local != state_->local.end() && local->first.starts_with(folded))) {
         const bool useGeneral = general != prior.end() && general->first.starts_with(folded) &&
@@ -279,20 +279,16 @@ std::string WordCompletion::complete(std::string_view before, std::string_view p
         const double value = count(&prior, word) + count(&state_->local, word) * localScale +
                              count(bigram, word) * bigramScale +
                              count(trigram, word) * trigramScale;
-        total += value;
         if (value > score) {
-            runnerUp = score;
             score = value;
             best = word;
-        } else {
-            runnerUp = std::max(runnerUp, value);
         }
         if (general != prior.end() && general->first == word)
             ++general;
         if (local != state_->local.end() && local->first == word)
             ++local;
     }
-    if (best.empty() || best == folded || score < total * 0.55 || score < runnerUp * 1.35)
+    if (best.empty() || best == folded)
         return {};
     bool uppercase = true;
     bool cased = false;

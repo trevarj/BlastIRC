@@ -38,7 +38,8 @@ int main() {
                   "accommodations\t500\naccommodation\t200\n"
                   "café\t300\nÉclair\t300\n𐐀word\t300\n"
                   "dupeword\t100\ndupeword\t600\nduperival\t150\n"
-                  "ambiguous\t300\nambiguity\t300\n"
+                  "ambiguous\t300\nambiguity\t310\n"
+                  "the\t200\nthat\t225\nthere\t250\nthen\t275\n"
                   "broken\tNaN\nnegative\t-1\noverbin\t1001\n"
                   "fraction\t100.5\nextra\t200\textra\nmissingbin\t\n"
                   "oldformat\nbad space\t200\n";
@@ -59,7 +60,9 @@ int main() {
     assert(completion.complete("", "accommodation").empty()); // Exact words are stop candidates.
     assert(completion.complete("", "dupe") == "dupeword");
     assert(completion.complete("", "dupew") == "dupeword");
-    assert(completion.complete("", "ambi").empty()); // No confident winner.
+    assert(completion.complete("", "t") == "the"); // Broad cold prefix: no majority required.
+    assert(completion.complete("", "the").empty());
+    assert(completion.complete("", "ambi") == "ambiguous"); // Close runner-up is not a veto.
     assert(completion.complete("", "caf") == "café");
     assert(completion.complete("", "CAF") == "CAFÉ");
     assert(completion.complete("", "Caf") == "Café");
@@ -109,15 +112,18 @@ int main() {
     local.setHistory(std::vector<std::string>{"review--remember"});
     assert(local.complete("", "rev") == "review");
     assert(local.complete("", "rem") == "remember");
-    local.setHistory(std::vector<std::string>{"can you--review", "please do remember"});
-    assert(local.complete("can you ", "re").empty());
-    local.setHistory(std::vector<std::string>{"can 'you' review", "please do remember"});
-    assert(local.complete("can you ", "re").empty());
+    local.setHistory(std::vector<std::string>{"remember remember remember", "can you--review"});
+    assert(local.complete("", "re") == "remember");
+    assert(local.complete("can you ", "re") == local.complete("", "re"));
+    local.setHistory(std::vector<std::string>{"remember remember remember", "can 'you' review"});
+    assert(local.complete("", "re") == "remember");
+    assert(local.complete("can you ", "re") == local.complete("", "re"));
     local.setHistory(contexts);
     assert(local.complete("can you ", "re") == "review");
     assert(local.complete("please do ", "re") == "remember");
-    assert(local.complete("", "re").empty());
-    assert(local.complete("", "r").empty()); // One letter still needs a confident winner.
+    const auto withoutContext = local.complete("", "re");
+    assert(withoutContext == "review" || withoutContext == "remember");
+    assert(local.complete("", "r") == withoutContext);
     local.setHistory(std::vector<std::string>{"review review review", "remember"});
     assert(local.complete("", "re") == "review");
     std::vector<std::string> recency(32, "remember");
@@ -129,10 +135,12 @@ int main() {
     std::reverse(recency.begin(), recency.end());
     local.setHistory(recency);
     assert(local.complete("", "re") == "remember");
-    local.setHistory(std::vector<std::string>{"can you. review", "please do remember"});
-    assert(local.complete("can you ", "re").empty()); // No sentence-crossing n-grams.
-    local.setHistory(std::vector<std::string>{"review", "can you", "please do remember"});
-    assert(local.complete("can you ", "re").empty()); // No message-crossing n-grams.
+    local.setHistory(std::vector<std::string>{"remember remember remember", "can you. review"});
+    assert(local.complete("", "re") == "remember");
+    assert(local.complete("can you ", "re") == local.complete("", "re")); // No sentence crossing.
+    local.setHistory(std::vector<std::string>{"remember remember remember", "can you", "review"});
+    assert(local.complete("", "re") == "remember");
+    assert(local.complete("can you ", "re") == local.complete("", "re")); // No message crossing.
     local.setHistory(std::vector<std::string>{"can you review", "please you remember"});
     assert(local.complete("can you ", "re") == "review"); // Trigram beats shared bigram.
     assert(local.complete("please you ", "re") == "remember");

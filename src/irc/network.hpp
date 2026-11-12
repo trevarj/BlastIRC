@@ -3,6 +3,15 @@
 #include <memory>
 
 namespace blast {
+enum class HistoryDirection { Latest, Before, After, Around, Targets };
+struct HistoryRequest {
+    string target{};
+    HistoryDirection direction = HistoryDirection::Latest;
+    HistoryCursor first{}, second{};
+    string requestId;
+    int limit = 50;
+    bool initial = false;
+};
 // All public methods are thread-safe. start/stop are idempotent; stop wakes DNS,
 // connect, TLS, reads and reconnect waits. poll transfers logical events in source
 // order across interleaved/nested multiline batches; control, sent and own ghosts are
@@ -40,6 +49,8 @@ namespace blast {
 // invite/account/chghost/setname/relaymsg/search/netsplit/netjoin/latency/raw;
 // command in tags[command]. ISUPPORT tags are a complete current snapshot,
 // including CASEMAPPING/CHANTYPES/PREFIX; absent tokens have been removed.
+// network kind=isupport-settled marks end of registration (376/422), including
+// servers retaining default ISUPPORT values; no absent tokens are fabricated.
 // CLIENTTAGDENY is delivered in ISUPPORT, not a fictitious reply/react capability.
 // Metadata: METADATA/761/766 use kind=metadata and target the literal target
 // (params[0] for METADATA, params[1] after the numeric's recipient for 761/766).
@@ -77,19 +88,27 @@ namespace blast {
 // read: text unprefixed RFC3339 marker, private to one logical IRC identity across
 // its connections; sharing an account alone need not attach different nicknames.
 // history_begin/end: target, label caller requestId, tags[initial]=1 for initial sync,
-// tags[batch], tags[direction]=latest/before/after/around/search, tags[limit] page size.
+// tags[batch], tags[direction]=latest/before/after/around/targets/search, tags[limit].
+// Begin unsolicited=1 identifies only an uncorrelated, unlabeled bare
+// chathistory/ZNC playback root; explicit unknown labels never receive this marker.
+// Internally derived history-owner identifies the page on begin/end and children;
+// a child's label independently retains its original message/send correlation.
+// Only genuine rootless ZNC playback gets internal history-standalone=1.
+// Neither internal marker accepts values from wire tags or nested context tags.
 // End tags[count] counts primary logical events, including event-playback
 // presence, not auxiliary draft/chathistory-context records. tags[cursor] is
 // the last primary event's MSGREFTYPES-supported msgid=/timestamp= selector.
+// Mutation protocol bounds use the mutation's wire msgid, never its target Event.id;
+// without that msgid, reaction/redaction bounds retain time only.
 // End carries tags[error] on rejection/timeout/disconnect; tags[rejected]=1 means
 // no protocol retry (admission/unsupported/disconnect). Deliberately canceled
 // pending initial requests also carry tags[cancelled]=1, with no generic error.
 // Historical NICK/QUIT use their batch conversation target, never mutate membership.
 // Events without server time deliberately do not invent historical timestamps.
-// history(target,before,requestId,initial) accepts opaque msgids, msgid= or timestamp= selectors;
-// bare ids are never interpreted as dates. An after= prefix requests gap-fill
-// AFTER. Outgoing times keep milliseconds. Callers with cached rows resolve ids
-// to their original server time when MSGREFTYPES permits only timestamps.
+// history accepts typed selectors: opaque case-sensitive ids with original server
+// time as fallback. TARGETS uses first.time=upper and second.time=lower.
+// history_target carries validated target/time records; end retains response-order
+// oldest/newest-id/time, opening-root end=1 and selected ref-type.
 // Public enqueue throws synchronously when stopped/reconnecting or its submission
 // queue is full; no request was admitted and no history_end follows that exception.
 // command accepts raw IRC (optional leading slash) plus /me, /msg, /query,
@@ -132,10 +151,7 @@ class NetworkClient {
     void command(const string &line, const string &submission = "", const string &commandId = "");
     void sojuMutation(const string &command, const string &id,
                       const std::map<string, string> &attributes);
-    void history(const string &target, const string &before, const string &requestId, bool initial);
-    // AROUND uses the first server-supported selector available from msgid and serverTime.
-    void historyAround(const string &target, const string &msgid, const string &serverTime,
-                       const string &requestId);
+    void history(const HistoryRequest &request);
     void search(const string &target, const string &query, const string &requestId);
     // First target is viewed; foreground work follows, then remaining ordered initial targets.
     // Only pending work is reprioritized or canceled; sent requests always complete.

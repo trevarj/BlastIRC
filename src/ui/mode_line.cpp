@@ -4,9 +4,12 @@
 #include "logic.hpp"
 #include <algorithm>
 #include <array>
+#include <core/input/key_symbols.h>
+#include <render/scene/input_area.h>
 #include <string>
 #include <ui/controls/glyph.h>
 #include <ui/controls/label.h>
+#include <utility>
 #include <vector>
 
 namespace blast {
@@ -30,6 +33,7 @@ struct ModeLine::Impl {
         float width = 0;
     };
     struct Unread {
+        InputArea *area;
         Label *label;
         std::string id, marker, name, target, caseMapping;
         size_t size = 0;
@@ -39,6 +43,7 @@ struct ModeLine::Impl {
         float width = 0;
     };
     Model &model;
+    std::function<void(std::string)> execute;
     std::array<Group, 6> groups;
     std::vector<Unread> unread;
     size_t unreadCount = 0;
@@ -48,7 +53,8 @@ struct ModeLine::Impl {
     float scale = 1;
     bool error = false;
 
-    Impl(Node &owner, Model &model) : model(model) {
+    Impl(Node &owner, Model &model, std::function<void(std::string)> execute)
+        : model(model), execute(std::move(execute)) {
         constexpr std::array icons{"user",        "server",   "plug-connected-x",
                                    "info-circle", "keyboard", "history"};
         for (size_t i = 0; i < groups.size(); ++i) {
@@ -66,7 +72,8 @@ struct ModeLine::Impl {
     }
 };
 
-ModeLine::ModeLine(Model &model) : impl_(std::make_unique<Impl>(*this, model)) {
+ModeLine::ModeLine(Model &model, std::function<void(std::string)> execute)
+    : impl_(std::make_unique<Impl>(*this, model, std::move(execute))) {
     setClipChildren(true);
     setPaintContained(true);
     sync(1, SidebarMode::Expanded);
@@ -165,7 +172,24 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
             if (channel.kind != "channel" || channel.archived || channel.unread <= 0)
                 continue;
             if (p.unreadCount == p.unread.size()) {
-                auto *label = child<Label>(*this);
+                const auto slot = p.unread.size();
+                auto *area = child<InputArea>(*this);
+                area->setFocusable(true);
+                area->setRetainsFocusOnPointerRelease(true);
+                area->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));
+                area->setClipChildren(true);
+                auto activate = [impl = impl_.get(), slot] {
+                    const auto &entry = impl->unread[slot];
+                    if (slot < impl->unreadCount && entry.area->visible() && entry.width > 0 &&
+                        impl->model.buffers.contains(entry.id))
+                        impl->execute("buffer:" + entry.id);
+                };
+                area->setOnClick([activate](const InputArea::PointerData &) { activate(); });
+                area->setOnKeyDown([activate](const InputArea::KeyData &key) {
+                    if (key.pressed && KeySymbol::isEnterOrSpace(key.sym))
+                        activate();
+                });
+                auto *label = child<Label>(*area);
                 label->setHitTestVisible(false);
                 label->setUseMarkup(false);
                 label->setMaxLines(1);
@@ -173,6 +197,7 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                 label->setBaselineMode(LabelBaselineMode::TextFixedHeight);
                 auto &entry = p.unread.emplace_back();
                 entry.label = label;
+                entry.area = area;
             }
             auto &entry = p.unread[p.unreadCount++];
             const std::string_view name = serverDisplayName(model, channel.server);
@@ -194,12 +219,14 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                     caption += '@';
                 caption.append(name).append("/").append(channel.target).append(": ");
                 caption += std::to_string(channel.unread);
-                text(*entry.label, caption);
+                if (entry.label->setText(caption))
+                    entry.area->setTooltip(caption);
                 entry.name = name;
                 entry.target = channel.target;
             }
             if (changed) {
                 entry.id = id;
+                entry.area->setTabFocusKey("buffer:" + id);
                 entry.count = channel.unread;
                 entry.marker = channel.readMarker;
                 entry.size = channel.messages.size();
@@ -218,7 +245,7 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
         }
     }
     for (size_t i = p.unreadCount; i < p.unread.size(); ++i) {
-        p.unread[i].label->setVisible(false);
+        p.unread[i].area->setVisible(false);
         p.unread[i].width = 0;
     }
     if (previousUnreadCount != p.unreadCount)
@@ -262,6 +289,7 @@ void ModeLine::doLayout(Renderer &renderer) {
         entry.width = 0;
         const float gap = 8 * p.scale;
         const bool visible = remaining >= gap + 24 * p.scale;
+        entry.area->setVisible(visible);
         entry.label->setVisible(visible);
         if (!visible)
             continue;
@@ -283,7 +311,9 @@ void ModeLine::doLayout(Renderer &renderer) {
         auto &entry = p.unread[i];
         if (!entry.width)
             continue;
-        entry.label->setPosition(x + 4 * p.scale, (height() - entry.label->height()) / 2);
+        entry.area->setPosition(x, 0);
+        entry.area->setSize(entry.width, height());
+        entry.label->setPosition(4 * p.scale, (height() - entry.label->height()) / 2);
         x += entry.width;
     }
 }

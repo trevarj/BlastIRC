@@ -144,6 +144,49 @@ struct RenameDrainPeer {
 };
 } // namespace
 struct ApplicationRegression {
+    static void completeOwnedHistory(Application &app, Buffer &room, Event event,
+                                     const string &owner) {
+        event.tags["history-owner"] = owner;
+        Application::HistoryPage page;
+        page.server = room.server;
+        page.buffer = room.id;
+        page.session = app.model.networks[room.server].sessionGeneration;
+        page.request.target = room.target;
+        page.request.requestId = owner;
+        page.request.direction = HistoryDirection::Around;
+        app.historyPages_[owner] = std::move(page);
+        app.activeHistory_[owner] = room.id;
+        const auto before = room.messages;
+        const auto timestamp = room.lastChatTimestamp;
+        const auto sequence = room.lastChatSequence;
+        const auto effects = app.model.effects.size();
+        app.reduce(event); // Submission labels remain independent of the enclosing page owner.
+        assert(room.messages.size() == before.size() && room.lastChatTimestamp == timestamp &&
+               room.lastChatSequence == sequence && app.model.effects.size() == effects);
+        for (size_t i = 0; i < before.size(); ++i)
+            assert(room.messages[i].id == before[i].id &&
+                   room.messages[i].label == before[i].label &&
+                   room.messages[i].timestamp == before[i].timestamp &&
+                   room.messages[i].pending == before[i].pending &&
+                   room.messages[i].sendStatus == before[i].sendStatus);
+        assert(app.historyPages_.at(owner).events.size() == 1);
+        Event end;
+        end.type = "history_end";
+        end.server = room.server;
+        end.target = room.target;
+        end.label = owner;
+        end.tags = {
+            {"history-owner", owner},   {"direction", "around"}, {"count", "1"},
+            {"oldest-id", event.id},    {"newest-id", event.id}, {"oldest-time", event.time},
+            {"newest-time", event.time}};
+        const bool savingAllowed = app.savingAllowed_;
+        app.savingAllowed_ = true;
+        app.storage_.prune(app.model.settings);
+        app.reduce(end);
+        app.savingAllowed_ = savingAllowed;
+        assert(!app.historyPages_.contains(owner));
+    }
+
     static void repeatSearch() {
         Application app;
         app.model = Model{};
@@ -259,7 +302,6 @@ struct ApplicationRegression {
     static void correlatedSearchHistory() {
         Application app;
         app.model = Model{};
-        app.savingAllowed_ = false;
         app.model.settings.retentionDays = 0;
         auto &source = app.buffer("search-history", "#source");
         source.draft = "pending draft";
@@ -301,6 +343,14 @@ struct ApplicationRegression {
                 row,           app.model.networks[source.server].sessionGeneration,
                 app.model.now, 0};
             app.activeHistory_[label] = source.id;
+            Application::HistoryPage page;
+            page.server = source.server;
+            page.buffer = source.id;
+            page.session = app.model.networks[source.server].sessionGeneration;
+            page.request.target = source.target;
+            page.request.direction = HistoryDirection::Around;
+            page.request.requestId = label;
+            app.historyPages_[label] = std::move(page);
             source.loading = true;
         };
         Event end;
@@ -337,9 +387,11 @@ struct ApplicationRegression {
         original.time = row.time;
         original.history = true;
         app.reduce(original);
-        assert(app.searchJump_ && app.searchJump_->matches == 1 &&
+        assert(app.searchJump_ && app.searchJump_->matches == 0 &&
                app.model.pendingSourceJump.revision == initialRevision);
         end.label = "successful";
+        end.tags["oldest-id"] = end.tags["newest-id"] = original.id;
+        end.tags["oldest-time"] = end.tags["newest-time"] = original.time;
         app.reduce(end);
         assert(!app.searchJump_ && !source.loading &&
                app.model.pendingSourceJump.revision == initialRevision + 1 &&
@@ -952,6 +1004,8 @@ struct ApplicationRegression {
         assert(app.model.buffers.at(target).topic.empty());
         assert(app.model.buffers.at(target).messages.size() == targetMessages);
 
+        const auto unsolicitedState = app.model.buffers.at(target).historyState;
+        app.savingAllowed_ = true; // Completed unsolicited pages use the real writer too.
         peer.send(":server 332 Me #target :current live topic");
         peer.send(":server BATCH +topic-history chathistory #target");
         peer.send("@batch=topic-history :Alice!user@host TOPIC #target :historic topic change");
@@ -959,8 +1013,21 @@ struct ApplicationRegression {
         peer.send("@batch=topic-history :Bob!user@host PRIVMSG #target "
                   ":Alice changed the topic: arbitrary historical chat");
         peer.send("@batch=topic-history :server 331 Me #target :No historic topic");
+        drain();
+        assert(app.model.buffers.at(target).messages.size() == targetMessages);
+        assert(!contains(target, "arbitrary historical chat"));
         peer.send(":server BATCH -topic-history");
         drain();
+        const auto &afterUnsolicited = app.model.buffers.at(target).historyState;
+        assert(afterUnsolicited.oldest == unsolicitedState.oldest &&
+               afterUnsolicited.newest == unsolicitedState.newest &&
+               afterUnsolicited.beginning == unsolicitedState.beginning &&
+               afterUnsolicited.gaps.size() == unsolicitedState.gaps.size());
+        for (size_t i = 0; i < unsolicitedState.gaps.size(); ++i)
+            assert(afterUnsolicited.gaps[i].id == unsolicitedState.gaps[i].id &&
+                   afterUnsolicited.gaps[i].older == unsolicitedState.gaps[i].older &&
+                   afterUnsolicited.gaps[i].newer == unsolicitedState.gaps[i].newer &&
+                   afterUnsolicited.gaps[i].unavailable == unsolicitedState.gaps[i].unavailable);
         assert(app.model.buffers.at(target).topic == "current live topic");
         assert(!contains(target, "historic topic change"));
         assert(app.model.buffers.at(target).messages.size() == targetMessages + 1);
@@ -981,6 +1048,18 @@ struct ApplicationRegression {
             return message.id == storedTopic.id && message.text == storedTopic.text &&
                    message.presence && message.history;
         }));
+        Event unowned;
+        unowned.type = "message";
+        unowned.server = server.name;
+        unowned.target = "#target";
+        unowned.label = "arbitrary-unowned-history";
+        unowned.id = "must-not-adopt-explicit-label";
+        unowned.text = "unknown labeled history must not materialize";
+        unowned.history = true;
+        app.reduce(unowned);
+        assert(!contains(target, unowned.text) &&
+               !app.storage_.message(target, unowned.id).has_value());
+        app.savingAllowed_ = false;
 
         command = submit(origin, "/names #target");
         reply(command.first, ":server 353 Me = #target :Alice Bob");
@@ -1598,15 +1677,36 @@ struct ApplicationRegression {
         history.id = "unmatched-history-status";
         history.label.clear();
         history.timestamp = 1770000001;
-        app.reduce(history);
+        history.time = "2026-02-02T02:40:01.000Z";
+        completeOwnedHistory(app, room, history, "history-owner-unmatched");
         assert(room.messages.size() == 3 && room.messages[1].id == historyLocalId &&
                room.messages[1].sendStatus == SendStatus::Queued &&
                room.messages.back().sendStatus == SendStatus::Confirmed);
         history.id = "matched-history-status";
         history.label = admission.label;
-        app.reduce(history);
+        completeOwnedHistory(app, room, history, "history-owner-matched");
         assert(room.messages.size() == 3 && room.messages[1].id == history.id &&
                room.messages[1].sendStatus == SendStatus::Confirmed);
+        const auto assertReopenedOwnHistoryOrder = [&](const vector<string> &expected) {
+            Storage reopened;
+            const auto durable = reopened.history(room.id, -1);
+            assertHistoryIds(durable, expected);
+            assert(!reopened.message(room.id, "status-canonical"));
+            assert(room.messages.size() == expected.size() + 1);
+            for (size_t i = 0; i < expected.size(); ++i) {
+                const auto &native = room.messages[i + 1];
+                const auto &stored = durable[i];
+                assert(native.id == expected[i] && stored.id == native.id &&
+                       stored.time == native.time && stored.timestamp == native.timestamp &&
+                       stored.orderingTimestamp == native.orderingTimestamp &&
+                       stored.label == native.label && stored.text == native.text &&
+                       stored.storageSequence == native.storageSequence &&
+                       stored.historyOrder == native.historyOrder &&
+                       stored.sendStatus == SendStatus::Confirmed &&
+                       native.sendStatus == SendStatus::Confirmed && stored.own && native.own);
+            }
+        };
+        assertReopenedOwnHistoryOrder({"matched-history-status", "unmatched-history-status"});
         sent.label = admission.label;
         app.reduce(sent);
         assert(room.messages[1].sendStatus == SendStatus::Confirmed);
@@ -1614,10 +1714,25 @@ struct ApplicationRegression {
         app.reduce(admission);
         history.id = room.messages.back().id;
         history.label = "history-request-label";
-        app.reduce(history);
+        completeOwnedHistory(app, room, history, "history-owner-exact-id");
         assert(room.messages.size() == 4 && room.messages.back().id == history.id &&
                room.messages.back().label == admission.label &&
                room.messages.back().sendStatus == SendStatus::Confirmed);
+        assertReopenedOwnHistoryOrder(
+            {"matched-history-status", "unmatched-history-status", history.id});
+        // A stale explicit owner must not fall back to a child's valid send label.
+        admission.label = "still-queued-after-stale-owner";
+        app.reduce(admission);
+        const string stalePendingId = room.messages.back().id;
+        const auto staleCount = room.messages.size();
+        Event stale = history;
+        stale.label = admission.label;
+        stale.id = "stale-history-must-not-confirm";
+        stale.tags["history-owner"] = "retired-history-owner";
+        app.reduce(stale);
+        assert(room.messages.size() == staleCount && room.messages.back().id == stalePendingId &&
+               room.messages.back().sendStatus == SendStatus::Queued &&
+               !app.storage_.message(room.id, stale.id));
 
         admission.label = "failed-status-label";
         admission.text = "failed submission";
@@ -2515,7 +2630,7 @@ struct ApplicationRegression {
         echo.label = pending.label;
         echo.history = true;
         echo.timestamp = 1700000200;
-        app.reduce(echo);
+        completeOwnedHistory(app, historyEchoRoom, echo, "chat-activity-history-confirmation");
         assert(historyEchoRoom.lastChatTimestamp == pending.timestamp &&
                historyEchoRoom.messages.back().timestamp == echo.timestamp);
         app.renameBuffer(historyEchoRoom.id, "#history-own-renamed");
@@ -2540,7 +2655,7 @@ struct ApplicationRegression {
         echo.label = historicalOwn.label;
         echo.history = true;
         echo.timestamp = 1700000400;
-        app.reduce(echo);
+        completeOwnedHistory(app, pureHistory, echo, "chat-activity-historical-own-replay");
         app.renameBuffer(pureHistory.id, "#pure-own-history-renamed");
         assert(app.buffer("chat-order", "#pure-own-history-renamed").lastChatTimestamp == 0);
 
@@ -3643,16 +3758,1370 @@ struct ApplicationRegression {
         app.storage_.load(disconnectedReload);
         assert(disconnectedReload.buffers.at(room.id).readMarker == room.readMarker);
     }
-    static void initialHistory() {
+    static void historyReadyWithoutIsupport() {
+        for (const int numeric : {376, 422}) {
+            RenameDrainPeer peer;
+            Application app;
+            app.model = Model{};
+            app.savingAllowed_ = false;
+            Identity identity;
+            identity.nick = "Me";
+            ServerConfig config;
+            config.name = "history-defaults-" + std::to_string(numeric);
+            config.host = "127.0.0.1";
+            config.port = peer.port;
+            config.tls = false;
+            app.model.servers = {config};
+            app.clients_[config.name] = std::make_unique<NetworkClient>(config, identity);
+            auto &client = *app.clients_.at(config.name);
+            client.start();
+            peer.accept();
+            peer.expect("CAP", {"LS", "302"});
+            peer.send(":server CAP * LS :batch draft/chathistory");
+            peer.expect("NICK", {identity.nick});
+            peer.expect("USER", {identity.username, "0", "*", identity.realname});
+            peer.expect("CAP", {"REQ", "batch draft/chathistory"});
+            peer.send(":server CAP Me ACK :batch draft/chathistory");
+            peer.expect("CAP", {"END"});
+            peer.send(":server 001 Me :Welcome");
+            peer.fence();
+            for (const auto &event : client.poll())
+                app.reduce(event);
+            app.scheduleHistory();
+            assert(app.historyPages_.empty()); // CAP/001 is not settled ISUPPORT.
+            // Real MOTD completion, deliberately no 005 or invented ISUPPORT.
+            peer.send(":server " + std::to_string(numeric) + " Me :MOTD settled");
+            bool fabricatedChannelTypes = false, settled = false;
+            const auto wait = [&](const auto &predicate) {
+                const auto deadline = RenameDrainPeer::Clock::now() + std::chrono::seconds(5);
+                do {
+                    for (const auto &event : client.poll()) {
+                        if (event.type == "network" && event.tags.contains("kind")) {
+                            fabricatedChannelTypes |= event.tags.at("kind") == "isupport" &&
+                                                      event.tags.contains("CHANTYPES");
+                            settled |= event.tags.at("kind") == "isupport-settled";
+                        }
+                        app.reduce(event);
+                    }
+                    app.scheduleHistory();
+                    if (predicate())
+                        return;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                } while (RenameDrainPeer::Clock::now() < deadline);
+                throw std::runtime_error("History readiness without ISUPPORT timed out");
+            };
+            wait([&] { return !app.historyPages_.empty(); });
+            assert(settled && !fabricatedChannelTypes);
+            const auto request = peer.read();
+            assert(request.command == "CHATHISTORY" && request.params.size() == 4 &&
+                   request.params[0] == "TARGETS");
+            peer.send("@draft/chathistory-end :server BATCH +defaults draft/chathistory-targets");
+            peer.send("@batch=defaults :server CHATHISTORY TARGETS #unknown "
+                      "2026-11-01T00:00:00.000Z");
+            peer.send(":server BATCH -defaults");
+            wait([&] { return app.historySessions_.at(config.name).planned; });
+            assert(
+                std::none_of(app.model.buffers.begin(), app.model.buffers.end(),
+                             [](const auto &entry) { return entry.second.target == "#unknown"; }));
+        }
+    }
+    static void zncReconnectPlaybackCursor() {
         RenameDrainPeer peer;
         Application app;
         app.model = Model{};
         app.savingAllowed_ = false;
+        Identity identity;
+        identity.nick = "Me";
+        ServerConfig config;
+        config.name = "znc-reconnect-cursor";
+        config.host = "127.0.0.1";
+        config.port = peer.port;
+        config.tls = false;
+        config.bouncer = "znc";
+        app.model.servers = {config};
+        auto &room = app.buffer(config.name, "Peer", "query");
+        Message anchor;
+        anchor.id = "opaque-playback-anchor";
+        anchor.time = "2026-11-01T00:00:00.125Z";
+        room.messages.push_back(anchor);
+        room.historyState.newest = {"protocol-anchor", "2026-11-01T00:00:00.124Z"};
+        Message ignored = anchor;
+        ignored.time = "2027-11-01T00:00:00.000Z";
+        ignored.id = "pending-future";
+        ignored.pending = true;
+        room.messages.push_back(ignored);
+        ignored.pending = false;
+        ignored.id = "local:future";
+        room.messages.push_back(ignored);
+        ignored.id = "local-future";
+        room.messages.push_back(ignored);
+        ignored.id = "invalid-time";
+        ignored.time = "not-a-timestamp";
+        room.messages.push_back(ignored);
+        ignored.id = "older-server-row";
+        ignored.time = "2026-10-31T00:00:00.000Z";
+        room.messages.push_back(ignored); // Never use vector order as a time highwater.
+        app.clients_[config.name] = std::make_unique<NetworkClient>(config, identity);
+        auto &client = *app.clients_.at(config.name);
+        client.start();
+        peer.accept();
+        peer.expect("CAP", {"LS", "302"});
+        peer.send(":server CAP * LS :batch znc.in/playback");
+        peer.expect("NICK", {identity.nick});
+        peer.expect("USER", {identity.username, "0", "*", identity.realname});
+        peer.expect("CAP", {"REQ", "batch znc.in/playback"});
+        peer.send(":server CAP Me ACK :batch znc.in/playback");
+        peer.expect("CAP", {"END"});
+        peer.send(":server 001 Me :Welcome");
+        peer.send(":server 376 Me :End of MOTD");
+        const auto deadline = RenameDrainPeer::Clock::now() + std::chrono::seconds(5);
+        do {
+            for (const auto &event : client.poll())
+                app.reduce(event);
+            app.requestHistory(room, "", true);
+            app.scheduleHistory();
+            if (!app.historyPages_.empty())
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (RenameDrainPeer::Clock::now() < deadline);
+        assert(!app.historyPages_.empty() && app.historySessions_.empty());
+        peer.expect("ZNC", {"*playback", "PLAY Peer 1793491200.125"});
+        assert(app.historyPages_.begin()->second.request.direction == HistoryDirection::After);
+        assert(app.historyPages_.begin()->second.request.first.id.empty() &&
+               app.historyPages_.begin()->second.request.first.time == anchor.time);
+        app.cancelHistory(room);
+        peer.send(":server BATCH +retired-playback znc.in/playback Peer");
+        peer.send(":server BATCH -retired-playback");
+        peer.fence(); // Cancellation does not steal an existing unlabeled holder.
+        auto &empty = app.buffer(config.name, "NoCache", "query");
+        ignored.id = "local:no-trusted-cache";
+        ignored.time = "2027-11-01T00:00:00.000Z";
+        empty.messages.push_back(ignored);
+        ignored.id = "pending-no-trusted-cache";
+        ignored.pending = true;
+        empty.messages.push_back(ignored);
+        app.requestHistory(empty, "", true);
+        app.scheduleHistory();
+        peer.expect("ZNC", {"*playback", "PLAY NoCache 0"});
+        assert(app.historyPages_.size() == 1 &&
+               app.historyPages_.begin()->second.request.direction == HistoryDirection::Latest &&
+               app.historyPages_.begin()->second.request.first.time.empty() &&
+               app.historyPages_.begin()->second.request.first.id.empty());
+    }
+    static void historyRenameContinuity() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        const string server = "history-rename";
+        auto &source = app.buffer(server, "#old");
+        auto &destination = app.buffer(server, "#new");
+        const string oldId = source.id, newId = destination.id;
+        const auto island = [&](Buffer &b, const string &prefix, const string &day) {
+            for (int i = 0; i < 2; ++i) {
+                Message message;
+                message.id = prefix + std::to_string(i);
+                message.time = "2026-11-" + day + "T0" + std::to_string(i) + ":00:00.000Z";
+                message.text = "retained island endpoint";
+                app.storage_.append(b.id, message);
+                b.messages.push_back(*app.storage_.message(b.id, message.id));
+                ++app.messageCount_;
+            }
+            b.historyState.oldest = {b.messages.front().id, b.messages.front().time};
+            b.historyState.newest = {b.messages.back().id, b.messages.back().time};
+            HistoryGap gap;
+            gap.older = b.historyState.oldest;
+            gap.newer = b.historyState.newest;
+            b.historyState.gaps.push_back(gap);
+            app.storage_.saveHistoryState(b);
+        };
+        island(source, "source-", "01");
+        island(destination, "destination-", "03");
+        const auto sourceGap = source.historyState.gaps.front();
+        const auto destinationGap = destination.historyState.gaps.front();
+        auto &session = app.historySessions_[server];
+        session.visible = {oldId};
+        session.background = {oldId};
+        session.seeds = {oldId};
+        session.refused.insert(oldId);
+        Application::HistoryPage retry;
+        retry.server = server;
+        retry.buffer = oldId;
+        retry.request.target = "#old";
+        session.retries.push_back(retry);
+        app.renameBuffer(oldId, "#new");
+        assert(!app.model.buffers.contains(oldId));
+        assert(session.visible.front() == newId && session.background.front() == newId &&
+               session.seeds.front() == newId && session.refused.contains(newId) &&
+               !session.refused.contains(oldId));
+        assert(session.retries.front().buffer == newId &&
+               session.retries.front().request.target == "#new");
+        auto &merged = app.model.buffers.at(newId);
+        assert(merged.historyState.oldest.id == "source-0" &&
+               merged.historyState.newest.id == "destination-1" &&
+               merged.historyState.gaps.size() == 3);
+        assert(std::any_of(
+            merged.historyState.gaps.begin(), merged.historyState.gaps.end(), [](const auto &gap) {
+                return gap.older.id == "source-1" && gap.older.time == "2026-11-01T01:00:00.000Z" &&
+                       gap.newer.id == "destination-0" &&
+                       gap.newer.time == "2026-11-03T00:00:00.000Z";
+            }));
+        for (const auto &original : {sourceGap, destinationGap})
+            assert(std::any_of(merged.historyState.gaps.begin(), merged.historyState.gaps.end(),
+                               [&](const auto &gap) {
+                                   return gap.id == original.id && gap.older == original.older &&
+                                          gap.newer == original.newer;
+                               }));
+        const auto expectedGaps = merged.historyState.gaps;
+        Buffer canonical = merged;
+        canonical.historyState = {};
+        app.storage_.loadHistoryState(canonical);
+        assert(canonical.historyState.oldest == merged.historyState.oldest &&
+               canonical.historyState.newest == merged.historyState.newest &&
+               canonical.historyState.gaps.size() == merged.historyState.gaps.size());
+        // A later overlapping page must not overwrite the destination's unioned gaps
+        // with the old source's pre-rename in-memory metadata.
+        Application::HistoryPage page;
+        page.server = server;
+        page.buffer = newId;
+        page.request.target = "#new";
+        page.request.direction = HistoryDirection::Latest;
+        Event overlap;
+        overlap.type = "message";
+        overlap.server = server;
+        overlap.target = "#new";
+        overlap.id = "destination-1";
+        overlap.time = "2026-11-03T01:00:00.000Z";
+        overlap.text = "retained island endpoint";
+        overlap.history = true;
+        page.events.push_back(overlap);
+        Event end;
+        end.tags = {{"direction", "latest"},       {"count", "1"},
+                    {"oldest-id", overlap.id},     {"newest-id", overlap.id},
+                    {"oldest-time", overlap.time}, {"newest-time", overlap.time}};
+        app.applyHistoryPage(page, end);
+        app.storage_.loadHistoryState(canonical);
+        assert(merged.historyState.gaps.size() == 3 && canonical.historyState.gaps.size() == 3);
+        for (const auto &gap : expectedGaps) {
+            assert(std::any_of(merged.historyState.gaps.begin(), merged.historyState.gaps.end(),
+                               [&](const auto &saved) {
+                                   return saved.id == gap.id && saved.older == gap.older &&
+                                          saved.newer == gap.newer;
+                               }));
+            assert(std::any_of(canonical.historyState.gaps.begin(),
+                               canonical.historyState.gaps.end(), [&](const auto &saved) {
+                                   return saved.id == gap.id && saved.older == gap.older &&
+                                          saved.newer == gap.newer;
+                               }));
+        }
+    }
+    static void historyMutationTargetsAreNotPageCoverage() {
+        for (const string kind : {"reaction", "redact"})
+            for (const bool context : {false, true}) {
+                Application app;
+                app.model = Model{};
+                app.model.settings.retentionDays = 0;
+                app.storage_.prune(app.model.settings);
+                auto &room = app.buffer("mutation-coverage-" + kind + (context ? "-context" : ""),
+                                        "Peer", "query");
+                Message prior;
+                prior.id = "protocol-old";
+                prior.nick = "Other";
+                prior.text = "original retained boundary";
+                prior.time = "2026-11-01T00:00:00.000Z";
+                prior.timestamp = 1793491200;
+                prior.history = true;
+                app.storage_.append(room.id, prior);
+                room.messages.push_back(*app.storage_.message(room.id, prior.id));
+                app.messageCount_ = 1;
+                room.historyState.oldest = room.historyState.newest = {prior.id, prior.time};
+                app.storage_.saveHistoryState(room);
+                Application::HistoryPage page;
+                page.server = room.server;
+                page.buffer = room.id;
+                page.request.target = room.target;
+                page.request.direction = HistoryDirection::Latest;
+                Event mutation;
+                mutation.type = kind;
+                mutation.server = room.server;
+                mutation.target = room.target;
+                mutation.nick = "Reactor";
+                mutation.id = prior.id; // Mutation target, not this wire event's identity.
+                mutation.tags["msgid"] = kind + "-wire-event";
+                mutation.time = "2026-11-02T00:00:00.000Z";
+                mutation.history = true;
+                mutation.text = kind == "reaction" ? "+1" : "removed";
+                if (context)
+                    mutation.tags["draft/chathistory-context"] = "1";
+                page.events.push_back(mutation);
+                Event newest;
+                newest.type = "message";
+                newest.server = room.server;
+                newest.target = room.target;
+                newest.nick = "Other";
+                newest.id = "new-primary";
+                newest.tags["msgid"] = newest.id;
+                newest.time = "2026-11-02T01:00:00.000Z";
+                newest.text = "new primary page";
+                newest.history = true;
+                page.events.push_back(newest);
+                const string expectedEdge = context ? newest.id : mutation.tags.at("msgid");
+                Event end;
+                end.tags = {{"direction", "latest"},
+                            {"count", context ? "1" : "2"},
+                            {"oldest-id", expectedEdge},
+                            {"oldest-time", context ? newest.time : mutation.time},
+                            {"newest-id", newest.id},
+                            {"newest-time", newest.time}};
+                app.applyHistoryPage(page, end);
+                assert(room.historyState.gaps.size() == 1);
+                const auto gap = room.historyState.gaps.front();
+                assert(gap.id > 0 && gap.older.id == prior.id && gap.older.time == prior.time &&
+                       gap.newer.id == expectedEdge);
+                const auto assertMutation = [&] {
+                    const auto durable = app.storage_.message(room.id, prior.id);
+                    const auto *loaded = sourceMessage(app.model, room.id, prior.id);
+                    assert(durable);
+                    if (kind == "redact") {
+                        assert(durable->deleted && durable->text.empty());
+                        const auto retained =
+                            std::find_if(room.messages.begin(), room.messages.end(),
+                                         [&](const auto &row) { return row.id == prior.id; });
+                        assert(retained != room.messages.end() && retained->deleted &&
+                               retained->text.empty() && !loaded);
+                    } else {
+                        assert(loaded && loaded->reactions.at("+1") == vector<string>{"Reactor"} &&
+                               durable->reactions.at("+1") == vector<string>{"Reactor"});
+                    }
+                };
+                assertMutation();
+                Buffer restored = room;
+                restored.historyState = {};
+                app.storage_.loadHistoryState(restored);
+                assert(restored.historyState.gaps.size() == 1 &&
+                       restored.historyState.gaps.front().id == gap.id);
+                // Actual replay of the old boundary row, unlike a mutation that
+                // merely targets it, can close the selected directional gap.
+                Application::HistoryPage fill;
+                fill.server = room.server;
+                fill.buffer = room.id;
+                fill.gapId = gap.id;
+                fill.request.target = room.target;
+                fill.request.direction = HistoryDirection::Before;
+                fill.request.first = gap.newer;
+                Event replay;
+                replay.type = "message";
+                replay.server = room.server;
+                replay.target = room.target;
+                replay.id = prior.id;
+                replay.tags["msgid"] = prior.id;
+                replay.nick = prior.nick;
+                replay.text = prior.text;
+                replay.time = prior.time;
+                replay.timestamp = prior.timestamp;
+                replay.history = true;
+                fill.events.push_back(replay);
+                end.tags = {{"direction", "before"},     {"count", "1"},
+                            {"oldest-id", prior.id},     {"newest-id", prior.id},
+                            {"oldest-time", prior.time}, {"newest-time", prior.time}};
+                app.applyHistoryPage(fill, end);
+                assert(room.historyState.gaps.empty());
+                app.storage_.loadHistoryState(restored);
+                assert(restored.historyState.gaps.empty());
+                assertMutation(); // Replaying history never undoes the mutation.
+            }
+    }
+    static void latestGapCanonicalPrimaryOverlap() {
+        for (const bool contextOnly : {false, true}) {
+            Application app;
+            app.model = Model{};
+            app.model.settings.retentionDays = 0;
+            app.storage_.prune(app.model.settings);
+            auto &room = app.buffer(contextOnly ? "latest-context-not-proof"
+                                                : "latest-timestamp-canonical-proof",
+                                    "Peer", "query");
+            Message prior;
+            prior.id = contextOnly ? "protocol-context" : "local:timestamp-protocol";
+            prior.nick = "Other";
+            prior.text = "original timestamp-only message";
+            prior.time = "2026-11-01T00:00:00.000Z";
+            prior.timestamp = 1793491200;
+            prior.history = true;
+            app.storage_.append(room.id, prior);
+            room.messages.push_back(*app.storage_.message(room.id, prior.id));
+            app.messageCount_ = 1;
+            room.historyState.oldest =
+                room.historyState.newest = {contextOnly ? prior.id : string{}, prior.time};
+            app.storage_.saveHistoryState(room);
+            Application::HistoryPage page;
+            page.server = room.server;
+            page.buffer = room.id;
+            page.request.target = room.target;
+            page.request.direction = HistoryDirection::Latest;
+            Event replay;
+            replay.type = "message";
+            replay.server = room.server;
+            replay.target = room.target;
+            replay.nick = prior.nick;
+            replay.text = prior.text;
+            replay.time = prior.time;
+            replay.timestamp = prior.timestamp;
+            replay.id = contextOnly ? prior.id : string{}; // No wire msgid on primary replay.
+            replay.history = true;
+            if (contextOnly)
+                replay.tags["draft/chathistory-context"] = "1";
+            page.events.push_back(replay);
+            Event primary = replay;
+            primary.id = "new-primary";
+            primary.text = "new primary page";
+            primary.time = "2026-11-02T00:00:00.000Z";
+            primary.timestamp = 1793577600;
+            primary.tags.clear();
+            page.events.push_back(primary);
+            Event end;
+            end.tags = {{"direction", "latest"},
+                        {"count", contextOnly ? "1" : "2"},
+                        {"oldest-id", contextOnly ? primary.id : string{}},
+                        {"oldest-time", contextOnly ? primary.time : prior.time},
+                        {"newest-id", primary.id},
+                        {"newest-time", primary.time}};
+            app.applyHistoryPage(page, end);
+            assert(room.messages.size() == 2 && app.storage_.history(room.id, -1).size() == 2);
+            assert(std::count_if(room.messages.begin(), room.messages.end(),
+                                 [&](const auto &row) { return row.id == prior.id; }) == 1);
+            Buffer restored = room;
+            restored.historyState = {};
+            app.storage_.loadHistoryState(restored);
+            assert(room.historyState.gaps.size() == (contextOnly ? 1u : 0u) &&
+                   restored.historyState.gaps.size() == room.historyState.gaps.size());
+            if (contextOnly) {
+                const auto &gap = room.historyState.gaps.front();
+                assert(gap.older.id == prior.id && gap.older.time == prior.time &&
+                       gap.newer.id == primary.id &&
+                       restored.historyState.gaps.front().id == gap.id);
+            }
+        }
+    }
+    static void latestGapUsesProtocolBoundary() {
+        for (const bool includesProtocolBoundary : {false, true}) {
+            Application app;
+            app.model = Model{};
+            app.model.settings.retentionDays = 0;
+            app.storage_.prune(app.model.settings);
+            auto &room = app.buffer(includesProtocolBoundary ? "latest-protocol-overlap"
+                                                             : "latest-protocol-gap",
+                                    "#room");
+            const auto retain = [&](const string &id, const string &time, bool presence) {
+                Message row;
+                row.id = id;
+                row.time = time;
+                row.text = presence ? "own JOIN" : "cached chat";
+                row.presence = row.own = presence;
+                app.storage_.append(room.id, row);
+                room.messages.push_back(*app.storage_.message(room.id, id));
+                ++app.messageCount_;
+            };
+            retain("protocol-join", "2026-11-01T00:00:00.000Z", true);
+            room.historyState.oldest =
+                room.historyState.newest = {"protocol-join", "2026-11-01T00:00:00.000Z"};
+            app.storage_.saveHistoryState(room);
+            retain("later-cached-chat", "2026-11-01T01:00:00.000Z", false);
+            retain("new-live-join", "2026-11-02T04:00:00.000Z", true);
+            Application::HistoryPage page;
+            page.server = room.server;
+            page.buffer = room.id;
+            page.request.target = room.target;
+            page.request.direction = HistoryDirection::Latest;
+            const auto primary = [&](const string &id, const string &time, bool join) {
+                Event row;
+                row.type = join ? "join" : "message";
+                row.server = room.server;
+                row.target = room.target;
+                row.nick = join ? "Me" : "Other";
+                row.id = id;
+                row.time = time;
+                row.text = join ? "" : "offline chat";
+                row.history = true;
+                row.own = join;
+                page.events.push_back(std::move(row));
+            };
+            if (includesProtocolBoundary)
+                primary("protocol-join", "2026-11-01T00:00:00.000Z", true);
+            primary("offline-chat", "2026-11-02T02:00:00.000Z", false);
+            primary("new-live-join", "2026-11-02T04:00:00.000Z", true);
+            Event end;
+            end.tags = {{"direction", "latest"},
+                        {"count", includesProtocolBoundary ? "3" : "2"},
+                        {"oldest-id", page.events.front().id},
+                        {"oldest-time", page.events.front().time},
+                        {"newest-id", "new-live-join"},
+                        {"newest-time", "2026-11-02T04:00:00.000Z"}};
+            app.applyHistoryPage(page, end);
+            Buffer restored = room;
+            restored.historyState = {};
+            app.storage_.loadHistoryState(restored);
+            assert(room.historyState.gaps.size() == (includesProtocolBoundary ? 0u : 1u) &&
+                   restored.historyState.gaps.size() == room.historyState.gaps.size());
+            if (!includesProtocolBoundary) {
+                const auto &gap = room.historyState.gaps.front();
+                assert(gap.id > 0 && gap.older.id == "protocol-join" &&
+                       gap.older.time == "2026-11-01T00:00:00.000Z" &&
+                       gap.newer.id == "offline-chat" &&
+                       restored.historyState.gaps.front().id == gap.id);
+            }
+        }
+    }
+    static void prunedHistoryCannotReproveEndpoints() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("pruned-history-proof", "Peer", "query");
+        Message old;
+        old.id = "pruned-but-visible";
+        old.time = "1970-01-02T00:00:00.000Z";
+        old.timestamp = 86400;
+        old.text = "retained in RAM after pruning";
+        app.storage_.append(room.id, old);
+        room.messages.push_back(*app.storage_.message(room.id, old.id));
+        assert(room.messages.front().storageSequence > 0);
+        const auto prunedSequence = room.messages.front().storageSequence;
+        app.messageCount_ = 1;
+        room.historyState.oldest = room.historyState.newest = {old.id, old.time};
+        room.historyState.beginning = true;
+        app.storage_.saveHistoryState(room);
+        auto retention = app.model.settings;
+        retention.retentionDays = 1;
+        app.storage_.prune(retention);
+        assert(!app.storage_.message(room.id, old.id));
+        app.storage_.loadHistoryState(room);
+        assert(room.messages.size() == 1 && room.historyState.oldest.id.empty() &&
+               room.historyState.newest.id.empty() && !room.historyState.beginning);
+        Application::HistoryPage page;
+        page.server = room.server;
+        page.buffer = room.id;
+        page.request.target = room.target;
+        page.request.direction = HistoryDirection::Latest;
+        Event end;
+        end.tags = {{"direction", "latest"}, {"count", "0"}, {"limit", "50"}};
+        app.applyHistoryPage(page, end);
+        Buffer restored = room;
+        restored.historyState = {};
+        app.storage_.loadHistoryState(restored);
+        for (const auto *state : {&room.historyState, &restored.historyState})
+            assert(state->oldest.id.empty() && state->oldest.time.empty() &&
+                   state->newest.id.empty() && state->newest.time.empty() && state->gaps.empty() &&
+                   !state->beginning);
+        app.storage_.prune(app.model.settings);
+        assert(!app.storage_.message(room.id, old.id)); // Empty pages cannot resurrect RAM.
+        Event returned;
+        returned.type = "message";
+        returned.server = room.server;
+        returned.target = room.target;
+        returned.id = old.id;
+        returned.nick = "Other";
+        returned.text = old.text;
+        returned.time = old.time;
+        returned.timestamp = old.timestamp;
+        returned.history = true;
+        completeOwnedHistory(app, room, returned, "pruned-row-owned-around");
+        const auto rematerialized = app.storage_.message(room.id, old.id);
+        assert(rematerialized && room.messages.size() == 1);
+        const auto &loaded = room.messages.front();
+        assert(loaded.id == old.id && rematerialized->id == old.id && loaded.time == old.time &&
+               rematerialized->time == old.time && loaded.timestamp == old.timestamp &&
+               rematerialized->timestamp == old.timestamp && loaded.text == old.text &&
+               rematerialized->text == old.text);
+        assert(loaded.storageSequence > 0 && loaded.storageSequence != prunedSequence &&
+               loaded.historyOrder >= 0 &&
+               loaded.storageSequence == rematerialized->storageSequence &&
+               loaded.historyOrder == rematerialized->historyOrder);
+    }
+    static void sparseAroundRollbackPreservesLoadedWindow() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("sparse-around-rollback", "Peer", "query");
+        for (int i = 0; i < 12; ++i) {
+            Message row;
+            row.id = "sparse-" + std::to_string(i);
+            row.text = "original text " + std::to_string(i);
+            row.time =
+                "2026-11-01T" + string(i < 10 ? "0" : "") + std::to_string(i) + ":00:00.000Z";
+            app.storage_.append(room.id, row);
+        }
+        const vector<string> originalIds{"sparse-1", "sparse-5", "sparse-9"};
+        for (const auto &id : originalIds) {
+            room.sourceMessageIndex[id] = room.messages.size();
+            room.messages.push_back(*app.storage_.message(room.id, id));
+        }
+        app.messageCount_ = room.messages.size();
+        app.model.activeBuffer = room.id;
+        app.model.pendingSourceJump = {77, room.id, "sparse-5"};
+        const auto anchor = app.model.pendingSourceJump;
+        sqlite3 *fault = nullptr;
+        const auto database =
+            std::filesystem::path(std::getenv("XDG_DATA_HOME")) / "blastirc/state.sqlite3";
+        assert(sqlite3_open(database.c_str(), &fault) == SQLITE_OK);
+        assert(sqlite3_exec(fault,
+                            "CREATE TRIGGER reject_sparse_around BEFORE INSERT ON messages "
+                            "WHEN NEW.id='sparse-failure' BEGIN "
+                            "SELECT RAISE(ABORT,'sparse around rejected'); END;",
+                            nullptr, nullptr, nullptr) == SQLITE_OK);
+        Application::HistoryPage page;
+        page.server = room.server;
+        page.buffer = room.id;
+        page.request.target = room.target;
+        page.request.direction = HistoryDirection::Around;
+        for (const auto &id : {"sparse-5", "sparse-new", "sparse-failure"}) {
+            Event row;
+            row.type = id == string("sparse-5") ? "reaction" : "message";
+            row.server = room.server;
+            row.target = room.target;
+            row.id = id;
+            row.nick = "Other";
+            row.text = id == string("sparse-5") ? "+1" : "page change must roll back";
+            row.time =
+                id == string("sparse-5") ? "2026-11-01T05:00:00.000Z" : "2026-11-01T06:00:00.000Z";
+            row.history = true;
+            page.events.push_back(std::move(row));
+        }
+        Event end;
+        end.tags = {{"direction", "around"},         {"count", "3"},
+                    {"oldest-id", "sparse-5"},       {"oldest-time", "2026-11-01T05:00:00.000Z"},
+                    {"newest-id", "sparse-failure"}, {"newest-time", "2026-11-01T06:00:00.000Z"}};
+        bool failed = false;
+        try {
+            app.applyHistoryPage(page, end);
+        } catch (const std::exception &) {
+            failed = true;
+        }
+        assert(failed && room.messages.size() == originalIds.size() &&
+               app.messageCount_ == originalIds.size());
+        for (size_t i = 0; i < originalIds.size(); ++i) {
+            assert(room.messages[i].id == originalIds[i]);
+            assert(room.messages[i].text == app.storage_.message(room.id, originalIds[i])->text);
+            assert(room.messages[i].reactions.empty() &&
+                   app.storage_.message(room.id, originalIds[i])->reactions.empty());
+            const auto *resolved = sourceMessage(app.model, room.id, originalIds[i]);
+            assert(resolved && resolved->id == originalIds[i]);
+        }
+        assert(app.model.activeBuffer == room.id &&
+               app.model.pendingSourceJump.revision == anchor.revision &&
+               app.model.pendingSourceJump.buffer == anchor.buffer &&
+               app.model.pendingSourceJump.message == anchor.message);
+        assert(!app.storage_.message(room.id, "sparse-new") &&
+               !app.storage_.message(room.id, "sparse-failure"));
+        assert(app.storage_.message(room.id, "sparse-5")->text == "original text 5");
+        assert(sqlite3_exec(fault, "DROP TRIGGER reject_sparse_around", nullptr, nullptr,
+                            nullptr) == SQLITE_OK);
+        sqlite3_close(fault);
+    }
+    static Event tiedHistoryRow(const Buffer &room, const string &id) {
+        Event row;
+        row.type = "message";
+        row.server = room.server;
+        row.target = room.target;
+        row.nick = "Other";
+        row.id = id;
+        row.tags["msgid"] = id;
+        row.text = "same-time wire row " + id;
+        row.time = "2026-11-01T00:00:00.123456789Z";
+        row.timestamp = 1793491200;
+        row.history = true;
+        return row;
+    }
+    template <class Rows>
+    static void assertHistoryIds(const Rows &rows, const vector<string> &expected) {
+        assert(rows.size() == expected.size());
+        for (size_t i = 0; i < expected.size(); ++i)
+            assert(rows[i].id == expected[i]);
+    }
+    static void completeTiedHistory(Application &app, Buffer &room, const vector<Event> &rows,
+                                    HistoryDirection direction, const string &owner,
+                                    HistoryCursor first = {}) {
+        Application::HistoryPage page;
+        page.server = room.server;
+        page.buffer = room.id;
+        page.session = app.model.networks[room.server].sessionGeneration;
+        page.request.target = room.target;
+        page.request.requestId = owner;
+        page.request.direction = direction;
+        page.request.first = std::move(first);
+        app.historyPages_[owner] = std::move(page);
+        app.activeHistory_[owner] = room.id;
+        vector<string> before;
+        map<string, std::pair<int64_t, int64_t>> identities;
+        for (const auto &row : room.messages) {
+            before.push_back(row.id);
+            identities.emplace(row.id, std::pair{row.storageSequence, row.historyOrder});
+        }
+        const auto count = app.messageCount_;
+        const auto oldest = room.historyState.oldest;
+        const auto newest = room.historyState.newest;
+        vector<string> primary;
+        for (auto row : rows) {
+            if (!row.tags.contains("draft/chathistory-context"))
+                primary.push_back(row.id);
+            row.tags["history-owner"] = owner;
+            app.reduce(row);
+            // Even a complete-looking stream is invisible until its owning end.
+            assertHistoryIds(room.messages, before);
+            assert(app.messageCount_ == count && room.historyState.oldest == oldest &&
+                   room.historyState.newest == newest);
+            for (const auto &loaded : room.messages) {
+                const auto durable = app.storage_.message(room.id, loaded.id);
+                const auto identity = identities.at(loaded.id);
+                assert(loaded.storageSequence == identity.first &&
+                       loaded.historyOrder == identity.second);
+                if (identity.first > 0)
+                    assert(durable && durable->storageSequence == identity.first &&
+                           durable->historyOrder == identity.second);
+                else
+                    assert(!durable);
+            }
+            for (const auto &incoming : rows)
+                if (!identities.contains(incoming.id))
+                    assert(!app.storage_.message(room.id, incoming.id));
+        }
+        assert(!primary.empty());
+        Event end;
+        end.type = "history_end";
+        end.server = room.server;
+        end.target = room.target;
+        end.label = owner;
+        end.tags = {{"history-owner", owner},
+                    {"direction", direction == HistoryDirection::Before   ? "before"
+                                  : direction == HistoryDirection::Around ? "around"
+                                                                          : "latest"},
+                    {"count", std::to_string(primary.size())},
+                    {"oldest-id", primary.front()},
+                    {"newest-id", primary.back()},
+                    {"oldest-time", rows.front().time},
+                    {"newest-time", rows.back().time}};
+        app.reduce(end);
+        assert(!app.historyPages_.contains(owner));
+    }
+    static void unknownTimeAroundPreservesNativeOrder() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("unknown-time-around-order", "#room");
+        auto first = tiedHistoryRow(room, "z-original");
+        auto last = tiedHistoryRow(room, "a-original");
+        first.time = last.time = "2026-11-01T00:00:00.000Z";
+        for (const auto &event : {first, last}) {
+            Message row;
+            row.id = event.id;
+            row.nick = event.nick;
+            row.text = event.text;
+            row.time = event.time;
+            row.timestamp = event.timestamp;
+            app.storage_.append(room.id, row);
+            app.insert(room, *app.storage_.message(room.id, row.id), false);
+        }
+        auto unknown = tiedHistoryRow(room, "m-unknown");
+        unknown.time.clear(); // Numeric receipt seconds are not a server-time tie proof.
+        completeTiedHistory(app, room, {unknown}, HistoryDirection::Around,
+                            "unknown-time-owned-around");
+        const vector<string> native{first.id, last.id, unknown.id};
+        assertHistoryIds(room.messages, native);
+        assertHistoryIds(app.storage_.history(room.id, -1), native);
+        const auto untimed = app.storage_.message(room.id, unknown.id);
+        assert(untimed && untimed->time.empty() && untimed->timestamp == unknown.timestamp);
+        // Receipt-time coincidence must not confirm an ordering that prevents a
+        // subsequent authoritative equal-server-time response from ordering its rows.
+        completeTiedHistory(app, room, {last, first}, HistoryDirection::Latest,
+                            "valid-time-after-unknown-around");
+        const vector<string> authoritative{last.id, first.id, unknown.id};
+        assertHistoryIds(room.messages, authoritative);
+        Storage reopened;
+        assertHistoryIds(reopened.history(room.id, -1), authoritative);
+        assert(reopened.message(room.id, unknown.id)->time.empty());
+    }
+    static void historyReconciliationPreservesUnrelatedGhostPositions() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("history-unrelated-ghost-order", "#room");
+        const vector<string> ghosts{"z-native-first", "a-native-second"};
+        const vector<int64_t> ranks{9, 3};
+        // Echo time correction can leave native positions intentionally different
+        // from rank order. These model-only rows are not part of this response.
+        for (size_t i = 0; i < ghosts.size(); ++i) {
+            Message ghost;
+            ghost.id = ghosts[i];
+            ghost.label = "queued-" + ghosts[i];
+            ghost.nick = "Me";
+            ghost.text = "untouched optimistic row";
+            ghost.time = "2026-10-31T00:00:00.123456789Z";
+            ghost.timestamp = ghost.orderingTimestamp = 1793404800;
+            ghost.historyOrder = ranks[i];
+            ghost.own = ghost.pending = true;
+            ghost.sendStatus = SendStatus::Queued;
+            room.messages.push_back(std::move(ghost));
+        }
+        app.messageCount_ = ghosts.size();
+        auto first = tiedHistoryRow(room, "q-target-first");
+        auto last = tiedHistoryRow(room, "b-target-last");
+        for (const auto &event : {first, last}) {
+            Message row;
+            row.id = event.id;
+            row.nick = event.nick;
+            row.text = event.text;
+            row.time = event.time;
+            row.timestamp = event.timestamp;
+            app.storage_.append(room.id, row);
+            app.insert(room, *app.storage_.message(room.id, row.id), false);
+        }
+        assertHistoryIds(room.messages, {ghosts[0], ghosts[1], first.id, last.id});
+        completeTiedHistory(app, room, {last, first}, HistoryDirection::Latest,
+                            "reconcile-only-returned-cohort");
+        assertHistoryIds(room.messages, {ghosts[0], ghosts[1], last.id, first.id});
+        assertHistoryIds(app.storage_.history(room.id, -1), {last.id, first.id});
+        for (size_t i = 0; i < ghosts.size(); ++i) {
+            const auto &row = room.messages[i];
+            assert(row.id == ghosts[i] && row.label == "queued-" + ghosts[i] && row.nick == "Me" &&
+                   row.text == "untouched optimistic row" &&
+                   row.time == "2026-10-31T00:00:00.123456789Z" && row.timestamp == 1793404800 &&
+                   row.orderingTimestamp == 1793404800 && row.historyOrder == ranks[i] &&
+                   row.storageSequence == 0 && row.own && row.pending && !row.history &&
+                   row.sendStatus == SendStatus::Queued);
+            assert(!app.storage_.message(room.id, ghosts[i]));
+        }
+    }
+    static void sameTimestampLatestThenOwnedBefore() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("same-time-native65", "#room");
+        // Explicit wire chronology (00..64), deliberately unrelated to ID/text ordering.
+        const vector<string> expected{
+            "rQ", "aV", "zD", "bK", "yH", "cP", "xB", "dN", "wF", "eT", "vJ", "fR", "uL",
+            "gX", "tC", "hZ", "sA", "iW", "Rj", "Ak", "Zl", "Bm", "Yn", "Co", "Xp", "Dq",
+            "Wr", "Es", "Vt", "Fu", "Uv", "Gw", "Tx", "Hy", "Sz", "I0", "q9", "J1", "p8",
+            "K2", "o7", "L3", "n6", "M4", "m5", "N5", "l4", "O6", "k3", "P7", "j2", "Q8",
+            "i1", "S9", "h0", "T0", "g9", "U1", "f8", "V2", "e7", "W3", "d6", "X4", "c5"};
+        vector<Event> latest, before;
+        for (size_t i = 0; i < expected.size(); ++i)
+            (i < 17 ? before : latest).push_back(tiedHistoryRow(room, expected[i]));
+        completeTiedHistory(app, room, latest, HistoryDirection::Latest, "same-time-latest");
+        const vector<string> tail(expected.begin() + 17, expected.end());
+        assertHistoryIds(room.messages, tail);
+        assertHistoryIds(app.storage_.history(room.id, -1), tail);
+        map<string, int64_t> originalSequences;
+        for (const auto &row : room.messages) {
+            assert(row.storageSequence > 0);
+            originalSequences.emplace(row.id, row.storageSequence);
+        }
+        completeTiedHistory(app, room, before, HistoryDirection::Before, "same-time-demand",
+                            {tail.front(), latest.front().time});
+        const auto assertRows = [&](const auto &rows) {
+            assertHistoryIds(rows, expected);
+            for (const auto &row : rows) {
+                assert(row.time == latest.front().time && row.timestamp == 1793491200);
+                if (originalSequences.contains(row.id))
+                    assert(row.storageSequence == originalSequences.at(row.id));
+            }
+        };
+        assertRows(room.messages);
+        assertRows(app.storage_.history(room.id, -1));
+        Storage reopened;
+        assertRows(reopened.history(room.id, -1));
+        // Ordinary local-first scrolling must use rank, not insertion seq, at this tie.
+        room.messages.clear();
+        room.sourceMessageIndex.clear();
+        app.messageCount_ = 0;
+        auto retainedTail = reopened.history(room.id, 48);
+        assertHistoryIds(retainedTail, tail);
+        for (auto &row : retainedTail)
+            app.insert(room, std::move(row), false);
+        app.action({"history", room.id, {}, {}});
+        assertRows(room.messages);
+        assert(app.historyPages_.empty() && app.messageCount_ == expected.size());
+        // Older-first local insertion is a separate comparator path: every prefix row
+        // has a later SQL identity, but an earlier durable tie rank than the cached tail.
+        room.messages.clear();
+        room.sourceMessageIndex.clear();
+        app.messageCount_ = 0;
+        auto prefix = reopened.history(room.id, -1, tail.front());
+        assertHistoryIds(prefix, vector<string>(expected.begin(), expected.begin() + 17));
+        for (auto &row : prefix)
+            app.insert(room, std::move(row), false);
+        retainedTail = reopened.history(room.id, 48);
+        for (auto &row : retainedTail)
+            app.insert(room, std::move(row), false);
+        assertRows(room.messages);
+        for (const auto &id : expected) {
+            const auto *resolved = sourceMessage(app.model, room.id, id);
+            assert(resolved && resolved->id == id);
+        }
+    }
+    static void sameTimestampCanonicalContextAndConfirmedOverlap() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("same-time-context-order", "#room");
+        auto last = tiedHistoryRow(room, "a-last");
+        auto first = tiedHistoryRow(room, "z-first");
+        auto own = tiedHistoryRow(room, "m-own-context");
+        own.nick = "Me";
+        own.own = true;
+        // Seed canonical existing rows in the opposite arrival order, unconfirmed
+        // as a page order; context and already-existing own rows still anchor it.
+        for (const auto &event : {last, own}) {
+            Message row;
+            row.id = event.id;
+            row.nick = event.nick;
+            row.text = event.text;
+            row.time = event.time;
+            row.timestamp = event.timestamp;
+            row.own = event.own;
+            app.storage_.append(room.id, row);
+            app.insert(room, *app.storage_.message(room.id, row.id), false);
+        }
+        const auto ownSeq = app.storage_.message(room.id, own.id)->storageSequence;
+        own.tags["draft/chathistory-context"] = "1";
+        completeTiedHistory(app, room, {first, own, last}, HistoryDirection::Latest,
+                            "canonical-context");
+        const vector<string> expected{first.id, own.id, last.id};
+        assertHistoryIds(room.messages, expected);
+        assertHistoryIds(app.storage_.history(room.id, -1), expected);
+        assert(app.storage_.message(room.id, own.id)->storageSequence == ownSeq);
+        // A contradictory overlapping response cannot reverse confirmed source order.
+        completeTiedHistory(app, room, {last, own, first}, HistoryDirection::Latest,
+                            "contradictory-confirmed-overlap");
+        assertHistoryIds(room.messages, expected);
+        Storage reopened;
+        assertHistoryIds(reopened.history(room.id, -1), expected);
+    }
+    static void materializedOwnHistoryKeepsConfirmedNativeNeighbors() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("materialized-own-native-neighbors", "#room");
+        app.model.networks[room.server].nick = "Me";
+        auto first = tiedHistoryRow(room, "z-confirmed-first");
+        auto last = tiedHistoryRow(room, "a-confirmed-last");
+        completeTiedHistory(app, room, {first, last}, HistoryDirection::Latest,
+                            "confirm-native-neighbors");
+        const auto firstSeq = room.messages.front().storageSequence;
+        const auto lastSeq = room.messages.back().storageSequence;
+        Message optimistic;
+        optimistic.id = "local:materialized-middle";
+        optimistic.label = "materialized-middle-label";
+        optimistic.nick = "Me";
+        optimistic.text = "own middle row";
+        optimistic.time = first.time;
+        optimistic.timestamp = optimistic.orderingTimestamp = first.timestamp;
+        optimistic.own = optimistic.pending = true;
+        optimistic.sendStatus = SendStatus::Queued;
+        room.messages.insert(room.messages.begin() + 1, std::move(optimistic));
+        room.sourceMessageIndex.clear();
+        ++app.messageCount_;
+        auto middle = tiedHistoryRow(room, "m-canonical-middle");
+        middle.nick = "Me";
+        middle.text = "own middle row";
+        middle.label = "materialized-middle-label";
+        middle.own = true;
+        completeTiedHistory(app, room, {middle}, HistoryDirection::Around,
+                            "materialize-between-confirmed-neighbors");
+        const vector<string> expected{first.id, middle.id, last.id};
+        assertHistoryIds(room.messages, expected);
+        Storage reopened;
+        assertHistoryIds(reopened.history(room.id, -1), expected);
+        assert(room.messages.front().storageSequence == firstSeq &&
+               room.messages.back().storageSequence == lastSeq &&
+               room.messages[1].storageSequence > 0 &&
+               room.messages[1].sendStatus == SendStatus::Confirmed &&
+               room.messages[1].label == middle.label);
+        completeTiedHistory(app, room, {last, middle, first}, HistoryDirection::Latest,
+                            "preserve-materialized-confirmed-source-order");
+        assertHistoryIds(room.messages, expected);
+        assertHistoryIds(reopened.history(room.id, -1), expected);
+    }
+    static void sameTimestampRankReconciliationRollback() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("same-time-rank-rollback", "#room");
+        auto middle = tiedHistoryRow(room, "q-middle");
+        auto last = tiedHistoryRow(room, "b-last");
+        completeTiedHistory(app, room, {middle, last}, HistoryDirection::Latest, "rank-seed");
+        const vector<string> original{middle.id, last.id};
+        map<string, std::pair<int64_t, int64_t>> identities;
+        for (const auto &row : room.messages)
+            identities.emplace(row.id, std::pair{row.storageSequence, row.historyOrder});
+        const auto state = room.historyState;
+        const auto count = app.messageCount_;
+        sqlite3 *fault = nullptr;
+        const auto database =
+            std::filesystem::path(std::getenv("XDG_DATA_HOME")) / "blastirc/state.sqlite3";
+        assert(sqlite3_open(database.c_str(), &fault) == SQLITE_OK);
+        assert(
+            sqlite3_exec(fault,
+                         "CREATE TRIGGER reject_reconciled_history BEFORE INSERT ON history_state "
+                         "WHEN NEW.buffer='same-time-rank-rollback/#room' "
+                         "AND EXISTS(SELECT 1 FROM messages WHERE buffer=NEW.buffer "
+                         "AND id='z-first' AND tie_order=0) "
+                         "AND EXISTS(SELECT 1 FROM messages WHERE buffer=NEW.buffer "
+                         "AND id='q-middle' AND tie_order=1) BEGIN "
+                         "SELECT RAISE(ABORT,'rank reconciliation rejected'); END;",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+        Application::HistoryPage page;
+        page.server = room.server;
+        page.buffer = room.id;
+        page.request.target = room.target;
+        page.request.direction = HistoryDirection::Before;
+        page.request.first = {middle.id, middle.time};
+        auto first = tiedHistoryRow(room, "z-first");
+        page.events = {first};
+        Event end;
+        end.tags = {{"direction", "before"},     {"count", "1"},
+                    {"oldest-id", first.id},     {"newest-id", first.id},
+                    {"oldest-time", first.time}, {"newest-time", first.time}};
+        bool failed = false;
+        try {
+            app.applyHistoryPage(page, end);
+        } catch (const std::exception &error) {
+            failed = string(error.what()).find("rank reconciliation rejected") != string::npos;
+        }
+        assert(failed && app.messageCount_ == count);
+        const auto assertRestored = [&](const auto &rows) {
+            assertHistoryIds(rows, original);
+            for (const auto &row : rows) {
+                const auto identity = identities.at(row.id);
+                assert(row.storageSequence == identity.first &&
+                       row.historyOrder == identity.second && row.time == middle.time &&
+                       row.timestamp == middle.timestamp);
+            }
+        };
+        assertRestored(room.messages);
+        assertRestored(app.storage_.history(room.id, -1));
+        assert(!app.storage_.message(room.id, first.id));
+        assert(room.historyState.oldest == state.oldest &&
+               room.historyState.newest == state.newest &&
+               room.historyState.gaps.size() == state.gaps.size());
+        Storage rolledBack;
+        assertRestored(rolledBack.history(room.id, -1));
+        Buffer durableState;
+        durableState.id = room.id;
+        rolledBack.loadHistoryState(durableState);
+        assert(durableState.historyState.oldest == state.oldest &&
+               durableState.historyState.newest == state.newest &&
+               durableState.historyState.gaps.size() == state.gaps.size());
+        for (const auto &id : original)
+            assert(sourceMessage(app.model, room.id, id));
+        assert(!sourceMessage(app.model, room.id, first.id));
+        assert(sqlite3_exec(fault, "DROP TRIGGER reject_reconciled_history", nullptr, nullptr,
+                            nullptr) == SQLITE_OK);
+        sqlite3_close(fault);
+        app.applyHistoryPage(page, end);
+        const vector<string> expected{first.id, middle.id, last.id};
+        assertHistoryIds(room.messages, expected);
+        Storage reopened;
+        assertHistoryIds(reopened.history(room.id, -1), expected);
+        for (const auto &id : original)
+            assert(app.storage_.message(room.id, id)->storageSequence == identities.at(id).first);
+    }
+    static void historyWriterRollback() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        auto &room = app.buffer("history-writer-rollback", "Peer", "query");
+        Message anchor;
+        anchor.id = "writer-anchor";
+        anchor.text = "cached anchor";
+        anchor.time = "2026-11-01T00:00:00.000Z";
+        anchor.timestamp = 1793491200;
+        app.storage_.append(room.id, anchor);
+        room.messages.push_back(*app.storage_.message(room.id, anchor.id));
+        app.messageCount_ = 1;
+        room.historyState.oldest = room.historyState.newest = {anchor.id, anchor.time};
+        HistoryGap existing;
+        existing.older = {"older-anchor", "2026-10-31T00:00:00.000Z"};
+        existing.newer = {anchor.id, anchor.time};
+        room.historyState.gaps.push_back(existing);
+        app.storage_.saveHistoryState(room);
+        const auto before = room.historyState;
+        sqlite3 *fault = nullptr;
+        const auto database =
+            std::filesystem::path(std::getenv("XDG_DATA_HOME")) / "blastirc/state.sqlite3";
+        assert(sqlite3_open(database.c_str(), &fault) == SQLITE_OK);
+        assert(sqlite3_exec(fault,
+                            "CREATE TRIGGER reject_history_page BEFORE INSERT ON messages "
+                            "WHEN NEW.id='writer-second' BEGIN "
+                            "SELECT RAISE(ABORT,'history writer rejected'); END;",
+                            nullptr, nullptr, nullptr) == SQLITE_OK);
+        const auto complete = [&] {
+            const string label = "writer-page";
+            Application::HistoryPage page;
+            page.server = room.server;
+            page.buffer = room.id;
+            page.session = app.model.networks[room.server].sessionGeneration;
+            page.request.target = room.target;
+            page.request.requestId = label;
+            page.request.direction = HistoryDirection::Latest;
+            for (const auto &id : {"writer-first", "writer-second"}) {
+                Event message;
+                message.type = "message";
+                message.server = room.server;
+                message.target = room.target;
+                message.label = label;
+                message.id = id;
+                message.nick = "Other";
+                message.text = "completed history page";
+                message.time = id == string("writer-first") ? "2026-11-02T00:00:00.000Z"
+                                                            : "2026-11-02T01:00:00.000Z";
+                message.history = true;
+                page.events.push_back(std::move(message));
+            }
+            app.historyPages_[label] = std::move(page);
+            app.activeHistory_[label] = room.id;
+            room.loading = true;
+            Event end;
+            end.type = "history_end";
+            end.server = room.server;
+            end.target = room.target;
+            end.label = label;
+            end.tags = {{"direction", "latest"},
+                        {"count", "2"},
+                        {"limit", "50"},
+                        {"oldest-id", "writer-first"},
+                        {"newest-id", "writer-second"},
+                        {"oldest-time", "2026-11-02T00:00:00.000Z"},
+                        {"newest-time", "2026-11-02T01:00:00.000Z"}};
+            app.reduce(end);
+        };
+        complete();
+        assert(!room.loading && room.messages.size() == 1 && room.messages.front().id == anchor.id);
+        const auto log = std::find_if(
+            app.model.buffers.begin(), app.model.buffers.end(), [&](const auto &entry) {
+                return entry.second.server == room.server && entry.second.kind == "server";
+            });
+        assert(log != app.model.buffers.end() && log->second.messages.size() == 1);
+        const auto &failure = log->second.messages.front();
+        assert(failure.presence && failure.text.find("history writer rejected") != string::npos);
+        const string failureId = failure.id;
+        const auto loadedCount = [&] {
+            size_t count = 0;
+            for (const auto &[id, b] : app.model.buffers)
+                if (b.kind != "search" && b.kind != "mentions")
+                    count += b.messages.size();
+            return count;
+        };
+        assert(app.messageCount_ == loadedCount());
+        assert(!app.storage_.message(room.id, "writer-first") &&
+               !app.storage_.message(room.id, "writer-second"));
+        const auto unchanged = [&](const HistoryState &state) {
+            assert(state.oldest == before.oldest && state.newest == before.newest &&
+                   state.beginning == before.beginning && state.gaps.size() == 1 &&
+                   state.gaps.front().id == before.gaps.front().id &&
+                   state.gaps.front().older == before.gaps.front().older &&
+                   state.gaps.front().newer == before.gaps.front().newer);
+        };
+        unchanged(room.historyState);
+        Buffer restored = room;
+        restored.historyState = {};
+        app.storage_.loadHistoryState(restored);
+        unchanged(restored.historyState);
+        assert(sqlite3_exec(fault, "DROP TRIGGER reject_history_page", nullptr, nullptr, nullptr) ==
+               SQLITE_OK);
+        sqlite3_close(fault);
+        complete(); // The same page remains retryable after a real writer failure.
+        assert(!room.loading && room.messages.size() == 3);
+        assert(log->second.messages.size() == 1 && log->second.messages.front().id == failureId &&
+               log->second.messages.front().presence &&
+               log->second.messages.front().text.find("history writer rejected") != string::npos);
+        assert(app.messageCount_ == loadedCount());
+        assert(app.storage_.message(room.id, "writer-first") &&
+               app.storage_.message(room.id, "writer-second"));
+        assert(room.historyState.newest.id == "writer-second");
+    }
+    static void historyWavePlanning() {
+        Application app;
+        app.model = Model{};
+        app.savingAllowed_ = false;
+        const string server = "history-wave-plan";
+        app.channelTypes_[server] = "#";
+        auto &session = app.historySessions_[server];
+        vector<string> changed;
+        for (int i = 0; i < 15; ++i) {
+            auto &b = app.buffer(server, "Peer" + std::to_string(i), "query");
+            changed.push_back(b.id);
+            session.advertised[app.fold(server, b.target)] = {
+                b.target, i == 0 ? "2026-11-02T00:00:00.000Z" : "2026-11-03T00:00:00.000Z"};
+        }
+        auto &viewed = app.model.buffers.at(changed.front());
+        viewed.archived = viewed.muted = true;
+        app.model.activeBuffer = viewed.id;
+        app.model.settings.pinnedBuffers = {changed[2], changed[1]};
+        auto &unchanged = app.buffer(server, "Current", "query");
+        unchanged.historyState.newest = {"opaque-CURRENT", "2026-11-04T00:00:00.001Z"};
+        session.advertised[app.fold(server, unchanged.target)] = {unchanged.target,
+                                                                  "2026-11-04T00:00:00.999Z"};
+        auto &unadvertised = app.buffer(server, "NoAdvert", "query");
+        unadvertised.historyState.newest = {"opaque-cursor", "2026-11-01T00:00:00.000Z"};
+        session.advertised["#unknown"] = {"#unknown", "2026-11-05T00:00:00.000Z"};
+        app.planHistory(server);
+        assert(session.visible.size() == 12 && session.background.size() == 3);
+        assert(session.visible[0] == viewed.id && session.visible[1] == changed[2] &&
+               session.visible[2] == changed[1]);
+        set<string> planned(session.visible.begin(), session.visible.end());
+        planned.insert(session.background.begin(), session.background.end());
+        assert(planned == set<string>(changed.begin(), changed.end()));
+        assert(unchanged.initialHistorySync == HistorySyncState::Idle &&
+               unadvertised.initialHistorySync == HistorySyncState::Idle);
+        for (const auto &id : session.background)
+            assert(app.model.buffers.at(id).initialHistorySync == HistorySyncState::Idle);
+        assert(session.nextTarget > app.model.now);
+        // Older-target seeds only include advertised changed rooms.
+        session.visible.clear();
+        session.background.clear();
+        for (const auto &id : changed)
+            app.model.buffers.at(id).initialHistorySync = HistorySyncState::Idle;
+        session.advertised.clear();
+        session.advertised[app.fold(server, viewed.target)] = {viewed.target,
+                                                               "2026-11-06T00:00:00.000Z"};
+        auto &noCursor = app.buffer(server, "Cursorless", "query");
+        app.planHistory(server, true);
+        assert(session.seeds.size() == 1 && session.seeds.front() == viewed.id);
+        assert(std::find(session.seeds.begin(), session.seeds.end(), noCursor.id) ==
+               session.seeds.end());
+    }
+    static void historyBackfillCheckpoints() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        for (int outcome = 0; outcome < 3; ++outcome) {
+            const bool failed = outcome == 1, retired = outcome == 2;
+            const bool checkpointed = !failed;
+            const string server = "backfill-outcome-" + std::to_string(outcome);
+            ServerConfig config;
+            config.name = server;
+            app.clients_[server] = std::make_unique<NetworkClient>(config, Identity{});
+            app.model.networks[server].state = "Ready";
+            app.model.networks[server].caps.insert("draft/chathistory");
+            app.channelTypes_[server] = "#";
+            auto &session = app.historySessions_[server];
+            session.backfill = true;
+            session.lower = "1970-01-01T00:00:00.000Z";
+            session.upper = "2026-10-01T00:00:00.000Z";
+            session.durable.watermark = "2026-11-01T00:00:00.000Z";
+            session.durable.backfillUpper = session.upper;
+            app.storage_.saveHistoryDiscovery(server, session.durable);
+            Application::HistoryPage targets;
+            targets.server = server;
+            targets.request.direction = HistoryDirection::Targets;
+            targets.request.limit = 100;
+            Event advertised;
+            advertised.type = "history_target";
+            advertised.target = "OlderPeer";
+            advertised.time = "2026-09-01T00:00:00.000Z";
+            targets.events.push_back(advertised);
+            if (retired) {
+                advertised.target = "RemainingPeer";
+                targets.events.push_back(advertised);
+            }
+            Event end;
+            end.type = "history_end";
+            end.server = server;
+            end.tags = {{"direction", "targets"},
+                        {"count", retired ? "2" : "1"},
+                        {"end", "1"},
+                        {"limit", "100"}};
+            app.finishHistoryPage(std::move(targets), end, true, true);
+            assert(session.seeds.size() == (retired ? 2u : 1u) &&
+                   session.checkpoint == session.lower);
+            app.scheduleHistory(); // The paced seed is not eligible yet.
+            assert(app.storage_.historyDiscovery(server).backfillUpper ==
+                   "2026-10-01T00:00:00.000Z");
+            Application::HistoryPage seed;
+            seed.server = server;
+            seed.buffer = session.seeds.front();
+            seed.request.target = app.model.buffers.at(seed.buffer).target;
+            seed.seed = seed.backfillSeed = true;
+            seed.request.initial = true;
+            session.seeds.pop_front();
+            app.historyPages_["held-seed"] = seed;
+            app.scheduleHistory(); // Empty queue is not proof while its seed is in flight.
+            assert(!app.storage_.historyDiscovery(server).backfillComplete);
+            app.historyPages_.erase("held-seed");
+            end.label = "held-seed";
+            end.tags = {{"direction", "latest"}, {"count", "0"}};
+            if (failed || retired) {
+                end.tags["error"] = failed ? "invalid page parameters" : "target unavailable";
+                end.tags["failure-code"] = failed ? "INVALID_PARAMS" : "INVALID_TARGET";
+            }
+            app.finishHistoryPage(std::move(seed), end, !failed && !retired, false);
+            if (retired) {
+                assert(!session.seedFailed && session.seeds.size() == 1);
+                app.scheduleHistory();
+                assert(!app.storage_.historyDiscovery(server).backfillComplete &&
+                       app.storage_.historyDiscovery(server).backfillUpper ==
+                           "2026-10-01T00:00:00.000Z");
+                Application::HistoryPage remaining;
+                remaining.server = server;
+                remaining.buffer = session.seeds.front();
+                remaining.seed = remaining.backfillSeed = true;
+                remaining.request.initial = true;
+                remaining.request.target = app.model.buffers.at(remaining.buffer).target;
+                session.seeds.pop_front();
+                end.label = "remaining-seed";
+                end.tags = {{"direction", "latest"}, {"count", "0"}};
+                app.finishHistoryPage(std::move(remaining), end, true, false);
+            }
+            app.scheduleHistory();
+            const auto saved = app.storage_.historyDiscovery(server);
+            assert(saved.watermark == "2026-11-01T00:00:00.000Z");
+            assert(saved.backfillComplete == checkpointed);
+            assert(saved.backfillUpper ==
+                   (checkpointed ? "1970-01-01T00:00:00.000Z" : "2026-10-01T00:00:00.000Z"));
+        }
+    }
+    static void saturatedDiscoveryFailsSafely() {
+        Application app;
+        app.model = Model{};
+        const string server = "saturated-discovery";
+        app.channelTypes_[server] = "#";
+        auto &session = app.historySessions_[server];
+        session.lower = "2026-10-01T00:00:00.000Z";
+        session.upper = "2026-11-01T00:00:00.001Z";
+        session.tieTime = "2026-11-01T00:00:00.000Z";
+        session.tieTargets = {"peer"};
+        session.durable.watermark = "2026-10-31T00:00:00.000Z";
+        app.storage_.saveHistoryDiscovery(server, session.durable);
+        Application::HistoryPage page;
+        page.server = server;
+        page.request.direction = HistoryDirection::Targets;
+        page.request.limit = 2;
+        Event target;
+        target.type = "history_target";
+        target.target = "Peer";
+        target.time = session.tieTime;
+        page.events = {target, target}; // Saturated repeated wire records, not dedup count.
+        Event end;
+        end.server = server;
+        end.tags = {{"direction", "targets"}, {"count", "2"}, {"limit", "2"}};
+        app.finishHistoryPage(std::move(page), end, true, false);
+        assert(session.discoveryFailed && !session.discovering);
+        assert(app.storage_.historyDiscovery(server).watermark == "2026-10-31T00:00:00.000Z");
+    }
+    static void discoveredLatestHistory() {
+        RenameDrainPeer peer;
+        Application app;
+        app.model = Model{};
         app.model.settings.retentionDays = 0;
         Identity identity;
         identity.nick = "Me";
         ServerConfig server;
-        server.name = "initial-history";
+        server.name = "discovered-history";
         server.host = "127.0.0.1";
         server.port = peer.port;
         server.tls = false;
@@ -3661,261 +5130,240 @@ struct ApplicationRegression {
         app.clients_[server.name] = std::make_unique<NetworkClient>(server, identity);
         auto &client = *app.clients_.at(server.name);
         auto &network = app.model.networks[server.name];
+        auto &viewed = app.buffer(server.name, "Viewed", "query");
+        auto &pinned = app.buffer(server.name, "Pinned", "query");
+        auto &unchanged = app.buffer(server.name, "Unchanged", "query");
         auto &room = app.buffer(server.name, "#room");
-        const auto idle = [](const Buffer &b) {
-            if (b.initialHistorySync != HistorySyncState::Idle || b.loading)
-                std::cerr << "Initial-history idle failure: target=" << b.target
-                          << " sync=" << static_cast<int>(b.initialHistorySync)
-                          << " foreground=" << b.loading << '\n';
-            assert(b.initialHistorySync == HistorySyncState::Idle && !b.loading);
-        };
-        // Neither configuration, capability, nor membership alone admits work.
-        app.requestHistory(room, "", true);
-        idle(room);
-        network.state = "Ready";
         room.joined = true;
-        app.requestHistory(room, "", true);
-        idle(room);
-        network.caps.insert("draft/chathistory");
-        room.joined = false;
-        app.requestHistory(room, "", true);
-        idle(room);
-        auto &unbound = app.buffer("initial-unbound", "Peer", "query");
-        app.model.networks[unbound.server].state = "Ready";
-        app.model.networks[unbound.server].caps.insert("draft/chathistory");
-        app.requestHistory(unbound, "", true);
-        idle(unbound);
-        auto &search = app.buffer(server.name, "*search*", "search");
-        app.requestHistory(search, "", true);
-        idle(search);
-        assert(app.requestedHistory_.empty() && app.activeHistory_.empty());
-        // A bouncer can restore membership before its deferred Ready event.
-        // Eligibility starts at Ready, without losing that already-observed JOIN.
-        network.state = "Registering";
-        Event earlyJoin;
-        earlyJoin.type = "join";
-        earlyJoin.server = server.name;
-        earlyJoin.target = room.target;
-        earlyJoin.nick = identity.nick;
-        earlyJoin.own = true;
-        app.reduce(earlyJoin);
-        assert(room.joined);
-        idle(room);
-        Event ready;
-        ready.type = "state";
-        ready.server = server.name;
-        ready.text = "Ready";
-        app.reduce(ready);
-        assert(room.initialHistorySync == HistorySyncState::Queued);
-        app.cancelHistory(room);
-        room.joined = false;
-        network.state.clear();
-        network.caps.clear();
+        viewed.muted = true; // Viewing wins over background mute priority.
+        app.model.activeBuffer = viewed.id;
+        app.model.settings.pinnedBuffers = {pinned.id};
+        unchanged.historyState.newest = {"already-current", "2026-11-02T00:00:00.900Z"};
+        Message cached;
+        cached.id = "cached-tail";
+        cached.text = "cached transcript remains visible";
+        cached.time = "2026-11-01T00:00:00.000Z";
+        cached.timestamp = 1793491200;
+        app.storage_.append(room.id, cached);
+        room.messages.push_back(cached);
+        room.historyState.oldest = room.historyState.newest = {cached.id, cached.time};
+        app.storage_.saveHistoryState(room);
+        HistoryDiscovery checkpoint;
+        checkpoint.watermark = "2026-10-31T00:00:00.000Z";
+        checkpoint.backfillComplete = true; // Isolate reconnect discovery from older-target work.
+        app.storage_.saveHistoryDiscovery(server.name, checkpoint);
         client.start();
         peer.accept();
         peer.expect("CAP", {"LS", "302"});
-        peer.send(":server CAP * LS :batch draft/chathistory");
+        peer.send(":server CAP * LS :batch draft/chathistory server-time");
         peer.expect("NICK", {identity.nick});
         peer.expect("USER", {identity.username, "0", "*", identity.realname});
-        peer.expect("CAP", {"REQ", "batch draft/chathistory"});
-        peer.send(":server CAP Me ACK :batch draft/chathistory");
+        peer.expect("CAP", {"REQ", "batch draft/chathistory server-time"});
+        peer.send(":server CAP Me ACK :batch draft/chathistory server-time");
         peer.expect("CAP", {"END"});
         peer.send(":server 001 Me :Welcome");
-        peer.send(":server 005 Me CHATHISTORY=2 :supported");
+        // Reconnect membership can arrive before discovery admits LATEST. This
+        // later live island must not replace the existing protocol newest boundary.
+        peer.send("@msgid=new-live-join;time=2026-11-02T04:00:00.000Z :Me!u@h JOIN #room");
+        peer.expect("WHO", {"#room"}); // The real own-JOIN path requests presence independently.
+        peer.send(":server 315 Me #room :End of WHO list");
+        peer.send(":server 366 Me #room :End of NAMES list");
+        peer.send(":server 005 Me CHANTYPES=# CHATHISTORY=100 :supported");
         peer.send(":server 376 Me :End of MOTD");
-        bool historyLimitSeen = false;
         const auto drain = [&] {
-            for (auto &event : client.poll()) {
-                if (event.type == "network" && event.tags["kind"] == "isupport" &&
-                    event.tags["CHATHISTORY"] == "2")
-                    historyLimitSeen = true;
-                const bool gapEnd = event.type == "history_end" && event.tags.contains("initial") &&
-                                    event.tags["direction"] == "after";
-                const string target = event.target;
+            for (auto &event : client.poll())
                 app.reduce(std::move(event));
-                if (gapEnd) {
-                    const auto &b = app.buffer(server.name, target);
-                    if (std::any_of(app.initialHistory_.begin(), app.initialHistory_.end(),
-                                    [&](const auto &v) { return v.second == b.id; }))
-                        assert(b.initialHistorySync == HistorySyncState::Loading);
-                }
-            }
             app.scheduleHistory();
-            assert(app.initialHistory_.size() <= 16);
         };
         const auto wait = [&](const auto &predicate) {
-            const auto deadline = RenameDrainPeer::Clock::now() + std::chrono::seconds(3);
+            const auto deadline = RenameDrainPeer::Clock::now() + std::chrono::seconds(5);
             do {
                 drain();
                 if (predicate())
                     return;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             } while (RenameDrainPeer::Clock::now() < deadline);
-            throw std::runtime_error("Initial-history reduction deadline expired");
+            throw std::runtime_error("Discovered-history reduction deadline expired");
         };
-        // Ready may precede a separately delivered 005 frame; establish the advertised
-        // page limit before checking two-row continuation behavior.
-        wait([&] { return network.state == "Ready" && historyLimitSeen; });
-        auto &viewed = app.buffer(server.name, "Viewed", "query");
-        auto &pinFirst = app.buffer(server.name, "PinFirst", "query");
-        auto &pinSecond = app.buffer(server.name, "PinSecond", "query");
-        auto &unread = app.buffer(server.name, "Unread", "query");
-        auto &recent = app.buffer(server.name, "Recent", "query");
-        auto &muted = app.buffer(server.name, "Muted", "query");
-        auto &archived = app.buffer(server.name, "Archived", "query");
-        viewed.muted = muted.muted = archived.archived = true;
-        unread.unread = 1;
-        unread.lastChatTimestamp = 1;
-        recent.lastChatTimestamp = 100;
-        app.model.settings.pinnedBuffers = {muted.id, archived.id, pinSecond.id, pinFirst.id};
-        vector<string> ids{viewed.id, pinFirst.id, pinSecond.id, unread.id,
-                           recent.id, muted.id,    archived.id};
-        for (int i = 0; i < 18; ++i)
-            ids.push_back(app.buffer(server.name, "Backlog" + std::to_string(i), "query").id);
-        app.model.activeBuffer = viewed.id;
-        for (const auto &id : ids) {
-            auto &b = app.model.buffers.at(id);
-            app.requestHistory(b, "", true);
-            app.requestHistory(b, "", true); // Repeated Ready/caps/JOIN is idempotent.
-            assert(b.initialHistorySync == HistorySyncState::Queued && !b.loading);
-        }
-        const auto order = app.historyOrder(server.name);
-        assert(order.size() == ids.size());
-        assert((vector<string>(order.begin(), order.begin() + 5) ==
-                vector<string>{"Viewed", "PinSecond", "PinFirst", "Unread", "Recent"}));
-        assert(order[order.size() - 2] == "Muted" && order.back() == "Archived");
-        app.scheduleHistory();
-        assert(app.initialHistory_.size() == 16 && app.activeHistory_.size() == 16);
-        peer.expect("CHATHISTORY", {"LATEST", "Viewed", "*", "2"});
-        wait([&] { return viewed.initialHistorySync == HistorySyncState::Loading; });
-        assert(!viewed.loading);
-        // Switching to a Core-backlogged buffer must displace unsent admitted work.
-        app.model.activeBuffer = archived.id;
+        wait([&] { return network.state == "Ready" && !app.historyPages_.empty(); });
+        const auto discovery = peer.read();
+        assert(discovery.command == "CHATHISTORY" && discovery.params.size() == 4 &&
+               discovery.params[0] == "TARGETS");
+        assert(discovery.params[2] == "timestamp=2026-10-30T23:59:50.000Z");
+        assert(viewed.messages.empty() && room.messages.size() == 2);
+        // Duplicate advertisements normalize target identity and retain the newest time.
+        peer.send(":server BATCH +targets draft/chathistory-targets");
+        peer.send("@batch=targets :server CHATHISTORY TARGETS Viewed 2026-11-02T00:00:00.000Z");
+        peer.send("@batch=targets :server CHATHISTORY TARGETS viewed 2026-11-01T00:00:00.000Z");
+        peer.send("@batch=targets :server CHATHISTORY TARGETS Pinned 2026-11-02T01:00:00.000Z");
+        peer.send("@batch=targets :server CHATHISTORY TARGETS #room 2026-11-02T02:00:00.000Z");
+        peer.send("@batch=targets :server CHATHISTORY TARGETS Unchanged 2026-11-02T00:00:00.000Z");
+        peer.send("@batch=targets :server CHATHISTORY TARGETS #unknown 2026-11-02T03:00:00.000Z");
+        peer.send(":server BATCH -targets");
         wait([&] {
-            return std::any_of(app.initialHistory_.begin(), app.initialHistory_.end(),
-                               [&](const auto &v) { return v.second == archived.id; });
+            return app.historySessions_.at(server.name).upper == "2026-11-01T00:00:00.001Z";
         });
-        assert(app.historyOrder(server.name).front() == "Archived");
-        peer.send(":server BATCH +first chathistory Viewed");
-        peer.send(":server BATCH -first");
-        peer.expect("CHATHISTORY", {"LATEST", "Archived", "*", "2"});
-        wait([&] { return archived.initialHistorySync == HistorySyncState::Loading; });
-        assert(viewed.initialHistorySync == HistorySyncState::Idle && !archived.loading);
-        // Cancellation clears both Core backlog and enqueued wire work.
-        for (const auto &id : ids)
-            app.cancelHistory(app.model.buffers.at(id));
-        assert(app.initialHistory_.empty() && app.activeHistory_.empty() &&
-               app.requestedHistory_.empty());
-        peer.send(":server BATCH +second chathistory Archived");
-        peer.send(":server BATCH -second");
+        assert(app.storage_.historyDiscovery(server.name).watermark == checkpoint.watermark);
+        const auto continuation = peer.read();
+        assert(continuation.command == "CHATHISTORY" && continuation.params.size() == 4 &&
+               continuation.params[0] == "TARGETS" &&
+               continuation.params[1] == "timestamp=2026-11-01T00:00:00.001Z" &&
+               continuation.params[2] == discovery.params[2]);
+        // Replay an exclusive-boundary tie cohort once; a short repeat advances
+        // to its exact time without claiming a fully enumerated timestamp cohort.
+        peer.send(":server BATCH +tie draft/chathistory-targets");
+        peer.send("@batch=tie :server CHATHISTORY TARGETS VIEWED 2026-11-01T00:00:00.000Z");
+        peer.send(":server BATCH -tie");
+        wait([&] {
+            return app.historySessions_.at(server.name).upper == "2026-11-01T00:00:00.000Z";
+        });
+        const auto afterTie = peer.read();
+        assert(afterTie.command == "CHATHISTORY" && afterTie.params.size() == 4 &&
+               afterTie.params[0] == "TARGETS" &&
+               afterTie.params[1] == "timestamp=2026-11-01T00:00:00.000Z" &&
+               afterTie.params[2] == discovery.params[2]);
+        assert(app.storage_.historyDiscovery(server.name).watermark == checkpoint.watermark);
+        peer.send("@draft/chathistory-end :server BATCH +terminal draft/chathistory-targets");
+        peer.send(":server BATCH -terminal");
+        wait([&] { return app.historySessions_.at(server.name).planned; });
+        assert(app.storage_.historyDiscovery(server.name).watermark == checkpoint.watermark);
+        peer.expect("CHATHISTORY", {"LATEST", "Viewed", "*", "50"});
+        assert(!viewed.loading && unchanged.initialHistorySync == HistorySyncState::Idle);
+        assert(std::none_of(app.model.buffers.begin(), app.model.buffers.end(),
+                            [](const auto &entry) { return entry.second.target == "#unknown"; }));
+        peer.send(":server BATCH +viewed chathistory Viewed");
+        peer.send(":server BATCH -viewed");
+        wait([&] { return viewed.initialHistorySync == HistorySyncState::Idle; });
+        peer.expect("CHATHISTORY", {"LATEST", "Pinned", "*", "50"});
+        peer.send(":server BATCH +pinned chathistory Pinned");
+        peer.send(":server BATCH -pinned");
+        wait([&] { return pinned.initialHistorySync == HistorySyncState::Idle; });
+        // Cached tails still fetch one newest page, never a connect-time AFTER chain.
+        peer.expect("CHATHISTORY", {"LATEST", "#room", "*", "50"});
+        peer.send(":server BATCH +latest chathistory #room");
+        peer.send("@batch=latest;msgid=new-tail;time=2026-11-02T02:00:00.000Z "
+                  ":Other!u@h PRIVMSG #room :newest page");
+        // The same live JOIN appears in the newest page. Its overlap proves
+        // nothing about the offline interval before this later island.
+        peer.send("@batch=latest;msgid=new-live-join;time=2026-11-02T04:00:00.000Z "
+                  ":Me!u@h JOIN #room");
         peer.fence();
         drain();
-        for (const auto &id : ids)
-            idle(app.model.buffers.at(id));
-
-        // A cached tail starts AFTER; full pages and error fallback never blink Idle.
-        room.joined = true;
-        Message cached;
-        cached.id = "cached-tail";
-        cached.text = "cached";
-        cached.time = "2026-11-01T00:00:00Z";
-        room.messages.push_back(cached);
-        app.model.activeBuffer = room.id;
-        app.requestHistory(room, "", true);
-        assert(app.gaps_.at(room.id).cursor == "msgid=cached-tail");
-        Event live;
-        live.type = "message";
-        live.server = server.name;
-        live.target = room.target;
-        live.nick = "Other";
-        live.id = "live-after-queue";
-        live.text = "arrived while initial sync was queued";
-        live.time = "2026-11-01T00:01:00Z";
-        live.timestamp = 1793491260;
-        app.reduce(live);
-        assert(app.gaps_.at(room.id).cursor == "msgid=cached-tail");
-        app.scheduleHistory();
-        peer.expect("CHATHISTORY", {"AFTER", "#room", "msgid=cached-tail", "2"});
-        wait([&] { return room.initialHistorySync == HistorySyncState::Loading; });
-        peer.send(":server BATCH +gap chathistory #room");
-        peer.send("@batch=gap;msgid=gap-one :Other!u@h PRIVMSG #room :one");
-        peer.send("@batch=gap;msgid=gap-two :Other!u@h PRIVMSG #room :two");
-        peer.send(":server BATCH -gap");
-        wait([&] { return app.gaps_.at(room.id).cursor == "msgid=gap-two"; });
-        peer.expect("CHATHISTORY", {"AFTER", "#room", "msgid=gap-two", "2"});
-        assert(room.initialHistorySync == HistorySyncState::Loading && !room.loading);
-        peer.send(":server FAIL CHATHISTORY INVALID_PARAMS #room :cursor expired");
-        wait([&] { return !app.gaps_.contains(room.id); });
-        assert(room.initialHistorySync == HistorySyncState::Loading && !room.loading);
-        peer.expect("CHATHISTORY", {"LATEST", "#room", "*", "2"});
-        // All queued foreground routes count, even before their history_begin.
-        app.requestHistory(room, "manual-one", false);
-        app.requestHistory(room, "manual-two", false);
-        assert(room.loading && app.activeHistory_.size() == 3);
-        Event searchBegin;
-        searchBegin.type = "history_begin";
-        searchBegin.server = server.name;
-        searchBegin.target = room.target;
-        searchBegin.label = "independent-search";
-        searchBegin.tags["direction"] = "search";
-        app.reduce(searchBegin); // Unowned search batches must not affect either spinner.
-        assert(!search.loading && room.loading);
-        app.searchRequests_[server.name] = {searchBegin.label, room.id, server.name, room.target,
-                                            network.sessionGeneration};
-        app.reduce(searchBegin);
-        assert(search.loading && room.loading);
-        peer.send(":server BATCH +fallback chathistory #room");
-        peer.send(":server BATCH -fallback");
-        peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=manual-one", "2"});
+        assert(room.messages.size() == 2 && !app.storage_.message(room.id, "new-tail").has_value());
+        peer.send(":server BATCH -latest");
         wait([&] { return room.initialHistorySync == HistorySyncState::Idle; });
-        assert(room.loading && search.loading && app.initialHistory_.empty());
-        peer.send(":server BATCH +manual chathistory #room");
-        peer.send(":server BATCH -manual");
-        peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=manual-two", "2"});
-        wait([&] { return app.activeHistory_.size() == 2; });
-        assert(room.loading && search.loading);
-        peer.send(":server FAIL CHATHISTORY INVALID_PARAMS #room :manual failed");
+        wait([&] {
+            return app.storage_.historyDiscovery(server.name).watermark ==
+                   "2026-11-02T04:00:00.000Z";
+        });
+        assert(room.messages.size() == 3 && !room.historyState.beginning &&
+               room.historyState.gaps.size() == 1);
+        const auto gap = room.historyState.gaps.front();
+        assert(gap.id > 0 && gap.older.id == "cached-tail" && gap.newer.id == "new-tail");
+        Buffer restored = room;
+        restored.historyState = {};
+        app.storage_.loadHistoryState(restored);
+        assert(restored.historyState.gaps.size() == 1 &&
+               restored.historyState.gaps.front().id == gap.id);
+        // One demand quantum walks at most three progressing short pages.
+        app.action({"history-gap", room.id, std::to_string(gap.id), {}});
+        for (int i = 0; i < 3; ++i) {
+            const string boundary = i ? "quantum-" + std::to_string(i - 1) : "new-tail";
+            peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=" + boundary, "50"});
+            const string batch = "quantum" + std::to_string(i);
+            const string id = "quantum-" + std::to_string(i);
+            peer.send(":server BATCH +" + batch + " chathistory #room");
+            peer.send("@batch=" + batch + ";msgid=" + id + ";time=2026-11-01T" +
+                      std::to_string(23 - i) + ":00:00.000Z :Other!u@h PRIVMSG #room :gap page");
+            peer.send(":server BATCH -" + batch);
+            wait([&] { return app.storage_.message(room.id, id).has_value(); });
+        }
         wait([&] { return !room.loading; });
-        assert(search.loading && app.model.status.find("manual failed") != string::npos);
-        searchBegin.type = "history_end";
-        app.reduce(searchBegin);
-        assert(!search.loading && app.activeHistory_.empty());
-
-        app.cancelHistory(room);
-        // Disconnect clears both admitted and still-unadmitted work and search.
-        network.state = "Ready";
-        app.requestHistory(room, "", true);
-        app.scheduleHistory();
-        app.requestHistory(viewed, "", true);
-        app.requestHistory(room, "disconnect-manual", false);
-        app.searchRequests_[server.name] = {searchBegin.label, room.id, server.name, room.target,
-                                            network.sessionGeneration};
-        searchBegin.type = "history_begin";
-        app.reduce(searchBegin);
-        assert(!app.initialHistory_.empty() && room.loading && search.loading &&
-               viewed.initialHistorySync == HistorySyncState::Queued);
+        assert(room.historyState.gaps.size() == 1 && !room.historyState.beginning);
+        peer.fence(); // No fourth BEFORE may precede the PONG.
+        // A repeated boundary with no insertion/protocol progress stops this demand,
+        // but keeps the durable gap available for another explicit attempt.
+        app.action({"history-gap", room.id, std::to_string(gap.id), {}});
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=quantum-2", "50"});
+        peer.send(":server BATCH +noadvance chathistory #room");
+        peer.send("@batch=noadvance;msgid=quantum-2;time=2026-11-01T21:00:00.000Z "
+                  ":Other!u@h PRIVMSG #room :gap page");
+        peer.send(":server BATCH -noadvance");
+        wait([&] { return !room.loading; });
+        assert(room.historyState.gaps.size() == 1 && !room.historyState.gaps.front().unavailable);
+        peer.fence();
+        // A full timestamp-selected page cannot safely skip equal-time siblings:
+        // stop this quantum despite real inserts, leaving the gap retryable.
+        peer.send(":server 005 Me MSGREFTYPES=timestamp :supported");
+        wait([&] { return app.historyReferences_[server.name] == "timestamp"; });
+        app.action({"history-gap", room.id, std::to_string(gap.id), {}});
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "timestamp=2026-11-01T21:00:00.000Z", "50"});
+        peer.send(":server BATCH +timestampfull chathistory #room");
+        for (int i = 0; i < 50; ++i)
+            peer.send("@batch=timestampfull;msgid=stamp-" + std::to_string(i) +
+                      ";time=2026-11-01T20:00:00.000Z :Other!u@h PRIVMSG #room :equal time");
+        peer.send(":server BATCH -timestampfull");
+        wait([&] { return !room.loading; });
+        assert(room.historyState.gaps.size() == 1 && !room.historyState.gaps.front().unavailable &&
+               !room.historyState.beginning);
+        peer.fence();
+        peer.send(":server 005 Me MSGREFTYPES=msgid,timestamp :supported");
+        wait([&] { return app.historyReferences_[server.name] == "msgid,timestamp"; });
+        app.action({"history-gap", room.id, std::to_string(gap.id), {}});
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=stamp-0", "50"});
+        peer.send(":server BATCH +fill chathistory #room");
+        peer.send("@batch=fill;msgid=cached-tail;time=2026-11-01T00:00:00.000Z "
+                  ":Other!u@h PRIVMSG #room :cached transcript remains visible");
+        peer.send("@batch=fill;msgid=middle;time=2026-11-01T12:00:00.000Z "
+                  ":Other!u@h PRIVMSG #room :bridges the gap");
+        peer.send(":server BATCH -fill");
+        wait([&] { return !room.loading; });
+        assert(room.historyState.gaps.empty() && room.messages.size() == 57 &&
+               !room.historyState.beginning);
+        app.storage_.loadHistoryState(restored);
+        assert(restored.historyState.gaps.empty());
+        // Failed correlated pages discard partial data and never alter discovery proof.
+        app.requestHistory(room, "cached-tail", false);
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=cached-tail", "50"});
+        peer.send(":server BATCH +partial chathistory #room");
+        peer.send("@batch=partial;msgid=must-not-commit;time=2026-10-31T12:00:00.000Z "
+                  ":Other!u@h PRIVMSG #room :partial result");
+        peer.send(":server FAIL CHATHISTORY INVALID_PARAMS #room :page rejected");
+        wait([&] { return !room.loading; });
+        assert(!app.storage_.message(room.id, "must-not-commit").has_value());
+        assert(std::none_of(room.messages.begin(), room.messages.end(),
+                            [](const auto &m) { return m.id == "must-not-commit"; }));
+        assert(app.storage_.historyDiscovery(server.name).watermark == "2026-11-02T04:00:00.000Z");
+        app.requestHistory(room, "cached-tail", false);
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=cached-tail", "50"});
+        assert(!app.historyPages_.empty());
+        const string staleLabel = app.historyPages_.begin()->first;
+        peer.send(":server BATCH +cancelled chathistory #room");
+        peer.send("@batch=cancelled;msgid=cancelled-row;time=2026-10-31T11:00:00.000Z "
+                  ":Other!u@h PRIVMSG #room :cancelled session");
+        peer.fence();
+        drain();
+        assert(room.loading && !app.storage_.message(room.id, "cancelled-row").has_value());
         Event disconnected;
         disconnected.type = "state";
         disconnected.server = server.name;
         disconnected.text = "Disconnected";
         app.reduce(disconnected);
-        idle(room);
-        idle(viewed);
-        idle(search);
-        assert(app.initialHistory_.empty() && app.activeHistory_.empty() && app.gaps_.empty() &&
-               app.requestedHistory_.empty());
-        // Transport rejection cannot strand an initial spinner or its cached gap.
-        app.cancelHistory(room);
-        client.stop();
-        drain(); // Consume stop's state reset before simulating stale Ready admission.
-        network.state = "Ready";
-        room.joined = true;
-        app.requestHistory(room, "", true);
-        app.scheduleHistory();
-        idle(room);
-        assert(app.initialHistory_.empty());
-        assert(!room.loading && app.activeHistory_.empty() && !app.gaps_.contains(room.id));
-        assert(!app.requestedHistory_.contains(room.id));
+        assert(app.historyPages_.empty() && app.activeHistory_.empty() &&
+               app.initialHistory_.empty() && app.historySessions_.empty());
+        for (const auto &[id, b] : app.model.buffers)
+            if (b.server == server.name)
+                assert(!b.loading && b.initialHistorySync == HistorySyncState::Idle);
+        Event staleEnd;
+        staleEnd.type = "history_end";
+        staleEnd.server = server.name;
+        staleEnd.target = room.target;
+        staleEnd.label = staleLabel;
+        staleEnd.tags = {{"direction", "before"}, {"count", "1"}, {"end", "1"}};
+        app.reduce(staleEnd);
+        assert(!app.storage_.message(room.id, "cancelled-row").has_value() &&
+               app.historyPages_.empty());
+        assert(app.storage_.historyDiscovery(server.name).watermark == "2026-11-02T04:00:00.000Z");
     }
     static void run() {
         commandArgumentContext();
@@ -3928,7 +5376,25 @@ struct ApplicationRegression {
         networkStatusErrors();
         sojuHierarchy();
         globalRead();
-        initialHistory();
+        historyReadyWithoutIsupport();
+        zncReconnectPlaybackCursor();
+        historyRenameContinuity();
+        historyMutationTargetsAreNotPageCoverage();
+        latestGapCanonicalPrimaryOverlap();
+        latestGapUsesProtocolBoundary();
+        prunedHistoryCannotReproveEndpoints();
+        sparseAroundRollbackPreservesLoadedWindow();
+        historyWriterRollback();
+        sameTimestampLatestThenOwnedBefore();
+        sameTimestampCanonicalContextAndConfirmedOverlap();
+        sameTimestampRankReconciliationRollback();
+        unknownTimeAroundPreservesNativeOrder();
+        historyReconciliationPreservesUnrelatedGhostPositions();
+        materializedOwnHistoryKeepsConfirmedNativeNeighbors();
+        historyWavePlanning();
+        historyBackfillCheckpoints();
+        saturatedDiscoveryFailsSafely();
+        discoveredLatestHistory();
         sojuReconnectCatalog();
         sendStatuses();
         avatars();
@@ -4033,8 +5499,6 @@ struct ApplicationRegression {
                "timestamp=2026-11-04T12:00:00.123Z");
         assert(app.historyCursor(cached, "msgid=" + historyMessage.id) ==
                "timestamp=2026-11-04T12:00:00.123Z");
-        assert(app.historyCursor(cached, "after=" + historyMessage.id) ==
-               "after=timestamp=2026-11-04T12:00:00.123Z");
         assert(app.historyCursor(cached, "timestamp=2026-11-04T12:00:00.456Z") ==
                "timestamp=2026-11-04T12:00:00.456Z");
         assert(app.historyCursor(cached, "unknown-id") == "msgid=unknown-id");
@@ -4070,8 +5534,8 @@ struct ApplicationRegression {
         assert(app.historyCursor(zncRoom, historyMessage.id) == "timestamp=" + historyMessage.time);
         app.requestHistory(zncRoom, "", true);
         assert(!zncRoom.loading && zncRoom.initialHistorySync == HistorySyncState::Queued);
-        assert(app.gaps_.at(zncRoom.id).cursor == "timestamp=" + historyMessage.time);
-        app.clients_.erase(znc.name); // This admission check never starts a transport.
+        assert(zncRoom.historyState.gaps.empty()); // Native playback is not TARGETS discovery.
+        app.clients_.erase(znc.name);              // This admission check never starts a transport.
 
         // 005 events are complete current snapshots, including token removals.
         Event support;

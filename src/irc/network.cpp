@@ -9,6 +9,7 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
@@ -104,6 +105,25 @@ string millisecondTimestamp(string s) {
         s.insert(19, ".000");
     return s;
 }
+string historyTimestamp(const string &encoded) {
+    const auto parsed = irc::parseTimestampParts(encoded);
+    if (!parsed)
+        throw std::invalid_argument("Invalid history timestamp");
+    using namespace std::chrono;
+    const sys_seconds instant{seconds{parsed->seconds}};
+    const auto day = floor<days>(instant);
+    const year_month_day date{day};
+    if (static_cast<int>(date.year()) < 1 || static_cast<int>(date.year()) > 9999)
+        throw std::invalid_argument("History timestamp is outside the supported UTC range");
+    const hh_mm_ss time{instant - day};
+    char text[128];
+    std::snprintf(text, sizeof(text), "%04d-%02u-%02uT%02lld:%02lld:%02lld.%03dZ",
+                  static_cast<int>(date.year()), static_cast<unsigned>(date.month()),
+                  static_cast<unsigned>(date.day()), static_cast<long long>(time.hours().count()),
+                  static_cast<long long>(time.minutes().count()),
+                  static_cast<long long>(time.seconds().count()), parsed->nanoseconds / 1000000);
+    return text;
+}
 std::map<string, string> attributes(const string &text, char separator = ',') {
     std::map<string, string> result;
     size_t p = 0;
@@ -172,6 +192,9 @@ struct NetworkClient::Impl {
         string fallbackNick{};
         bool initial = false;
         vector<string> targets{};
+        HistoryRequest history{};
+        Clock::time_point admitted = Clock::now();
+        bool timestampRetry = false;
     };
     struct SentMultiline {
         Request request;
@@ -206,6 +229,7 @@ struct NetworkClient::Impl {
     };
     struct Batch {
         string type, target, label, parent;
+        string historyOwner{};
         bool history = false;
         std::map<string, string> tags;
         vector<WireMessage> lines;
@@ -218,11 +242,17 @@ struct NetworkClient::Impl {
         Clock::time_point sent;
         bool begun = false;
         string direction = "latest";
-        int limit = 200;
+        int limit = 50;
         size_t count = 0;
-        string cursor;
+        string cursor{};
         std::uint64_t cursorOrder = 0;
         bool initial = false;
+        bool unsolicited = false;
+        HistoryCursor oldest{}, newest{};
+        std::uint64_t oldestOrder = UINT64_MAX, newestOrder = 0;
+        bool root = false, rootClosed = false, ended = false;
+        string protocolError{}, refType{}, failureCode{};
+        Request request{};
     };
     struct Command {
         string id, label, name, target;
@@ -349,19 +379,40 @@ struct NetworkClient::Impl {
         eventBytes += bytes;
         events.push_back(std::move(e));
     }
+    static std::uint64_t orderFor(const Event &e) {
+        std::uint64_t order = 0;
+        auto sequence = e.tags.find("source-order");
+        if (sequence != e.tags.end())
+            std::from_chars(sequence->second.data(),
+                            sequence->second.data() + sequence->second.size(), order);
+        return order;
+    }
     void emit(Event e) {
         if (e.history && !e.tags.contains("draft/chathistory-context") && e.type != "typing" &&
             e.type != "history_begin" && e.type != "history_end") {
-            auto h = histories.find(e.label);
+            auto owner = e.tags.find("history-owner");
+            auto h = histories.find(owner == e.tags.end() ? e.label : owner->second);
             auto command = e.tags.find("command");
             if (h != histories.end() && (command == e.tags.end() || command->second != "BATCH")) {
                 ++h->second.count;
+                auto id = e.tags.find("msgid");
+                const string noId;
+                const string &boundaryId = id != e.tags.end() ? id->second
+                                           : (e.type == "reaction" || e.type == "redact") ? noId
+                                                                                          : e.id;
+                if (orderFor(e) <= h->second.oldestOrder) {
+                    h->second.oldestOrder = orderFor(e);
+                    h->second.oldest = {boundaryId, e.time};
+                }
+                if (orderFor(e) >= h->second.newestOrder) {
+                    h->second.newestOrder = orderFor(e);
+                    h->second.newest = {boundaryId, e.time};
+                }
                 std::uint64_t order = 0;
                 auto sequence = e.tags.find("source-order");
                 if (sequence != e.tags.end())
                     std::from_chars(sequence->second.data(),
                                     sequence->second.data() + sequence->second.size(), order);
-                auto id = e.tags.find("msgid");
                 auto refs = isupport.find("MSGREFTYPES");
                 bool identified =
                     id != e.tags.end() && !id->second.empty() &&
@@ -485,7 +536,7 @@ struct NetworkClient::Impl {
         failedSend(target, text, l, reason);
     }
     void rejectRequest(const Request &r, const string &reason) {
-        if (r.type == "history" || r.type == "history-around" || r.type == "search") {
+        if (r.type == "history" || r.type == "search") {
             deliver(historyFailure(r, reason));
             return;
         }
@@ -685,7 +736,9 @@ struct NetworkClient::Impl {
     }
     void enqueue(Request r) {
         size_t bytes = r.type.size() + r.target.size() + r.text.size() + r.extra.size() +
-                       r.submission.size() + r.commandId.size() + r.fallbackNick.size();
+                       r.submission.size() + r.commandId.size() + r.fallbackNick.size() +
+                       r.history.first.id.size() + r.history.first.time.size() +
+                       r.history.second.id.size() + r.history.second.time.size();
         for (const auto &target : r.targets)
             bytes += target.size();
         std::lock_guard lock(queueMutex);
@@ -1600,6 +1653,7 @@ struct NetworkClient::Impl {
                 e.reply = attr(m, name);
         e.label = attr(m, "label");
         e.time = attr(m, "time");
+        string historyOwner;
         std::uint64_t order = frameSerial;
         string b = attr(m, "batch");
         int depth = 0;
@@ -1609,6 +1663,8 @@ struct NetworkClient::Impl {
                 break;
             const auto &context = it->second;
             e.history |= context.history;
+            if (historyOwner.empty())
+                historyOwner = context.historyOwner;
             if (context.tags.contains("draft/chathistory-context"))
                 e.tags["draft/chathistory-context"] = context.tags.at("draft/chathistory-context");
             if (context.history && !context.target.empty() && !e.tags.contains("history-target"))
@@ -1649,12 +1705,22 @@ struct NetworkClient::Impl {
             e.timestamp = *t;
         else
             e.time.clear();
-        if (m.tags.contains("znc.in/playback"))
+        const bool contextualHistory = e.history;
+        const bool playback = m.tags.contains("znc.in/playback") ||
+                              ((m.command == "PRIVMSG" || m.command == "NOTICE") &&
+                               m.prefix.starts_with("*playback!"));
+        e.tags.erase("history-owner");
+        e.tags.erase("history-standalone");
+        if (!historyOwner.empty())
+            e.tags["history-owner"] = historyOwner;
+        else if (!contextualHistory && config.bouncer == "znc" && playback)
+            e.tags["history-standalone"] = "1";
+        if (playback)
             e.history = true;
         if (e.history)
             e.tags["source-order"] = std::to_string(order);
         if (!e.label.empty()) {
-            auto h = histories.find(e.label);
+            auto h = histories.find(historyOwner.empty() ? e.label : historyOwner);
             if (h != histories.end() && h->second.direction == "search")
                 e.tags["search"] = "1";
         }
@@ -1665,11 +1731,20 @@ struct NetworkClient::Impl {
         return e;
     }
     static string historyDirection(const Request &r) {
-        return r.type == "search"             ? "search"
-               : r.type == "history-around"   ? "around"
-               : r.text.starts_with("after=") ? "after"
-               : r.text.empty()               ? "latest"
-                                              : "before";
+        if (r.type == "search")
+            return "search";
+        switch (r.history.direction) {
+        case HistoryDirection::Before:
+            return "before";
+        case HistoryDirection::After:
+            return "after";
+        case HistoryDirection::Around:
+            return "around";
+        case HistoryDirection::Targets:
+            return "targets";
+        default:
+            return "latest";
+        }
     }
     static Event historyFailure(const Request &r, const string &reason) {
         Event e;
@@ -1677,11 +1752,12 @@ struct NetworkClient::Impl {
         e.target = r.target;
         e.label = r.submission;
         e.tags = {{"direction", historyDirection(r)},
-                  {"limit", r.type == "search" ? "100" : "200"},
+                  {"limit", std::to_string(r.type == "search" ? 100 : r.history.limit)},
                   {"count", "0"},
                   {"cursor", ""},
                   {"batch", ""},
                   {"error", reason}};
+        e.tags["history-owner"] = e.label;
         e.tags["rejected"] = "1";
         if (r.initial)
             e.tags["initial"] = "1";
@@ -1696,9 +1772,12 @@ struct NetworkClient::Impl {
         e.type = "history_begin";
         e.target = h.target;
         e.label = h.label;
+        e.tags["history-owner"] = h.label;
         e.tags["batch"] = batch;
         e.tags["direction"] = h.direction;
         e.tags["limit"] = std::to_string(h.limit);
+        if (h.unsolicited)
+            e.tags["unsolicited"] = "1";
         if (h.initial)
             e.tags["initial"] = "1";
         emit(std::move(e));
@@ -1711,11 +1790,27 @@ struct NetworkClient::Impl {
         e.type = "history_end";
         e.target = it->second.target;
         e.label = it->second.label;
+        e.tags["history-owner"] = it->second.label;
         e.tags["batch"] = it->second.batch;
         e.tags["direction"] = it->second.direction;
         e.tags["limit"] = std::to_string(it->second.limit);
         e.tags["count"] = std::to_string(it->second.count);
         e.tags["cursor"] = it->second.cursor;
+        e.tags["oldest-id"] = it->second.oldest.id;
+        e.tags["oldest-time"] = it->second.oldest.time;
+        e.tags["newest-id"] = it->second.newest.id;
+        e.tags["newest-time"] = it->second.newest.time;
+        e.tags["ref-type"] = it->second.refType;
+        if (it->second.ended)
+            e.tags["end"] = "1";
+        if (!it->second.failureCode.empty())
+            e.tags["failure-code"] = it->second.failureCode;
+        if (err.empty() && !it->second.protocolError.empty())
+            e.tags["error"] = it->second.protocolError;
+        else if (err.empty() && (!it->second.root || !it->second.rootClosed))
+            e.tags["error"] = "History response did not contain a complete root batch";
+        if (err == "History request timed out")
+            e.tags["timeout"] = "1";
         if (it->second.initial)
             e.tags["initial"] = "1";
         if (rejected)
@@ -1728,7 +1823,8 @@ struct NetworkClient::Impl {
             unlabeledHistory.clear();
     }
     void startHistory() {
-        if (historyQueue.empty() || !unlabeledHistory.empty() || histories.size() >= 16)
+        if (historyQueue.empty() || !unlabeledHistory.empty() ||
+            histories.size() >= (has("labeled-response") ? 6 : 1))
             return;
         // ponytail: at most 128 pending requests; scan rather than maintain a second queue index.
         auto rank = [&](const Request &r) {
@@ -1743,19 +1839,29 @@ struct NetworkClient::Impl {
         auto next =
             std::min_element(historyQueue.begin(), historyQueue.end(),
                              [&](const Request &a, const Request &b) { return rank(a) < rank(b); });
+        if (next->timestampRetry && std::any_of(batches.begin(), batches.end(), [&](const auto &p) {
+                return p.second.label == next->submission;
+            }))
+            return;
         Request r = std::move(*next);
         historyQueue.erase(next);
         string l = r.submission.empty() ? label() : r.submission;
-        History h{r.target, l,  {}, Clock::now(), false, historyDirection(r), 200,
-                  0,        {}, 0,  r.initial};
+        History h{r.target, l, {}, r.admitted, false, historyDirection(r)};
+        h.request = r;
+        h.initial = r.initial;
+        h.begun = r.timestampRetry;
+        int maximum = 100;
         auto page = isupport.find("CHATHISTORY");
-        if (page != isupport.end()) {
-            int n = integer(page->second, 200);
-            if (n > 0)
-                h.limit = std::min(n, 200);
-        }
-        if (r.type == "search")
-            h.limit = 100;
+        if (page != isupport.end())
+            maximum = integer(page->second, 100);
+        if (maximum < 0)
+            maximum = 100;
+        h.limit = r.type == "search"
+                      ? 100
+                      : std::min(r.history.limit,
+                                 r.history.direction == HistoryDirection::Targets ? 100 : 50);
+        if (maximum > 0)
+            h.limit = std::min(h.limit, maximum);
         histories.emplace(l, std::move(h));
         beginHistory(histories.at(l));
         std::map<string, string> tags;
@@ -1770,58 +1876,45 @@ struct NetworkClient::Impl {
                      ";limit=100"},
                     tags);
             } else if (has("draft/chathistory") || has("chathistory")) {
-                int limit = 200;
-                auto it = isupport.find("CHATHISTORY");
-                if (it != isupport.end()) {
-                    int advertisedLimit = integer(it->second, 200);
-                    if (advertisedLimit > 0)
-                        limit = std::min(limit, advertisedLimit);
+                const int limit = histories.at(l).limit;
+                const auto direction = r.history.direction;
+                if (direction == HistoryDirection::Targets) {
+                    raw("CHATHISTORY",
+                        {"TARGETS", "timestamp=" + historyTimestamp(r.history.first.time),
+                         "timestamp=" + historyTimestamp(r.history.second.time),
+                         std::to_string(limit)},
+                        tags);
+                    return;
                 }
-                string selector = "*", sub = "LATEST", bound = r.text;
-                if (r.type == "history-around") {
-                    sub = "AROUND";
-                    auto refs = isupport.find("MSGREFTYPES");
-                    auto supports = [&](const string &kind) {
-                        return refs == isupport.end() ||
-                               ("," + refs->second + ",").find("," + kind + ",") != string::npos;
-                    };
-                    if (!r.text.empty() && supports("msgid"))
-                        bound = "msgid=" + r.text;
-                    else if (!r.extra.empty() && supports("timestamp"))
-                        bound = "timestamp=" + r.extra;
-                    else
-                        throw std::invalid_argument("No supported AROUND history selector");
-                }
-                if (!bound.empty()) {
-                    if (r.type != "history-around")
-                        sub = "BEFORE";
-                    if (bound.starts_with("after=")) {
-                        sub = "AFTER";
-                        bound.erase(0, 6);
-                    }
-                    if (bound.starts_with("timestamp="))
-                        selector = "timestamp=" + millisecondTimestamp(bound.substr(10));
-                    else if (bound.starts_with("msgid="))
-                        selector = bound;
-                    else
-                        selector = "msgid=" + bound;
-                    string kind = selector.substr(0, selector.find('='));
-                    auto refs = isupport.find("MSGREFTYPES");
-                    if (refs != isupport.end() && refs->second.find(kind) == string::npos)
-                        throw std::invalid_argument("Server does not support " + kind +
-                                                    " history selectors");
-                }
+                string sub = upper(historyDirection(r));
+                auto refs = isupport.find("MSGREFTYPES");
+                auto supports = [&](const string &kind) {
+                    return refs == isupport.end() ||
+                           ("," + refs->second + ",").find("," + kind + ",") != string::npos;
+                };
+                string selector = "*";
+                if (!r.timestampRetry && !r.history.first.id.empty() && supports("msgid")) {
+                    selector = "msgid=" + r.history.first.id;
+                    histories.at(l).refType = "msgid";
+                } else if (!r.history.first.time.empty() &&
+                           (r.timestampRetry || supports("timestamp"))) {
+                    selector = "timestamp=" + historyTimestamp(r.history.first.time);
+                    histories.at(l).refType = "timestamp";
+                } else if (direction != HistoryDirection::Latest || !r.history.first.id.empty() ||
+                           !r.history.first.time.empty())
+                    throw std::invalid_argument("No supported history selector");
                 raw("CHATHISTORY", {sub, r.target, selector, std::to_string(limit)}, tags);
-            } else if (r.type != "history-around" && config.bouncer == "znc" &&
-                       has("znc.in/playback")) {
+            } else if (r.history.direction != HistoryDirection::Around &&
+                       r.history.direction != HistoryDirection::Targets &&
+                       config.bouncer == "znc" && has("znc.in/playback")) {
                 unlabeledHistory = l;
                 string cursor = "0";
-                string bound = r.text;
-                bool after = bound.starts_with("after=");
-                if (after)
-                    bound.erase(0, 6);
-                if (bound.starts_with("timestamp="))
-                    bound.erase(0, 10);
+                string bound = r.history.first.time;
+                if (bound.empty() && (!r.history.first.id.empty() ||
+                                      r.history.direction == HistoryDirection::Before ||
+                                      r.history.direction == HistoryDirection::After))
+                    throw std::invalid_argument("ZNC playback requires a timestamp cursor");
+                bool after = r.history.direction == HistoryDirection::After;
                 if (!bound.empty()) {
                     const auto t = irc::parseTimestampParts(bound);
                     if (!t)
@@ -1851,22 +1944,39 @@ struct NetworkClient::Impl {
             endHistory(l, e.what(), true);
         }
     }
+    string historyRootType(const History &history) const {
+        return history.direction == "targets"  ? "draft/chathistory-targets"
+               : history.direction == "search" ? "soju.im/search"
+               : config.bouncer == "znc" && !has("draft/chathistory") && !has("chathistory")
+                   ? "znc.in/playback"
+                   : "chathistory";
+    }
     void batch(const WireMessage &m) {
         if (m.params.empty() || m.params[0].size() < 2)
             return;
         string id = m.params[0].substr(1);
         if (m.params[0][0] == '+') {
-            if (m.params.size() < 2)
+            if (m.params.size() < 2) {
+                auto malformed = event(m);
+                const string key = malformed.label.empty() ? unlabeledHistory : malformed.label;
+                if (!key.empty())
+                    endHistory(key, "Malformed history root batch");
                 return;
+            }
             if (batches.size() >= 128 || batches.contains(id))
                 throw Failure("Invalid or excessive IRC batches");
             Batch b;
             b.type = m.params[1];
+            for (char &c : b.type)
+                if (c >= 'A' && c <= 'Z')
+                    c += 'a' - 'A';
             b.target = m.params.size() > 2 ? m.params[2] : "";
             b.parent = attr(m, "batch");
             b.tags = m.tags;
             auto context = event(m);
             b.label = context.label;
+            if (auto owner = context.tags.find("history-owner"); owner != context.tags.end())
+                b.historyOwner = owner->second;
             if (b.type == "soju.im/bouncer-networks") {
                 Event e;
                 e.type = "network";
@@ -1875,8 +1985,8 @@ struct NetworkClient::Impl {
                 emit(std::move(e));
             }
             b.history = context.history || b.type == "chathistory" ||
-                        b.type == "draft/chathistory" || b.type == "znc.in/playback" ||
-                        b.type == "soju.im/search";
+                        b.type == "draft/chathistory" || b.type == "draft/chathistory-targets" ||
+                        b.type == "znc.in/playback" || b.type == "soju.im/search";
             b.order = frameSerial;
             string parent = b.parent;
             unsigned depth = 0;
@@ -1888,25 +1998,55 @@ struct NetworkClient::Impl {
                     break;
                 parent = p->second.parent;
             }
-            if (b.history) {
-                if (b.label.empty() && !unlabeledHistory.empty()) {
-                    auto pending = histories.find(unlabeledHistory);
-                    if (pending != histories.end() &&
-                        (b.target.empty() || fold(b.target) == fold(pending->second.target)))
-                        b.label = unlabeledHistory;
+            if (b.label.empty() && !unlabeledHistory.empty() && b.parent.empty()) {
+                const auto pending = histories.find(unlabeledHistory);
+                if (pending != histories.end() && b.type == historyRootType(pending->second) &&
+                    (pending->second.direction == "targets" ||
+                     pending->second.direction == "search" ||
+                     (!b.target.empty() && fold(b.target) == fold(pending->second.target))))
+                    b.label = unlabeledHistory;
+            }
+            if (auto pending = histories.find(b.label); pending != histories.end()) {
+                auto &h = pending->second;
+                const auto parentBatch = batches.find(b.parent);
+                const bool responseRoot =
+                    b.parent.empty() || (parentBatch != batches.end() &&
+                                         parentBatch->second.type == "labeled-response");
+                if (responseRoot && b.type != "labeled-response") {
+                    const string expected = historyRootType(h);
+                    if (h.root || b.type != expected ||
+                        (h.direction != "targets" && h.direction != "search" &&
+                         (b.target.empty() || fold(b.target) != fold(h.target))))
+                        h.protocolError = "Unexpected history root batch";
+                    h.root = true;
+                    h.batch = id;
+                    h.ended = b.tags.contains("draft/chathistory-end");
+                    b.history = true;
+                    b.historyOwner = h.label;
                 }
+            }
+            if (b.history) {
+                const bool unsolicited = b.label.empty() && b.parent.empty() &&
+                                         (b.type == "chathistory" || b.type == "znc.in/playback");
                 if (b.label.empty())
                     b.label = label();
                 if (!histories.contains(b.label))
                     histories.emplace(
-                        b.label,
-                        History{
-                            b.target, b.label, id, Clock::now(), false, "latest", 200, 0, {}, 0});
+                        b.label, History{b.target, b.label, id, Clock::now(), false, "latest"});
                 auto pending = histories.find(b.label);
+                if (b.historyOwner.empty())
+                    b.historyOwner = pending->second.label;
+                if (unsolicited)
+                    pending->second.unsolicited = true;
                 if (b.target.empty())
                     b.target = pending->second.target;
-                pending->second.batch = id;
+                if (pending->second.batch.empty())
+                    pending->second.batch = id;
                 beginHistory(pending->second, id);
+                if (pending->second.request.type.empty() && pending->second.batch == id) {
+                    pending->second.root = true;
+                    pending->second.ended = b.tags.contains("draft/chathistory-end");
+                }
             }
             if (b.type == "draft/multiline") {
                 b.delivery = std::make_shared<Delivery>();
@@ -1968,13 +2108,24 @@ struct NetworkClient::Impl {
             batchBytes -= b.bytes;
             string batchLabel = b.label, batchType = b.type;
             bool historical = b.history;
+            if (auto h = histories.find(batchLabel); h != histories.end() && h->second.batch == id)
+                h->second.rootClosed = true;
+            if (historical)
+                for (const auto &[key, child] : batches)
+                    if (child.parent == id)
+                        if (auto h = histories.find(batchLabel); h != histories.end())
+                            h->second.protocolError = "History batch closed before nested batch";
             batches.erase(it);
             if (historical && !batchLabel.empty()) {
                 bool sibling = false;
                 for (const auto &[key, other] : batches)
                     if (other.history && other.label == batchLabel)
                         sibling = true;
-                if (!sibling)
+                const bool wrapped =
+                    std::any_of(batches.begin(), batches.end(), [&](const auto &p) {
+                        return p.second.type == "labeled-response" && p.second.label == batchLabel;
+                    });
+                if (!sibling && !wrapped)
                     endHistory(batchLabel);
             }
             if (batchType == "labeled-response" && !batchLabel.empty() &&
@@ -2074,8 +2225,10 @@ struct NetworkClient::Impl {
             retarget(request.target);
         for (auto &target : historyPriority)
             retarget(target);
-        for (auto &[label, history] : histories)
+        for (auto &[label, history] : histories) {
             retarget(history.target);
+            retarget(history.request.target);
+        }
         for (auto &[id, batch] : batches) {
             retarget(batch.target);
             for (auto &line : batch.lines)
@@ -2197,6 +2350,12 @@ struct NetworkClient::Impl {
             support(m);
             return;
         }
+        if (registered && (m.command == "376" || m.command == "422")) {
+            Event settled = event(m);
+            settled.type = "network";
+            settled.tags["kind"] = "isupport-settled";
+            emit(std::move(settled));
+        }
         if (m.command == "BATCH") {
             batch(m);
             return;
@@ -2214,6 +2373,29 @@ struct NetworkClient::Impl {
             return;
         }
         Event e = event(m);
+        if (auto h = histories.find(e.tags.contains("history-owner") ? e.tags.at("history-owner")
+                                                                     : e.label);
+            h != histories.end() && h->second.direction == "targets" && m.command != "BATCH" &&
+            e.history) {
+            if (m.command != "CHATHISTORY" || m.params.size() != 3 ||
+                upper(m.params[0]) != "TARGETS" || !token(m.params[1]) ||
+                !irc::parseTimestampParts(m.params[2])) {
+                h->second.protocolError = "Malformed CHATHISTORY TARGETS record";
+                return;
+            }
+            e.type = "history_target";
+            e.label = h->second.label;
+            e.target = m.params[1];
+            try {
+                e.time = historyTimestamp(m.params[2]);
+            } catch (const std::invalid_argument &) {
+                h->second.protocolError = "Malformed CHATHISTORY TARGETS timestamp";
+                return;
+            }
+            e.timestamp = irc::parseTimestampParts(m.params[2])->seconds;
+            emit(std::move(e));
+            return;
+        }
         correlateCommand(m, e);
         if (!m.params.empty())
             e.target = conversationTarget(m.params[0]);
@@ -2256,8 +2438,6 @@ struct NetworkClient::Impl {
                         raw("NOTICE", {e.nick, "\1" + ctcp + "\1"});
                 }
             }
-            if (m.tags.contains("znc.in/playback") || m.prefix.starts_with("*playback!"))
-                e.history = true;
             confirmSend(e);
             emit(std::move(e));
             return;
@@ -2587,12 +2767,29 @@ struct NetworkClient::Impl {
                         failAttempt(e.label, rejection.what());
                     }
                 } else {
-                    if (!e.label.empty() && histories.contains(e.label)) {
-                        endHistory(e.label, e.text);
-                        return;
-                    } else if (!unlabeledHistory.empty() && !m.params.empty() &&
-                               (m.params[0] == "CHATHISTORY" || m.params[0] == "SEARCH")) {
-                        endHistory(unlabeledHistory, e.text);
+                    const string historyLabel =
+                        !e.label.empty() && histories.contains(e.label) ? e.label
+                        : !unlabeledHistory.empty() && !m.params.empty() &&
+                                (m.params[0] == "CHATHISTORY" || m.params[0] == "SEARCH")
+                            ? unlabeledHistory
+                            : "";
+                    if (!historyLabel.empty()) {
+                        auto &h = histories.at(historyLabel);
+                        const string code = m.params.size() > 1 ? m.params[1] : "";
+                        if (code == "INVALID_MSGREFTYPE" && h.refType == "msgid" &&
+                            !h.request.timestampRetry && !h.request.history.first.time.empty() &&
+                            !h.root && h.count == 0) {
+                            Request retry = h.request;
+                            retry.timestampRetry = true;
+                            histories.erase(historyLabel);
+                            if (unlabeledHistory == historyLabel)
+                                unlabeledHistory.clear();
+                            historyQueue.push_front(std::move(retry));
+                        } else {
+                            h.failureCode = code;
+                            endHistory(historyLabel,
+                                       e.text.empty() ? "History request rejected" : e.text);
+                        }
                         return;
                     }
                     bool chatFailure =
@@ -2966,11 +3163,20 @@ struct NetworkClient::Impl {
                      r.fallbackNick);
             return;
         }
-        if (r.type == "history" || r.type == "history-around") {
-            if (!token(r.target) || r.target.size() > 512 || r.text.size() > 2048 ||
-                (!r.text.empty() && !token(r.text)) || r.extra.size() > 2048 ||
-                (!r.extra.empty() && (!token(r.extra) || !irc::parseTimestampParts(r.extra))) ||
-                !token(r.submission) || r.submission.size() > 512)
+        if (r.type == "history") {
+            const auto &h = r.history;
+            auto cursorValid = [&](const HistoryCursor &cursor) {
+                return cursor.id.size() <= 2048 && (cursor.id.empty() || token(cursor.id)) &&
+                       cursor.time.size() <= 128 &&
+                       (cursor.time.empty() ||
+                        (token(cursor.time) && irc::parseTimestampParts(cursor.time)));
+            };
+            if ((h.direction != HistoryDirection::Targets &&
+                 (!token(r.target) || r.target.size() > 512)) ||
+                !cursorValid(h.first) || !cursorValid(h.second) ||
+                (h.direction == HistoryDirection::Targets &&
+                 (!r.target.empty() || h.first.time.empty() || h.second.time.empty())) ||
+                h.limit <= 0 || !token(r.submission) || r.submission.size() > 512)
                 throw std::invalid_argument("Invalid history request");
             if (historyQueue.size() >= 128)
                 throw std::invalid_argument("Too many queued history requests");
@@ -3196,10 +3402,19 @@ struct NetworkClient::Impl {
                 }
         vector<string> expired;
         for (const auto &[key, h] : histories)
-            if (now - h.sent > 30s)
+            if (now - h.sent >= 35s)
                 expired.push_back(key);
         for (const auto &key : expired)
             endHistory(key, "History request timed out");
+        for (auto it = historyQueue.begin(); it != historyQueue.end();)
+            if (now - it->admitted >= 35s) {
+                auto end = historyFailure(*it, "History request timed out");
+                end.tags["timeout"] = "1";
+                end.tags.erase("rejected");
+                deliver(std::move(end));
+                it = historyQueue.erase(it);
+            } else
+                ++it;
         for (auto it = sentMultiline.begin(); it != sentMultiline.end();)
             if (now >= it->second.deadline) {
                 attemptBytes -= it->second.request.text.size();
@@ -3446,15 +3661,11 @@ void NetworkClient::sojuMutation(const string &command, const string &id,
     }
     impl_->enqueue({"soju", id, cmd, std::move(encoded), {}});
 }
-void NetworkClient::history(const string &target, const string &before, const string &requestId,
-                            bool initial) {
-    Impl::Request request{"history", target, before, {}, requestId};
-    request.initial = initial;
+void NetworkClient::history(const HistoryRequest &history) {
+    Impl::Request request{"history", history.target, {}, {}, history.requestId};
+    request.history = history;
+    request.initial = history.initial;
     impl_->enqueue(std::move(request));
-}
-void NetworkClient::historyAround(const string &target, const string &msgid,
-                                  const string &serverTime, const string &requestId) {
-    impl_->enqueue({"history-around", target, msgid, serverTime, requestId});
 }
 void NetworkClient::search(const string &target, const string &query, const string &requestId) {
     impl_->enqueue({"search", target, query, {}, requestId});

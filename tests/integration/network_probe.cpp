@@ -498,28 +498,32 @@ void run() {
         skip("reaction", "message-tags absent or CLIENTTAGDENY disallows draft/react or reply");
 
     if (primary->has("draft/chathistory")) {
-        const size_t boundaryStart = peer->events.size();
-        primary->client.send(channel, token + " history-boundary");
+        const size_t boundaryStart = primary->events.size();
+        peer->client.send(channel, token + " history-boundary");
+        // Receipt by a separate upstream peer does not order a bouncer's history
+        // ingestion. Observe this connection ingesting the boundary before querying it.
         const Event boundary = waitEvent(
-            *peer, primary.get(), boundaryStart,
+            *primary, peer.get(), boundaryStart,
             [&](const Event &e) { return liveMessage(e, token + " history-boundary"); },
-            "history pagination boundary is acknowledged by server");
+            "history consumer ingests the acknowledged pagination boundary");
         const size_t start = primary->events.size();
-        primary->client.history(channel, "", token + "-latest", false);
+        const string latestLabel = token + "-latest";
+        primary->client.history({.target = channel, .requestId = latestLabel});
         const Event latestEnd = waitEvent(
             *primary, peer.get(), start,
-            [&](const Event &e) { return e.type == "history_end" && e.target == channel; },
+            [&](const Event &e) { return e.type == "history_end" && e.label == latestLabel; },
             "CHATHISTORY batch completes");
         require(tag(latestEnd, "error").empty(),
                 "CHATHISTORY consumer completion reported an error: " + tag(latestEnd, "error"));
         require(primary->find(start,
                               [&](const Event &e) {
-                                  return e.type == "history_begin" && e.target == channel;
+                                  return e.type == "history_begin" && e.label == latestLabel;
                               }),
                 "history ended without consumer history_begin");
         require(primary->find(start,
                               [&](const Event &e) {
                                   return e.type == "message" && e.text == firstText && e.history &&
+                                         tag(e, "history-owner") == latestLabel &&
                                          e.timestamp > 0 && !e.time.empty();
                               }),
                 "CHATHISTORY did not return original message with historical server-time");
@@ -531,42 +535,105 @@ void run() {
                     "CHATHISTORY continuation cursor uses an unsupported reference type");
         pass("CHATHISTORY brackets, actual message and authoritative historical time");
         const Event *historicalBoundary = primary->find(start, [&](const Event &e) {
-            return e.type == "message" && e.text == boundary.text && e.history;
+            return e.type == "message" && e.text == boundary.text && e.history &&
+                   tag(e, "history-owner") == latestLabel;
         });
-        require(historicalBoundary, "LATEST omitted the acknowledged pagination boundary");
-        string cursor;
-        if (!historicalBoundary->id.empty() &&
-            (primary->messageReferences.empty() ||
-             primary->messageReferences.find("msgid") != string::npos))
-            cursor = "msgid=" + historicalBoundary->id;
-        else {
-            require(primary->messageReferences.empty() ||
-                        primary->messageReferences.find("timestamp") != string::npos,
-                    "CHATHISTORY advertised no usable pagination reference type");
-            require(!historicalBoundary->time.empty() && historicalBoundary->timestamp > 0,
-                    "CHATHISTORY timestamp cursor lacks authoritative historical server-time");
-            cursor = "timestamp=" + historicalBoundary->time;
+        if (!historicalBoundary) {
+            std::cerr << "LATEST trace count=" << tag(latestEnd, "count")
+                      << " limit=" << tag(latestEnd, "limit") << " end=" << tag(latestEnd, "end")
+                      << " refs=" << primary->messageReferences.substr(0, 80)
+                      << " boundary-time=" << boundary.time.substr(0, 40) << '\n';
+            size_t traced = 0;
+            for (size_t i = start; i < primary->events.size() && traced < 8; ++i) {
+                const auto &record = primary->events[i];
+                if (record.history && tag(record, "history-owner") == latestLabel) {
+                    std::cerr << "  type=" << record.type.substr(0, 32)
+                              << " time=" << record.time.substr(0, 40)
+                              << " msgid=" << !record.id.empty()
+                              << " context=" << record.tags.contains("draft/chathistory-context")
+                              << '\n';
+                    ++traced;
+                }
+            }
         }
+        require(historicalBoundary, "LATEST omitted the acknowledged pagination boundary");
+        const HistoryCursor cursor{historicalBoundary->id, historicalBoundary->time};
         const size_t olderStart = primary->events.size();
-        primary->client.history(channel, cursor, token + "-older", false);
+        primary->client.history({.target = channel,
+                                 .direction = HistoryDirection::Before,
+                                 .first = cursor,
+                                 .requestId = token + "-older"});
         const Event olderEnd = waitEvent(
             *primary, peer.get(), olderStart,
-            [&](const Event &e) { return e.type == "history_end" && e.target == channel; },
+            [&](const Event &e) { return e.type == "history_end" && e.label == token + "-older"; },
             "CHATHISTORY BEFORE batch completes");
         require(tag(olderEnd, "error").empty(),
                 "BEFORE pagination reported a consumer error: " + tag(olderEnd, "error"));
         require(primary->find(olderStart,
                               [&](const Event &e) {
-                                  return e.type == "message" && e.text == firstText && e.history;
+                                  return e.type == "message" && e.text == firstText && e.history &&
+                                         tag(e, "history-owner") == token + "-older";
                               }),
                 "BEFORE pagination omitted earlier consumer-visible message");
         require(!primary->find(olderStart,
                                [&](const Event &e) {
-                                   return e.type == "message" && e.text == boundary.text &&
-                                          e.history;
+                                   return e.type == "message" && e.history &&
+                                          tag(e, "history-owner") == token + "-older" &&
+                                          (e.text == boundary.text ||
+                                           (!cursor.id.empty() && e.id == cursor.id));
                                }),
                 "BEFORE pagination included its exclusive boundary");
+        size_t olderCount = 0;
+        for (size_t i = olderStart; i < primary->events.size(); ++i) {
+            const auto &record = primary->events[i];
+            if (record.history && tag(record, "history-owner") == token + "-older" &&
+                record.type != "typing" && tag(record, "command") != "BATCH" &&
+                !record.tags.contains("draft/chathistory-context"))
+                ++olderCount;
+        }
+        require(olderCount > 0 && tag(olderEnd, "count") == std::to_string(olderCount),
+                "BEFORE primary count does not match the completed consumer page");
         pass("load-older pagination excludes its advertised-selector boundary");
+        const size_t aroundStart = primary->events.size();
+        primary->client.history({.target = channel,
+                                 .direction = HistoryDirection::Around,
+                                 .first = cursor,
+                                 .requestId = token + "-around"});
+        const Event aroundEnd = waitEvent(
+            *primary, peer.get(), aroundStart,
+            [&](const Event &e) { return e.type == "history_end" && e.label == token + "-around"; },
+            "CHATHISTORY AROUND batch completes");
+        require(tag(aroundEnd, "error").empty() && tag(aroundEnd, "direction") == "around",
+                "AROUND context request failed");
+        require(primary->find(aroundStart,
+                              [&](const Event &e) {
+                                  return e.type == "message" && e.history &&
+                                         e.text == boundary.text;
+                              }),
+                "AROUND omitted the selected acknowledged message");
+        pass("AROUND returns selected history context");
+
+        const size_t targetsStart = primary->events.size();
+        const string targetsLabel = token + "-targets";
+        primary->client.history({.direction = HistoryDirection::Targets,
+                                 .first = {"", "9999-12-31T23:59:59.999Z"},
+                                 .second = {"", "1970-01-01T00:00:00.000Z"},
+                                 .requestId = targetsLabel,
+                                 .limit = 100});
+        const Event targetsEnd = waitEvent(
+            *primary, peer.get(), targetsStart,
+            [&](const Event &e) { return e.type == "history_end" && e.label == targetsLabel; },
+            "CHATHISTORY TARGETS batch completes");
+        require(tag(targetsEnd, "error").empty() && tag(targetsEnd, "direction") == "targets",
+                "advertised CHATHISTORY TARGETS failed: " + tag(targetsEnd, "error"));
+        require(primary->find(targetsStart,
+                              [&](const Event &e) {
+                                  return e.type == "history_target" && e.label == targetsLabel &&
+                                         irc::casefold(e.target) == irc::casefold(channel) &&
+                                         !e.time.empty();
+                              }),
+                "TARGETS omitted the active channel's timestamped discovery record");
+        pass("TARGETS returns active channel discovery records and correlated completion");
     } else
         skip("CHATHISTORY", "draft/chathistory not advertised by " + kind);
 
@@ -627,7 +694,7 @@ void run() {
                  "optional external playback module is not advertised");
         } else {
             const size_t start = primary->events.size();
-            primary->client.history(channel, "", token + "-znc", false);
+            primary->client.history({.target = channel, .requestId = token + "-znc"});
             const auto completed = waitEvent(
                 *primary, peer.get(), start,
                 [&](const Event &e) { return e.type == "history_end" && e.target == channel; },
@@ -658,7 +725,8 @@ void run() {
             *primary, peer.get(), [&] { return primary->ready; }, "bouncer downstream reconnects");
         primary->client.command("JOIN " + channel);
         if (primary->has("draft/chathistory"))
-            primary->client.history(channel, "", token + "-reconnect", true);
+            primary->client.history(
+                {.target = channel, .requestId = token + "-reconnect", .initial = true});
         waitEvent(
             *primary, peer.get(), 0,
             [&](const Event &e) {

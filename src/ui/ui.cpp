@@ -1148,7 +1148,8 @@ struct Ui::Impl {
         titleRow->setHitTestVisible(false);
         title->setHitTestVisible(false);
         title->setMaxLines(1);
-        modeLine = static_cast<ModeLine *>(scene->addChild(std::make_unique<ModeLine>(model)));
+        modeLine =
+            static_cast<ModeLine *>(scene->addChild(std::make_unique<ModeLine>(model, callback)));
         const std::array<std::pair<const char *, const char *>, 3> tools = {
             {{"panel-left", "Toggle navigation"},
              {"terminal", "Execute command"},

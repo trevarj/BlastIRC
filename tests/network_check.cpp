@@ -42,8 +42,8 @@ void require(bool condition, const char *reason) {
 struct TemporaryDirectory {
     fs::path path;
     TemporaryDirectory() {
-        char name[] = "/tmp/blastirc-network-check-XXXXXX";
-        const auto *created = ::mkdtemp(name);
+        string name = (fs::temp_directory_path() / "blastirc-network-check-XXXXXX").string();
+        const auto *created = ::mkdtemp(name.data());
         require(created != nullptr, "Cannot create isolated network-check directory");
         path = created;
     }
@@ -179,6 +179,37 @@ struct WirePeer {
                 first = false;
             }
             message << ']'; // Error codes only, never TLS/IRC payloads or error-data strings.
+            // Capture trust/temp state before scoped fixture teardown restores
+            // the environment and deletes the private CA. Never print path values.
+            for (const char *key : {"SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "SSL_CERT_DIR", "TMPDIR",
+                                    "TMP", "TEMP", "NIX_BUILD_TOP"}) {
+                const char *value = std::getenv(key);
+                message << "; " << key << "={set=" << (value != nullptr);
+                if (value) {
+                    std::error_code fileError, parentError;
+                    const fs::path path(value);
+                    message << ",exists=" << fs::exists(path, fileError)
+                            << ",status-error=" << fileError.value()
+                            << ",parent-exists=" << fs::exists(path.parent_path(), parentError)
+                            << ",parent-error=" << parentError.value();
+                    if (std::strcmp(key, "SSL_CERT_FILE") == 0 ||
+                        std::strcmp(key, "NIX_SSL_CERT_FILE") == 0) {
+                        std::unique_ptr<BIO, decltype(&BIO_free)> file(BIO_new_file(value, "r"),
+                                                                       BIO_free);
+                        std::unique_ptr<X509, decltype(&X509_free)> certificate(
+                            file ? PEM_read_bio_X509(file.get(), nullptr, nullptr, nullptr)
+                                 : nullptr,
+                            X509_free);
+                        message << ",certificate-readable=" << bool(certificate)
+                                << ",matches-fixture-certificate="
+                                << (certificate &&
+                                    X509_cmp(certificate.get(),
+                                             SSL_CTX_get0_certificate(context)) == 0);
+                        ERR_clear_error();
+                    }
+                }
+                message << '}';
+            }
             throw std::runtime_error(message.str());
         }
         waitFd(connection.value, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, deadline);
@@ -1447,6 +1478,312 @@ void avatarSmoke(SSL_CTX *context, const Identity &identity, const fs::path &cer
     }
 }
 
+void historyConsumerWireChecks(SSL_CTX *context, const Identity &identity, bool labeled) {
+    WirePeer peer(context);
+    NetworkClient client(server(peer.port), identity);
+    vector<Event> events;
+    registerClient(peer, client, events, identity,
+                   "message-tags server-time batch draft/chathistory" +
+                       string(labeled ? " labeled-response" : ""));
+    for (const string numeric : {"376", "422"}) {
+        const auto from = events.size();
+        const string text = "history capability settlement " + numeric;
+        peer.send(":server " + numeric + " " + identity.nick + " :" + text);
+        const auto marker = waitEvent(client, events, from, [](const Event &e) {
+            return e.type == "network" && tag(e, "kind") == "isupport-settled";
+        });
+        require(events[marker].params == vector<string>{identity.nick, text} &&
+                    !events[marker].tags.contains("CHANTYPES"),
+                "History capability settlement fabricated ISUPPORT tokens or lost numeric params");
+        waitEvent(client, events, from, [&](const Event &e) {
+            return e.type == "network" && tag(e, "kind") == "raw" &&
+                   e.params == vector<string>{identity.nick, text};
+        });
+        require(std::none_of(events.begin() + from, events.end(),
+                             [](const Event &e) {
+                                 return e.type == "network" && tag(e, "kind") == "isupport" &&
+                                        e.tags.contains("CHANTYPES");
+                             }),
+                "MOTD terminal numeric fabricated CHANTYPES advertisement");
+    }
+    auto prefix = [&](const string &id) { return labeled ? "@label=" + id + " " : ""; };
+    auto end = [&](const string &id) {
+        const auto index = waitEvent(client, events, 0, [&](const Event &e) {
+            return e.type == "history_end" && e.label == id;
+        });
+        return events[index];
+    };
+    auto latest = [&](const string &id) {
+        client.history({.target = "#bounds", .requestId = id});
+        peer.expect("CHATHISTORY", {"LATEST", "#bounds", "*", "50"});
+    };
+    const string time = "2026-11-01T12:00:00.123Z";
+    latest("ordered");
+    if (!labeled) {
+        const auto liveStart = events.size();
+        peer.send(":server BATCH +live-join netjoin old.server new.server\r\n"
+                  "@batch=live-join :LivePeer!u@h JOIN #live\r\n"
+                  ":server BATCH -live-join\r\n"
+                  ":server BATCH +live-split netsplit old.server new.server\r\n"
+                  "@batch=live-split :LivePeer!u@h QUIT :split\r\n"
+                  ":server BATCH -live-split");
+        waitEvent(client, events, liveStart,
+                  [](const Event &e) { return e.type == "quit" && e.nick == "LivePeer"; });
+        for (const auto &type : {"join", "quit"})
+            require(std::any_of(events.begin() + liveStart, events.end(),
+                                [&](const Event &e) {
+                                    return e.type == type && e.nick == "LivePeer" && !e.history &&
+                                           e.label.empty();
+                                }),
+                    "Unrelated live presence inherited pending history semantics");
+        require(std::none_of(
+                    events.begin() + liveStart, events.end(),
+                    [](const Event &e) { return e.type == "history_end" && e.label == "ordered"; }),
+                "Unrelated live batch completed pending unlabeled history");
+    }
+    peer.send(prefix("ordered") +
+              ":server BATCH +ordered chathistory #bounds\r\n"
+              "@batch=ordered;msgid=z-old;time=" +
+              time +
+              " :Peer!u@h PRIVMSG #bounds :first\r\n"
+              "@batch=ordered;msgid=a-new;time=" +
+              time + " :Peer!u@h PRIVMSG #bounds :last\r\n:server BATCH -ordered");
+    const auto ordered = end("ordered");
+    require(tag(ordered, "error").empty() && tag(ordered, "count") == "2" &&
+                tag(ordered, "oldest-id") == "z-old" && tag(ordered, "newest-id") == "a-new" &&
+                tag(ordered, "oldest-time") == time && tag(ordered, "newest-time") == time,
+            "History bounds sorted opaque IDs or lost tied response-order timestamps");
+    for (const bool identified : {true, false}) {
+        const string owner = identified ? "mutation-ids" : "mutation-time";
+        latest(owner);
+        peer.send(prefix(owner) +
+                  ":server BATCH +mutations chathistory #bounds\r\n"
+                  "@batch=mutations;+draft/react=:);+reply=reacted-message;time=" +
+                  time + (identified ? ";msgid=reaction-wire-id" : "") +
+                  " :Peer!u@h TAGMSG #bounds\r\n"
+                  "@batch=mutations;time=" +
+                  time + (identified ? ";msgid=redaction-wire-id" : "") +
+                  " :Peer!u@h REDACT #bounds redacted-message :removed\r\n"
+                  ":server BATCH -mutations");
+        const auto mutationEnd = end(owner);
+        require(tag(mutationEnd, "error").empty() && tag(mutationEnd, "count") == "2" &&
+                    tag(mutationEnd, "oldest-id") == (identified ? "reaction-wire-id" : "") &&
+                    tag(mutationEnd, "newest-id") == (identified ? "redaction-wire-id" : "") &&
+                    tag(mutationEnd, "oldest-time") == time &&
+                    tag(mutationEnd, "newest-time") == time,
+                "Mutation boundaries used target IDs instead of their own wire IDs/time");
+        for (const string type : {"reaction", "redact"})
+            require(std::any_of(events.begin(), events.end(),
+                                [&](const Event &e) {
+                                    return e.type == type && e.history &&
+                                           tag(e, "history-owner") == owner &&
+                                           e.id == (type == "reaction" ? "reacted-message"
+                                                                       : "redacted-message");
+                                }),
+                    "History boundary accounting changed the mutation consumer target ID");
+    }
+    latest("page-owner");
+    peer.send(prefix("page-owner") +
+              ":server BATCH +owner-page chathistory #bounds\r\n"
+              "@batch=owner-page;label=original-send;msgid=owner-first;time=" +
+              time +
+              ";history-owner=wire-spoof;history-standalone=1 "
+              ":Self!u@h PRIVMSG #bounds :owned direct\r\n"
+              "@batch=owner-page;history-owner=context-spoof;history-standalone=1 "
+              ":server BATCH +owner-lines draft/multiline #bounds\r\n"
+              "@batch=owner-lines;label=original-multiline;msgid=owner-last;time=" +
+              time +
+              ";history-owner=fragment-spoof;history-standalone=1 "
+              ":Self!u@h PRIVMSG #bounds :owned multiline\r\n"
+              ":server BATCH -owner-lines\r\n:server BATCH -owner-page");
+    const auto ownedEnd = end("page-owner");
+    require(tag(ownedEnd, "error").empty() && tag(ownedEnd, "count") == "2" &&
+                tag(ownedEnd, "oldest-id") == "owner-first" &&
+                tag(ownedEnd, "newest-id") == "owner-last",
+            "Original send labels stole page ownership or count/bounds");
+    for (const string id : {"owner-first", "owner-last"})
+        require(std::any_of(events.begin(), events.end(),
+                            [&](const Event &e) {
+                                return e.type == "message" && e.id == id && e.history &&
+                                       e.label == (id == "owner-first" ? "original-send"
+                                                                       : "original-multiline") &&
+                                       tag(e, "history-owner") == "page-owner" &&
+                                       !e.tags.contains("history-standalone");
+                            }),
+                "History ownership did not survive original label/multiline spoofed context");
+    peer.send("@history-owner=forged;history-standalone=1;msgid=spoof-live "
+              ":Peer!u@h PRIVMSG #bounds :untrusted wire markers");
+    const auto spoof = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "message" && e.id == "spoof-live";
+    });
+    require(!events[spoof].history && !events[spoof].tags.contains("history-owner") &&
+                !events[spoof].tags.contains("history-standalone"),
+            "Arbitrary wire markers acquired trusted history ownership");
+    if (labeled) {
+        peer.send("@label=retired-history :server BATCH +retired chathistory #bounds\r\n"
+                  "@batch=retired;history-owner=retired-history;history-standalone=1;"
+                  "msgid=retired-message :Peer!u@h PRIVMSG #bounds :stale page\r\n"
+                  ":server BATCH -retired");
+        const auto stale = waitEvent(client, events, 0, [](const Event &e) {
+            return e.type == "message" && e.id == "retired-message";
+        });
+        require(events[stale].history && tag(events[stale], "history-owner") == "retired-history" &&
+                    !events[stale].tags.contains("history-standalone"),
+                "Stale explicitly labeled root lost its rejecting owner identity");
+        require(std::none_of(events.begin(), events.end(),
+                             [](const Event &e) {
+                                 return e.type == "history_begin" && e.label == "retired-history" &&
+                                        e.tags.contains("unsolicited");
+                             }),
+                "Stale explicitly labeled root was admitted as unsolicited playback");
+    }
+
+    auto targets = [&](const string &id) {
+        client.history({.direction = HistoryDirection::Targets,
+                        .first = {"", "2026-11-02T00:00:00Z"},
+                        .second = {"", "2026-10-01T00:00:00Z"},
+                        .requestId = id,
+                        .limit = 100});
+        peer.expect("CHATHISTORY", {"TARGETS", "timestamp=2026-11-02T00:00:00.000Z",
+                                    "timestamp=2026-10-01T00:00:00.000Z", "100"});
+    };
+    const auto targetsStart = events.size();
+    targets("targets");
+    peer.send(
+        string(labeled ? "@label=targets;draft/chathistory-end " : "@draft/chathistory-end ") +
+        ":server BATCH +targets draft/chathistory-targets\r\n"
+        "@batch=targets :server CHATHISTORY TARGETS #Room "
+        "2026-11-01T13:00:00.123999999+01:00\r\n"
+        "@batch=targets :server CHATHISTORY TARGETS #Room " +
+        time + "\r\n:server BATCH -targets");
+    const auto targetEnd = end("targets");
+    require(tag(targetEnd, "error").empty() && tag(targetEnd, "direction") == "targets" &&
+                tag(targetEnd, "count") == "2" && tag(targetEnd, "end") == "1",
+            "TARGETS lost raw record count or opening end tag");
+    require(std::count_if(events.begin() + targetsStart, events.end(),
+                          [&](const Event &e) {
+                              return e.type == "history_target" && e.label == "targets" &&
+                                     e.target == "#Room" && e.time == time;
+                          }) == 2,
+            "TARGETS lost correlation or failed UTC/millisecond truncation normalization");
+    for (const string kind :
+         {"wrong-root", "bad-time", "bad-target", "missing-record-field", "utc-overflow"}) {
+        if (!labeled && kind == "wrong-root")
+            continue; // Unlabeled unrelated root types cannot identify this request.
+        targets(kind);
+        const string type = kind == "wrong-root" ? "chathistory" : "draft/chathistory-targets";
+        string record;
+        if (kind == "bad-time")
+            record = "@batch=broken :server CHATHISTORY TARGETS #Room not-a-time\r\n";
+        else if (kind == "bad-target")
+            record = "@batch=broken :server CHATHISTORY TARGETS :invalid target " + time + "\r\n";
+        else if (kind == "missing-record-field")
+            record = "@batch=broken :server CHATHISTORY TARGETS #Room\r\n";
+        else if (kind == "utc-overflow")
+            record = "@batch=broken :server CHATHISTORY TARGETS #Room "
+                     "9999-12-31T23:59:59-01:00\r\n";
+        peer.send(prefix(kind) + ":server BATCH +broken " + type + "\r\n" + record +
+                  ":server BATCH -broken");
+        const auto failed = end(kind);
+        require(!tag(failed, "error").empty() && tag(failed, "end").empty(),
+                "Malformed TARGETS response fabricated successful empty discovery");
+        require(std::none_of(
+                    events.begin(), events.end(),
+                    [&](const Event &e) { return e.type == "history_target" && e.label == kind; }),
+                "Malformed TARGETS record reached its consumer");
+    }
+    if (labeled) {
+        latest("missing-root");
+        peer.send("@label=missing-root :server BATCH +missing labeled-response\r\n"
+                  "@batch=missing :server ACK\r\n:server BATCH -missing");
+        require(!tag(end("missing-root"), "error").empty(),
+                "Labeled response without history root fabricated empty success");
+    }
+    if (labeled) {
+        latest("wrong-message-root");
+        peer.send(prefix("wrong-message-root") +
+                  ":server BATCH +wrong-message draft/chathistory-targets\r\n"
+                  ":server BATCH -wrong-message");
+        require(!tag(end("wrong-message-root"), "error").empty(),
+                "Message page accepted TARGETS root as empty history");
+    }
+
+    peer.send(":server 005 " + identity.nick + " MSGREFTYPES=msgid,timestamp :supported");
+    waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "network" && tag(e, "MSGREFTYPES") == "msgid,timestamp";
+    });
+    client.history({.target = "#retry",
+                    .direction = HistoryDirection::Before,
+                    .first = {"original-id", time},
+                    .requestId = "retry"});
+    peer.expect("CHATHISTORY", {"BEFORE", "#retry", "msgid=original-id", "50"});
+    peer.send(prefix("retry") +
+              ":server FAIL CHATHISTORY INVALID_MSGREFTYPE #retry :use timestamp");
+    peer.expect("CHATHISTORY", {"BEFORE", "#retry", "timestamp=" + time, "50"});
+    collect(client, events);
+    require(
+        std::none_of(events.begin(), events.end(),
+                     [](const Event &e) { return e.type == "history_end" && e.label == "retry"; }),
+        "Recoverable msgid failure prematurely ended the logical request");
+    peer.send(prefix("retry") +
+              ":server FAIL CHATHISTORY INVALID_MSGREFTYPE #retry :timestamp denied");
+    const auto retryEnd = end("retry");
+    require(tag(retryEnd, "error") == "timestamp denied" &&
+                tag(retryEnd, "failure-code") == "INVALID_MSGREFTYPE" &&
+                tag(retryEnd, "ref-type") == "timestamp",
+            "Timestamp fallback lost explicit failure or selector metadata");
+    peer.fence();
+    peer.quietUntil(Clock::now() + 100ms);
+    for (const string cap : {"invalid", "0", "17"}) {
+        peer.send(":server 005 " + identity.nick + " CHATHISTORY=" + cap + " :supported");
+        waitEvent(client, events, 0, [&](const Event &e) {
+            return e.type == "network" && tag(e, "CHATHISTORY") == cap;
+        });
+        const string id = "cap-" + cap;
+        client.history({.direction = HistoryDirection::Targets,
+                        .first = {"", "2026-11-02T00:00:00Z"},
+                        .second = {"", "2026-10-01T00:00:00Z"},
+                        .requestId = id,
+                        .limit = 100});
+        peer.expect("CHATHISTORY",
+                    {"TARGETS", "timestamp=2026-11-02T00:00:00.000Z",
+                     "timestamp=2026-10-01T00:00:00.000Z", cap == "17" ? "17" : "100"});
+        peer.send(prefix(id) + ":server BATCH +cap draft/chathistory-targets\r\n"
+                               ":server BATCH -cap");
+        require(tag(end(id), "error").empty(), "Advertised history cap broke TARGETS completion");
+    }
+    peer.send(":server 005 " + identity.nick + " CHATHISTORY=0 :supported");
+    peer.fence();
+    const int slots = labeled ? 6 : 1;
+    const auto timeoutStart = Clock::now();
+    for (int i = 0; i < slots; ++i)
+        latest("timeout-" + std::to_string(i));
+    client.history({.target = "#bounds", .requestId = "timeout-queued"});
+    client.command("PING :timeout-admitted");
+    peer.expect("PING", {"timeout-admitted"});
+    peer.quietUntil(Clock::now() + 100ms);
+    const auto deadline = timeoutStart + 40s;
+    for (;;) {
+        collect(client, events);
+        const auto completed = std::count_if(events.begin(), events.end(), [](const Event &e) {
+            return e.type == "history_end" && e.label.starts_with("timeout-");
+        });
+        if (completed == slots + 1)
+            break;
+        require(Clock::now() < deadline, "History timeout excluded time waiting in the queue");
+        std::this_thread::sleep_for(10ms);
+    }
+    require(Clock::now() >= timeoutStart + 34s,
+            "History requests expired before their 35s deadline");
+    for (const auto &e : events)
+        if (e.type == "history_end" && e.label.starts_with("timeout-"))
+            require(tag(e, "timeout") == "1" && !tag(e, "error").empty() &&
+                        tag(e, "count") == "0" && tag(e, "end").empty(),
+                    "Active or queued timeout fabricated a successful empty page");
+    client.stop();
+    collect(client, events);
+}
+
 void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled) {
     WirePeer peer(context);
     NetworkClient client(server(peer.port), identity);
@@ -1459,10 +1796,10 @@ void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled
         peer.expect("PING", {"history-admitted"});
     };
     auto request = [&](const string &target, const string &id, bool initial) {
-        client.history(target, "", id, initial);
+        client.history({.target = target, .requestId = id, .initial = initial});
     };
     auto wire = [&](const string &target, const string &id) {
-        const auto message = peer.expect("CHATHISTORY", {"LATEST", target, "*", "200"});
+        const auto message = peer.expect("CHATHISTORY", {"LATEST", target, "*", "50"});
         require(labeled ? message.tags.contains("label") && message.tags.at("label") == id
                         : !message.tags.contains("label"),
                 "History wire label lost caller correlation");
@@ -1489,7 +1826,10 @@ void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled
         return e.type == "network" && tag(e, "kind") == "isupport" &&
                tag(e, "MSGREFTYPES") == "timestamp";
     });
-    client.historyAround("#around", "selected-id", "2026-11-01T12:00:00Z", "around-time");
+    client.history({.target = "#around",
+                    .direction = HistoryDirection::Around,
+                    .first = {"selected-id", "2026-11-01T12:00:00Z"},
+                    .requestId = "around-time"});
     const auto around = peer.expect(
         "CHATHISTORY", {"AROUND", "#around", "timestamp=2026-11-01T12:00:00.000Z", "17"});
     require(labeled ? around.tags.contains("label") && around.tags.at("label") == "around-time"
@@ -1517,8 +1857,11 @@ void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled
         return e.type == "network" && tag(e, "kind") == "isupport" &&
                tag(e, "MSGREFTYPES") == "msgid";
     });
-    client.historyAround("#around", "selected-id", "2026-11-01T12:00:00Z", "around-id");
-    peer.expect("CHATHISTORY", {"AROUND", "#around", "msgid=selected-id", "200"});
+    client.history({.target = "#around",
+                    .direction = HistoryDirection::Around,
+                    .first = {"selected-id", "2026-11-01T12:00:00Z"},
+                    .requestId = "around-id"});
+    peer.expect("CHATHISTORY", {"AROUND", "#around", "msgid=selected-id", "50"});
     peer.send(string(labeled ? "@label=around-id " : "") +
               ":server FAIL CHATHISTORY INVALID_PARAMS #around :history denied");
     const auto aroundFailure = waitEvent(client, events, 0, [](const Event &e) {
@@ -1527,7 +1870,10 @@ void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled
     require(tag(events[aroundFailure], "direction") == "around" &&
                 tag(events[aroundFailure], "error") == "history denied",
             "AROUND failure lost correlation");
-    client.historyAround("#around", "", "2026-11-01T12:00:00Z", "around-invalid");
+    client.history({.target = "#around",
+                    .direction = HistoryDirection::Around,
+                    .first = {"", "2026-11-01T12:00:00Z"},
+                    .requestId = "around-invalid"});
     const auto aroundInvalid = waitEvent(client, events, 0, [](const Event &e) {
         return e.type == "history_end" && e.label == "around-invalid";
     });
@@ -1536,7 +1882,7 @@ void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled
                 !tag(events[aroundInvalid], "error").empty(),
             "Unsupported AROUND selector was not rejected");
     // Fill active slots so ranking changes operate only on pending work.
-    const int active = labeled ? 16 : 1;
+    const int active = labeled ? 6 : 1;
     for (int i = 0; i < active; ++i) {
         const string id = "held-" + std::to_string(i);
         request("#" + id, id, true);
@@ -1552,6 +1898,7 @@ void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled
     client.cancelInitialHistory("#cancel");
     client.prioritizeHistory({"#c", "#a", "#b"});
     admitted();
+    peer.quietUntil(Clock::now() + 100ms);
     const auto canceled = waitEvent(client, events, 0, [](const Event &e) {
         return e.type == "history_end" && e.label == "canceled";
     });
@@ -1591,11 +1938,26 @@ void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled
                 tag(events[searchBegin], "direction") == "search",
             "Generic search did not stay foreground");
     require(!labeled || search.tags.at("label") == searchId, "Search label mismatch");
-    finish("#search", searchId);
+    peer.send(string(labeled ? "@label=" + searchId + " " : "") +
+              ":server BATCH +search-result soju.im/search\r\n:server BATCH -search-result");
+    const auto searchEnd = waitEvent(client, events, 0, [&](const Event &e) {
+        return e.type == "history_end" && e.label == searchId;
+    });
+    require(tag(events[searchEnd], "error").empty() &&
+                tag(events[searchEnd], "direction") == "search" &&
+                tag(events[searchEnd], "count") == "0",
+            "Targetless native Soju SEARCH root did not complete normally");
     wire("#a", "initial-a");
     // Hold the last request while exercising the 128-pending bound.
-    client.history("invalid target", "after=msgid=cursor", "invalid-initial", true);
-    client.history("#invalid", "bad cursor", "invalid-foreground", false);
+    client.history({.target = "invalid target",
+                    .direction = HistoryDirection::After,
+                    .first = {"cursor", ""},
+                    .requestId = "invalid-initial",
+                    .initial = true});
+    client.history({.target = "#invalid",
+                    .direction = HistoryDirection::Before,
+                    .first = {"bad cursor", ""},
+                    .requestId = "invalid-foreground"});
     for (int i = 0; i < 128; ++i)
         request("#queued-" + std::to_string(i), "queued-" + std::to_string(i), true);
     request("#overflow", "overflow-initial", true);
@@ -1617,7 +1979,11 @@ void historyQueueChecks(SSL_CTX *context, const Identity &identity, bool labeled
     client.stop();
     bool stoppedRejected = false;
     try {
-        client.history("#stopped", "after=msgid=cursor", "stopped-initial", true);
+        client.history({.target = "#stopped",
+                        .direction = HistoryDirection::After,
+                        .first = {"cursor", ""},
+                        .requestId = "stopped-initial",
+                        .initial = true});
     } catch (const std::runtime_error &) {
         stoppedRejected = true;
     }
@@ -1659,7 +2025,26 @@ void playbackChecks(SSL_CTX *context, const Identity &identity) {
     vector<Event> events;
     registerClient(peer, client, events, identity,
                    "message-tags batch server-time znc.in/playback");
-    client.history("#playback", "after=timestamp=2026-11-05T00:00:00.123Z", "playback-after", true);
+    peer.send("@znc.in/playback;msgid=standalone-playback;history-owner=spoof "
+              ":alice!user@localhost PRIVMSG #playback :genuine standalone playback");
+    const auto standalone = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "message" && e.id == "standalone-playback";
+    });
+    require(events[standalone].history && tag(events[standalone], "history-standalone") == "1" &&
+                !events[standalone].tags.contains("history-owner"),
+            "Genuine standalone ZNC playback lacked trusted standalone classification");
+    peer.send("@history-standalone=1;msgid=forged-playback "
+              ":alice!user@localhost PRIVMSG #playback :ordinary ZNC live message");
+    const auto forged = waitEvent(client, events, 0, [](const Event &e) {
+        return e.type == "message" && e.id == "forged-playback";
+    });
+    require(!events[forged].history && !events[forged].tags.contains("history-standalone"),
+            "Arbitrary ZNC wire marker became trusted standalone playback");
+    client.history({.target = "#playback",
+                    .direction = HistoryDirection::After,
+                    .first = {"", "2026-11-05T00:00:00.123Z"},
+                    .requestId = "playback-after",
+                    .initial = true});
     peer.expect("ZNC", {"*playback", "PLAY #playback 1793836800.123"});
     peer.send(":server BATCH +playback znc.in/playback #playback");
     peer.send("@batch=playback;time=2026-11-05T00:00:01.250Z;msgid=playback-message "
@@ -1690,7 +2075,7 @@ void playbackChecks(SSL_CTX *context, const Identity &identity) {
                         }),
             "Real ZNC batch message was not delivered as historical");
     const auto from = events.size();
-    client.history("#missing", "", "playback-missing", false);
+    client.history({.target = "#missing", .requestId = "playback-missing"});
     peer.expect("ZNC", {"*playback", "PLAY #missing 0"});
     peer.send(":server 401 " + identity.nick + " *playback :No such nick");
     const auto &rejected = events[waitEvent(client, events, from, [](const Event &event) {
@@ -1702,7 +2087,8 @@ void playbackChecks(SSL_CTX *context, const Identity &identity) {
     peer.send(":server CAP " + identity.nick + " DEL :znc.in/playback");
     peer.fence();
     const auto unsupportedFrom = events.size();
-    client.history("#unsupported", "", "playback-unsupported", true);
+    client.history(
+        {.target = "#unsupported", .requestId = "playback-unsupported", .initial = true});
     const auto &unsupported =
         events[waitEvent(client, events, unsupportedFrom, [](const Event &event) {
             return event.type == "history_end" && event.target == "#unsupported";
@@ -2347,9 +2733,9 @@ int main(int argc, char **argv) {
         std::cerr << "usage: network-check [--avatar PUBLIC_URL OUTPUT | --soju]\n";
         return 1;
     }
-    // The full suite includes >18s of intentional metadata/expiry waits before
-    // TLS and frame I/O. Keep per-operation deadlines; bound total shutdown too.
-    ::alarm(avatar ? 40 : soju ? 20 : 60);
+    // The full suite includes two 35s history deadline checks plus metadata/expiry
+    // waits and TLS/frame I/O. Keep per-operation deadlines; bound total shutdown too.
+    ::alarm(avatar ? 40 : soju ? 20 : 180);
     const char *phase = "TLS fixture setup";
     try {
         TemporaryDirectory directory;
@@ -2395,6 +2781,9 @@ int main(int argc, char **argv) {
         blockedSentChecks(context.get(), identity, true, false, true);
         phase = "channel metadata / postponed synchronization";
         preReadyMetadataChecks(context.get(), identity);
+        phase = "history consumer wire / discovery / root validation / selector retry";
+        historyConsumerWireChecks(context.get(), identity, false);
+        historyConsumerWireChecks(context.get(), identity, true);
         phase = "history ranking / correlated admission / disconnect cleanup";
         historyQueueChecks(context.get(), identity, false);
         historyQueueChecks(context.get(), identity, true);

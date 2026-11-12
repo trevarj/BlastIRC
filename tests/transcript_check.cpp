@@ -2717,6 +2717,230 @@ void tailAppendKeepsActions(TranscriptTestRenderer &renderer) {
     dispatcher.setSceneRoot(nullptr);
 }
 
+void durableHistoryGaps(TranscriptTestRenderer &renderer) {
+    for (const auto layout :
+         {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc, blast::MessageLayout::Stacked})
+        for (const float scale : {1.f, 2.f}) {
+            blast::Model model;
+            model.settings.scale = model.settings.messageScale = scale;
+            model.settings.reducedMotion = true;
+            model.settings.themeSource = "builtin";
+            blast::Theme theme;
+            theme.update(model);
+            auto &buffer = model.buffers["gap-room"];
+            buffer.id = buffer.target = "gap-room";
+            buffer.kind = "query";
+            buffer.server = "retained-offline-network"; // No live Network entry is required.
+            model.settings.messageLayouts[buffer.id] = layout;
+            // Dense IRC needs a real tail long enough to put the seam above a 160px viewport.
+            for (int i = 0; i < 20; ++i) {
+                blast::Message message;
+                message.id = "gap-row-" + std::to_string(i);
+                message.text = "GapBody" + std::to_string(i);
+                message.nick = "Peer";
+                message.timestamp = 1794054840 + i;
+                message.time = "2026-11-07T12:34:56Z";
+                buffer.messages.push_back(std::move(message));
+            }
+            buffer.historyState.gaps.push_back({73, {"gap-row-2", {}}, {"gap-row-3", {}}, false});
+            const auto before = buffer;
+            blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
+            Clipboard clipboard;
+            blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+            view.setReadEligible(false);
+            InputDispatcher dispatcher;
+            dispatcher.setSceneRoot(&view);
+            view.setInputDispatcher(dispatcher);
+            LayoutRect viewport{17, 23, 800 * scale, 1800 * scale};
+            const auto arrange = [&] {
+                view.sync();
+                view.arrange(renderer, viewport);
+            };
+            const auto control = [&](std::string_view suffix) {
+                Button *found = nullptr;
+                const auto visit = [&](auto &&self, Node &node) -> void {
+                    if (auto *button = dynamic_cast<Button *>(&node);
+                        button && button->inputArea()->tabFocusKey().ends_with(suffix)) {
+                        // Recycled hidden controls can retain the same durable gap key.
+                        assert(!found || !found->visible() || !button->visible());
+                        if (!found || button->visible())
+                            found = button;
+                    }
+                    for (const auto &child : node.children())
+                        self(self, *child);
+                };
+                visit(visit, view);
+                return found;
+            };
+            const auto click = [&](Button *button) {
+                assert(button);
+                float x, y;
+                Node::mapToScene(button, button->width() / 2, button->height() / 2, x, y);
+                dispatcher.pointerButton(x, y, BTN_LEFT, true, 101, 1010, false);
+                dispatcher.pointerButton(x, y, BTN_LEFT, false, 102, 1020, false);
+            };
+            arrange();
+            auto *gap = control(":history-gap:73");
+            assert(gap && gap->visible() && gap->enabled());
+            assert(plainText(*gap, "Load missing messages"));
+            const auto gapBounds = sceneBounds(*gap);
+            assert(gapBounds.y >= sceneBounds(body(view, "GapBody2").row).y +
+                                      body(view, "GapBody2").row.height() - .02f);
+            assert(gapBounds.y + gapBounds.height <=
+                   sceneBounds(body(view, "GapBody3").row).y + .02f);
+            containedBounds(gapBounds, nativeHistoryClip(view));
+            click(gap);
+            assert(model.actions.size() == 1 && model.actions.back().type == "history-gap" &&
+                   model.actions.back().buffer == buffer.id && model.actions.back().text == "73");
+            unchanged(buffer, before);
+            model.actions.clear();
+            dispatcher.setFocus(nullptr);
+            // Real upward intent also works at the clamp. Two unchanged gaps are each
+            // attempted once, not alternated forever after no-progress completions.
+            auto *clampedScroll = find<ScrollView>(view);
+            assert(clampedScroll && clampedScroll->maxScrollOffset() == 0);
+            buffer.historyState.gaps.push_back({74, {"gap-row-5", {}}, {"gap-row-6", {}}, false});
+            arrange();
+            const auto wheelUp = [&] {
+                dispatcher.pointerAxis(viewport.x + 60 * scale, viewport.y + 80 * scale,
+                                       WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                       WL_POINTER_AXIS_SOURCE_WHEEL, -15, 0, -120, -1.f);
+            };
+            wheelUp();
+            std::set<std::string> attempted;
+            for (int frame = 0; frame < 6; ++frame) {
+                arrange();
+                if (frame < 2) {
+                    assert(model.actions.size() == 1 && model.actions.back().type == "history-gap");
+                    assert(attempted.insert(model.actions.back().text).second);
+                } else
+                    assert(model.actions.empty());
+                model.actions.clear();
+            }
+            assert(attempted == std::set<std::string>({"73", "74"}));
+            near(clampedScroll->scrollOffset(), 0);
+            // A source jump cancels demand even when a new boundary becomes eligible.
+            assert(view.jumpToSourceMessage("gap-row-4"));
+            buffer.historyState.gaps.front().newer.time = "changed-after-source-jump";
+            arrange();
+            assert(model.actions.empty());
+            // Leaving and restoring the cached viewport likewise cannot revive demand.
+            wheelUp();
+            arrange();
+            assert(model.actions.size() == 1);
+            model.actions.clear();
+            auto &other = model.buffers["gap-other"];
+            other.id = other.target = "gap-other";
+            other.kind = "query";
+            pane.buffer = other.id;
+            arrange();
+            buffer.historyState.gaps.back().newer.time = "changed-while-away";
+            pane.buffer = buffer.id;
+            arrange();
+            arrange();
+            assert(model.actions.empty());
+            buffer.historyState.gaps = before.historyState.gaps;
+            assert(view.scrollToBoundary(true));
+            arrange();
+            viewport.height = 160 * scale;
+            arrange();
+            auto *demandScroll = find<ScrollView>(view);
+            assert(demandScroll && gap->y() < demandScroll->scrollOffset());
+            demandScroll->setScrollOffset(gap->y());
+            arrange();
+            assert(model.actions.empty()); // A raw geometry setter is not user intent.
+            wheelUp();
+            arrange();
+            assert(model.actions.size() == 1 && model.actions.back().type == "history-gap" &&
+                   model.actions.back().text == "73");
+            arrange();
+            assert(model.actions.size() == 1); // One logical flight despite repeated layouts.
+            model.actions.clear();
+            arrange();
+            assert(model.actions.empty()); // A no-progress completion does not frame-retry.
+            assert(view.scrollToBoundary(true));
+            arrange();
+            viewport.height = 1800 * scale;
+            arrange();
+            buffer.historyState.gaps.front().unavailable = true;
+            // Activation re-resolves durable metadata even before the next UI sync.
+            click(gap);
+            assert(model.actions.empty());
+            arrange();
+            assert(!gap->enabled() && plainText(*gap, "Missing messages unavailable"));
+            buffer.historyState.gaps.clear();
+            click(gap);
+            assert(model.actions.empty());
+            arrange();
+            assert(!gap->visible());
+            buffer.historyState.gaps.push_back({0, {}, {}, false});
+            arrange();
+            assert(!gap->visible()); // Unsaved/invalid IDs cannot become requests.
+            buffer.historyState.gaps = {{74, {}, {"pruned-boundary", {}}, false}};
+            arrange();
+            gap = control(":history-gap:74");
+            assert(gap && gap->visible() && gap->enabled());
+            assert(sceneBounds(*gap).y + gap->height() <=
+                   sceneBounds(body(view, "GapBody0").row).y + .02f);
+            viewport.height = 160 * scale;
+            assert(view.jumpToSourceMessage("gap-row-4"));
+            arrange();
+            auto *scroll = find<ScrollView>(view);
+            assert(scroll);
+            dispatcher.setFocus(nullptr);
+            scroll->setScrollOffset(scroll->scrollOffset() + 5 * scale);
+            arrange();
+            const float anchoredY = sceneBounds(body(view, "GapBody4", true).row).y;
+            buffer.historyState.gaps.clear();
+            arrange();
+            near(sceneBounds(body(view, "GapBody4", true).row).y, anchoredY);
+            viewport.height = 1800 * scale;
+            buffer.historyState.gaps = {{74, {}, {"pruned-boundary", {}}, false}};
+            arrange();
+            buffer.loading = true;
+            arrange();
+            assert(!gap->enabled());
+            buffer.loading = false;
+            buffer.historyState.beginning = true;
+            buffer.historyState.oldest = {"gap-row-0", {}};
+            arrange();
+            assert(!control(":load-older")->visible());
+            buffer.historyState.oldest.id = "older-local-row";
+            arrange();
+            assert(control(":load-older")->visible());
+            buffer.historyState.beginning = false;
+            buffer.historyState.gaps.clear();
+            viewport.height = 160 * scale;
+            arrange();
+            assert(view.scrollToBoundary(false));
+            arrange();
+            assert(model.actions.empty()); // Beginning-of-buffer stays within loaded rows.
+            assert(view.scrollHalfPage(-1));
+            arrange();
+            assert(model.actions.size() == 1 && model.actions.back().type == "history" &&
+                   model.actions.back().extra == "gap-row-0");
+            model.actions.clear();
+            arrange();
+            assert(model.actions.empty()); // Stable oldest anchor cannot loop on layout.
+            assert(view.scrollToBoundary(false));
+            buffer.messages.clear();
+            ++buffer.messagesRevision;
+            arrange();
+            assert(control(":load-older")->visible()); // Empty LATEST is not proof of no history.
+            assert(model.actions.empty());
+            viewport.height = 1800 * scale;
+            arrange();
+            wheelUp(); // Empty, non-scrollable conversations can request ordinary older history.
+            arrange();
+            assert(model.actions.size() == 1 && model.actions.back().type == "history" &&
+                   model.actions.back().extra.empty());
+            model.actions.clear();
+            arrange();
+            arrange();
+            assert(model.actions.empty());
+        }
+}
+
 void focusRevealIntents(TranscriptTestRenderer &renderer) {
     blast::Model model;
     model.settings.timestamps = false;
@@ -6062,10 +6286,16 @@ void visitSeparator(TranscriptTestRenderer &renderer) {
 }
 
 void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
-    for (const bool own : {false, true}) {
+    for (const auto &[layout, own] :
+         {std::pair{blast::MessageLayout::Bubbles, false},
+          std::pair{blast::MessageLayout::Bubbles, true},
+          std::pair{blast::MessageLayout::Irc, false}, std::pair{blast::MessageLayout::Irc, true},
+          std::pair{blast::MessageLayout::Stacked, false},
+          std::pair{blast::MessageLayout::Stacked, true}}) {
         blast::Model model;
         model.now = 10;
-        model.settings.avatars = false;
+        const bool traditional = layout != blast::MessageLayout::Bubbles;
+        model.settings.avatars = traditional;
         model.settings.reducedMotion = false;
         model.settings.fx = blast::FxLevel::Full;
         model.settings.incomingMotion = blast::SendMotion::Slide;
@@ -6074,6 +6304,7 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         auto &buffer = model.buffers["entrance"];
         buffer.id = buffer.target = "entrance";
         buffer.kind = "query";
+        model.settings.messageLayouts[buffer.id] = layout;
         blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
         Clipboard clipboard;
         MenuHost host;
@@ -6100,16 +6331,25 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         arrange();
         auto rendered = body(view, message.text);
         assert(rendered.content.opacity() == 0);
+        const float rowHeight = rendered.row.height();
+        const float textX = rendered.text.x(), textY = rendered.text.y();
+        if (traditional) {
+            assert(rendered.row.clipChildren() && !rendered.row.hitTestVisible());
+            assert(!find<blast::MaterialNode>(rendered.content)->visible());
+        }
         auto *date = plainText(view, "Undated history");
         assert(date);
         float dateX, dateY;
         Node::absolutePosition(date, dateX, dateY);
-        if (own) {
+        if (own && !traditional) {
             float x, y;
             const auto *surface = bubbleSurface(rendered);
             Node::mapToScene(surface, surface->width() * .5f, surface->height() * .5f, x, y);
             near(x, 367);
             near(y, 340);
+        } else if (own) {
+            near(rendered.content.x(), 0);
+            assert(rendered.content.y() > 0); // Flight becomes a row-clipped rise.
         } else {
             assert(rendered.content.x() > 0);
             near(rendered.content.y(), 0);
@@ -6123,7 +6363,7 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         near(stillY, dateY);
         const float inFlightDistance =
             std::hypot(body(view, message.text).content.x(), body(view, message.text).content.y());
-        if (!own) {
+        if (!own && !traditional) {
             const auto moving = body(view, message.text);
             auto *surface = bubbleSurface(moving);
             assert(surface && moving.content.x() > 0 &&
@@ -6160,6 +6400,12 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         near(settled.content.x(), 0);
         near(settled.content.y(), 0);
         near(settled.content.opacity(), 1);
+        near(settled.content.scaleX(), 1);
+        near(settled.content.scaleY(), 1);
+        near(settled.row.height(), rowHeight);
+        near(settled.text.x(), textX);
+        near(settled.text.y(), textY);
+        assert(settled.row.hitTestVisible());
         // Settled rows never replay when settings change.
         model.settings.reducedMotion = true;
         arrange();
@@ -6182,14 +6428,76 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
             const auto cancelled = body(view, message.text);
             near(cancelled.content.x(), 0);
             near(cancelled.content.y(), 0);
-            near(cancelled.content.opacity(), 1);
+            const float settledOpacity = traditional && own ? .52f : 1.f;
+            near(cancelled.content.opacity(), settledOpacity);
             model.settings.reducedMotion = false;
             model.settings.fx = blast::FxLevel::Full;
             arrange();
-            near(body(view, message.text).content.opacity(), 1);
+            near(body(view, message.text).content.opacity(), settledOpacity);
         }
         assert(model.actions.empty());
         view.setMotionHost(nullptr);
+        if (traditional) {
+            // Pixels share the native Pop transform, without a composer host or flight proxy.
+            model.settings.sendMotion = model.settings.incomingMotion = blast::SendMotion::Pop;
+            model.settings.sendReveal = model.settings.incomingReveal = blast::SendReveal::Pixels;
+            model.settings.incomingDurationMs = 800;
+            model.now += 1;
+            message.id = message.label = "traditional-pop";
+            message.text = "TraditionalPop";
+            message.pending = false;
+            message.arrival = model.now;
+            buffer.messages.push_back(message);
+            arrange();
+            const auto pop = body(view, message.text);
+            near(pop.content.scaleX(), 1);
+            near(pop.content.scaleY(), 1);
+            auto *reveal = find<blast::PixelRevealNode>(pop.row);
+            assert(reveal && reveal->visible() && !reveal->children().empty());
+            near(reveal->scaleX(), .92f);
+            near(reveal->scaleY(), .92f);
+            // Native proxy rendering removes source translation, NOT source scale.
+            // The partition parent is the sole scaling level for actual proxied paint.
+            for (const auto &tile : reveal->children()) {
+                auto *proxy = find<RenderProxyNode>(*tile);
+                assert(proxy && proxy->source() == &pop.content);
+                near(tile->scaleX(), 1);
+                near(proxy->scaleX(), 1);
+                near(reveal->scaleX() * tile->scaleX() * proxy->scaleX() *
+                         proxy->source()->scaleX(),
+                     .92f);
+                near(reveal->scaleY() * tile->scaleY() * proxy->scaleY() *
+                         proxy->source()->scaleY(),
+                     .92f);
+            }
+            near(reveal->transformOriginY(), pop.content.transformOriginY());
+            assert(!pop.row.hitTestVisible() && motionHost.children().empty());
+            model.now += .15;
+            arrange();
+            const auto movingPop = body(view, message.text);
+            auto *movingReveal = find<blast::PixelRevealNode>(movingPop.row);
+            assert(movingReveal->scaleX() != .92f);
+            near(movingPop.content.scaleX(), 1);
+            model.now += 1;
+            arrange();
+            const auto settledPop = body(view, message.text);
+            near(settledPop.content.scaleX(), 1);
+            near(settledPop.content.opacity(), 1);
+            assert(settledPop.row.hitTestVisible() &&
+                   !find<blast::PixelRevealNode>(settledPop.row)->visible());
+            message.id = message.label = "traditional-history";
+            message.text = "TraditionalHistory";
+            message.history = true;
+            message.arrival = model.now;
+            buffer.messages.push_back(message);
+            arrange();
+            const auto history = body(view, message.text);
+            near(history.content.scaleX(), 1);
+            near(history.content.x(), 0);
+            near(history.content.y(), 0);
+            near(history.content.opacity(), 1);
+            assert(history.row.hitTestVisible());
+        }
     }
 }
 
@@ -9404,6 +9712,7 @@ void runTranscriptCheck() {
     ownJoinProjection(renderer);
     tailAppendKeepsActions(renderer);
     focusRevealIntents(renderer);
+    durableHistoryGaps(renderer);
     mergeArrivalBaseline(renderer);
     renameArrivalBaseline(renderer);
     rowGapReflow(renderer, false);

@@ -83,6 +83,24 @@ static void sql(const fs::path &file, const char *command) {
     assert(result == SQLITE_OK);
     assert(sqlite3_close(db) == SQLITE_OK);
 }
+static void dropHistoryOrderSchema(const fs::path &database) {
+    sql(database,
+        "DROP INDEX messages_buffer_order; DROP INDEX messages_order; DROP INDEX messages_time;"
+        "DROP INDEX messages_chat_activity;"
+        "ALTER TABLE messages DROP COLUMN tie_order;"
+        "ALTER TABLE messages DROP COLUMN tie_order_confirmed;"
+        "CREATE INDEX messages_buffer_order ON "
+        "messages(buffer,sort_time,server_nanoseconds(time),seq);"
+        "CREATE INDEX messages_order ON messages(sort_time,server_nanoseconds(time),seq);"
+        "CREATE INDEX messages_time ON "
+        "messages(buffer,time,sort_time,server_nanoseconds(time),seq);");
+}
+static void dropHistorySchema(const fs::path &database) {
+    sql(database,
+        "DROP TABLE history_gaps; DROP TABLE history_state; "
+        "DROP TABLE history_discovery; ALTER TABLE closed_buffers DROP COLUMN discarded_at;");
+    dropHistoryOrderSchema(database);
+}
 static int64_t scalar(const fs::path &file, const char *query) {
     sqlite3 *db = nullptr;
     sqlite3_stmt *statement = nullptr;
@@ -339,6 +357,7 @@ static void fractionalHistory(const fs::path &database) {
         storage.append(id, timed("legacy-invalid", "2023-11-14T22:13:20.900Zjunk"));
     }
     // Restore an actual v4 index layout without rewriting any legacy message values.
+    dropHistorySchema(database);
     sql(database, "DROP INDEX messages_buffer_order; DROP INDEX messages_order; "
                   "DROP INDEX messages_provisional; DROP INDEX messages_time; "
                   "ALTER TABLE messages DROP COLUMN activity; "
@@ -357,6 +376,7 @@ static void fractionalHistory(const fs::path &database) {
     }
     // Upgrade a v5 database too, then preserve raw-time boundaries with inconsistent
     // legacy seconds instead of replacing them with parsed timestamp seconds.
+    dropHistorySchema(database);
     sql(database, "DROP INDEX messages_time; ALTER TABLE messages DROP COLUMN activity; "
                   "ALTER TABLE messages DROP COLUMN activity_target; "
                   "ALTER TABLE buffers DROP COLUMN muted; "
@@ -653,6 +673,7 @@ static void queuedSends(const fs::path &database, int64_t now) {
         assert(model.buffers.at("Libera/#multiline-retry").draft == original);
         assert(scalar(database, "SELECT COUNT(*) FROM queued_sends") == 0);
     }
+    dropHistorySchema(database);
     sql(database, "DROP TABLE queued_sends; ALTER TABLE messages DROP COLUMN activity; "
                   "ALTER TABLE messages DROP COLUMN activity_target; "
                   "ALTER TABLE buffers DROP COLUMN muted; "
@@ -1537,6 +1558,7 @@ static void activitySchema6Migration(const fs::path &database, const fs::path &c
     }
     const string profiles = contents(config / "config.toml");
     const string preferences = contents(config / "settings.toml");
+    dropHistorySchema(database);
     sql(database, "ALTER TABLE messages DROP COLUMN activity; "
                   "ALTER TABLE messages DROP COLUMN activity_target; "
                   "ALTER TABLE buffers DROP COLUMN muted; "
@@ -1545,7 +1567,7 @@ static void activitySchema6Migration(const fs::path &database, const fs::path &c
         scalar(database, "SELECT seq FROM messages WHERE id='migration-server-id'");
     {
         Storage storage;
-        assert(scalar(database, "PRAGMA user_version") == 9);
+        assert(scalar(database, "PRAGMA user_version") == 11);
         assert(scalar(database, "SELECT COUNT(*) FROM messages WHERE activity<>0") == 0);
         assert(scalar(database, "SELECT seq FROM messages WHERE id='migration-server-id'") ==
                sequence);
@@ -1578,12 +1600,13 @@ static void activitySchema6Migration(const fs::path &database, const fs::path &c
         nick.activityTarget = "schema8-target";
         storage.append(id, nick);
     }
+    dropHistorySchema(database);
     sql(database, "ALTER TABLE messages DROP COLUMN activity_target; "
                   "ALTER TABLE buffers DROP COLUMN muted; "
                   "ALTER TABLE buffers DROP COLUMN archived; PRAGMA user_version=7;");
     {
         Storage storage;
-        assert(scalar(database, "PRAGMA user_version") == 9);
+        assert(scalar(database, "PRAGMA user_version") == 11);
         const auto nick = storage.message(id, "schema7-nick");
         assert(nick && nick->activity == ActivityKind::Nick && nick->activityTarget.empty() &&
                nick->text == "opaque nick-change display text");
@@ -1612,6 +1635,7 @@ static void chatFlags(const fs::path &database, const fs::path &config, int64_t 
     }
     const string profiles = contents(config / "config.toml");
     const string preferences = contents(config / "settings.toml");
+    dropHistorySchema(database);
     sql(database, "ALTER TABLE buffers DROP COLUMN muted; "
                   "ALTER TABLE buffers DROP COLUMN archived; PRAGMA user_version=8;");
     for (int reopen = 0; reopen < 2; ++reopen) {
@@ -1619,7 +1643,7 @@ static void chatFlags(const fs::path &database, const fs::path &config, int64_t 
         Model model;
         storage.load(model);
         const auto &buffer = model.buffers.at(id);
-        assert(scalar(database, "PRAGMA user_version") == 9);
+        assert(scalar(database, "PRAGMA user_version") == 11);
         assert(!buffer.muted && !buffer.archived);
         assert(model.activeBuffer == id && buffer.draft == "retained flag migration draft" &&
                buffer.readMarker == "flag-read" && buffer.unread == 1 &&
@@ -1718,15 +1742,15 @@ static void chatFlags(const fs::path &database, const fs::path &config, int64_t 
                                renamed.archived == (sourceArchived && destinationArchived));
                     }
                 }
-    sql(database, "PRAGMA user_version=10;");
+    sql(database, "PRAGMA user_version=12;");
     bool rejected = false;
     try {
         Storage future;
     } catch (const std::runtime_error &) {
         rejected = true;
     }
-    assert(rejected && scalar(database, "PRAGMA user_version") == 10);
-    sql(database, "PRAGMA user_version=9;");
+    assert(rejected && scalar(database, "PRAGMA user_version") == 12);
+    sql(database, "PRAGMA user_version=11;");
 }
 static void retainedMentions(const fs::path &database, int64_t now) {
     Storage storage;
@@ -1895,6 +1919,498 @@ static void retainedMentions(const fs::path &database, int64_t now) {
            !actualNickMention("nickname", "nick", "ascii") &&
            !actualNickMention("CURRENT{!", "current[", "ascii") &&
            actualNickMention("CURRENT{!", "current[", "rfc1459"));
+}
+static void protocolHistoryStorage(const fs::path &database, int64_t now) {
+    auto buffer = sendBuffer("HistoryNet/CaseSensitive");
+    const HistoryCursor oldest{"Opaque-Z", "2026-11-01T00:00:00.001Z"};
+    const HistoryCursor newest{"opaque-a", "2026-11-02T00:00:00.001Z"};
+    int64_t gapId = 0;
+    // Real v9 upgrade keeps existing rows, source metadata and private config bytes.
+    const auto legacy = sendBuffer("HistoryNet/LegacyClosed");
+    auto legacyOpen = sendBuffer("HistoryNet/LegacyOpen");
+    auto cached = message("legacy-open-id", now - 20, "retained legacy cache");
+    cached.time = "2026-11-01T03:04:05.678Z";
+    string profiles, preferences;
+    fs::path config;
+    {
+        Storage storage;
+        config = storage.configDir();
+        profiles = contents(config / "config.toml");
+        preferences = contents(config / "settings.toml");
+        storage.append(legacy.id, message("legacy-row", now), "", 0, false, &legacy);
+        storage.closeBuffer(legacy);
+        storage.append(legacyOpen.id, cached, "", 0, false, &legacyOpen);
+        storage.append("HistoryNet/Dangling", message("dangling-id", now - 10));
+    }
+    const auto cachedRows = scalar(database, "SELECT COUNT(*) FROM messages");
+    dropHistorySchema(database);
+    sql(database, "PRAGMA user_version=9;");
+    {
+        Storage migrated;
+        assert(scalar(database, "PRAGMA user_version") == 11);
+        assert(migrated.message(legacy.id, "legacy-row"));
+        assert(migrated.sourceBuffer(legacy.id)->target == legacy.target);
+        assert(migrated.historyDiscarded(legacy.id) == std::optional<string>(""));
+        assert(scalar(database, "SELECT COUNT(*) FROM messages") == cachedRows);
+        const auto preserved = migrated.message(legacyOpen.id, cached.id);
+        assert(preserved && preserved->text == cached.text && preserved->time == cached.time &&
+               preserved->timestamp == cached.timestamp);
+        migrated.loadHistoryState(legacyOpen);
+        assert(legacyOpen.historyState.newest == (HistoryCursor{cached.id, cached.time}));
+        assert(legacyOpen.historyState.oldest == HistoryCursor{} &&
+               !legacyOpen.historyState.beginning && legacyOpen.historyState.gaps.empty());
+        assert(migrated.historyDiscovery("HistoryNet").watermark.empty());
+        Buffer closedState, danglingState;
+        closedState.id = legacy.id;
+        danglingState.id = "HistoryNet/Dangling";
+        migrated.loadHistoryState(closedState);
+        migrated.loadHistoryState(danglingState);
+        assert(closedState.historyState.newest == HistoryCursor{} &&
+               danglingState.historyState.newest == HistoryCursor{});
+        auto joined = message("new-live-join", now);
+        joined.time = "2026-11-02T03:04:05.678Z";
+        joined.presence = true;
+        joined.activity = ActivityKind::Join;
+        migrated.append(legacyOpen.id, joined, "", 0, false, &legacyOpen);
+        migrated.loadHistoryState(legacyOpen);
+        assert(legacyOpen.historyState.newest == (HistoryCursor{cached.id, cached.time}));
+        assert(contents(config / "config.toml") == profiles &&
+               contents(config / "settings.toml") == preferences);
+    }
+    {
+        Storage storage;
+        Model model;
+        storage.load(model);
+        model.settings.retentionDays = 0;
+        model.settings.maxMessages = 100000;
+        model.buffers[buffer.id] = buffer;
+        storage.save(model);
+        // Mixed durable rows exercise the boundary selector, not a RAM transcript tail.
+        const string boundaryBuffer = "HistoryNet/BoundarySelection";
+        assert(!storage.latestHistoryBoundary(boundaryBuffer));
+        storage.append(boundaryBuffer, message("opaque-server-id", now));
+        assert(storage.latestHistoryBoundary(boundaryBuffer)->id == "opaque-server-id");
+        const string originalTime = "2026-11-03T12:00:00.123456789+02:00";
+        auto hidden = message("local-boundary", now + 1);
+        hidden.time = originalTime;
+        hidden.presence = hidden.deleted = true;
+        storage.append(boundaryBuffer, hidden);
+        storage.append(boundaryBuffer, message("local:no-time", now + 2));
+        storage.append(boundaryBuffer, message("local-no-time", now + 3));
+        storage.append(boundaryBuffer, message("", now + 4));
+        auto pending = message("pending-server-looking-id", now + 5);
+        pending.time = originalTime;
+        pending.own = pending.pending = true;
+        storage.append(boundaryBuffer, pending);
+        auto selected = storage.latestHistoryBoundary(boundaryBuffer);
+        assert(selected && selected->id == hidden.id && selected->time == originalTime);
+        hidden.id.clear();
+        hidden.timestamp = now + 6;
+        int64_t anonymousSequence = 0;
+        storage.append(boundaryBuffer, hidden, "", 0, false, nullptr, &anonymousSequence);
+        selected = storage.latestHistoryBoundary(boundaryBuffer);
+        assert(selected && selected->id == "local:" + std::to_string(anonymousSequence) &&
+               selected->time == originalTime);
+        const auto anonymousPosition = storage.messagePosition(boundaryBuffer, selected->id);
+        assert(anonymousPosition && anonymousPosition->first == anonymousSequence &&
+               anonymousPosition->second >= 0);
+        buffer.historyState = {oldest, newest, true, {{0, oldest, newest, false}}};
+        auto write = storage.historyWrite();
+        auto row = message(oldest.id, now);
+        row.time = oldest.time;
+        row.reactions["+1"] = {"bob"};
+        storage.append(buffer.id, row);
+        storage.saveHistoryState(buffer);
+        storage.saveHistoryDiscovery("HistoryNet", {newest.time, oldest.time, false});
+        write.commit();
+        gapId = buffer.historyState.gaps.front().id;
+        assert(gapId > 0);
+    }
+    {
+        Storage storage;
+        Model model;
+        storage.load(model);
+        auto &loaded = model.buffers.at(buffer.id);
+        assert(loaded.historyState.oldest == oldest && loaded.historyState.newest == newest);
+        assert(loaded.historyState.beginning && loaded.historyState.gaps.size() == 1);
+        assert(loaded.historyState.gaps.front().id == gapId);
+        assert(storage.historyDiscovery("HistoryNet").backfillUpper == oldest.time);
+        assert(!storage.historyDiscarded(buffer.id));
+        // Existing nested append/update transactions join the completed-page transaction.
+        {
+            auto abandoned = storage.historyWrite();
+            auto row = *storage.message(buffer.id, oldest.id);
+            row.deleted = true;
+            storage.update(buffer.id, row);
+            storage.append(buffer.id, message("uncommitted", now));
+            loaded.historyState.gaps.clear();
+            loaded.historyState.gaps.push_back({0, oldest, newest, true});
+            storage.saveHistoryState(loaded);
+            assert(loaded.historyState.gaps.front().id != gapId);
+            storage.saveHistoryDiscovery("HistoryNet", {"not committed", "", true});
+        }
+        assert(!storage.message(buffer.id, "uncommitted"));
+        auto original = storage.message(buffer.id, oldest.id);
+        assert(original && !original->deleted && original->reactions.at("+1").front() == "bob");
+        storage.loadHistoryState(loaded); // Caller repairs its in-memory page after rollback.
+        assert(loaded.historyState.gaps.front().id == gapId);
+        assert(storage.historyDiscovery("HistoryNet").watermark == newest.time);
+        // A failed inner metadata write cannot leave the earlier page rows committed.
+        sql(database, "CREATE TRIGGER fail_history_state BEFORE UPDATE ON history_state "
+                      "BEGIN SELECT RAISE(ABORT,'injected history failure'); END;");
+        bool failed = false;
+        try {
+            auto write = storage.historyWrite();
+            storage.append(buffer.id, message("failed-page", now));
+            storage.saveHistoryState(loaded);
+            write.commit();
+        } catch (const std::runtime_error &) {
+            failed = true;
+        }
+        sql(database, "DROP TRIGGER fail_history_state;");
+        assert(failed && !storage.message(buffer.id, "failed-page"));
+        // Rollback to an inner savepoint leaves the containing page writable.
+        {
+            auto outer = storage.historyWrite();
+            storage.append(buffer.id, message("outer-page", now));
+            {
+                auto inner = storage.historyWrite();
+                storage.append(buffer.id, message("inner-page", now));
+            }
+            outer.commit();
+        }
+        assert(storage.message(buffer.id, "outer-page") &&
+               !storage.message(buffer.id, "inner-page"));
+        loaded.historyState.gaps.front().unavailable = true;
+        storage.saveHistoryState(loaded);
+        storage.closeBuffer(loaded);
+        const auto discarded = storage.historyDiscarded(buffer.id);
+        assert(discarded && !discarded->empty());
+        storage.renameBuffer(buffer.id, "HistoryNet/Renamed");
+        assert(!storage.historyDiscarded(buffer.id));
+        assert(storage.historyDiscarded("HistoryNet/Renamed") == discarded);
+    }
+    {
+        Storage storage;
+        Buffer renamed;
+        renamed.id = "HistoryNet/Renamed";
+        storage.loadHistoryState(renamed);
+        assert(renamed.historyState.oldest == oldest && renamed.historyState.beginning);
+        assert(renamed.historyState.gaps.front().id == gapId &&
+               renamed.historyState.gaps.front().unavailable);
+        // Merging independent cached extents must preserve both gaps and the union.
+        auto target = sendBuffer("HistoryNet/Destination");
+        target.historyState = {
+            {"later", "2026-11-03T00:00:00Z"}, {"latest", "2026-11-04T00:00:00Z"}, false, {}};
+        storage.saveHistoryState(target);
+        storage.renameBuffer(renamed.id, target.id);
+        storage.loadHistoryState(target);
+        assert(target.historyState.oldest == oldest);
+        assert(target.historyState.newest.id == "latest" && target.historyState.gaps.size() == 2);
+        assert(target.historyState.gaps.front().id == gapId);
+        // Equal-time opaque IDs do not prove adjacent response slices are continuous.
+        auto tiedSource = sendBuffer("HistoryNet/TiedSource");
+        auto tiedDestination = sendBuffer("HistoryNet/TiedDestination");
+        const string tie = "2026-11-03T12:00:00.123Z";
+        tiedSource.historyState = {{"z", tie}, {"A", tie}, false, {}};
+        tiedDestination.historyState = {{"y", tie}, {"B", tie}, false, {}};
+        storage.saveHistoryState(tiedSource);
+        storage.saveHistoryState(tiedDestination);
+        storage.renameBuffer(tiedSource.id, tiedDestination.id);
+        storage.loadHistoryState(tiedDestination);
+        assert(tiedDestination.historyState.gaps.size() == 1);
+        assert(tiedDestination.historyState.gaps.front().older.id == "A" &&
+               tiedDestination.historyState.gaps.front().newer.id == "y");
+        // Conversely an exact shared opaque boundary proves the seam, even in a tie.
+        tiedSource.id = "HistoryNet/OverlapSource";
+        tiedDestination.id = "HistoryNet/OverlapDestination";
+        tiedSource.historyState = {{"z", tie}, {"A", tie}, false, {}};
+        tiedDestination.historyState = {{"A", tie}, {"B", tie}, false, {}};
+        storage.saveHistoryState(tiedSource);
+        storage.saveHistoryState(tiedDestination);
+        storage.renameBuffer(tiedSource.id, tiedDestination.id);
+        storage.loadHistoryState(tiedDestination);
+        assert(tiedDestination.historyState.gaps.empty());
+        storage.clearHistory(target.id);
+        storage.loadHistoryState(target);
+        assert(target.historyState.oldest.id.empty() && target.historyState.gaps.empty() &&
+               !target.historyState.beginning);
+        assert(storage.historyDiscovery("HistoryNet").watermark == newest.time);
+        // Retention invalidates proofs whose local source rows disappeared.
+        storage.append(target.id, message("pruned", now));
+        target.historyState = {oldest, newest, true, {{0, oldest, newest, false}}};
+        storage.saveHistoryState(target);
+        sql(database, "UPDATE messages SET sort_time=1 WHERE buffer='HistoryNet/Destination';");
+        Model model;
+        storage.load(model);
+        model.settings.retentionDays = 1;
+        storage.prune(model.settings);
+        storage.loadHistoryState(target);
+        assert(target.historyState.oldest.id.empty() && !target.historyState.beginning &&
+               target.historyState.gaps.empty());
+        storage.clearHistory();
+        const auto discovery = storage.historyDiscovery("HistoryNet");
+        assert(discovery.watermark.empty() && discovery.backfillUpper.empty() &&
+               !discovery.backfillComplete);
+        // Completed-page metadata is written before retention, never resurrected afterward.
+        model.settings.retentionDays = 0;
+        model.settings.maxMessages = 2;
+        storage.prune(model.settings);
+        storage.takeHistoryInvalidations();
+        auto page = sendBuffer("HistoryNet/PageRetention");
+        {
+            auto outer = storage.historyWrite();
+            storage.append(page.id, message("page-1", now));
+            {
+                auto inner = storage.historyWrite();
+                storage.append(page.id, message("page-2", now + 1));
+                storage.append(page.id, message("page-3", now + 2));
+                inner.commit();
+            }
+            assert(storage.history(page.id, -1).size() == 3);
+            page.historyState = {oldest, newest, true, {{0, oldest, newest, false}}};
+            storage.saveHistoryState(page);
+            outer.commit();
+        }
+        assert(storage.history(page.id, -1).size() == 2);
+        assert(storage.takeHistoryInvalidations() == vector<string>{page.id});
+        assert(storage.takeHistoryInvalidations().empty());
+        storage.loadHistoryState(page);
+        assert(page.historyState.oldest.id.empty() && page.historyState.gaps.empty() &&
+               !page.historyState.beginning);
+        // Forced trim failure rolls back rows and protocol proof in that same outer write.
+        sql(database, "CREATE TRIGGER fail_page_trim BEFORE DELETE ON messages "
+                      "WHEN OLD.buffer='HistoryNet/PageRetention' "
+                      "BEGIN SELECT RAISE(ABORT,'injected page trim failure'); END;");
+        bool trimFailed = false;
+        try {
+            auto write = storage.historyWrite();
+            storage.append(page.id, message("page-4", now + 3));
+            page.historyState = {oldest, newest, true, {{0, oldest, newest, false}}};
+            storage.saveHistoryState(page);
+            write.commit();
+        } catch (const std::runtime_error &) {
+            trimFailed = true;
+        }
+        sql(database, "DROP TRIGGER fail_page_trim;");
+        assert(trimFailed && !storage.message(page.id, "page-4") &&
+               storage.history(page.id, -1).size() == 2);
+        assert(storage.takeHistoryInvalidations().empty());
+        storage.loadHistoryState(page);
+        assert(page.historyState.oldest.id.empty() && !page.historyState.beginning);
+        storage.clearHistory();
+    }
+}
+static void historyPlaybackOrdering(const fs::path &database, int64_t now) {
+    auto source = sendBuffer("HistoryOrder/#cohort");
+    const string time = "2026-11-03T12:00:00.123456789Z";
+    auto ids = [](const auto &rows) {
+        vector<string> result;
+        for (const auto &row : rows)
+            result.push_back(row.id);
+        return result;
+    };
+    auto append = [&](Storage &storage, const string &id) {
+        auto row = message(id, now);
+        row.time = time;
+        row.mention = true;
+        storage.append(source.id, row, "", 0, false, &source, &row.storageSequence,
+                       &row.historyOrder);
+        assert(row.storageSequence > 0 && row.historyOrder >= 0);
+        return row;
+    };
+    int64_t originalSequence = 0;
+    {
+        Storage storage;
+        Model model;
+        storage.load(model);
+        model.settings.retentionDays = 0;
+        model.settings.maxMessages = 100000;
+        model.buffers[source.id] = source;
+        storage.save(model);
+        originalSequence = append(storage, "B").storageSequence;
+        append(storage, "D");
+        source.historyState.newest = {"B", time};
+        storage.saveHistoryState(source);
+    }
+    // An interim v10 database gains ranks without touching its existing protocol metadata.
+    dropHistoryOrderSchema(database);
+    sql(database, "PRAGMA user_version=10;");
+    const vector<string> expected{"pre1", "pre2", "A", "D", "X", "C", "B", "tailY", "tailZ"};
+    {
+        Storage storage;
+        assert(scalar(database, "PRAGMA user_version") == 11);
+        storage.loadHistoryState(source);
+        assert(source.historyState.newest == (HistoryCursor{"B", time}));
+        assert(storage.message(source.id, "B")->historyOrder == originalSequence);
+        // A native optimistic own row can preexist logically while first becoming durable now.
+        const string optimisticBuffer = "HistoryOrder/#optimistic";
+        auto live = message("live-before-own", now);
+        live.time = time;
+        storage.append(optimisticBuffer, live);
+        {
+            auto write = storage.historyWrite();
+            auto own = message("materialized-own", now);
+            own.time = time;
+            own.own = true;
+            storage.append(optimisticBuffer, own);
+            write.reconcileOrder(optimisticBuffer, {own.id}, true, {own.id});
+            write.commit();
+        }
+        assert(ids(storage.history(optimisticBuffer)) ==
+               (vector<string>{"live-before-own", "materialized-own"}));
+        // Native order, not merely logical existingness, also proves placement before a neighbor.
+        {
+            auto write = storage.historyWrite();
+            auto own = message("materialized-before", now);
+            own.time = time;
+            own.own = true;
+            storage.append(optimisticBuffer, own);
+            write.reconcileOrder(optimisticBuffer, {own.id}, true,
+                                 {own.id, "live-before-own", "materialized-own"});
+            write.commit();
+        }
+        assert(ids(storage.history(optimisticBuffer)) ==
+               (vector<string>{"materialized-before", "live-before-own", "materialized-own"}));
+        // Receipt/fallback seconds are not authoritative playback time, even with a msgid.
+        const string unknownBuffer = "HistoryOrder/#unknown-time";
+        storage.append(unknownBuffer, message("untimed-live", now));
+        {
+            auto write = storage.historyWrite();
+            auto untimed = message("untimed-history", now);
+            untimed.history = true;
+            storage.append(unknownBuffer, untimed);
+            untimed.id = "malformed-time-history";
+            untimed.time = "not-a-server-time";
+            storage.append(unknownBuffer, untimed);
+            assert(write
+                       .reconcileOrder(unknownBuffer, {"malformed-time-history", "untimed-history"},
+                                       true)
+                       .empty());
+            write.commit();
+        }
+        assert(ids(storage.history(unknownBuffer)) ==
+               (vector<string>{"untimed-live", "untimed-history", "malformed-time-history"}));
+        assert(storage.messagePosition(unknownBuffer, "untimed-history")->second == 1 &&
+               storage.messagePosition(unknownBuffer, "malformed-time-history")->second == 2);
+        assert(scalar(database,
+                      "SELECT COUNT(*) FROM messages WHERE "
+                      "buffer='HistoryOrder/#unknown-time' AND tie_order_confirmed<>0") == 0);
+        // First confirmed playback may correct provisional live-arrival order.
+        {
+            auto write = storage.historyWrite();
+            write.reconcileOrder(source.id, {"D", "B", "D"}, false);
+            write.commit();
+        }
+        assert(ids(storage.history(source.id)) == (vector<string>{"D", "B"}));
+        // LATEST uses the nearest known next/previous neighbors, not lexical IDs.
+        {
+            auto write = storage.historyWrite();
+            append(storage, "A");
+            append(storage, "C");
+            write.reconcileOrder(source.id, {"A", "D", "C", "B"}, false);
+            write.commit();
+        }
+        assert(ids(storage.history(source.id)) == (vector<string>{"A", "D", "C", "B"}));
+        // An unanchored BEFORE page prepends in wire order.
+        {
+            auto write = storage.historyWrite();
+            append(storage, "pre1");
+            append(storage, "pre2");
+            write.reconcileOrder(source.id, {"pre1", "pre2"}, true);
+            write.commit();
+        }
+        // AROUND still anchors inside the existing cohort rather than blindly prepending.
+        {
+            auto write = storage.historyWrite();
+            append(storage, "X");
+            write.reconcileOrder(source.id, {"D", "X", "C"}, true);
+            write.commit();
+        }
+        // Unanchored LATEST/AFTER order appends, without reverting earlier confirmed order.
+        {
+            auto write = storage.historyWrite();
+            append(storage, "tailY");
+            append(storage, "tailZ");
+            const auto ranks = write.reconcileOrder(source.id, {"tailY", "tailZ"}, false);
+            assert(ranks.size() == expected.size() && std::is_sorted(ranks.begin(), ranks.end()));
+            write.commit();
+        }
+        {
+            auto write = storage.historyWrite();
+            write.reconcileOrder(source.id, {"B", "D"}, false); // Contradicts confirmed D,B.
+            write.commit();
+        }
+        auto rows = storage.history(source.id);
+        assert(ids(rows) == expected);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            assert(rows[i].historyOrder == static_cast<int64_t>(i));
+            assert(rows[i].timestamp == now && rows[i].time == time);
+        }
+        assert(scalar(database, "SELECT COUNT(*) FROM messages WHERE "
+                                "buffer='HistoryOrder/#cohort' AND tie_order_confirmed=1") == 9);
+        auto existing = *storage.message(source.id, "B");
+        existing.historyOrder = -1;
+        existing.text = "updated without moving its confirmed position";
+        storage.update(source.id, existing, "", 0, false, nullptr, &existing.storageSequence,
+                       &existing.historyOrder);
+        assert(existing.storageSequence == originalSequence && existing.historyOrder == 6);
+        assert(storage.messagePosition(source.id, "B") ==
+               (std::pair<int64_t, int64_t>{originalSequence, 6}));
+        assert(ids(storage.history(source.id, 3, "C")) == (vector<string>{"A", "D", "X"}));
+        assert(storage.history(source.id, 3, time).empty());
+        assert(storage.latestHistoryBoundary(source.id)->id == "tailZ");
+        map<string, Network> networks;
+        networks[source.server].nick = "self";
+        assert(ids(storage.mentionSources(networks).at(source.id).messages) == expected);
+        // Failure after reconciliation rolls back the page, all rank shifts and protocol state.
+        sql(database, "CREATE TRIGGER fail_after_order BEFORE UPDATE ON history_state "
+                      "WHEN NEW.buffer='HistoryOrder/#cohort' "
+                      "BEGIN SELECT RAISE(ABORT,'injected post-order metadata failure'); END;");
+        bool failed = false;
+        try {
+            auto write = storage.historyWrite();
+            append(storage, "rollback");
+            write.reconcileOrder(source.id, {"rollback"}, true);
+            source.historyState.beginning = true;
+            storage.saveHistoryState(source);
+            write.commit();
+        } catch (const std::runtime_error &) {
+            failed = true;
+        }
+        sql(database, "DROP TRIGGER fail_after_order;");
+        assert(failed && !storage.message(source.id, "rollback"));
+        rows = storage.history(source.id);
+        assert(ids(rows) == expected);
+        for (size_t i = 0; i < rows.size(); ++i)
+            assert(rows[i].historyOrder == static_cast<int64_t>(i));
+        storage.loadHistoryState(source);
+        assert(!source.historyState.beginning && source.historyState.newest.id == "B");
+        storage.read(source.id, "D");
+    }
+    {
+        Storage storage;
+        Model model;
+        storage.load(model);
+        const auto &restored = model.buffers.at(source.id);
+        assert(expected == ids(restored.messages));
+        assert(ids(storage.history("HistoryOrder/#optimistic")) ==
+               (vector<string>{"materialized-before", "live-before-own", "materialized-own"}));
+        assert(storage.message(source.id, "B")->storageSequence == originalSequence);
+        const string renamed = "HistoryOrder/#renamed";
+        storage.renameBuffer(source.id, renamed);
+        storage.load(model);
+        assert(model.buffers.at(renamed).readMarker == "D" &&
+               model.buffers.at(renamed).unread == 5);
+        assert(ids(storage.history(renamed)) == expected);
+        model.settings.retentionDays = 0;
+        model.settings.maxMessages = 3;
+        storage.prune(model.settings);
+        assert(ids(storage.history(renamed)) == (vector<string>{"B", "tailY", "tailZ"}));
+        assert(!storage.messagePosition(renamed, "D"));
+        assert(storage.messagePosition(renamed, "B")->first == originalSequence);
+        storage.clearHistory();
+    }
 }
 int main() {
     char temporary[] = "/tmp/blastirc-storage-XXXXXX";
@@ -2284,12 +2800,15 @@ int main() {
         chatFlags(data / "state.sqlite3", config, now);
         chatActivityMetadata(now);
         retainedMentions(data / "state.sqlite3", now);
+        protocolHistoryStorage(data / "state.sqlite3", now);
+        historyPlaybackOrdering(data / "state.sqlite3", now);
         mode(config, 0700);
         mode(data, 0700);
         mode(config / "config.toml", 0600);
         mode(config / "settings.toml", 0600);
         mode(data / "state.sqlite3", 0600);
         // Exercise an actual schema upgrade, preserving the v1 tables.
+        dropHistorySchema(data / "state.sqlite3");
         sql(data / "state.sqlite3",
             "DROP TABLE reactions; DROP TABLE closed_buffers; DROP TABLE queued_sends; "
             "ALTER TABLE messages DROP COLUMN activity; "

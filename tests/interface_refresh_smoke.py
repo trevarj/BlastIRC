@@ -5,7 +5,7 @@ Run inside nix develop: python tests/interface_refresh_smoke.py BINARY --scope N
 Each scope owns a fresh private compositor/profile; no desktop or production profile
 is reused. BLASTIRC_SMOKE_SCREENSHOT selects the artifact basename.
 The startup-history-sync scope holds genuine private Ergo history on the wire;
-it records cached-chat, pending-header, and released-history native evidence.
+it proves discovery/LATEST, cached-chat/loading state, and native-demand BEFORE gap fill.
 The jump-bottom scope proves the zero-arrival native FAB click and resumed following.
 """
 import argparse
@@ -8116,6 +8116,8 @@ class _StartupHistoryRelay:
         self.stopping = threading.Event()
         self.errors = []
         self.requests = []
+        self.pages = []
+        self.held_batch = None
         self.tasks = set()
         self.batch = None
         self.loop = None
@@ -8214,18 +8216,34 @@ class _StartupHistoryRelay:
                 line = line.split(' ', 1)[1]
             parts = line.split()
             if not server and len(parts) >= 3 and parts[0].upper() == 'CHATHISTORY':
-                if parts[2].casefold() == self.target:
+                if parts[1].upper() == 'TARGETS' or parts[2].casefold() == self.target:
                     # Never retain authentication or unrelated client frames.
                     self.requests.append(line)
             if server and len(parts) >= 4 and parts[0].upper() == 'BATCH':
                 if (parts[1].startswith('+') and parts[2].casefold() == 'chathistory'
                         and parts[3].lstrip(':').casefold() == self.target):
                     assert self.requests, 'History batch preceded the actual GUI request'
-                    assert self.batch is None, 'Unexpected second target history batch'
+                    assert self.batch is None, 'Overlapping target history batches'
                     self.batch = parts[1][1:]
+                    request = next(request for request in reversed(self.requests)
+                                   if request.split()[1].upper() != 'TARGETS')
+                    self.pages.append({'batch': self.batch, 'request': request,
+                                       'body_frames': 0, 'fixture_messages': [],
+                                       'oldest_primary': None, 'newest_primary': None})
+            if server and self.batch is not None and tags.get('batch') == self.batch:
+                self.pages[-1]['body_frames'] += 1
+                if len(parts) >= 3 and parts[0] == 'PRIVMSG' and ' :OFFLINEHISTORY' in line:
+                    self.pages[-1]['fixture_messages'].append(line.split(' :', 1)[1])
+                if (parts and parts[0] != 'BATCH' and 'draft/chathistory-context' not in tags
+                        and (tags.get('msgid') or tags.get('time'))):
+                    cursor = [tags.get('msgid', ''), tags.get('time', '')]
+                    if self.pages[-1]['oldest_primary'] is None:
+                        self.pages[-1]['oldest_primary'] = cursor
+                    self.pages[-1]['newest_primary'] = cursor
             if (server and self.batch is not None and tags.get('batch') == self.batch
                     and not self.held.is_set()):
                 self.held.set()
+                self.held_batch = self.batch
                 # ponytail: pause this direction, preserving nested wire-frame ordering.
                 if not await self.asyncio.to_thread(self.release.wait, 20):
                     raise TimeoutError('Private history body was not released before its deadline')
@@ -8233,6 +8251,7 @@ class _StartupHistoryRelay:
             await destination.drain()
             if server and self.batch is not None and parts[:2] == ['BATCH', '-' + self.batch]:
                 self.completed.set()
+                self.batch = None
 
     def ready(self, event):
         if self.errors:
@@ -8409,15 +8428,46 @@ def run_soju_search_context(ctx):
 
 
 def run_startup_history_sync(ctx):
-    """Actual cached native chat stays usable while a real Ergo batch is held open."""
+    """Real discovery/LATEST leaves a durable gap, filled only after native scroll demand."""
     destination = Path(ctx['destination'])
     config = Path(ctx['preferences']).with_name('config.toml')
     _policy_focus(ctx, ctx['channel_id'])
     gui.expand_navigation(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'])
     cached = 'CACHEDHISTORY retained native startup witness'
-    remote = 'REMOTEHISTORY actual offline Ergo startup witness'
+    remote = [f'OFFLINEHISTORY {index:02d} actual offline Ergo witness' for index in range(65)]
     _policy_send(ctx, cached, target=ctx['channel'])
     gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
+
+    def rows(sql, parameters=()):
+        with sqlite3.connect(f"file:{ctx['database_path']}?mode=ro", uri=True) as database:
+            return database.execute(sql, parameters).fetchall()
+
+    def offline_rows():
+        return rows('SELECT id,time,text FROM messages WHERE buffer=? AND text LIKE ? '
+                    'ORDER BY text', (ctx['channel_id'], 'OFFLINEHISTORY %'))
+
+    def gaps():
+        return rows('SELECT id,older_id,older_time,newer_id,newer_time,unavailable '
+                    'FROM history_gaps WHERE buffer=? ORDER BY id', (ctx['channel_id'],))
+
+    def source_snapshot():
+        return {
+            'message_columns': ['seq', 'id', 'time', 'text', 'presence', 'pending'],
+            'newest_stored_messages_by_sequence': rows(
+                'SELECT seq,id,time,text,presence,pending FROM messages WHERE buffer=? '
+                'ORDER BY seq DESC LIMIT 100', (ctx['channel_id'],)),
+            'history_state_columns': ['oldest_id', 'oldest_time', 'newest_id', 'newest_time', 'beginning'],
+            'history_state': rows(
+                'SELECT oldest_id,oldest_time,newest_id,newest_time,beginning '
+                'FROM history_state WHERE buffer=?', (ctx['channel_id'],)),
+            'gap_columns': ['id', 'older_id', 'older_time', 'newer_id', 'newer_time', 'unavailable'],
+            'gaps': gaps(),
+        }
+
+    anchor = rows('SELECT id,time,text FROM messages WHERE buffer=? AND text=?',
+                  (ctx['channel_id'], cached))
+    assert len(anchor) == 1 and anchor[0][0] and anchor[0][1], anchor
+    cached_source = source_snapshot()
     layout = gui.read_layout(ctx['preferences'])
     x, y, width, height = layout['conversation']['rect']
     header = (x, y, width, gui.pane_metrics(layout, ctx['args'].zoom)['header_minimum'])
@@ -8441,7 +8491,8 @@ def run_startup_history_sync(ctx):
         _, _, prefix = ctx['observer'].wait(lambda command, params, prefix:
             command == 'QUIT' and prefix.split('!', 1)[0] in departed, timeout=15)
         departed.remove(prefix.split('!', 1)[0])
-    _policy_send(ctx, remote, target=ctx['channel'], durable=False)
+    for body in remote:
+        ctx['observer'].send(f"PRIVMSG {ctx['channel']} :{body}")
     barrier = 'startup-history-offline-stored'
     ctx['observer'].send('PING :' + barrier)
     ctx['observer'].wait(lambda command, params, prefix:
@@ -8478,6 +8529,14 @@ def run_startup_history_sync(ctx):
         ctx['cleanup'].callback(close_restarted_gui)
         gui.SESSION.until('actual target CHATHISTORY body held after BATCH begin',
                           lambda: relay.ready(relay.held))
+        discovery_requests = list(relay.requests)
+        directions = [request.split()[1].upper() for request in discovery_requests]
+        assert 'TARGETS' in directions and 'LATEST' in directions, discovery_requests
+        assert directions.index('TARGETS') < directions.index('LATEST'), discovery_requests
+        target_requests = [request for request in discovery_requests
+                           if request.split()[1].upper() != 'TARGETS']
+        assert len(target_requests) == 1 and target_requests[0].startswith('CHATHISTORY LATEST '), target_requests
+        assert int(target_requests[0].split()[-1]) == 50, target_requests
         started = time.monotonic()
         # Mapping and wire receipt can precede the restarted surface's first paint.
         def cached_frame():
@@ -8488,10 +8547,9 @@ def run_startup_history_sync(ctx):
         pending_words = gui.SESSION.until('cached native chat painted during actual history hold',
                                          cached_frame)
         assert 'cachedhistory' in tokens(pending_words), 'Pending history replaced the cached transcript'
-        assert 'remotehistory' not in tokens(pending_words), 'Held remote history body was painted early'
-        with sqlite3.connect(f"file:{ctx['database_path']}?mode=ro", uri=True) as database:
-            assert database.execute('SELECT 1 FROM messages WHERE buffer=? AND text=?',
-                (ctx['channel_id'], remote)).fetchall() == [], 'Held history body reached Core early'
+        assert 'offlinehistory' not in tokens(pending_words), 'Held remote history body was painted early'
+        assert offline_rows() == [], 'Held history body reached Core early'
+        held_source = source_snapshot()
         pending_header = [item for item in pending_words if int(item['top']) < y + header[3]]
         indication = tokens(pending_header) - tokens(baseline)
         assert indication, 'Actual pending header added no visible history indication'
@@ -8510,16 +8568,149 @@ def run_startup_history_sync(ctx):
         return result if not indication.intersection(tokens(result)) else None
 
     final_header = gui.SESSION.until('native history indication retired after real batch end', idle_header)
-    assert upload.label_rect(ctx['window'], destination, 'REMOTEHISTORY',
-                             region=layout['conversation']['rect']), 'Actual history body is not painted'
+    latest_rows = gui.SESSION.until('committed actual LATEST page', lambda: offline_rows() or None)
+    latest_bodies = [row[2] for row in latest_rows]
+    assert remote[-1] in latest_bodies and 0 < len(latest_rows) <= 50, latest_rows
+    missing = [body for body in remote if body not in latest_bodies]
+    assert len(missing) >= 15 and missing == remote[:len(missing)], (missing, latest_bodies)
+    latest_gaps = gaps()
+    diagnostic_path = destination.with_name(destination.stem + '-startup-history-gap-diagnostics.json')
+    if len(latest_gaps) != 1 or latest_gaps[0][5]:
+        diagnostic = {
+            'cached_anchor': anchor, 'before_restart': cached_source, 'while_latest_held': held_source,
+            'after_latest': source_snapshot(), 'latest_fixture_count': len(latest_rows),
+            'latest_first_fixture_row': latest_rows[0], 'latest_last_fixture_row': latest_rows[-1],
+            'missing_fixture_messages': missing, 'actual_requests': list(relay.requests),
+            'actual_pages': list(relay.pages),
+        }
+        diagnostic_path.write_text(json.dumps(diagnostic, indent=2) + '\n')
+    assert len(latest_gaps) == 1 and not latest_gaps[0][5], {
+        'gaps': latest_gaps, 'cached_anchor': anchor, 'diagnostic': str(diagnostic_path)}
+    gap = latest_gaps[0]
+    held_state = held_source['history_state']
+    assert len(held_state) == 1 and (held_state[0][2] or held_state[0][3]), held_source
+    previous_newest = held_state[0][2:4]
+    latest_page = next(page for page in relay.pages
+                       if page['request'].startswith('CHATHISTORY LATEST '))
+    assert latest_page['oldest_primary'], latest_page
+    assert (gap[1], gap[2]) == previous_newest, (gap, previous_newest)
+    assert [gap[3], gap[4]] == latest_page['oldest_primary'], (gap, latest_page)
+    assert rows('SELECT id,time,text FROM messages WHERE buffer=? AND text=?',
+                (ctx['channel_id'], cached)) == anchor, 'LATEST lost the cached anchor'
+    gui.SESSION.until('actual LATEST offline history painted in native chat', lambda:
+        upload.label_rect(ctx['window'], destination, 'OFFLINEHISTORY',
+                          region=layout['conversation']['rect']))
     final_capture = str(_policy_capture(ctx, 'startup-history-idle-after'))
+
+    before_demand = list(relay.requests)
+    assert all(request.split()[1].upper() in ('TARGETS', 'LATEST')
+               for request in before_demand), ('History fetched before native gap demand', before_demand)
+    assert offline_rows() == latest_rows, 'Missing interval filled before native navigation'
+    gap_capture = str(_policy_capture(ctx, 'startup-history-gap-before-demand'))
+    scrolls = []
+
+    def scroll_demand():
+        relay.ready(relay.completed)
+        if any(request.startswith('CHATHISTORY BEFORE ')
+               for request in relay.requests[len(before_demand):]):
+            return True
+        gui.move_pointer(ctx['window'], x + width / 2, y + height / 2)
+        offset = gui.GUI_DEBUG[ctx['window']][1].stat().st_size
+        gui.POINTER.scroll(-3)
+        gui.await_native_frame(ctx['window'], offset, re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
+        scrolls.append({'point': (x + width / 2, y + height / 2), 'wheel_steps': -3,
+                        'native_frame_after_debug_offset': offset})
+        return None
+
+    gui.SESSION.until('actual native scrolling toward the seam demands BEFORE', scroll_demand)
+    assert scrolls, 'Gap fetch preceded native scrolling'
+
+    def filled_gap():
+        relay.ready(relay.completed)
+        loaded = offline_rows()
+        return loaded if [row[2] for row in loaded] == remote and not gaps() else None
+
+    filled = gui.SESSION.until('BEFORE commits the missing interval and retires durable gap', filled_gap)
+    demand_requests = relay.requests[len(before_demand):]
+    target_demand = [request for request in demand_requests if request.split()[1].upper() != 'TARGETS']
+    assert 1 <= len(target_demand) <= 3, demand_requests
+    assert all(request.startswith('CHATHISTORY BEFORE ') for request in target_demand), demand_requests
+    assert ('msgid=' + gap[3]) in target_demand[0] or ('timestamp=' + gap[4]) in target_demand[0], (gap, target_demand)
+    assert not any(request.startswith('CHATHISTORY AFTER ') for request in relay.requests), relay.requests
+    assert sum(request.startswith('CHATHISTORY LATEST ') for request in relay.requests) == 1, relay.requests
+    assert rows('SELECT id,time,text FROM messages WHERE buffer=? AND text=?',
+                (ctx['channel_id'], cached)) == anchor, 'Gap demand lost the cached anchor'
+    assert all(row[0] and row[1] for row in filled), filled
+    assert len({row[0] for row in filled}) == len(remote), 'History replay duplicated protocol IDs'
+    display_rows = rows(
+        'SELECT id,time,timestamp,sort_time,seq,text,tie_order,tie_order_confirmed FROM messages '
+        'WHERE buffer=? AND text LIKE ? ORDER BY sort_time,time,tie_order,seq',
+        (ctx['channel_id'], 'OFFLINEHISTORY %'))
+    display_order = [row[5] for row in display_rows]
+    order_diagnostic_path = destination.with_name(
+        destination.stem + '-startup-history-display-order-diagnostics.json')
+    if display_order != remote:
+        offset = gui.GUI_DEBUG[ctx['window']][1].stat().st_size
+        gui.move_pointer(ctx['window'], x + width / 2 + 7, y + height / 2 + 7)
+        gui.await_native_frame(ctx['window'], offset, re.compile(r'wl_pointer[@#]\d+\.motion\('))
+        order_capture = str(_policy_capture(ctx, 'startup-history-gap-order-failed'))
+        order_diagnostic_path.write_text(json.dumps({
+            'display_columns': ['id', 'time', 'timestamp', 'sort_time', 'seq', 'text',
+                                'tie_order', 'tie_order_confirmed'],
+            'display_rows': display_rows, 'expected_text_order': remote,
+            'cached_anchor': anchor, 'previous_protocol_newest': previous_newest,
+            'durable_gaps_after_demand': gaps(), 'actual_requests': list(relay.requests),
+            'actual_pages': list(relay.pages), 'native_capture': order_capture,
+            'native_frame_after_debug_offset': offset,
+        }, indent=2) + '\n')
+    assert display_order == remote, {
+        'actual_text_order': display_order, 'diagnostic': str(order_diagnostic_path)}
+    gui.SESSION.until('native gap marker retires after committed fill', lambda:
+        not upload.label_rect(ctx['window'], destination, 'Load missing messages',
+                              region=layout['conversation']['rect']))
+    filled_capture = str(_policy_capture(ctx, 'startup-history-gap-filled'))
+    prefix_scrolls = []
+
+    def native_prefix():
+        offset = gui.GUI_DEBUG[ctx['window']][1].stat().st_size
+        gui.move_pointer(ctx['window'], x + width / 2, y + height / 2)
+        gui.POINTER.scroll(-3)
+        gui.await_native_frame(ctx['window'], offset, re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
+        prefix_scrolls.append({'wheel_steps': -3, 'native_frame_after_debug_offset': offset})
+        observed = words('filled-prefix', layout['conversation']['rect'])
+        visible = []
+        for word, number in zip(observed, observed[1:]):
+            if (word['text'].casefold() == 'offlinehistory'
+                    and re.fullmatch(r'[0-9]{2}', number['text'])
+                    and abs(int(word['top']) - int(number['top'])) <= 12):
+                visible.append((int(word['top']), int(number['text'])))
+        visible.sort()
+        indices = [index for _, index in visible]
+        if 0 not in indices or 1 not in indices:
+            return None
+        assert indices[:2] == [0, 1] and indices == sorted(set(indices)), {
+            'native_visible_offline_indices': indices, 'words': observed}
+        return visible
+
+    prefix_visible = gui.SESSION.until('native wheel reveals recovered 00 then 01 in wire order',
+                                       native_prefix)
+    prefix_capture = str(_policy_capture(ctx, 'startup-history-filled-prefix'))
     return _refresh_return(ctx, 'startup-history-sync', {
-        'actual_requests': relay.requests, 'actual_held_batch': relay.batch,
+        'actual_requests': list(relay.requests), 'actual_held_batch': relay.held_batch,
+        'actual_pages': list(relay.pages), 'requests_before_native_gap_demand': before_demand,
+        'native_gap_scroll_demand': scrolls, 'durable_gap_before_demand': gap,
+        'previous_protocol_newest': previous_newest,
+        'offline_seed_count': len(remote), 'latest_fixture_count': len(latest_rows),
+        'missing_until_native_demand': missing, 'filled_fixture_count': len(filled),
+        'persisted_display_text_order': display_order,
+        'native_recovered_prefix_rows': prefix_visible, 'native_prefix_scrolls': prefix_scrolls,
+        'durable_gaps_after_demand': gaps(), 'cached_protocol_anchor_preserved': anchor,
         'held_observation_seconds': held_seconds,
-        'cached_message': cached, 'remote_history_message': remote,
+        'cached_message': cached, 'offline_messages': remote,
         'dynamic_pending_header_tokens': sorted(indication),
         'idle_header_tokens': sorted(tokens(final_header)), 'header_region': header,
-        'captures': [baseline_capture, pending_capture, final_capture],
+        'captures': [baseline_capture, pending_capture, final_capture, gap_capture, filled_capture,
+                     prefix_capture],
         'tls_upstream_verified_private_ca': True, 'unchanged_real_batch_end_released': True})
 
 

@@ -148,7 +148,7 @@ if get_option('tests')
 
   network_check = executable('blastirc-network-check', 'tests/network_check.cpp',
     dependencies: [irc_dep, avatar_dep], cpp_args: check_args)
-  test('network', network_check)
+  test('network', network_check, timeout: 180)
   test('soju-wire', network_check, args: ['--soju'])
 
   avatar_check = executable('blastirc-avatar-check', 'tests/avatar_check.cpp',

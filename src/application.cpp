@@ -31,6 +31,22 @@ bool flag(const Event &e, const string &name) {
     auto value = tag(e, name);
     return value == "1" || value == "true";
 }
+const string &historyOwner(const Event &e) {
+    const auto owner = e.tags.find("history-owner");
+    return owner == e.tags.end() ? e.label : owner->second;
+}
+bool historyPrimary(const Event &e) {
+    return !e.tags.contains("draft/chathistory-context") && e.type != "typing" &&
+           tag(e, "command") != "BATCH";
+}
+bool historyMutation(const Event &e) { return e.type == "reaction" || e.type == "redact"; }
+const string &historyProtocolId(const Event &e) {
+    const auto wire = e.tags.find("msgid");
+    if (wire != e.tags.end())
+        return wire->second;
+    static const string missing;
+    return historyMutation(e) ? missing : e.id;
+}
 string upper(string value) {
     for (char &c : value)
         if (c >= 'a' && c <= 'z')
@@ -80,6 +96,75 @@ int64_t markerTime(const string &value) {
 int markerFraction(const string &value) {
     const auto parsed = irc::parseTimestampParts(value);
     return parsed ? parsed->nanoseconds : 0;
+}
+int64_t historyRank(const Message &message) {
+    return message.historyOrder < 0 ? std::numeric_limits<int64_t>::max() : message.historyOrder;
+}
+bool historyTieLess(const Message &a, const Message &b) {
+    if (historyRank(a) != historyRank(b))
+        return historyRank(a) < historyRank(b);
+    const auto aSequence =
+        a.storageSequence > 0 ? a.storageSequence : std::numeric_limits<int64_t>::max();
+    const auto bSequence =
+        b.storageSequence > 0 ? b.storageSequence : std::numeric_limits<int64_t>::max();
+    return aSequence < bSequence;
+}
+bool historyMessageLess(const Message &a, const Message &b) {
+    if (a.timestamp != b.timestamp)
+        return a.timestamp < b.timestamp;
+    const auto aFraction = markerFraction(a.time), bFraction = markerFraction(b.time);
+    if (aFraction != bFraction)
+        return aFraction < bFraction;
+    return historyTieLess(a, b);
+}
+bool reorderHistoryTies(Buffer &buffer, const vector<size_t> &positions) {
+    bool changed = false;
+    vector<size_t> order;
+    for (size_t first = 0; first < positions.size();) {
+        const auto timestamp = buffer.messages[positions[first]].timestamp;
+        const auto fraction = markerFraction(buffer.messages[positions[first]].time);
+        size_t last = first + 1;
+        while (last < positions.size() && buffer.messages[positions[last]].timestamp == timestamp &&
+               markerFraction(buffer.messages[positions[last]].time) == fraction)
+            ++last;
+        auto begin = positions.begin() + first;
+        auto end = positions.begin() + last;
+        if (!std::is_sorted(begin, end, [&](size_t a, size_t b) {
+                return historyTieLess(buffer.messages[a], buffer.messages[b]);
+            })) {
+            order.resize(last - first);
+            for (size_t i = 0; i < order.size(); ++i)
+                order[i] = i;
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                const auto &left = buffer.messages[positions[first + a]];
+                const auto &right = buffer.messages[positions[first + b]];
+                if (historyTieLess(left, right))
+                    return true;
+                if (historyTieLess(right, left))
+                    return false;
+                return a < b;
+            });
+            // Apply the index permutation with one moved row, not a transcript-sized row copy.
+            for (size_t i = 0; i < order.size(); ++i) {
+                if (order[i] == i)
+                    continue;
+                Message held = std::move(buffer.messages[positions[first + i]]);
+                size_t destination = i;
+                while (order[destination] != i) {
+                    const auto source = order[destination];
+                    buffer.messages[positions[first + destination]] =
+                        std::move(buffer.messages[positions[first + source]]);
+                    order[destination] = destination;
+                    destination = source;
+                }
+                buffer.messages[positions[first + destination]] = std::move(held);
+                order[destination] = destination;
+            }
+            changed = true;
+        }
+        first = last;
+    }
+    return changed;
 }
 string eventBody(const Event &e) {
     if (!e.text.empty())
@@ -352,8 +437,10 @@ Buffer &Application::buffer(const string &server, const string &target, const st
         value.target = target;
         value.title = target;
         value.kind = kind.empty() ? (channel(server, target) ? "channel" : "query") : kind;
-        if (savingAllowed_)
+        if (savingAllowed_) {
             storage_.seedChatActivity(value);
+            storage_.loadHistoryState(value);
+        }
         reviseMessages(value);
         it = model.buffers.emplace(id, std::move(value)).first;
     }
@@ -380,6 +467,7 @@ void Application::repairChatActivity(Buffer &b) {
             if (auto stored = storage_.message(b.id, row.id)) {
                 row.storageSequence = stored->storageSequence;
                 row.orderingTimestamp = stored->orderingTimestamp;
+                row.historyOrder = stored->historyOrder;
                 recordChatActivity(b, *stored);
                 continue;
             }
@@ -487,6 +575,47 @@ void Application::renameBuffer(string oldId, string target) {
             }
         }
     };
+    auto remapHistory = [&] {
+        for (auto &[label, page] : historyPages_)
+            if (page.buffer == oldId) {
+                page.buffer = id;
+                page.request.target = target;
+            }
+        if (auto session = historySessions_.find(server); session != historySessions_.end()) {
+            auto &s = session->second;
+            auto remapQueue = [&](auto &queue) {
+                for (auto &buffer : queue)
+                    if (buffer == oldId)
+                        buffer = id;
+                set<string> seen;
+                std::erase_if(queue,
+                              [&](const auto &buffer) { return !seen.insert(buffer).second; });
+            };
+            remapQueue(s.visible);
+            remapQueue(s.background);
+            remapQueue(s.seeds);
+            for (auto &page : s.retries)
+                if (page.buffer == oldId) {
+                    page.buffer = id;
+                    page.request.target = target;
+                }
+            if (s.refused.erase(oldId))
+                s.refused.insert(id);
+            auto advertised = s.advertised.extract(fold(server, previous));
+            if (!advertised.empty()) {
+                advertised.key() = fold(server, target);
+                advertised.mapped().name = target;
+                const auto existing = s.advertised.find(advertised.key());
+                if (existing == s.advertised.end())
+                    s.advertised.insert(std::move(advertised));
+                else if (std::pair{markerTime(existing->second.time),
+                                   markerFraction(existing->second.time)} <
+                         std::pair{markerTime(advertised.mapped().time),
+                                   markerFraction(advertised.mapped().time)})
+                    existing->second = std::move(advertised.mapped());
+            }
+        }
+    };
     if (searchJump_ && searchJump_->sourceBuffer == oldId)
         cancelSearchJump();
     std::erase_if(searchRequests_, [&](const auto &entry) { return entry.second.source == oldId; });
@@ -497,6 +626,7 @@ void Application::renameBuffer(string oldId, string target) {
         old->second.title = target;
         ++mentionsLiveRevision_;
         joinIntent();
+        remapHistory();
         if (model.bufferRenamed)
             model.bufferRenamed(oldId, id);
         return;
@@ -595,11 +725,7 @@ void Application::renameBuffer(string oldId, string target) {
                 seen.emplace(b.messages.back().id, &b.messages.back());
             }
         }
-        std::stable_sort(b.messages.begin(), b.messages.end(), [](const auto &a, const auto &b) {
-            if (a.timestamp != b.timestamp)
-                return a.timestamp < b.timestamp;
-            return markerFraction(a.time) < markerFraction(b.time);
-        });
+        std::stable_sort(b.messages.begin(), b.messages.end(), historyMessageLess);
         restoreDraft(b, source.draft);
         if (b.readMarker.empty() || markerTime(source.readMarker) > markerTime(b.readMarker) ||
             (markerTime(source.readMarker) == markerTime(b.readMarker) &&
@@ -626,6 +752,9 @@ void Application::renameBuffer(string oldId, string target) {
         b.target = target;
         b.title = target;
     }
+    if (savingAllowed_)
+        storage_.loadHistoryState(dest->second);
+    remapHistory();
     auto moveKey = [&](auto &values) {
         auto node = values.extract(oldId);
         if (!node.empty()) {
@@ -636,7 +765,6 @@ void Application::renameBuffer(string oldId, string target) {
     };
     moveKey(channelAvatars_);
     moveKey(namesCache_);
-    moveKey(gaps_);
     moveKey(model.settings.channelPresence);
     moveKey(model.settings.bufferFools);
     moveKey(model.settings.messageLayouts);
@@ -958,6 +1086,7 @@ void Application::connect(string name, string origin) {
     }
 }
 void Application::stopClient(string server) {
+    cancelHistorySession(server);
     if (auto *c = client(server)) {
         c->stop();
         for (const auto &e : c->poll())
@@ -1017,18 +1146,36 @@ bool Application::store(const Buffer &b, Message &m, bool update, const string &
     }
     try {
         const size_t parts = completedSend.empty() ? 0 : queuedSends_.at(completedSend).parts;
-        const bool retired =
-            update
-                ? storage_.update(b.id, m, completedSend, parts, confirmed, &b, &m.storageSequence)
-                : storage_.append(b.id, m, completedSend, parts, confirmed, &b, &m.storageSequence);
-        if (auto source = unsavedSources_.find(b.id); source != unsavedSources_.end())
-            std::erase_if(source->second.messages, [&](const auto &row) { return row.id == m.id; });
+        const bool retired = update ? storage_.update(b.id, m, completedSend, parts, confirmed, &b,
+                                                      &m.storageSequence, &m.historyOrder)
+                                    : storage_.append(b.id, m, completedSend, parts, confirmed, &b,
+                                                      &m.storageSequence, &m.historyOrder);
+        if (applyingHistory_)
+            historyCanonicalId_ = m.id;
+        if (!applyingHistory_)
+            if (auto source = unsavedSources_.find(b.id); source != unsavedSources_.end())
+                std::erase_if(source->second.messages,
+                              [&](const auto &row) { return row.id == m.id; });
         return completedSend.empty() || retired;
     } catch (const std::exception &e) {
+        if (applyingHistory_)
+            throw;
         remember();
         report(e.what(), b.server);
         return false;
     }
+}
+void Application::captureHistoryRow(const Buffer &buffer, Message &row) {
+    if (!applyingHistory_)
+        return;
+    if (const auto position = storage_.messagePosition(buffer.id, row.id)) {
+        row.storageSequence = position->first;
+        row.historyOrder = position->second;
+    } else {
+        // A retained RAM row may have been pruned; only this returned event re-materializes it.
+        store(buffer, row, true);
+    }
+    historyCanonicalId_ = row.id;
 }
 void Application::restoreDraft(Buffer &b, const string &text, bool distinctSubmission) {
     // Separate submissions may equal the new draft; only buffer-merging callers deduplicate text.
@@ -1253,18 +1400,28 @@ void Application::presence(Buffer &b, Event e, const string &text, bool emit) {
 bool Application::insert(Buffer &b, Message m, bool persist, const string &completedSend,
                          bool confirmed) {
     ++mentionsLiveRevision_;
-    if (!m.id.empty() && std::any_of(b.messages.begin(), b.messages.end(),
-                                     [&](const auto &old) { return old.id == m.id; }))
-        return false;
-    if (m.history && m.timestamp > 0 &&
-        std::any_of(b.messages.begin(), b.messages.end(), [&](const auto &old) {
-            return !old.pending && old.timestamp == m.timestamp && old.time == m.time &&
-                   fold(b.server, old.nick) == fold(b.server, m.nick) && old.text == m.text &&
-                   old.action == m.action && old.presence == m.presence &&
-                   old.activity == m.activity &&
-                   (old.id.starts_with("local:") || m.id.starts_with("local:"));
-        }))
-        return false;
+    if (!m.id.empty()) {
+        auto duplicate = std::find_if(b.messages.begin(), b.messages.end(),
+                                      [&](const auto &old) { return old.id == m.id; });
+        if (duplicate != b.messages.end()) {
+            captureHistoryRow(b, *duplicate);
+            return false;
+        }
+    }
+    if (m.history && m.timestamp > 0) {
+        const auto duplicate =
+            std::find_if(b.messages.begin(), b.messages.end(), [&](const auto &old) {
+                return !old.pending && old.timestamp == m.timestamp && old.time == m.time &&
+                       fold(b.server, old.nick) == fold(b.server, m.nick) && old.text == m.text &&
+                       old.action == m.action && old.presence == m.presence &&
+                       old.activity == m.activity &&
+                       (old.id.starts_with("local:") || m.id.starts_with("local:"));
+            });
+        if (duplicate != b.messages.end()) {
+            captureHistoryRow(b, *duplicate);
+            return false;
+        }
+    }
     if (m.id.empty())
         m.id = localId();
     bool durableReplay = false;
@@ -1275,6 +1432,7 @@ bool Application::insert(Buffer &b, Message m, bool persist, const string &compl
                 m.mention = m.mention || old->mention;
                 m.storageSequence = old->storageSequence;
                 m.orderingTimestamp = old->orderingTimestamp;
+                m.historyOrder = old->historyOrder;
                 m.reactions = old->reactions;
                 if (old->deleted) {
                     m.deleted = true;
@@ -1306,16 +1464,26 @@ bool Application::insert(Buffer &b, Message m, bool persist, const string &compl
     bool appendOnly = true;
     if (m.history) {
         auto pos = b.messages.begin();
+        const auto incomingTime = irc::parseTimestampParts(m.time);
+        auto earlierThan = [&](const Message &existing) {
+            if (m.timestamp != existing.timestamp)
+                return m.timestamp < existing.timestamp;
+            const auto existingTime = irc::parseTimestampParts(existing.time);
+            const auto incomingFraction = incomingTime ? incomingTime->nanoseconds : 0;
+            const auto existingFraction = existingTime ? existingTime->nanoseconds : 0;
+            if (incomingFraction != existingFraction)
+                return incomingFraction < existingFraction;
+            // Receipt-time placeholders retain native arrival order, not playback authority.
+            return incomingTime && existingTime && m.historyOrder >= 0 &&
+                   existing.historyOrder >= 0 && historyTieLess(m, existing);
+        };
         if (m.timestamp > 0) {
-            while (
-                pos != b.messages.end() &&
-                ((pos->history && pos->timestamp == 0) ||
-                 (pos->timestamp > 0 && (pos->timestamp < m.timestamp ||
-                                         (pos->timestamp == m.timestamp &&
-                                          markerFraction(pos->time) <= markerFraction(m.time))))))
+            while (pos != b.messages.end() && ((pos->history && pos->timestamp == 0) ||
+                                               (pos->timestamp > 0 && !earlierThan(*pos))))
                 ++pos;
         } else {
-            while (pos != b.messages.end() && pos->history && pos->timestamp == 0)
+            while (pos != b.messages.end() && pos->history && pos->timestamp == 0 &&
+                   !earlierThan(*pos))
                 ++pos;
         }
         appendOnly = pos == b.messages.end();
@@ -1365,7 +1533,7 @@ void Application::receive(Event e) {
         return;
     if (flag(e, "search")) {
         const auto request = searchRequests_.find(e.server);
-        if (request == searchRequests_.end() || request->second.label != e.label ||
+        if (request == searchRequests_.end() || request->second.label != historyOwner(e) ||
             request->second.session != network.sessionGeneration)
             return;
         const auto *source = findBuffer(request->second.source);
@@ -1408,7 +1576,7 @@ void Application::receive(Event e) {
         if (const auto *routed = findBuffer(routedQueue->second.buffer);
             routed && routed->server == e.server)
             e.target = routed->target;
-    if (!e.label.empty())
+    if (!e.history && !e.label.empty())
         for (const auto &[key, p] : pending_)
             if (p.label == e.label) {
                 if (auto routed = findBuffer(p.buffer))
@@ -1424,17 +1592,6 @@ void Application::receive(Event e) {
     auto &b = buffer(e.server, e.target, e.target == "*server*" ? "server" : "");
     e.own =
         e.own || (!network.nick.empty() && fold(e.server, e.nick) == fold(e.server, network.nick));
-    if (e.history) {
-        auto gap = gaps_.find(b.id);
-        if (gap != gaps_.end() && gap->second.active &&
-            (gap->second.label.empty() || gap->second.label == e.label)) {
-            ++gap->second.received;
-            if (!e.id.empty())
-                gap->second.next = "msgid=" + e.id;
-            else if (!e.time.empty())
-                gap->second.next = "timestamp=" + e.time;
-        }
-    }
     const bool pending = flag(e, "pending");
     const string submission = pending ? tag(e, "submission") : string{};
     auto queued = pending ? queuedSends_.find(submission) : queuedSends_.end();
@@ -1516,6 +1673,8 @@ void Application::receive(Event e) {
                     (e.type == "action") == m.action && model.now - m.arrival <= 30);
         });
         if (old != b.messages.end()) {
+            if (applyingHistory_ && old->storageSequence <= 0 && !old->history)
+                historyCanonicalExisting_ = true;
             const bool wasRead = b.readMarker == old->id || b.readMarker == "local:" + old->id;
             const bool correctedActivity =
                 old->id == b.lastChatId || old->pending || b.replayChatKeys.contains(old->id);
@@ -1576,9 +1735,11 @@ void Application::receive(Event e) {
                     try {
                         storage_.read(b.id, b.readMarker);
                     } catch (const std::exception &error) {
+                        if (applyingHistory_)
+                            throw;
                         report(error.what(), b.server);
                     }
-                if (markerTime(b.readMarker) > 0)
+                if (!applyingHistory_ && markerTime(b.readMarker) > 0)
                     if (auto c = client(b.server))
                         c->markRead(b.target, b.readMarker);
             }
@@ -1588,9 +1749,14 @@ void Application::receive(Event e) {
         }
         completedSend = confirmQueuedSend(b, e.label);
     }
-    if (!e.id.empty() && std::any_of(b.messages.begin(), b.messages.end(),
-                                     [&](const auto &m) { return m.id == e.id; }))
-        return;
+    if (!e.id.empty()) {
+        auto existing = std::find_if(b.messages.begin(), b.messages.end(),
+                                     [&](const auto &message) { return message.id == e.id; });
+        if (existing != b.messages.end()) {
+            captureHistoryRow(b, *existing);
+            return;
+        }
+    }
     bool restoreArchive = b.archived && !b.muted && !e.history && !e.own &&
                           !isFool(model, b.server, e.nick) &&
                           (b.kind == "channel" || b.kind == "query");
@@ -1660,9 +1826,15 @@ void Application::receive(Event e) {
     }
 }
 void Application::groupPresence(Event e, bool joins, bool explicitBatch) {
+    auto &b = buffer(e.server, e.target);
     if (joins && e.own) {
-        auto &b = buffer(e.server, e.target);
         presence(b, e, e.nick + " joined " + b.target, false);
+        return;
+    }
+    if (applyingHistory_ && presenceMode(b) == PresenceMode::Hidden) {
+        // Complete pages can write hidden evidence immediately, retaining its canonical identity.
+        presence(b, e, e.nick + (joins ? " joined " : " quit: ") + (joins ? b.target : e.text),
+                 false);
         return;
     }
     const string key = e.server + "\n" + (joins ? "join\n" : "quit\n") +
@@ -1680,7 +1852,6 @@ void Application::groupPresence(Event e, bool joins, bool explicitBatch) {
         group.joins = joins;
     }
     group.explicitBatch = group.explicitBatch || explicitBatch;
-    auto &b = buffer(e.server, e.target);
     if (presenceMode(b) != PresenceMode::Hidden) {
         if (e.id.empty())
             e.id = localId();
@@ -1718,8 +1889,523 @@ void Application::flushPresence(PresenceGroup &group, bool aggregate) {
     }
     group.emitted = true;
 }
+bool Application::historyEvent(const Event &event) {
+    if (flag(event, "search") || tag(event, "direction") == "search")
+        return false;
+    const bool history = event.history || event.type == "history_begin" ||
+                         event.type == "history_end" || event.type == "history_target";
+    if (!history)
+        return false;
+    if (flag(event, "history-standalone") && !event.tags.contains("history-owner"))
+        return false;
+    const auto &owner = historyOwner(event);
+    auto found = historyPages_.find(owner);
+    if (found == historyPages_.end() && event.type == "history_begin" &&
+        flag(event, "unsolicited") && !owner.empty()) {
+        const auto network = model.networks.find(event.server);
+        const auto room =
+            std::find_if(model.buffers.begin(), model.buffers.end(), [&](const auto &entry) {
+                return entry.second.server == event.server &&
+                       fold(event.server, entry.second.target) == fold(event.server, event.target);
+            });
+        if (network == model.networks.end() || network->second.state != "Ready" ||
+            !network->second.caps.contains("batch") || room == model.buffers.end() ||
+            (room->second.kind != "channel" && room->second.kind != "query") ||
+            storage_.historyDiscarded(room->first))
+            return true;
+        HistoryPage page;
+        page.server = event.server;
+        page.buffer = room->first;
+        page.session = network->second.sessionGeneration;
+        page.unsolicited = true;
+        page.request.target = room->second.target;
+        page.request.requestId = owner;
+        page.started = model.now;
+        const auto limit = tag(event, "limit");
+        if (!limit.empty()) {
+            int value = 0;
+            const auto parsed = std::from_chars(limit.data(), limit.data() + limit.size(), value);
+            if (parsed.ec == std::errc{} && value > 0)
+                page.request.limit = value;
+        }
+        found = historyPages_.emplace(owner, std::move(page)).first;
+        activeHistory_[owner] = room->first;
+    }
+    if (found == historyPages_.end())
+        return !owner.empty();
+    auto &page = found->second;
+    auto network = model.networks.find(page.server);
+    if (network == model.networks.end() || network->second.sessionGeneration != page.session) {
+        historyPages_.erase(found);
+        return true;
+    }
+    if (event.server != page.server)
+        return true;
+    if (event.type == "history_begin") {
+        if (page.seed)
+            return true;
+        if (auto *b = findBuffer(page.buffer)) {
+            if (page.request.initial)
+                b->initialHistorySync = HistorySyncState::Loading;
+            else
+                b->loading = true;
+        }
+        return true;
+    }
+    if (event.type != "history_end") {
+        size_t bytes = sizeof(Event) + event.text.size() + event.id.size() + event.time.size() +
+                       event.nick.size() + event.target.size();
+        for (const auto &[key, value] : event.tags)
+            bytes += key.size() + value.size();
+        for (const auto &value : event.params)
+            bytes += value.size();
+        size_t total = bytes;
+        for (const auto &[label, pending] : historyPages_)
+            total += pending.bytes;
+        if (page.events.size() >= 65536 || total > 32 * 1024 * 1024) {
+            Event failed = event;
+            failed.type = "history_end";
+            failed.label = owner;
+            failed.tags["error"] = "History page exceeded receive limits";
+            auto retired = std::move(page);
+            historyPages_.erase(found);
+            const auto server = retired.server;
+            try {
+                finishHistoryPage(std::move(retired), failed, false, false);
+            } catch (const std::exception &error) {
+                cancelHistorySession(server);
+                report("History: " + string(error.what()), server);
+            }
+            return true;
+        }
+        page.bytes += bytes;
+        page.events.push_back(event);
+        return true;
+    }
+    auto completed = std::move(page);
+    historyPages_.erase(found);
+    Event end = event;
+    end.label = owner;
+    if (tag(end, "count") != "0" &&
+        ((tag(end, "oldest-id").empty() && tag(end, "oldest-time").empty()) ||
+         (tag(end, "newest-id").empty() && tag(end, "newest-time").empty())))
+        end.tags["incomplete"] = "1";
+    bool applied = tag(end, "error").empty() && !flag(end, "cancelled");
+    bool progressed = false;
+    if (applied && completed.request.direction != HistoryDirection::Targets) {
+        try {
+            progressed = applyHistoryPage(completed, end);
+        } catch (const std::exception &error) {
+            applied = false;
+            end.tags["error"] = error.what();
+        }
+    }
+    if (completed.request.direction == HistoryDirection::Around) {
+        applyingHistory_ = true;
+        reduce(end);
+        applyingHistory_ = false;
+    }
+    const auto server = completed.server;
+    try {
+        finishHistoryPage(std::move(completed), end, applied, progressed);
+    } catch (const std::exception &error) {
+        cancelHistorySession(server);
+        report("History: " + string(error.what()), server);
+    }
+    return true;
+}
+
+bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
+    auto *b = findBuffer(page.buffer);
+    if (!b)
+        throw std::runtime_error("History conversation closed");
+    if (!savingAllowed_)
+        throw std::runtime_error("History cannot be committed while storage is unavailable");
+    auto write = storage_.historyWrite();
+    storage_.loadHistoryState(*b);
+    auto before = b->historyState;
+    HistoryCursor oldest{tag(end, "oldest-id"), tag(end, "oldest-time")};
+    HistoryCursor newest{tag(end, "newest-id"), tag(end, "newest-time")};
+    auto usable = [](const HistoryCursor &cursor) {
+        return !cursor.id.empty() || irc::parseTimestampParts(cursor.time).has_value();
+    };
+    auto timeLess = [](const HistoryCursor &a, const HistoryCursor &z) {
+        const auto x = irc::parseTimestampParts(a.time), y = irc::parseTimestampParts(z.time);
+        return x && y &&
+               (x->seconds < y->seconds ||
+                (x->seconds == y->seconds && x->nanoseconds < y->nanoseconds));
+    };
+    auto identical = [](const HistoryCursor &a, const HistoryCursor &z) {
+        return !a.id.empty() && a.id == z.id;
+    };
+    // MOTD prefers the persisted protocol cursor, not the newest live cache island.
+    auto previousNewest = before.newest;
+    std::optional<HistoryCursor> durableNewest;
+    if (!usable(previousNewest) || previousNewest.id.empty())
+        durableNewest = storage_.latestHistoryBoundary(b->id);
+    if (!usable(previousNewest) && durableNewest)
+        previousNewest = *durableNewest;
+    string previousAnchor = previousNewest.id;
+    if (previousAnchor.empty() && durableNewest && irc::parseTimestampParts(previousNewest.time) &&
+        irc::parseTimestampParts(durableNewest->time) &&
+        !timeLess(previousNewest, *durableNewest) && !timeLess(*durableNewest, previousNewest))
+        previousAnchor = durableNewest->id;
+    size_t count = 0;
+    const auto countText = tag(end, "count");
+    const auto parsed =
+        std::from_chars(countText.data(), countText.data() + countText.size(), count);
+    if (countText.empty() || parsed.ec != std::errc{})
+        count = page.events.size();
+    const bool bounded = usable(oldest) && usable(newest);
+    set<string> ids;
+    for (const auto &event : page.events) {
+        const auto &id = historyProtocolId(event);
+        if (historyPrimary(event) && !id.empty())
+            ids.insert(id);
+    }
+    const auto savedState = b->historyState;
+    const auto savedSize = b->messages.size();
+    const auto savedRead = b->readMarker;
+    const auto savedTyping = b->typing;
+    const auto savedJump = model.pendingSourceJump;
+    const ChatActivityKey savedActivity{b->lastChatTimestamp, b->lastChatSequence, b->lastChatTime};
+    const auto savedChatId = b->lastChatId;
+    const auto replayMaximum =
+        b->chatReplaySequences.empty() ? 0 : *b->chatReplaySequences.rbegin();
+    map<int64_t, bool> replayBefore;
+    map<string, std::optional<ChatActivityKey>> keysBefore;
+    set<string> touched;
+    for (const auto &event : page.events) {
+        touched.insert(event.id);
+        touched.insert(event.reply);
+    }
+    for (const auto &row : b->messages)
+        if (std::any_of(page.events.begin(), page.events.end(), [&](const auto &event) {
+                return (!row.label.empty() && row.label == event.label) ||
+                       ((row.id.starts_with("local:") || row.id.starts_with("local-")) &&
+                        row.time == event.time &&
+                        fold(b->server, row.nick) == fold(b->server, event.nick) &&
+                        row.text == event.text && row.action == (event.type == "action"));
+            }))
+            touched.insert(row.id);
+    for (const auto &row : b->messages)
+        if (touched.contains(row.id)) {
+            replayBefore[row.storageSequence] =
+                b->chatReplaySequences.contains(row.storageSequence);
+            const auto key = b->replayChatKeys.find(row.id);
+            keysBefore[row.id] =
+                key == b->replayChatKeys.end() ? std::nullopt : std::optional{key->second};
+        }
+    // Keep membership/order as compact stable identities; only touched rows need an undo copy.
+    vector<std::pair<int64_t, int64_t>> originalOrder;
+    originalOrder.reserve(b->messages.size());
+    map<string, int64_t> localIdentities;
+    map<int64_t, Message> originalRows;
+    int64_t localIdentity = 0;
+    for (const auto &row : b->messages) {
+        const auto identity = row.storageSequence > 0 ? row.storageSequence : --localIdentity;
+        originalOrder.emplace_back(identity, row.historyOrder);
+        if (row.storageSequence == 0)
+            localIdentities.emplace(row.id, identity);
+        if (touched.contains(row.id))
+            originalRows.emplace(identity, row);
+    }
+    map<string, Pending> savedPending;
+    for (const auto &[key, pending] : pending_)
+        if (pending.buffer == b->id)
+            savedPending.emplace(key, pending);
+    map<string, QueuedSend> savedQueued;
+    for (const auto &[key, queued] : queuedSends_)
+        if (queued.buffer == b->id)
+            savedQueued.emplace(key, queued);
+    const auto savedCount = messageCount_;
+    const auto savedRevision = messageRevision_;
+    const auto savedMentions = mentionsLiveRevision_;
+    const auto savedSequence = sequence_;
+    bool committed = false;
+    string oldestAnchor, newestAnchor;
+    bool firstPrimary = true;
+    vector<string> playbackOrder;
+    set<string> existingCanonicalIds;
+    playbackOrder.reserve(page.events.size());
+    try {
+        applyingHistory_ = true;
+        for (auto &event : page.events) {
+            event.target = b->target;
+            historyCanonicalId_.clear();
+            historyCanonicalExisting_ = false;
+            reduce(event);
+            if (historyMutation(event))
+                historyCanonicalId_.clear();
+            if (!historyCanonicalId_.empty()) {
+                playbackOrder.push_back(historyCanonicalId_);
+                if (historyCanonicalExisting_)
+                    existingCanonicalIds.insert(historyCanonicalId_);
+            }
+            if (historyPrimary(event)) {
+                const auto &protocolId = historyProtocolId(event);
+                const auto &canonicalId = historyCanonicalId_;
+                if (!canonicalId.empty())
+                    ids.insert(canonicalId);
+                if (firstPrimary) {
+                    oldestAnchor = protocolId.empty() ? canonicalId : protocolId;
+                    firstPrimary = false;
+                }
+                newestAnchor = protocolId.empty() ? canonicalId : protocolId;
+            }
+        }
+        for (auto group = presenceGroups_.begin(); group != presenceGroups_.end();) {
+            if (std::any_of(group->second.events.begin(), group->second.events.end(),
+                            [&](const auto &event) {
+                                return historyOwner(event) == page.request.requestId;
+                            })) {
+                flushPresence(group->second, false);
+                group = presenceGroups_.erase(group);
+            } else
+                ++group;
+        }
+        applyingHistory_ = false;
+        historyCanonicalId_.clear();
+        historyCanonicalExisting_ = false;
+        vector<string> existingCanonicalOrder;
+        if (!existingCanonicalIds.empty()) {
+            set<std::pair<int64_t, int>> affectedTimes;
+            for (const auto &row : b->messages)
+                if (existingCanonicalIds.contains(row.id))
+                    if (const auto time = irc::parseTimestampParts(row.time))
+                        affectedTimes.emplace(row.timestamp, time->nanoseconds);
+            vector<int64_t> originalSequences;
+            originalSequences.reserve(originalOrder.size());
+            for (const auto &[identity, rank] : originalOrder)
+                if (identity > 0)
+                    originalSequences.push_back(identity);
+            std::sort(originalSequences.begin(), originalSequences.end());
+            for (const auto &row : b->messages) {
+                const auto time = irc::parseTimestampParts(row.time);
+                if (!time || !affectedTimes.contains({row.timestamp, time->nanoseconds}))
+                    continue;
+                if (existingCanonicalIds.contains(row.id) ||
+                    std::binary_search(originalSequences.begin(), originalSequences.end(),
+                                       row.storageSequence))
+                    existingCanonicalOrder.push_back(row.id);
+            }
+        }
+        const auto ranks =
+            write.reconcileOrder(b->id, playbackOrder,
+                                 page.request.direction == HistoryDirection::Before ||
+                                     page.request.direction == HistoryDirection::Around,
+                                 existingCanonicalOrder);
+        vector<size_t> playbackPositions;
+        playbackPositions.reserve(std::min(b->messages.size(), ranks.size()));
+        for (size_t position = 0; position < b->messages.size(); ++position) {
+            auto &row = b->messages[position];
+            const auto rank = std::lower_bound(
+                ranks.begin(), ranks.end(), row.storageSequence,
+                [](const auto &entry, int64_t sequence) { return entry.first < sequence; });
+            if (rank != ranks.end() && rank->first == row.storageSequence) {
+                row.historyOrder = rank->second;
+                playbackPositions.push_back(position);
+            }
+        }
+        if (reorderHistoryTies(*b, playbackPositions))
+            reviseMessages(*b);
+        auto &state = b->historyState;
+        state.oldest = before.oldest;
+        state.newest = before.newest;
+        const bool inserted = b->messages.size() != savedSize;
+        if (count && bounded) {
+            HistoryCursor gapOlder = previousNewest;
+            if (gapOlder.id.empty())
+                gapOlder.id = previousAnchor;
+            HistoryCursor gapNewer = oldest;
+            if (gapNewer.id.empty())
+                gapNewer.id = oldestAnchor;
+            HistoryCursor newestBoundary = newest;
+            if (newestBoundary.id.empty())
+                newestBoundary.id = newestAnchor;
+            const bool includesPrevious =
+                (!previousNewest.id.empty() && ids.contains(previousNewest.id)) ||
+                (!previousAnchor.empty() && ids.contains(previousAnchor));
+            const bool orderedTimes = irc::parseTimestampParts(previousNewest.time) &&
+                                      irc::parseTimestampParts(oldest.time) &&
+                                      irc::parseTimestampParts(newest.time) &&
+                                      !timeLess(newest, oldest);
+            if (page.request.direction == HistoryDirection::Latest && !flag(end, "end") &&
+                orderedTimes && !includesPrevious && !timeLess(oldest, previousNewest) &&
+                !identical(gapOlder, gapNewer)) {
+                const bool already =
+                    std::any_of(state.gaps.begin(), state.gaps.end(), [&](const auto &gap) {
+                        const bool coversOlder =
+                            timeLess(gap.older, gapOlder) || identical(gap.older, gapOlder);
+                        const bool coversNewer =
+                            timeLess(gapNewer, gap.newer) || identical(gapNewer, gap.newer);
+                        return coversOlder && coversNewer;
+                    });
+                if (!already)
+                    state.gaps.push_back({0, gapOlder, gapNewer, false});
+            }
+            vector<blast::HistoryGap> remaining;
+            for (auto gap : state.gaps) {
+                const bool reachesOlder =
+                    ids.contains(gap.older.id) || timeLess(gapNewer, gap.older);
+                const bool reachesNewer =
+                    ids.contains(gap.newer.id) || timeLess(gap.newer, newestBoundary) ||
+                    (page.gapId == gap.id && identical(page.request.first, gap.newer));
+                const bool insideOlder = timeLess(gap.older, gapNewer);
+                const bool insideNewer = timeLess(newestBoundary, gap.newer);
+                const bool joinsNewer =
+                    ids.contains(gap.newer.id) ||
+                    (page.gapId == gap.id && identical(page.request.first, gap.newer));
+                const bool tiedNewer = irc::parseTimestampParts(gapNewer.time) &&
+                                       irc::parseTimestampParts(gap.newer.time) &&
+                                       !timeLess(gapNewer, gap.newer) &&
+                                       !timeLess(gap.newer, gapNewer);
+                if (reachesOlder && reachesNewer)
+                    continue;
+                if (reachesNewer && !reachesOlder && !identical(gapNewer, gap.newer) &&
+                    !timeLess(gapNewer, gap.older) &&
+                    (timeLess(gapNewer, gap.newer) || (joinsNewer && tiedNewer))) {
+                    gap.newer = gapNewer;
+                    gap.unavailable = false;
+                } else if (reachesOlder && insideNewer && timeLess(gap.older, newestBoundary)) {
+                    gap.older = newestBoundary;
+                    gap.unavailable = false;
+                } else if (insideOlder && insideNewer && timeLess(gapNewer, newestBoundary)) {
+                    auto upper = gap;
+                    upper.id = 0;
+                    upper.older = newestBoundary;
+                    gap.newer = gapNewer;
+                    remaining.push_back(std::move(upper));
+                }
+                remaining.push_back(std::move(gap));
+            }
+            state.gaps = std::move(remaining);
+            if (!usable(state.oldest) || timeLess(oldest, state.oldest) ||
+                (page.request.direction == HistoryDirection::Before &&
+                 !timeLess(state.oldest, oldest)))
+                state.oldest = oldest;
+            if (!usable(state.newest) || timeLess(state.newest, newest) ||
+                (page.request.direction == HistoryDirection::Latest &&
+                 !timeLess(newest, state.newest)))
+                state.newest = newest;
+            if (flag(end, "end") && page.request.direction == HistoryDirection::Latest &&
+                page.request.first.id.empty() && page.request.first.time.empty())
+                state.beginning = true;
+        }
+        if (page.request.direction == HistoryDirection::Before && (flag(end, "end") || !count)) {
+            if (page.gapId) {
+                for (auto &gap : state.gaps)
+                    if (gap.id == page.gapId)
+                        gap.unavailable = true;
+            } else
+                state.beginning = true;
+        }
+        storage_.saveHistoryState(*b);
+        write.commit();
+        committed = true;
+        storage_.loadHistoryState(*b);
+        for (const auto &id : storage_.takeHistoryInvalidations())
+            if (id != b->id)
+                if (auto *affected = findBuffer(id))
+                    storage_.loadHistoryState(*affected);
+        if (auto source = unsavedSources_.find(b->id); source != unsavedSources_.end())
+            std::erase_if(source->second.messages,
+                          [&](const auto &row) { return touched.contains(row.id); });
+        if (b->readMarker != savedRead && markerTime(b->readMarker) > 0)
+            try {
+                if (auto c = client(b->server))
+                    c->markRead(b->target, b->readMarker);
+            } catch (const std::exception &error) {
+                report(error.what(), b->server);
+            }
+        bool gapsChanged = state.gaps.size() != before.gaps.size();
+        if (!gapsChanged)
+            for (size_t i = 0; i < state.gaps.size(); ++i)
+                gapsChanged = gapsChanged || state.gaps[i].older != before.gaps[i].older ||
+                              state.gaps[i].newer != before.gaps[i].newer ||
+                              state.gaps[i].unavailable != before.gaps[i].unavailable;
+        return inserted || state.oldest != before.oldest || state.newest != before.newest ||
+               gapsChanged;
+    } catch (...) {
+        applyingHistory_ = false;
+        historyCanonicalId_.clear();
+        historyCanonicalExisting_ = false;
+        if (committed) {
+            for (auto &[id, value] : model.buffers)
+                value.historyState = {};
+            throw;
+        }
+        model.pendingSourceJump = savedJump;
+        // Restore exact loaded islands, not the database's newest window.
+        b->historyState = savedState;
+        b->readMarker = savedRead;
+        b->typing = savedTyping;
+        map<int64_t, Message> retained;
+        for (auto &row : b->messages) {
+            auto identity = row.storageSequence;
+            if (identity == 0) {
+                const auto local = localIdentities.find(row.id);
+                if (local == localIdentities.end())
+                    continue;
+                identity = local->second;
+            }
+            retained.emplace(identity, std::move(row));
+        }
+        for (auto &[identity, row] : originalRows)
+            retained.insert_or_assign(identity, std::move(row));
+        b->messages.clear();
+        for (const auto &[identity, rank] : originalOrder)
+            if (auto row = retained.find(identity); row != retained.end()) {
+                row->second.historyOrder = rank;
+                b->messages.push_back(std::move(row->second));
+            }
+        std::erase_if(b->chatReplaySequences,
+                      [&](int64_t sequence) { return sequence > replayMaximum; });
+        for (const auto &[sequence, present] : replayBefore) {
+            if (present)
+                b->chatReplaySequences.insert(sequence);
+            else
+                b->chatReplaySequences.erase(sequence);
+        }
+        for (const auto &id : touched)
+            b->replayChatKeys.erase(id);
+        for (const auto &[id, key] : keysBefore)
+            if (key)
+                b->replayChatKeys[id] = *key;
+        b->lastChatTimestamp = savedActivity.timestamp;
+        b->lastChatSequence = savedActivity.sequence;
+        b->lastChatTime = savedActivity.time;
+        b->lastChatId = savedChatId;
+        b->sourceMessageIndex.clear();
+        std::erase_if(pending_, [&](const auto &entry) { return entry.second.buffer == b->id; });
+        pending_.merge(savedPending);
+        std::erase_if(queuedSends_,
+                      [&](const auto &entry) { return entry.second.buffer == b->id; });
+        queuedSends_.merge(savedQueued);
+        messageCount_ = savedCount - savedSize + b->messages.size();
+        messageRevision_ = savedRevision;
+        mentionsLiveRevision_ = savedMentions;
+        sequence_ = savedSequence;
+        std::erase_if(activity_,
+                      [&](const auto &entry) { return entry.first.starts_with(b->id + "\n"); });
+        for (const auto &row : b->messages)
+            activity(*b, row);
+        ++b->messagesRevision;
+        ++b->participationRevision;
+        recount(*b);
+        std::erase_if(presenceGroups_, [&](const auto &group) {
+            return std::any_of(
+                group.second.events.begin(), group.second.events.end(),
+                [&](const auto &event) { return historyOwner(event) == page.request.requestId; });
+        });
+        throw;
+    }
+}
+
 void Application::reduce(const Event &input) {
     if (sojuRetired_.contains(input.server))
+        return;
+    if (!applyingHistory_ && historyEvent(input))
         return;
     Event e = input;
     const bool routedCommand = commandResponse(e);
@@ -1763,9 +2449,9 @@ void Application::reduce(const Event &input) {
             }
         return;
     }
-    if (!e.label.empty() && retiredSearchHistory_.contains(e.label))
+    if (!historyOwner(e).empty() && retiredSearchHistory_.contains(historyOwner(e)))
         return;
-    if (e.history && searchJump_ && e.label == searchJump_->label) {
+    if (e.history && searchJump_ && historyOwner(e) == searchJump_->label) {
         auto &jump = *searchJump_;
         if (e.server != jump.server || !findBuffer(jump.sourceBuffer) ||
             n.sessionGeneration != jump.session)
@@ -1790,8 +2476,8 @@ void Application::reduce(const Event &input) {
         }
     }
     if ((e.history || e.type == "history_begin" || e.type == "history_end") && !flag(e, "search") &&
-        !e.label.empty()) {
-        auto route = activeHistory_.find(e.label);
+        !historyOwner(e).empty()) {
+        auto route = activeHistory_.find(historyOwner(e));
         if (route != activeHistory_.end())
             if (auto b = findBuffer(route->second))
                 e.target = b->target;
@@ -1809,6 +2495,7 @@ void Application::reduce(const Event &input) {
         if (!tag(e, "nick").empty())
             n.nick = tag(e, "nick");
         if (e.text == "Connecting" || e.text == "Disconnected" || e.text == "Failed") {
+            historyClassificationSettled_.erase(e.server);
             if (searchJump_ && searchJump_->server == e.server)
                 cancelSearchJump();
             searchRequests_.erase(e.server);
@@ -1828,6 +2515,7 @@ void Application::reduce(const Event &input) {
                 n.sojuMutationError = "Connection changed before management acknowledgement";
             }
             sojuMutations_.erase(e.server);
+            cancelHistorySession(e.server);
         }
         if (e.text == "Connecting") {
             n.sojuNetworks.clear();
@@ -1852,19 +2540,12 @@ void Application::reduce(const Event &input) {
             failSends(failed, e.text + (n.error.empty() ? "" : " — " + n.error));
             std::erase_if(requestedHistory_,
                           [&](const auto &id) { return id.starts_with(e.server + "/"); });
-            std::erase_if(gaps_,
-                          [&](const auto &item) { return item.first.starts_with(e.server + "/"); });
             std::erase_if(activeHistory_, [&](const auto &item) {
                 return item.second.starts_with(e.server + "/");
             });
             std::erase_if(initialHistory_, [&](const auto &item) {
-                if (item.second.starts_with(e.server + "/"))
-                    promotedHistory_.erase(item.first);
-                if (item.second.starts_with(e.server + "/"))
-                    startedHistory_.erase(item.first);
                 return item.second.starts_with(e.server + "/");
             });
-            historyPriorities_.erase(e.server);
             for (auto &[id, b] : model.buffers)
                 if (b.server == e.server) {
                     b.joined = false;
@@ -1937,9 +2618,7 @@ void Application::reduce(const Event &input) {
         const bool hasRead =
             n.caps.contains("draft/read-marker") || n.caps.contains("soju.im/read");
         if (hadHistory && !hasHistory)
-            for (auto &[id, b] : model.buffers)
-                if (b.server == e.server)
-                    cancelHistory(b);
+            cancelHistorySession(e.server);
         if (n.state == "Ready")
             for (auto &[id, b] : model.buffers)
                 if (b.server == e.server && (b.joined || b.kind == "query")) {
@@ -1964,6 +2643,10 @@ void Application::reduce(const Event &input) {
     }
     if (e.type == "network") {
         auto kind = tag(e, "kind");
+        if (kind == "isupport-settled") {
+            historyClassificationSettled_.insert(e.server);
+            return;
+        }
         if (kind == "authentication") {
             n.saslAuthenticated = flag(e, "authenticated") && tag(e, "mechanism") == "PLAIN";
             return;
@@ -2306,11 +2989,13 @@ void Application::reduce(const Event &input) {
     if ((e.type == "typing" || e.type == "reaction" || e.type == "redact") && !e.nick.empty() &&
         !e.own && fold(e.server, e.target) == fold(e.server, n.nick))
         e.target = e.nick;
+    if (e.type == "history_begin" || e.type == "history_end")
+        e.label = historyOwner(e);
     const bool searchBatch =
         (e.type == "history_begin" || e.type == "history_end") && tag(e, "direction") == "search";
     if (searchBatch) {
         const auto request = searchRequests_.find(e.server);
-        if (request == searchRequests_.end() || request->second.label != e.label ||
+        if (request == searchRequests_.end() || request->second.label != historyOwner(e) ||
             request->second.session != n.sessionGeneration)
             return;
     }
@@ -2327,28 +3012,13 @@ void Application::reduce(const Event &input) {
                      : e.target.empty() ? "server"
                                         : "");
     if (e.type == "history_begin") {
-        promotedHistory_.erase(e.label);
-        if (flag(e, "initial"))
-            startedHistory_.insert(e.label);
-        if (flag(e, "initial"))
-            b.initialHistorySync = HistorySyncState::Loading;
-        else
-            b.loading = true;
+        b.loading = true;
         if (!e.label.empty())
             activeHistory_[e.label] = b.id;
-        auto gap = gaps_.find(b.id);
-        if (flag(e, "initial") && tag(e, "direction") == "after" && gap != gaps_.end()) {
-            gap->second.active = true;
-            gap->second.received = 0;
-            gap->second.next.clear();
-            gap->second.label = e.label;
-        }
         return;
     }
     if (e.type == "history_end") {
-        const bool initial = initialHistory_.erase(e.label) != 0;
-        const bool promoted = promotedHistory_.erase(e.label) != 0;
-        startedHistory_.erase(e.label);
+        initialHistory_.erase(e.label);
         if (!e.label.empty())
             activeHistory_.erase(e.label);
         b.loading = std::any_of(activeHistory_.begin(), activeHistory_.end(), [&](const auto &v) {
@@ -2382,52 +3052,6 @@ void Application::reduce(const Event &input) {
                 jumpSource(jump.sourceBuffer, jump.matchedId);
             } else if (tag(e, "error").empty() && !flag(e, "cancelled")) {
                 report("Original message not found in history", jump.server);
-            }
-        }
-        if (promoted && flag(e, "cancelled")) {
-            return; // Keep its gap/backlog; the freed slot goes to the newly viewed buffer.
-        }
-        auto gap = gaps_.find(b.id);
-        if (initial && tag(e, "direction") == "after" && gap != gaps_.end() &&
-            (gap->second.label.empty() || gap->second.label == e.label)) {
-            auto &g = gap->second;
-            int limit = 200;
-            const auto value = tag(e, "limit");
-            if (!value.empty()) {
-                int parsed = 0;
-                auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
-                if (result.ec == std::errc{} && parsed > 0)
-                    limit = parsed;
-            }
-            const auto count = tag(e, "count");
-            if (!count.empty()) {
-                size_t parsed = 0;
-                auto result = std::from_chars(count.data(), count.data() + count.size(), parsed);
-                if (result.ec == std::errc{})
-                    g.received = parsed;
-            }
-            if (!tag(e, "cursor").empty())
-                g.next = tag(e, "cursor");
-            if (tag(e, "error").empty() && g.received >= static_cast<size_t>(limit) &&
-                !g.next.empty() && g.next != g.cursor) {
-                g.cursor = g.next;
-                g.next.clear();
-                g.active = false;
-                g.received = 0;
-                enqueueHistory(b, "after=" + g.cursor, true);
-            } else {
-                gaps_.erase(gap);
-                if (!tag(e, "error").empty() && !flag(e, "cancelled") && !flag(e, "rejected") &&
-                    model.networks[b.server].state == "Ready")
-                    enqueueHistory(b, "", true);
-            }
-        }
-        if (initial && std::none_of(initialHistory_.begin(), initialHistory_.end(),
-                                    [&](const auto &v) { return v.second == b.id; })) {
-            b.initialHistorySync = HistorySyncState::Idle;
-            if (!tag(e, "error").empty()) {
-                requestedHistory_.erase(b.id);
-                gaps_.erase(b.id);
             }
         }
         if (!tag(e, "error").empty() && !flag(e, "cancelled"))
@@ -2720,8 +3344,7 @@ bool Application::zncPlayback(const string &server) const {
 string Application::historyCursor(const Buffer &b, const string &cursor) const {
     if (cursor.empty())
         return {};
-    const bool after = cursor.starts_with("after=");
-    string selector = after ? cursor.substr(6) : cursor;
+    string selector = cursor;
     if (!selector.starts_with("timestamp=")) {
         const string id = selector.starts_with("msgid=") ? selector.substr(6) : selector;
         auto refs = historyReferences_.find(b.server);
@@ -2737,183 +3360,666 @@ string Application::historyCursor(const Buffer &b, const string &cursor) const {
         else
             selector = "msgid=" + id;
     }
-    return after ? "after=" + selector : selector;
+    return selector;
 }
+namespace {
+int64_t historyMillis(const string &time) {
+    const auto parsed = irc::parseTimestampParts(time);
+    return parsed ? parsed->seconds * 1000 + parsed->nanoseconds / 1000000 : 0;
+}
+string historyTime(int64_t millis) {
+    using namespace std::chrono;
+    millis = std::max<int64_t>(0, millis);
+    const sys_time<milliseconds> point{milliseconds{millis}};
+    const auto day = floor<days>(point);
+    const year_month_day date{day};
+    const hh_mm_ss clock{point - day};
+    auto pad = [](int value, size_t width) {
+        auto text = std::to_string(value);
+        return string(width > text.size() ? width - text.size() : 0, '0') + text;
+    };
+    return pad(int(date.year()), 4) + "-" + pad(unsigned(date.month()), 2) + "-" +
+           pad(unsigned(date.day()), 2) + "T" + pad(clock.hours().count(), 2) + ":" +
+           pad(clock.minutes().count(), 2) + ":" + pad(clock.seconds().count(), 2) + "." +
+           pad(clock.subseconds().count(), 3) + "Z";
+}
+} // namespace
 vector<string> Application::historyOrder(const string &server) const {
     vector<const Buffer *> pending;
     for (const auto &[id, b] : model.buffers)
         if (b.server == server && b.initialHistorySync != HistorySyncState::Idle)
             pending.push_back(&b);
+    const auto session = historySessions_.find(server);
     const auto &pins = model.settings.pinnedBuffers;
     auto pin = [&](const Buffer &b) { return std::find(pins.begin(), pins.end(), b.id); };
+    auto advertised = [&](const Buffer &b) {
+        if (session == historySessions_.end())
+            return int64_t{0};
+        const auto it = session->second.advertised.find(fold(server, b.target));
+        return it == session->second.advertised.end() ? int64_t{0} : historyMillis(it->second.time);
+    };
     std::stable_sort(pending.begin(), pending.end(), [&](const Buffer *a, const Buffer *b) {
         if ((a->id == model.activeBuffer) != (b->id == model.activeBuffer))
             return a->id == model.activeBuffer;
+        if (pin(*a) != pin(*b))
+            return pin(*a) < pin(*b);
         const bool lowA = a->muted || a->archived, lowB = b->muted || b->archived;
         if (lowA != lowB)
             return !lowA;
-        if (pin(*a) != pin(*b))
-            return pin(*a) < pin(*b);
-        if ((a->unread > 0) != (b->unread > 0))
-            return a->unread > 0;
+        if (advertised(*a) != advertised(*b))
+            return advertised(*a) > advertised(*b);
         return chatActivityBefore(*a, *b);
     });
     vector<string> order;
-    // Slot zero is always the viewed target, even without pending initial work.
-    const auto active = model.buffers.find(model.activeBuffer);
-    order.push_back(active != model.buffers.end() && active->second.server == server
-                        ? active->second.target
-                        : "");
     for (const auto *b : pending)
-        if (b->target != order.front())
-            order.push_back(b->target);
+        order.push_back(b->target);
     return order;
 }
-void Application::enqueueHistory(Buffer &b, const string &cursor, bool initial) {
-    auto c = client(b.server);
+void Application::submitHistory(HistoryPage page) {
+    auto c = client(page.server);
     if (!c)
         return;
-    const auto label = localId();
-    activeHistory_[label] = b.id; // Include queued foreground requests, not just begun batches.
-    if (initial) {
-        initialHistory_[label] = b.id;
-        if (b.initialHistorySync == HistorySyncState::Idle)
-            b.initialHistorySync = HistorySyncState::Queued;
-    } else
-        b.loading = true;
-    try {
-        c->history(b.target, cursor, label, initial);
-    } catch (const std::exception &e) {
-        activeHistory_.erase(label);
-        initialHistory_.erase(label);
-        if (initial) {
-            b.initialHistorySync = HistorySyncState::Idle;
-            gaps_.erase(b.id);
-            requestedHistory_.erase(b.id);
+    if (page.request.requestId.empty())
+        page.request.requestId = localId();
+    page.started = model.now;
+    if (page.request.direction == HistoryDirection::Latest && page.request.first.id.empty() &&
+        page.request.first.time.empty())
+        if (const auto *b = findBuffer(page.buffer); b && b->kind == "query")
+            if (const auto floor = storage_.historyDiscarded(b->id); floor && !floor->empty())
+                page.request.first.time = *floor;
+    const auto label = page.request.requestId;
+    historyPages_.emplace(label, std::move(page));
+    auto &stored = historyPages_.at(label);
+    if (!stored.buffer.empty()) {
+        activeHistory_[label] = stored.buffer;
+        if (auto b = findBuffer(stored.buffer)) {
+            if (stored.request.initial) {
+                initialHistory_[label] = b->id;
+                b->initialHistorySync = HistorySyncState::Queued;
+            } else if (!stored.seed)
+                b->loading = true;
         }
-        b.loading = std::any_of(activeHistory_.begin(), activeHistory_.end(), [&](const auto &v) {
-            return v.second == b.id && !initialHistory_.contains(v.first);
-        });
-        report("History: " + string(e.what()), b.server);
+    }
+    try {
+        c->history(stored.request);
+    } catch (const std::exception &error) {
+        auto failed = std::move(stored);
+        historyPages_.erase(label);
+        Event end;
+        end.server = failed.server;
+        end.label = label;
+        end.tags["error"] = error.what();
+        finishHistoryPage(std::move(failed), end, false, false);
     }
 }
+void Application::enqueueHistory(Buffer &b, HistoryRequest request, int64_t gapId,
+                                 unsigned budget) {
+    request.target = b.target;
+    for (auto *cursor : {&request.first, &request.second})
+        if (cursor->id.starts_with("local:") || cursor->id.starts_with("local-"))
+            cursor->id.clear();
+    if (request.direction == HistoryDirection::Latest && request.first.id.empty() &&
+        request.first.time.empty() && b.kind == "query")
+        if (const auto floor = storage_.historyDiscarded(b.id); floor && !floor->empty())
+            request.first.time = *floor;
+    const auto &network = model.networks[b.server];
+    if (network.state != "Ready" || !client(b.server) ||
+        (!network.caps.contains("chathistory") && !network.caps.contains("draft/chathistory") &&
+         !zncPlayback(b.server)))
+        return;
+    if (const auto session = historySessions_.find(b.server);
+        session != historySessions_.end() && session->second.refused.contains(b.id))
+        return;
+    for (auto &[label, page] : historyPages_)
+        if (page.server == b.server && page.buffer == b.id &&
+            ((request.direction == HistoryDirection::Before &&
+              page.request.direction == HistoryDirection::Before) ||
+             (page.request.direction == request.direction && page.request.first == request.first &&
+              page.request.second == request.second && page.gapId == gapId))) {
+            if (request.initial && !page.request.initial) {
+                page.request.initial = true;
+                page.seed = false;
+                initialHistory_[label] = b.id;
+                b.initialHistorySync = HistorySyncState::Loading;
+            } else if (!request.initial)
+                b.loading = true;
+            return;
+        }
+    HistoryPage page;
+    page.request = std::move(request);
+    page.server = b.server;
+    page.buffer = b.id;
+    page.session = model.networks[b.server].sessionGeneration;
+    page.gapId = gapId;
+    page.budget = budget;
+    submitHistory(std::move(page));
+}
+void Application::enqueueHistory(Buffer &b, const string &cursor, bool initial) {
+    HistoryRequest request;
+    request.initial = initial;
+    request.direction = cursor.empty() ? HistoryDirection::Latest : HistoryDirection::Before;
+    auto selector = historyCursor(b, cursor);
+    if (selector.starts_with("timestamp="))
+        request.first.time = selector.substr(10);
+    else if (selector.starts_with("msgid=")) {
+        request.first.id = selector.substr(6);
+        const auto row = std::find_if(b.messages.begin(), b.messages.end(),
+                                      [&](const Message &m) { return m.id == request.first.id; });
+        if (row != b.messages.end())
+            request.first.time = row->time;
+    }
+    enqueueHistory(b, std::move(request));
+}
 void Application::cancelHistory(Buffer &b) {
-    if (b.initialHistorySync != HistorySyncState::Idle)
-        if (auto c = client(b.server))
-            try {
-                c->cancelInitialHistory(b.target);
-            } catch (const std::exception &e) {
-                report("History: " + string(e.what()), b.server);
-            }
-    std::erase_if(activeHistory_, [&](const auto &v) {
-        if (v.second == b.id)
-            promotedHistory_.erase(v.first);
-        if (v.second == b.id)
-            startedHistory_.erase(v.first);
-        return v.second == b.id && initialHistory_.contains(v.first);
+    if (auto c = client(b.server))
+        try {
+            c->cancelInitialHistory(b.target);
+        } catch (const std::exception &e) {
+            report("History: " + string(e.what()), b.server);
+        }
+    std::erase_if(historyPages_, [&](const auto &entry) {
+        if (entry.second.buffer != b.id)
+            return false;
+        activeHistory_.erase(entry.first);
+        initialHistory_.erase(entry.first);
+        return true;
     });
-    std::erase_if(initialHistory_, [&](const auto &v) { return v.second == b.id; });
+    if (auto it = historySessions_.find(b.server); it != historySessions_.end()) {
+        auto &s = it->second;
+        std::erase(s.visible, b.id);
+        std::erase(s.background, b.id);
+        if (std::erase(s.seeds, b.id))
+            s.seedFailed = true;
+        std::erase_if(s.retries, [&](const HistoryPage &page) { return page.buffer == b.id; });
+    }
     b.initialHistorySync = HistorySyncState::Idle;
+    b.loading = false;
     requestedHistory_.erase(b.id);
-    gaps_.erase(b.id);
+}
+void Application::cancelHistorySession(const string &server) {
+    historySessions_.erase(server);
+    std::erase_if(historyPages_, [&](const auto &entry) {
+        if (entry.second.server != server)
+            return false;
+        activeHistory_.erase(entry.first);
+        initialHistory_.erase(entry.first);
+        return true;
+    });
+    for (auto &[id, b] : model.buffers)
+        if (b.server == server) {
+            b.initialHistorySync = HistorySyncState::Idle;
+            b.loading = false;
+            requestedHistory_.erase(id);
+        }
+}
+void Application::planHistory(const string &server, bool seeds) {
+    auto &s = historySessions_.at(server);
+    for (const auto &[key, advertised] : s.advertised) {
+        auto known = std::find_if(model.buffers.begin(), model.buffers.end(), [&](const auto &v) {
+            return v.second.server == server && fold(server, v.second.target) == key;
+        });
+        if (known != model.buffers.end() || channel(server, advertised.name))
+            continue;
+        const auto discarded = storage_.historyDiscarded(server + "/" + key);
+        if (discarded &&
+            (discarded->empty() || historyMillis(advertised.time) <= historyMillis(*discarded)))
+            continue;
+        buffer(server, advertised.name, "query");
+    }
+    for (auto &[id, b] : model.buffers) {
+        if (b.server != server || (b.kind != "query" && b.kind != "channel") ||
+            (b.kind == "channel" && !b.joined))
+            continue;
+        const auto advertised = s.advertised.find(fold(server, b.target));
+        const bool hasCursor =
+            !b.historyState.newest.id.empty() || !b.historyState.newest.time.empty();
+        const bool changed =
+            !s.refused.contains(id) && (!hasCursor || (advertised != s.advertised.end() &&
+                                                       markerTime(b.historyState.newest.time) <
+                                                           markerTime(advertised->second.time)));
+        if (seeds && advertised == s.advertised.end())
+            continue;
+        b.initialHistorySync = changed ? HistorySyncState::Queued : HistorySyncState::Idle;
+    }
+    size_t count = 0;
+    for (const auto &target : historyOrder(server)) {
+        auto found = std::find_if(model.buffers.begin(), model.buffers.end(), [&](const auto &v) {
+            return v.second.server == server &&
+                   fold(server, v.second.target) == fold(server, target);
+        });
+        if (found == model.buffers.end())
+            continue;
+        auto &b = found->second;
+        if (seeds) {
+            s.seeds.push_back(b.id);
+            b.initialHistorySync = HistorySyncState::Idle;
+        } else if (count++ < 12)
+            s.visible.push_back(b.id);
+        else {
+            s.background.push_back(b.id);
+            b.initialHistorySync = HistorySyncState::Idle;
+        }
+    }
+    s.nextTarget = model.now + .5;
 }
 void Application::scheduleHistory() {
     for (const auto &[server, c] : clients_) {
-        if (model.networks[server].state != "Ready")
-            continue;
-        const auto order = historyOrder(server);
-        if (historyPriorities_[server] != order) {
-            try {
-                c->prioritizeHistory(order);
-                historyPriorities_[server] = order;
-            } catch (const std::exception &e) {
-                // These requests have not reached the worker, so a rejected scheduling
-                // handoff must retire their planned state just like a history enqueue.
-                for (auto &[id, b] : model.buffers)
-                    if (b.server == server && b.initialHistorySync != HistorySyncState::Idle &&
-                        std::none_of(initialHistory_.begin(), initialHistory_.end(),
-                                     [&](const auto &v) { return v.second == id; })) {
-                        b.initialHistorySync = HistorySyncState::Idle;
-                        requestedHistory_.erase(id);
-                        gaps_.erase(id);
-                    }
-                report("History: " + string(e.what()), server);
+        try {
+            const auto &network = model.networks[server];
+            if (network.state != "Ready")
+                continue;
+            const bool supported =
+                network.caps.contains("draft/chathistory") || network.caps.contains("chathistory");
+            if (!supported) {
+                if (zncPlayback(server))
+                    for (auto &[id, b] : model.buffers)
+                        if (b.server == server && b.initialHistorySync != HistorySyncState::Idle &&
+                            std::none_of(initialHistory_.begin(), initialHistory_.end(),
+                                         [&](const auto &v) { return v.second == id; })) {
+                            HistoryRequest request;
+                            request.initial = true;
+                            auto newest = irc::parseTimestampParts(b.historyState.newest.time);
+                            if (newest)
+                                request.first.time = b.historyState.newest.time;
+                            for (const auto &row : b.messages) {
+                                if (row.pending || row.id.empty() || row.id.starts_with("local:") ||
+                                    row.id.starts_with("local-"))
+                                    continue;
+                                const auto time = irc::parseTimestampParts(row.time);
+                                if (time && (!newest || time->seconds > newest->seconds ||
+                                             (time->seconds == newest->seconds &&
+                                              time->nanoseconds > newest->nanoseconds))) {
+                                    request.first.time = row.time;
+                                    newest = time;
+                                }
+                            }
+                            if (!request.first.time.empty())
+                                request.direction = HistoryDirection::After;
+                            enqueueHistory(b, std::move(request));
+                        }
                 continue;
             }
-        }
-        size_t admitted = 0;
-        for (const auto &[label, id] : initialHistory_)
-            if (const auto *b = findBuffer(id); b && b->server == server)
-                ++admitted;
-        const auto viewed = findBuffer(model.activeBuffer);
-        if (admitted >= 16 && viewed && viewed->server == server &&
-            viewed->initialHistorySync != HistorySyncState::Idle &&
-            std::none_of(initialHistory_.begin(), initialHistory_.end(),
-                         [&](const auto &v) { return v.second == viewed->id; })) {
-            // Only unsent work can yield its admission slot; never preempt a wire batch.
-            for (auto target = order.rbegin(); target != order.rend(); ++target) {
-                auto queued = std::find_if(
-                    initialHistory_.begin(), initialHistory_.end(), [&](const auto &v) {
-                        const auto *b = findBuffer(v.second);
-                        return b && b->server == server && b->target == *target &&
-                               !startedHistory_.contains(v.first);
-                    });
-                if (queued == initialHistory_.end())
-                    continue;
-                try {
-                    if (promotedHistory_.insert(queued->first).second)
-                        c->cancelInitialHistory(*target);
-                } catch (const std::exception &e) {
-                    promotedHistory_.erase(queued->first);
-                    report("History: " + string(e.what()), server);
+            if (!channelTypes_.contains(server) && !historyClassificationSettled_.contains(server))
+                continue;
+            auto priorities = historyOrder(server);
+            if (const auto *viewed = findBuffer(model.activeBuffer);
+                viewed && viewed->server == server) {
+                std::erase(priorities, viewed->target);
+                priorities.insert(priorities.begin(), viewed->target);
+            }
+            c->prioritizeHistory(priorities);
+            auto existing = historySessions_.find(server);
+            if (existing != historySessions_.end() &&
+                existing->second.generation != network.sessionGeneration)
+                cancelHistorySession(server);
+            if (!historySessions_.contains(server)) {
+                HistorySession session;
+                session.generation = network.sessionGeneration;
+                session.durable = storage_.historyDiscovery(server);
+                const auto now = historyMillis(irc::timestampNow());
+                const auto base = session.durable.watermark.empty()
+                                      ? now - 30LL * 24 * 60 * 60 * 1000
+                                      : historyMillis(session.durable.watermark);
+                session.lower = historyTime(base - 10000);
+                session.upper = historyTime(now + 10000);
+                if (session.durable.backfillUpper.empty() && !session.durable.backfillComplete) {
+                    session.durable.backfillUpper = historyTime(historyMillis(session.lower) + 1);
+                    if (savingAllowed_)
+                        storage_.saveHistoryDiscovery(server, session.durable);
                 }
-                break;
+                historySessions_.emplace(server, std::move(session));
             }
-        }
-        for (const auto &target : order) {
-            if (admitted >= 16)
-                break;
-            auto b = std::find_if(model.buffers.begin(), model.buffers.end(), [&](const auto &v) {
-                return v.second.server == server && v.second.target == target;
-            });
-            if (b == model.buffers.end() ||
-                b->second.initialHistorySync == HistorySyncState::Idle ||
-                std::any_of(initialHistory_.begin(), initialHistory_.end(),
-                            [&](const auto &v) { return v.second == b->first; }))
+            auto &s = historySessions_.at(server);
+            if (auto *viewed = findBuffer(model.activeBuffer); viewed && viewed->server == server) {
+                const auto background =
+                    std::find(s.background.begin(), s.background.end(), viewed->id);
+                if (background != s.background.end()) {
+                    s.background.erase(background);
+                    s.visible.push_front(viewed->id);
+                    viewed->initialHistorySync = HistorySyncState::Queued;
+                } else if (auto queued = std::find(s.visible.begin(), s.visible.end(), viewed->id);
+                           queued != s.visible.end() && queued != s.visible.begin()) {
+                    s.visible.erase(queued);
+                    s.visible.push_front(viewed->id);
+                }
+            }
+            size_t active = 0;
+            bool targets = false, seed = false;
+            for (const auto &[label, page] : historyPages_)
+                if (page.server == server && page.session == s.generation) {
+                    ++active;
+                    targets |= page.request.direction == HistoryDirection::Targets;
+                    seed |= page.seed;
+                }
+            const unsigned width = network.caps.contains("labeled-response") ? s.width : 1;
+            while (!s.retries.empty() && active < width) {
+                auto page = std::move(s.retries.front());
+                s.retries.pop_front();
+                targets |= page.request.direction == HistoryDirection::Targets;
+                seed |= page.seed;
+                submitHistory(std::move(page));
+                ++active;
+            }
+            if (s.discovering) {
+                if (!targets && active < width && model.now >= s.nextDiscovery &&
+                    (!s.backfill || (s.seeds.empty() && !seed && s.checkpoint.empty()))) {
+                    HistoryPage page;
+                    page.server = server;
+                    page.session = s.generation;
+                    page.request.direction = HistoryDirection::Targets;
+                    page.request.limit = 100;
+                    page.request.first.time = s.upper;
+                    page.request.second.time = s.lower;
+                    submitHistory(std::move(page));
+                    ++active;
+                    targets = true;
+                }
+                if (!s.backfill)
+                    continue;
+            }
+            while (!s.visible.empty() && active < width) {
+                const auto id = s.visible.front();
+                s.visible.pop_front();
+                if (auto b = findBuffer(id)) {
+                    enqueueHistory(*b, "", true);
+                    ++active;
+                }
+            }
+            const bool visibleActive =
+                std::any_of(initialHistory_.begin(), initialHistory_.end(), [&](const auto &entry) {
+                    const auto b = findBuffer(entry.second);
+                    return b && b->server == server;
+                });
+            if (!s.visible.empty() || visibleActive) {
+                s.visibleDone = false;
                 continue;
-            auto &buffer = b->second;
-            const auto gap = gaps_.find(buffer.id);
-            enqueueHistory(buffer, gap == gaps_.end() ? "" : "after=" + gap->second.cursor, true);
-            ++admitted;
+            }
+            if (!s.visibleDone) {
+                s.visibleDone = true;
+                s.nextTarget = model.now + .5;
+            }
+            if (!s.backfill && s.planned && !s.discoveryFailed &&
+                historyMillis(s.highwater) > historyMillis(s.durable.watermark)) {
+                s.durable.watermark = s.highwater;
+                if (savingAllowed_)
+                    storage_.saveHistoryDiscovery(server, s.durable);
+            }
+            if (!s.backfill && !s.discovering && active == 0 && !s.durable.backfillComplete &&
+                !s.durable.backfillUpper.empty()) {
+                s.backfill = true;
+                s.discovering = true;
+                s.upper = s.durable.backfillUpper;
+                s.lower = historyTime(0);
+                s.tieTime.clear();
+                s.tieTargets.clear();
+                s.advertised.clear();
+                s.shortTie = false;
+                s.nextDiscovery = model.now + 2;
+            }
+            auto &paced = !s.seeds.empty() ? s.seeds : s.background;
+            if (!paced.empty() && !seed && active == 0 && model.now >= s.nextTarget) {
+                const auto id = paced.front();
+                paced.pop_front();
+                if (auto b = findBuffer(id)) {
+                    HistoryPage page;
+                    page.server = server;
+                    page.buffer = id;
+                    page.session = s.generation;
+                    page.seed = true;
+                    page.backfillSeed = &paced == &s.seeds;
+                    page.request.target = b->target;
+                    submitHistory(std::move(page));
+                }
+                s.nextTarget = model.now + .5;
+                continue;
+            }
+            if (s.backfill && s.seeds.empty() && !seed && !targets && active == 0) {
+                if (s.seedFailed) {
+                    s.discovering = false;
+                    continue;
+                }
+                if (!s.checkpoint.empty()) {
+                    s.durable.backfillUpper = s.checkpoint;
+                    if (s.terminal && !s.shortTie)
+                        s.durable.backfillComplete = true;
+                    if (savingAllowed_)
+                        storage_.saveHistoryDiscovery(server, s.durable);
+                    s.checkpoint.clear();
+                    s.nextDiscovery = model.now + 2;
+                }
+                if (s.terminal)
+                    s.discovering = false;
+            }
+        } catch (const std::exception &error) {
+            cancelHistorySession(server);
+            report("History: " + string(error.what()), server);
+        }
+    }
+}
+void Application::finishHistoryPage(HistoryPage page, const Event &end, bool applied,
+                                    bool progressed) {
+    activeHistory_.erase(end.label);
+    initialHistory_.erase(end.label);
+    auto b = findBuffer(page.buffer);
+    if (b) {
+        b->loading =
+            std::any_of(activeHistory_.begin(), activeHistory_.end(), [&](const auto &entry) {
+                return entry.second == b->id && !initialHistory_.contains(entry.first);
+            });
+        if (page.request.initial)
+            b->initialHistorySync = HistorySyncState::Idle;
+    }
+    auto found = page.unsolicited ? historySessions_.end() : historySessions_.find(page.server);
+    if (page.session != model.networks[page.server].sessionGeneration)
+        return;
+    const bool error = !tag(end, "error").empty() || flag(end, "cancelled") || !applied;
+    if (found != historySessions_.end()) {
+        auto &s = found->second;
+        if (s.generation != page.session)
+            return;
+        if (flag(end, "timeout")) {
+            s.width = std::max(1u, s.width / 2);
+            s.clean = 0;
+        } else if (!error && ++s.clean >= 3) {
+            s.width = std::min(6u, s.width + 1);
+            s.clean = 0;
+        }
+        if (error) {
+            const auto reason = upper(tag(end, "failure-code"));
+            const bool retryable = flag(end, "timeout") || reason == "TEMPORARILY_UNAVAILABLE" ||
+                                   reason == "TEMPORARY_ERROR" || reason == "TRY_AGAIN";
+            if (!flag(end, "cancelled") && !flag(end, "rejected") && retryable &&
+                page.retries < 1) {
+                ++page.retries;
+                page.events.clear();
+                page.bytes = 0;
+                page.request.requestId.clear();
+                if (b) {
+                    if (page.request.initial)
+                        b->initialHistorySync = HistorySyncState::Queued;
+                    else if (!page.seed)
+                        b->loading = true;
+                }
+                s.retries.push_back(std::move(page));
+                return;
+            }
+            if (page.request.direction == HistoryDirection::Targets) {
+                s.discoveryFailed = true;
+                s.discovering = false;
+                if (!s.backfill) {
+                    planHistory(page.server);
+                    s.planned = true;
+                }
+            } else if (reason == "INVALID_TARGET") {
+                s.refused.insert(page.buffer);
+                std::erase(s.visible, page.buffer);
+                std::erase(s.background, page.buffer);
+                std::erase(s.seeds, page.buffer);
+            } else if (page.backfillSeed)
+                s.seedFailed = true;
+            if (!flag(end, "cancelled"))
+                report("History: " + tag(end, "error"), page.server);
+            return;
+        }
+        if (page.request.direction == HistoryDirection::Targets) {
+            int64_t oldest = std::numeric_limits<int64_t>::max();
+            set<string> tied;
+            size_t count = 0;
+            int limit = page.request.limit;
+            const auto negotiated = tag(end, "limit");
+            if (!negotiated.empty()) {
+                int value = 0;
+                const auto parsed = std::from_chars(negotiated.data(),
+                                                    negotiated.data() + negotiated.size(), value);
+                if (parsed.ec == std::errc{} && value > 0)
+                    limit = value;
+            }
+            for (const auto &event : page.events) {
+                if (event.type != "history_target")
+                    continue;
+                ++count;
+                const auto time = historyMillis(event.time);
+                const auto key = fold(page.server, event.target);
+                auto &advertised = s.advertised[key];
+                if (advertised.name.empty() || time > historyMillis(advertised.time))
+                    advertised = {event.target, event.time};
+                if (time > historyMillis(s.highwater))
+                    s.highwater = event.time;
+                if (time < oldest) {
+                    oldest = time;
+                    tied.clear();
+                }
+                if (time == oldest)
+                    tied.insert(key);
+            }
+            if (s.advertised.size() > 100000) {
+                s.discoveryFailed = true;
+                s.discovering = false;
+                report("History: TARGETS exceeded the discovery limit", page.server);
+                if (!s.backfill) {
+                    planHistory(page.server);
+                    s.planned = true;
+                }
+                return;
+            }
+            s.terminal = flag(end, "end") || count == 0;
+            string next;
+            if (!s.terminal) {
+                const bool repeated = s.tieTime == historyTime(oldest) && s.tieTargets == tied;
+                if (repeated && count < static_cast<size_t>(limit) &&
+                    oldest > historyMillis(s.lower)) {
+                    s.shortTie = true;
+                    next = historyTime(oldest);
+                    s.tieTime.clear();
+                    s.tieTargets.clear();
+                } else if (repeated) {
+                    s.discoveryFailed = true;
+                } else {
+                    next = historyTime(oldest + 1);
+                    s.tieTime = historyTime(oldest);
+                    s.tieTargets = std::move(tied);
+                    if (historyMillis(next) >= historyMillis(s.upper) ||
+                        historyMillis(next) <= historyMillis(s.lower))
+                        s.discoveryFailed = true;
+                }
+            }
+            if (s.discoveryFailed) {
+                s.discovering = false;
+                report("History: TARGETS could not advance its timestamp boundary", page.server);
+            } else if (s.terminal)
+                s.discovering = false;
+            if (s.backfill) {
+                if (!s.discoveryFailed) {
+                    s.checkpoint = s.terminal ? s.lower : next;
+                    if (!s.terminal)
+                        s.upper = next;
+                    planHistory(page.server, true);
+                    s.advertised.clear();
+                    s.nextDiscovery = model.now + 2;
+                }
+            } else if (!s.discovering) {
+                planHistory(page.server);
+                s.planned = true;
+            } else
+                s.upper = next;
+            return;
+        }
+        if (page.request.initial && !page.seed)
+            for (const auto &name : {"oldest-time", "newest-time"})
+                if (historyMillis(tag(end, name)) > historyMillis(s.highwater))
+                    s.highwater = tag(end, name);
+        if (page.seed)
+            s.nextTarget = model.now + .5;
+    } else if (error) {
+        report("History: " + tag(end, "error"), page.server);
+        return;
+    }
+    const auto actualLimit =
+        tag(end, "limit").empty() ? std::to_string(page.request.limit) : tag(end, "limit");
+    const bool timestampFull =
+        tag(end, "ref-type") == "timestamp" && tag(end, "count") == actualLimit;
+    if (b && page.request.initial && (timestampFull || flag(end, "incomplete")))
+        requestedHistory_.erase(b->id);
+    if (b && page.gapId && page.budget > 1 && applied && progressed && !timestampFull &&
+        !flag(end, "incomplete") && tag(end, "count") != "0") {
+        const auto gap = std::find_if(b->historyState.gaps.begin(), b->historyState.gaps.end(),
+                                      [&](const auto &value) { return value.id == page.gapId; });
+        if (gap != b->historyState.gaps.end() && !gap->unavailable) {
+            HistoryRequest request;
+            request.direction = HistoryDirection::Before;
+            request.first = gap->newer;
+            enqueueHistory(*b, std::move(request), page.gapId, page.budget - 1);
         }
     }
 }
 void Application::requestHistory(Buffer &b, const string &before, bool initial) {
     const auto &n = model.networks[b.server];
+    if (const auto session = historySessions_.find(b.server);
+        session != historySessions_.end() && session->second.refused.contains(b.id))
+        return;
     if ((b.kind != "channel" && b.kind != "query") || n.state != "Ready" ||
         (b.kind == "channel" && !b.joined) || !client(b.server))
         return;
-    const bool playback = zncPlayback(b.server);
-    if (!n.caps.contains("draft/chathistory") && !n.caps.contains("chathistory") && !playback)
+    if (!n.caps.contains("draft/chathistory") && !n.caps.contains("chathistory") &&
+        !zncPlayback(b.server))
         return;
     if (!initial) {
-        enqueueHistory(b, historyCursor(b, before), false);
+        HistoryRequest request;
+        request.direction = before.empty() ? HistoryDirection::Latest : HistoryDirection::Before;
+        const auto selector = historyCursor(b, before);
+        if (selector.starts_with("timestamp="))
+            request.first.time = selector.substr(10);
+        else if (selector.starts_with("msgid=")) {
+            request.first.id = selector.substr(6);
+            const auto row =
+                std::find_if(b.messages.begin(), b.messages.end(),
+                             [&](const auto &value) { return value.id == request.first.id; });
+            if (row != b.messages.end())
+                request.first.time = row->time;
+        }
+        auto older = [&](const HistoryCursor &cursor) {
+            if (cursor.id.empty() && cursor.time.empty())
+                return;
+            if (request.first.id.empty() && request.first.time.empty())
+                request.first = cursor;
+            else if (historyMillis(cursor.time) &&
+                     historyMillis(cursor.time) < historyMillis(request.first.time))
+                request.first = cursor;
+        };
+        older(b.historyState.oldest);
+        for (const auto &gap : b.historyState.gaps)
+            older(gap.older);
+        if (!request.first.id.empty() || !request.first.time.empty())
+            request.direction = HistoryDirection::Before;
+        enqueueHistory(b, std::move(request));
         return;
     }
-    if (!requestedHistory_.insert(b.id).second)
-        return;
-    auto tail = std::find_if(b.messages.rbegin(), b.messages.rend(), [&](const auto &m) {
-        return !m.presence && !m.pending &&
-               (!m.time.empty() ||
-                (!playback && !m.id.starts_with("local:") && !m.id.starts_with("local-")));
-    });
-    if (tail != b.messages.rend()) {
-        auto &gap = gaps_[b.id];
-        gap.cursor = !tail->id.starts_with("local:") && !tail->id.starts_with("local-")
-                         ? historyCursor(b, tail->id)
-                         : "timestamp=" + tail->time;
+    if (requestedHistory_.insert(b.id).second) {
+        b.initialHistorySync = HistorySyncState::Queued;
+        const auto session = historySessions_.find(b.server);
+        if (session != historySessions_.end() && session->second.planned)
+            session->second.visible.push_front(b.id);
     }
-    b.initialHistorySync = HistorySyncState::Queued;
 }
 void Application::clear(Buffer *b) {
     if (savingAllowed_)
@@ -2926,6 +4032,9 @@ void Application::clear(Buffer *b) {
             report(e.what(), b ? b->server : "");
             return;
         }
+    if (!b)
+        for (const auto &[server, network] : model.networks)
+            cancelHistorySession(server);
     if (searchJump_ &&
         (!b || searchJump_->sourceBuffer == b->id || searchJump_->searchBuffer == b->id))
         cancelSearchJump();
@@ -2944,11 +4053,13 @@ void Application::clear(Buffer *b) {
             queued.stored = false;
     for (auto &[id, value] : model.buffers)
         if (!b || id == b->id) {
+            cancelHistory(value);
             if (value.kind != "search" && value.kind != "mentions")
                 messageCount_ -= value.messages.size();
             if (!value.messages.empty())
                 reviseMessages(value);
             value.messages.clear();
+            value.historyState = {};
             value.unread = 0;
             value.readMarker.clear();
         }
@@ -3743,6 +4854,24 @@ void Application::action(const Action &a) {
             c->redact(b->target, a.extra);
         return;
     }
+    if (a.type == "history-gap") {
+        if (b->loading)
+            return;
+        int64_t id = 0;
+        const auto parsed = std::from_chars(a.text.data(), a.text.data() + a.text.size(), id);
+        if (parsed.ec != std::errc{} || parsed.ptr != a.text.data() + a.text.size() || id <= 0)
+            return;
+        const auto gap = std::find_if(b->historyState.gaps.begin(), b->historyState.gaps.end(),
+                                      [&](const auto &value) { return value.id == id; });
+        if (gap == b->historyState.gaps.end() || gap->unavailable)
+            return;
+        HistoryRequest request;
+        request.target = b->target;
+        request.direction = HistoryDirection::Before;
+        request.first = gap->newer;
+        enqueueHistory(*b, std::move(request), id, 3);
+        return;
+    }
     if (a.type == "history") {
         if (b->loading)
             return;
@@ -3751,14 +4880,19 @@ void Application::action(const Action &a) {
         if (savingAllowed_)
             try {
                 auto page = storage_.history(b->id, 200, before);
+                const bool local = !page.empty();
                 for (auto &m : page) {
                     m.history = true;
                     m.pending = false;
                     insert(*b, std::move(m), false);
                 }
+                if (local)
+                    return;
             } catch (const std::exception &e) {
                 report(e.what(), b->server);
             }
+        if (b->historyState.beginning)
+            return;
         string remote = b->messages.empty() ? before : b->messages.front().id;
         // Locally assigned ids are not valid CHATHISTORY selectors.
         if (remote.starts_with("local:") || remote.starts_with("local-")) {
@@ -3901,7 +5035,6 @@ void Application::action(const Action &a) {
             else
                 ++group;
         }
-        gaps_.erase(id);
         if (searchJump_ && (searchJump_->sourceBuffer == id || searchJump_->searchBuffer == id))
             cancelSearchJump();
         std::erase_if(searchRequests_, [&](const auto &entry) {
@@ -4002,6 +5135,7 @@ void Application::refreshMentions() {
                 message.mention |= old->second.mention;
                 message.storageSequence = old->second.storageSequence;
                 message.orderingTimestamp = old->second.orderingTimestamp;
+                message.historyOrder = old->second.historyOrder;
                 rows.erase(old);
             }
             const auto network = model.networks.find(live.server);
@@ -4047,6 +5181,8 @@ void Application::refreshMentions() {
             return at < bt;
         if (markerFraction(a.time) != markerFraction(b.time))
             return markerFraction(a.time) < markerFraction(b.time);
+        if (historyRank(a) != historyRank(b))
+            return historyRank(a) < historyRank(b);
         if (a.storageSequence != b.storageSequence)
             return a.storageSequence < b.storageSequence;
         if (a.arrival != b.arrival)
@@ -4229,7 +5365,12 @@ void Application::jumpSearch(const string &searchId, const string &rowId) {
         const string id = row.sourceId.starts_with("local:") || row.sourceId.starts_with("local-")
                               ? string{}
                               : row.sourceId;
-        c->historyAround(source->target, id, row.time, label);
+        HistoryRequest request;
+        request.target = source->target;
+        request.direction = HistoryDirection::Around;
+        request.first = {id, row.time};
+        request.requestId = label;
+        enqueueHistory(*liveSource, std::move(request));
     } catch (const std::exception &error) {
         const string server = source->server;
         cancelSearchJump();
@@ -4318,6 +5459,7 @@ void Application::jumpSource(const string &id, const string &messageId) {
             if (auto old = rows.find(row.id); old != rows.end()) {
                 row.storageSequence = old->second.storageSequence;
                 row.orderingTimestamp = old->second.orderingTimestamp;
+                row.historyOrder = old->second.historyOrder;
             }
             rows[row.id] = std::move(row);
         };
@@ -4339,6 +5481,8 @@ void Application::jumpSource(const string &id, const string &messageId) {
                     return at < bt;
                 if (markerFraction(a.time) != markerFraction(b.time))
                     return markerFraction(a.time) < markerFraction(b.time);
+                if (historyRank(a) != historyRank(b))
+                    return historyRank(a) < historyRank(b);
                 if (a.storageSequence != b.storageSequence)
                     return a.storageSequence < b.storageSequence;
                 return a.id < b.id;
@@ -4445,25 +5589,27 @@ bool Application::save() {
             }
             if (queued->second.complete && queued->second.parts &&
                 queued->second.confirmed.size() == queued->second.parts) {
-                for (const auto &message : b->messages)
+                for (auto &message : b->messages)
                     if (message.own && submissionPart(message.label, queued->first))
-                        storage_.update(b->id, message, {}, 0, true);
+                        storage_.update(b->id, message, {}, 0, true, nullptr,
+                                        &message.storageSequence, &message.historyOrder);
                 storage_.recoverSend(*b, queued->first);
                 queued = queuedSends_.erase(queued);
                 continue;
             }
             if (queued->second.complete && !queued->second.preserveRaw) {
-                const Message *last = nullptr;
+                Message *last = nullptr;
                 size_t parts = 0;
-                for (const auto &m : b->messages)
+                for (auto &m : b->messages)
                     if (m.own && submissionPart(m.label, queued->first)) {
-                        storage_.update(b->id, m, {}, 0,
-                                        queued->second.confirmed.contains(m.label));
+                        storage_.update(b->id, m, {}, 0, queued->second.confirmed.contains(m.label),
+                                        nullptr, &m.storageSequence, &m.historyOrder);
                         last = &m;
                         ++parts;
                     }
                 if (last && parts == queued->second.parts &&
-                    storage_.update(b->id, *last, queued->first, queued->second.parts)) {
+                    storage_.update(b->id, *last, queued->first, queued->second.parts, false,
+                                    nullptr, &last->storageSequence, &last->historyOrder)) {
                     queued = queuedSends_.erase(queued);
                     continue;
                 }
@@ -4471,20 +5617,38 @@ bool Application::save() {
             ++queued;
         }
         for (auto source = unsavedSources_.begin(); source != unsavedSources_.end();) {
-            for (const auto &row : source->second.messages) {
+            vector<const Message *> savedRows;
+            savedRows.reserve(source->second.messages.size());
+            for (auto &row : source->second.messages) {
                 const bool replay = row.history && !row.presence && !row.deleted &&
                                     !storage_.message(source->first, row.id).has_value();
-                int64_t sequence = 0;
                 storage_.update(source->first, row, {}, 0, row.sendStatus == SendStatus::Confirmed,
-                                &source->second, &sequence);
+                                &source->second, &row.storageSequence, &row.historyOrder);
                 if (replay)
                     if (auto live = model.buffers.find(source->first); live != model.buffers.end())
-                        live->second.chatReplaySequences.insert(sequence);
+                        live->second.chatReplaySequences.insert(row.storageSequence);
+                savedRows.push_back(&row);
             }
+            // Index retry metadata only; transcript chronology never depends on opaque IDs.
+            std::sort(savedRows.begin(), savedRows.end(),
+                      [](const auto *a, const auto *b) { return a->id < b->id; });
+            if (auto live = model.buffers.find(source->first); live != model.buffers.end())
+                for (auto &row : live->second.messages) {
+                    const auto stored = std::lower_bound(
+                        savedRows.begin(), savedRows.end(), row.id,
+                        [](const auto *saved, const string &id) { return saved->id < id; });
+                    if (stored != savedRows.end() && (*stored)->id == row.id) {
+                        row.storageSequence = (*stored)->storageSequence;
+                        row.historyOrder = (*stored)->historyOrder;
+                    }
+                }
             source = unsavedSources_.erase(source);
         }
         storage_.save(model);
         storage_.prune(model.settings);
+        for (auto &[id, value] : model.buffers)
+            storage_.loadHistoryState(value);
+        storage_.takeHistoryInvalidations();
         return true;
     } catch (const std::exception &e) {
         report(e.what());

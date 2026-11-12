@@ -37,8 +37,10 @@
 #include <ui/controls/scroll_view.h>
 #include <ui/controls/select_popup_context.h>
 #include <ui/controls/spinner.h>
+#include <ui/style.h>
 #include <unordered_map>
 #include <utility>
+#include <wayland-client-protocol.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 extern char **environ;
@@ -808,6 +810,7 @@ struct TranscriptView::Impl {
     struct Row {
         std::string key, id, footerText;
         double height = 32;
+        float gapHeight = 0;
         size_t signature = 0;
         uint64_t revision = 0, focusIdentity = 0;
         double entranceStarted = -1;
@@ -861,6 +864,8 @@ struct TranscriptView::Impl {
         FoolDisplay revealedFoolDisplay = FoolDisplay::Minimized;
         std::string revealedFoolMapping;
         bool following = true, windowActive = false, initialized = false;
+        bool historyDemandActive = false;
+        std::set<std::string> historyDemandKeys;
         PresenceMode projectedPresence = PresenceMode::Smart;
         uint64_t participationRevision = 0;
         uint64_t mediaParticipationRevision = 0;
@@ -876,6 +881,14 @@ struct TranscriptView::Impl {
         std::unordered_map<std::string, double> reactionTimes;
         std::vector<bool> smartEligible;
         std::unordered_map<std::string, std::deque<int64_t>> smartActivity;
+        struct GapPlacement {
+            int64_t id;
+            size_t row;
+            bool unavailable;
+            float offset;
+        };
+        std::vector<GapPlacement> gaps;
+        std::string gapKey;
     };
     struct Slot {
         InputArea *area = nullptr;
@@ -979,6 +992,12 @@ struct TranscriptView::Impl {
     ScrollView *scroll = nullptr;
     Node *canvas = nullptr;
     Button *history = nullptr, *unseen = nullptr;
+    struct GapControl {
+        Button *button;
+        std::string source;
+        int64_t id = 0;
+    };
+    std::vector<GapControl> gapButtons;
     Label *empty = nullptr;
     Node *typing = nullptr;
     InputArea *keys = nullptr;
@@ -1165,7 +1184,23 @@ struct TranscriptView::Impl {
                 view.markLayoutDirty();
             }
         });
-        auto body = std::make_unique<Node>();
+        auto body = std::make_unique<InputArea>();
+        body->setAcceptedButtons(0);
+        body->setFocusable(false);
+        body->setTabStop(false);
+        body->setOnAxisHandler([this](const InputArea::PointerData &data) {
+            if (!cache || data.axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+                return false;
+            const float delta = data.scrollDelta(Style::scrollWheelStep);
+            if (delta == 0)
+                return false;
+            const bool towardOlder = delta < 0;
+            if (towardOlder && (!cache->historyDemandActive || data.scrollStepStartsGesture()))
+                cache->historyDemandKeys.clear();
+            cache->historyDemandActive = towardOlder;
+            view.markLayoutDirty();
+            return false; // Observe intent even at the clamp; retain native scrolling.
+        });
         canvas = body.get();
         scroll->content()->setGap(0);
         scroll->content()->setPadding(0);
@@ -1561,6 +1596,10 @@ struct TranscriptView::Impl {
             !readable(*buffer, size_t(entry - buffer->messages.begin())))
             return false;
         cancelFocusReveal();
+        if (cache) {
+            cache->historyDemandActive = false;
+            cache->historyDemandKeys.clear();
+        }
         pane.following = false;
         mentionCursorBuffer = buffer->id;
         mentionCursor = entry->id;
@@ -2299,6 +2338,9 @@ struct TranscriptView::Impl {
         pane.following = scroll->maxScrollOffset() - offset <= 1;
         if (pane.following)
             pane.unseen = 0;
+        cache->historyDemandActive = direction < 0;
+        if (cache->historyDemandActive)
+            cache->historyDemandKeys.clear();
         const bool wasArranging = std::exchange(arranging, true);
         scroll->setScrollOffset(offset);
         arranging = wasArranging;
@@ -2313,6 +2355,8 @@ struct TranscriptView::Impl {
         scroll->cancelPendingScrollRequests();
         jumpTarget.clear();
         navigationRevealIdentity = 0;
+        cache->historyDemandActive = false;
+        cache->historyDemandKeys.clear();
         pane.following = newest;
         if (newest) {
             clearTextSelection();
@@ -2795,7 +2839,7 @@ struct TranscriptView::Impl {
             previous == absent || localDate(entry.timestamp, "%Y-%m-%d") !=
                                       localDate(buffer.messages[previous].timestamp, "%Y-%m-%d");
         row.grouped = buffer.kind != "mentions" && previous != absent && previous + 1 == index &&
-                      !row.day && !row.unread && !entry.presence &&
+                      row.gapHeight == 0 && !row.day && !row.unread && !entry.presence &&
                       !(cache->geometry.channel && entry.own) && !entry.action && !entry.deleted &&
                       !buffer.messages[previous].presence && !buffer.messages[previous].action &&
                       !buffer.messages[previous].deleted &&
@@ -2841,6 +2885,7 @@ struct TranscriptView::Impl {
             paddingY + g.rowGap(entry.presence, row.grouped);
         if (!entry.reactions.empty())
             row.height += g.reaction;
+        row.height += row.gapHeight;
     }
     Row estimate(const Buffer &buffer, size_t index, const Geometry &g, float width) {
         Row row;
@@ -3302,6 +3347,66 @@ struct TranscriptView::Impl {
                                           ? previousCount
                                           : absent;
             projectActivities(buffer, g, width, first, reflow, appendFrom);
+            c.gapKey.clear();
+        }
+        std::string gapKey = g.key + ":" + c.foolPolicy + ":" + std::to_string(int(mode)) + ":" +
+                             std::to_string(buffer.messagesRevision) + ":" +
+                             std::to_string(c.rows.size()) + ":" +
+                             std::to_string(buffer.participationRevision);
+        for (const auto &gap : buffer.historyState.gaps)
+            gapKey += "|" + std::to_string(gap.id) + ":" + gap.newer.id + ":" + gap.newer.time +
+                      ":" + std::to_string(gap.unavailable);
+        if (gapKey != c.gapKey) {
+            if (!c.gaps.empty())
+                for (size_t index = 0; index < c.rows.size(); ++index)
+                    if (auto &row = c.rows[index]; row.gapHeight > 0) {
+                        const double delta = -std::min(double(row.gapHeight), row.height);
+                        row.height += delta;
+                        c.heights.add(index, delta);
+                        row.gapHeight = 0;
+                        row.measured = false;
+                    }
+            c.gaps.clear();
+            for (const auto &gap : buffer.historyState.gaps) {
+                if (gap.id <= 0)
+                    continue;
+                size_t index = 0;
+                if (!gap.newer.id.empty()) {
+                    const auto found = c.keys.find("message:" + gap.newer.id);
+                    if (found != c.keys.end())
+                        index = found->second;
+                    else {
+                        const auto message = std::find_if(
+                            buffer.messages.begin(), buffer.messages.end(),
+                            [&](const auto &entry) { return entry.id == gap.newer.id; });
+                        if (message != buffer.messages.end())
+                            index = size_t(message - buffer.messages.begin());
+                    }
+                }
+                if (gap.newer.id.empty() && !gap.newer.time.empty()) {
+                    const auto found = std::find_if(
+                        buffer.messages.begin(), buffer.messages.end(),
+                        [&](const auto &message) { return message.time == gap.newer.time; });
+                    if (found != buffer.messages.end())
+                        index = size_t(found - buffer.messages.begin());
+                }
+                while (index < c.rows.size() && c.rows[index].hiddenActivity)
+                    ++index;
+                // A pruned or privacy-hidden boundary leaves an honest loaded-edge marker.
+                if (index == c.rows.size())
+                    index = absent;
+                c.gaps.push_back({gap.id, index, gap.unavailable,
+                                  index < c.rows.size() ? c.rows[index].gapHeight : 0});
+                if (index < c.rows.size()) {
+                    auto &row = c.rows[index];
+                    const float extent = std::max(32 * g.scale, g.header + 8 * g.scale);
+                    row.gapHeight += extent;
+                    row.height += extent;
+                    row.measured = false;
+                    c.heights.add(index, extent);
+                }
+            }
+            c.gapKey = std::move(gapKey);
         }
         c.initialized = true;
         c.participationRevision = buffer.participationRevision;
@@ -3314,7 +3419,7 @@ struct TranscriptView::Impl {
         if (!baseline.following && anchor < baseline.rows.size()) {
             anchorIdentity = baseline.rows[anchor].focusIdentity;
             oldBodyTop = baseline.header + baseline.heights.prefix(anchor) +
-                         baseline.rows[anchor].bodyOffset;
+                         baseline.rows[anchor].gapHeight + baseline.rows[anchor].bodyOffset;
             oldBodyHeight = baseline.rows[anchor].bodyHeight;
         }
         auto *activeCache = std::exchange(cache, &baseline);
@@ -3331,7 +3436,7 @@ struct TranscriptView::Impl {
                 baseline.scroll = ui_logic::anchoredBodyScroll(
                     baseline.scroll, oldBodyTop,
                     baseline.header + baseline.heights.prefix(relocated) +
-                        baseline.rows[relocated].bodyOffset,
+                        baseline.rows[relocated].gapHeight + baseline.rows[relocated].bodyOffset,
                     oldBodyHeight, baseline.rows[relocated].bodyHeight, false);
         }
     }
@@ -3670,6 +3775,7 @@ struct TranscriptView::Impl {
         if (g.footerVisible(entry))
             row.footerOffset = float(row.height) - paddingY - row.footerHeight;
         row.height += g.rowGap(entry.presence, row.grouped);
+        row.height += row.gapHeight;
         row.measured = true;
         row.revision = ++c.revision;
         c.heights.add(index, row.height - oldHeight);
@@ -3797,8 +3903,8 @@ struct TranscriptView::Impl {
         const auto &metrics = g.metrics;
         const float friendExtent = row.friendAuthor ? 18 * g.scale : 0;
         slot.index = index;
-        slot.area->setPosition(0, float(c.header + c.heights.prefix(index)));
-        slot.area->setSize(c.width, float(row.height));
+        slot.area->setPosition(0, float(c.header + c.heights.prefix(index) + row.gapHeight));
+        slot.area->setSize(c.width, float(row.height - row.gapHeight));
         slot.area->setVisible(true);
         slot.area->setFocusable(readable(buffer, index) || row.activitySummary);
         const bool foolish = this->foolish(buffer, entry);
@@ -3868,6 +3974,8 @@ struct TranscriptView::Impl {
         if (slot.reveal)
             slot.reveal->setReveal(1);
         if (slot.reveal)
+            slot.reveal->setScale(1);
+        if (slot.reveal)
             slot.reveal->setSource(nullptr);
         if (slot.content)
             slot.area->removeChild(slot.content);
@@ -3884,7 +3992,9 @@ struct TranscriptView::Impl {
         slot.area->addChild(std::move(decorations));
         auto content = std::make_unique<Node>();
         slot.content = content.get();
-        slot.content->setSize(c.width, float(row.height));
+        slot.content->setSize(c.width, float(row.height - row.gapHeight));
+        // Traditional entrances stay inside their stable row and the scroller viewport.
+        slot.area->setClipChildren(!g.bubbles);
         slot.area->addChild(std::move(content));
         if (!slot.reveal) {
             auto reveal = std::make_unique<PixelRevealNode>();
@@ -3901,7 +4011,7 @@ struct TranscriptView::Impl {
             : entry.own && g.bubbles && !entry.action
                 ? c.width - metrics.inset * g.scale - avatarLane - row.surfaceWidth
                 : metrics.inset * g.scale + avatarLane;
-        const float surfaceHeight = float(row.height) - top - gap;
+        const float surfaceHeight = float(row.height - row.gapHeight) - top - gap;
         auto material = std::make_unique<MaterialNode>(MaterialKind::Message);
         slot.material = material.get();
         slot.material->setPosition(surfaceX, top);
@@ -4476,7 +4586,7 @@ struct TranscriptView::Impl {
         }
     }
 
-    void stopFlight(Slot &slot) {
+    void stopFlight(Slot &slot, bool restoreHitTesting = true) {
         if (slot.flightReveal) {
             slot.flightReveal->setSource(nullptr);
             slot.flightGroup->removeChild(slot.flightReveal);
@@ -4493,7 +4603,7 @@ struct TranscriptView::Impl {
         }
         if (slot.content)
             slot.content->setOpacity(1);
-        if (!slot.area->hitTestVisible()) {
+        if (restoreHitTesting && !slot.area->hitTestVisible()) {
             slot.area->setHitTestVisible(true);
             slot.area->setExcludeSubtreeFromTabOrder(false);
             if (dispatcher)
@@ -4511,6 +4621,8 @@ struct TranscriptView::Impl {
             slot.content->setScale(1);
         if (slot.reveal)
             slot.reveal->setReveal(1);
+        if (slot.reveal)
+            slot.reveal->setScale(1);
     }
     void excludeRows() {
         for (auto &slot : slots) {
@@ -4578,22 +4690,29 @@ struct TranscriptView::Impl {
             Node::transformedBounds(slot.material, finalLeft, finalTop, finalRight, finalBottom);
             const bool destinationVisible =
                 finalRight > left && finalLeft < right && finalBottom > top && finalTop < bottom;
-            const bool enabled = row.entranceStarted >= 0 && (g.bubbles || !entry.own) &&
-                                 !interacting && destinationVisible && !foolish(*buffer, entry) &&
-                                 (!entry.own || (motionHost && composerOrigin)) &&
+            const bool enabled = row.entranceStarted >= 0 && !interacting && destinationVisible &&
+                                 !foolish(*buffer, entry) &&
+                                 (!entry.own || !g.bubbles || (motionHost && composerOrigin)) &&
                                  !model.settings.reducedMotion && model.settings.fx != FxLevel::Off;
             const auto origin = composerOrigin.value_or(std::pair{destinationX, destinationY});
+            // A composer flight belongs to bubbles; native columns use the existing short rise.
+            const auto sendMotion = !g.bubbles && model.settings.sendMotion == SendMotion::Flight
+                                        ? SendMotion::Rise
+                                        : model.settings.sendMotion;
             const auto entrance = fx::messageEntrance(
                 model.now - row.entranceStarted, entry.own, origin.first, origin.second,
-                destinationX, destinationY, enabled, model.settings.sendMotion,
-                model.settings.sendReveal, model.settings.incomingMotion,
-                model.settings.incomingReveal, model.settings.incomingDurationMs);
+                destinationX, destinationY, enabled, sendMotion, model.settings.sendReveal,
+                model.settings.incomingMotion, model.settings.incomingReveal,
+                model.settings.incomingDurationMs);
             if (!entrance.active)
                 row.entranceStarted = -1;
             const float lane = !row.grouped && g.avatars ? g.avatarLane(false) : 0;
-            const LayoutRect revealBounds{slot.material->x() - (entry.own ? 0 : lane), 0,
-                                          slot.material->width() + lane, slot.content->height()};
-            if (entrance.active && entry.own) {
+            const LayoutRect revealBounds =
+                g.bubbles ? LayoutRect{slot.material->x() - (entry.own ? 0 : lane), 0,
+                                       slot.material->width() + lane, slot.content->height()}
+                          : LayoutRect{slot.material->x(), slot.material->y(),
+                                       slot.material->width(), slot.material->height()};
+            if (entrance.active && entry.own && g.bubbles) {
                 slot.reveal->setReveal(1);
                 slot.content->setPosition(entrance.x, entrance.y);
                 if (!slot.flight) {
@@ -4627,14 +4746,31 @@ struct TranscriptView::Impl {
                 slot.flightReveal->setReveal(entrance.reveal, opacity,
                                              model.settings.sendReveal == SendReveal::Pixels);
             } else {
-                stopFlight(slot);
+                stopFlight(slot, g.bubbles || !entrance.active);
                 slot.content->setPosition(entrance.x, entrance.y);
                 slot.content->setTransformOrigin(slot.material->x() + slot.material->width() * .5f,
-                                                 slot.material->height() * .5f);
-                slot.content->setScale(entrance.scale);
+                                                 (g.bubbles ? 0 : slot.material->y()) +
+                                                     slot.material->height() * .5f);
+                const bool pixels =
+                    (entry.own ? model.settings.sendReveal : model.settings.incomingReveal) ==
+                    SendReveal::Pixels;
+                // Proxies retain their source scale. During native pixel reveal,
+                // scale partitions and proxied paint together only at the reveal parent.
+                const bool pixelTransform =
+                    !g.bubbles && pixels && entrance.active && entrance.reveal < 1;
+                slot.content->setScale(pixelTransform ? 1 : entrance.scale);
                 slot.reveal->setRevealBounds(revealBounds);
-                slot.reveal->setReveal(entrance.reveal, opacity,
-                                       model.settings.incomingReveal == SendReveal::Pixels);
+                slot.reveal->setReveal(entrance.reveal, opacity, pixels);
+                if (!g.bubbles) {
+                    slot.reveal->setTransformOrigin(slot.content->transformOriginX(),
+                                                    slot.content->transformOriginY());
+                    slot.reveal->setScale(pixelTransform ? entrance.scale : 1);
+                    if (slot.area->hitTestVisible() == entrance.active) {
+                        slot.area->setHitTestVisible(!entrance.active);
+                        if (dispatcher)
+                            dispatcher->syncPointerHover();
+                    }
+                }
             }
             paintTextSelection(slot, textRange, top, bottom);
             const bool hovered = slot.area->hovered();
@@ -4737,7 +4873,7 @@ struct TranscriptView::Impl {
             if (!inViewport && !slot.area->excludeSubtreeFromTabOrder() &&
                 !(textDrag.armed && textDrag.owner == slot.focusIdentity))
                 cancelMessagePresses(*slot.area);
-            slot.area->setExcludeSubtreeFromTabOrder(!inViewport || slot.flight);
+            slot.area->setExcludeSubtreeFromTabOrder(!inViewport || !slot.area->hitTestVisible());
             if (slot.statusSpinner) {
                 float statusLeft, statusTop, statusRight, statusBottom;
                 Node::transformedBounds(slot.statusSpinner, statusLeft, statusTop, statusRight,
@@ -4879,6 +5015,8 @@ struct TranscriptView::Impl {
             view.clearTextSelection();
             cancelFocusReveal();
             if (cache) {
+                cache->historyDemandActive = false;
+                cache->historyDemandKeys.clear();
                 cache->scroll = scroll->scrollOffset();
                 cache->following = pane.following;
                 cache->unseen = pane.unseen;
@@ -4887,6 +5025,8 @@ struct TranscriptView::Impl {
             }
             active = pane.buffer;
             cache = &caches[active];
+            cache->historyDemandActive = false;
+            cache->historyDemandKeys.clear();
             for (auto &row : cache->rows)
                 row.entranceStarted = -1;
             pane.following = cache->following;
@@ -4911,6 +5051,8 @@ struct TranscriptView::Impl {
                 slot.area->setVisible(false);
             }
             history->setVisible(false);
+            for (auto &control : gapButtons)
+                control.button->setVisible(false);
             empty->setVisible(true);
             empty->setText("Select a conversation to see its messages.");
             typing->setVisible(false);
@@ -4941,8 +5083,12 @@ struct TranscriptView::Impl {
                       [this](const auto &entry) { return model.now - entry.second > .5; });
         if (pane.following && !focusRevealTarget && cache->pendingArrivals == 0)
             pane.unseen = 0;
-        history->setVisible(buffer->kind != "mentions");
-        history->setEnabled(buffer->kind != "mentions" && !buffer->loading);
+        const bool localOlder = !buffer->messages.empty() &&
+                                !buffer->historyState.oldest.id.empty() &&
+                                buffer->historyState.oldest.id != buffer->messages.front().id;
+        history->setVisible(buffer->kind != "mentions" &&
+                            (!buffer->historyState.beginning || localOlder));
+        history->setEnabled(history->visible() && !buffer->loading);
         history->setText(buffer->loading ? "Loading history…" : "Load older messages");
         empty->setVisible(buffer->messages.empty());
         empty->setText(buffer->loading ? "Loading messages…" : "No messages yet");
@@ -5028,7 +5174,7 @@ struct TranscriptView::Impl {
         std::optional<double> footerAnchor;
         if (!pane.following && jumpTarget.empty() && oldAnchor < c.rows.size()) {
             const auto &row = c.rows[oldAnchor];
-            const double rowTop = c.header + c.heights.prefix(oldAnchor);
+            const double rowTop = c.header + c.heights.prefix(oldAnchor) + row.gapHeight;
             anchorKey = row.key;
             oldBodyTop = rowTop + row.bodyOffset;
             oldBodyHeight = row.bodyHeight;
@@ -5061,11 +5207,16 @@ struct TranscriptView::Impl {
         }
         if (popupOwned && popupPolicy != privacyPolicy(*buffer))
             closePopup();
-        c.header = buffer->kind == "mentions" ? 0 : std::max(28 * g.scale, g.header + 8 * g.scale);
+        const float gapExtent = std::max(32 * g.scale, g.header + 8 * g.scale);
+        const float olderExtent = history->visible() ? gapExtent : 0;
+        c.header = olderExtent;
+        for (const auto &gap : c.gaps)
+            if (gap.row == absent)
+                c.header += gapExtent;
         history->setFontSize(g.uiFont);
-        history->setControlHeight(c.header);
+        history->setControlHeight(gapExtent);
         history->setPosition(0, 0);
-        history->setSize(bodyWidth, c.header);
+        history->setSize(bodyWidth, olderExtent);
         empty->setFontSize(g.uiFont);
         empty->setPosition(12 * g.scale, c.header + 12 * g.scale);
         empty->setMaxWidth(std::max(1.f, bodyWidth - 24 * g.scale));
@@ -5094,7 +5245,8 @@ struct TranscriptView::Impl {
                 readable(*buffer, target->second)) {
                 anchor = target->second;
                 measure(renderer, *buffer, anchor);
-                desired = c.header + c.heights.prefix(anchor) + c.rows[anchor].bodyOffset;
+                desired = c.header + c.heights.prefix(anchor) + c.rows[anchor].gapHeight +
+                          c.rows[anchor].bodyOffset;
                 selectedIdentity = c.rows[anchor].focusIdentity;
                 sourceJumpIdentity = selectedIdentity;
                 selectedIndexHint = anchor;
@@ -5107,7 +5259,7 @@ struct TranscriptView::Impl {
                 anchor = found->second;
                 measure(renderer, *buffer, anchor);
                 const auto &row = c.rows[anchor];
-                const double rowTop = c.header + c.heights.prefix(anchor);
+                const double rowTop = c.header + c.heights.prefix(anchor) + row.gapHeight;
                 if (footerAnchor) {
                     desired = rowTop + (row.footerHeight > 0
                                             ? row.footerOffset + *footerAnchor * row.footerHeight
@@ -5362,8 +5514,10 @@ struct TranscriptView::Impl {
             if (captured != slots.end() && index < c.rows.size()) {
                 used[size_t(captured - slots.begin())] = true;
                 captured->index = index;
-                captured->area->setPosition(0, float(c.header + c.heights.prefix(index)));
-                captured->area->setSize(c.width, float(c.rows[index].height));
+                captured->area->setPosition(
+                    0, float(c.header + c.heights.prefix(index) + c.rows[index].gapHeight));
+                captured->area->setSize(c.width,
+                                        float(c.rows[index].height - c.rows[index].gapHeight));
             }
         }
         for (size_t i = 0; i < slots.size(); ++i)
@@ -5374,6 +5528,89 @@ struct TranscriptView::Impl {
                     cancelMessagePresses(*slots[i].area);
                 slots[i].area->setVisible(false);
             }
+        bool visibleGap = false;
+        bool historyPending =
+            buffer->loading ||
+            std::any_of(model.actions.begin(), model.actions.end(), [&](const auto &action) {
+                return action.buffer == buffer->id &&
+                       (action.type == "history" || action.type == "history-gap");
+            });
+        float edgeOffset = olderExtent;
+        for (size_t i = 0; i < c.gaps.size(); ++i) {
+            if (i == gapButtons.size()) {
+                auto button = std::make_unique<Button>();
+                button->setVariant(ButtonVariant::Ghost);
+                gapButtons.push_back({button.get(), {}});
+                canvas->addChild(std::move(button));
+            }
+            auto &control = gapButtons[i];
+            auto *button = control.button;
+            const auto &gap = c.gaps[i];
+            button->setVisible(true);
+            button->setEnabled(!gap.unavailable && !buffer->loading);
+            button->setText(gap.unavailable ? "Missing messages unavailable"
+                                            : "Load missing messages");
+            button->setTooltip(gap.unavailable ? "The server could not supply this missing history"
+                                               : "Request missing messages in this conversation");
+            button->setFontSize(g.uiFont);
+            button->setControlHeight(gapExtent);
+            if (control.source != buffer->id || control.id != gap.id) {
+                control.source = buffer->id;
+                control.id = gap.id;
+                button->inputArea()->setTabFocusKey("transcript:" + std::to_string(pane.id) +
+                                                    ":history-gap:" + std::to_string(gap.id));
+                const auto source = buffer->id;
+                const auto id = gap.id;
+                button->setOnClick([this, source, id] {
+                    auto *buffer = current();
+                    if (!buffer || buffer->id != source || buffer->loading)
+                        return;
+                    const auto &gaps = buffer->historyState.gaps;
+                    if (std::none_of(gaps.begin(), gaps.end(), [id](const auto &gap) {
+                            return gap.id == id && !gap.unavailable;
+                        }))
+                        return;
+                    focus(pane.id);
+                    model.actions.push_back({"history-gap", source, std::to_string(id), {}});
+                });
+            }
+            double top = edgeOffset;
+            if (gap.row < c.rows.size())
+                top = c.header + c.heights.prefix(gap.row) + gap.offset;
+            else
+                edgeOffset += gapExtent;
+            button->setPosition(0, float(top));
+            button->setSize(bodyWidth, gapExtent);
+            if (!gap.unavailable && top + gapExtent > desired && top < desired + height) {
+                visibleGap = true;
+                const auto metadata =
+                    std::find_if(buffer->historyState.gaps.begin(), buffer->historyState.gaps.end(),
+                                 [&](const auto &item) { return item.id == gap.id; });
+                if (metadata != buffer->historyState.gaps.end()) {
+                    const auto key = "gap:" + std::to_string(gap.id) + ":" + metadata->newer.id +
+                                     ":" + metadata->newer.time;
+                    if (c.historyDemandActive && !historyPending &&
+                        c.historyDemandKeys.insert(key).second) {
+                        model.actions.push_back(
+                            {"history-gap", buffer->id, std::to_string(gap.id), {}});
+                        historyPending = true;
+                    }
+                }
+            }
+        }
+        for (size_t i = c.gaps.size(); i < gapButtons.size(); ++i)
+            gapButtons[i].button->setVisible(false);
+        const bool olderAvailable =
+            !buffer->server.empty() && (buffer->kind == "channel" || buffer->kind == "query");
+        if (c.historyDemandActive && !historyPending && !visibleGap && history->visible() &&
+            olderAvailable && desired <= gapExtent) {
+            const auto oldest =
+                buffer->messages.empty() ? std::string{} : buffer->messages.front().id;
+            const auto key = "older:" + oldest;
+            if (c.historyDemandKeys.insert(key).second) {
+                model.actions.push_back({"history", buffer->id, {}, oldest});
+            }
+        }
         const double rowsEnd = c.header + c.heights.prefix(c.rows.size());
         const auto mentions = retainedMentions(*buffer);
         const auto position = mentionPosition(*buffer, mentions);
@@ -5622,7 +5859,8 @@ struct TranscriptView::Impl {
         for (const auto index : c.arrivals)
             if (index < c.rows.size()) {
                 auto &arrival = c.rows[index];
-                const double top = c.header + c.heights.prefix(index) + arrival.bodyOffset;
+                const double top =
+                    c.header + c.heights.prefix(index) + arrival.gapHeight + arrival.bodyOffset;
                 if (arrival.hiddenActivity || top >= c.scroll + height ||
                     top + arrival.bodyHeight <= c.scroll)
                     arrival.entranceStarted = -1;

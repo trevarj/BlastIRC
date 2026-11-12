@@ -246,7 +246,7 @@ def visible_words(window, destination, label="locator", *, region=None, psm=None
     mode = psm if psm is not None else (6 if region is not None else 11)
     result = subprocess.run(["tesseract", str(image), "stdout", "--psm", str(mode), "tsv"],
                             check=True, capture_output=True, text=True, timeout=15)
-    words = [row for row in csv.DictReader(io.StringIO(result.stdout), delimiter="\t")
+    words = [row for row in csv.DictReader(io.StringIO(result.stdout), delimiter="\t", quoting=csv.QUOTE_NONE)
              if row["text"].strip() and float(row["conf"]) >= min_confidence]
     for row in words:
         row["left"] = str(int(row["left"]) // recognition_scale + left - geometry["X"])

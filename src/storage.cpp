@@ -183,6 +183,7 @@ Message storedMessage(sqlite3 *db, const Statement &query) {
     Message message;
     message.storageSequence = query.integer(0);
     message.orderingTimestamp = query.integer(17);
+    message.historyOrder = query.integer(18);
     message.id = query.text(1);
     message.nick = query.text(2);
     message.text = query.text(3);
@@ -216,16 +217,36 @@ Message storedMessage(sqlite3 *db, const Statement &query) {
     }
     return message;
 }
+std::optional<HistoryCursor> latestStoredHistoryBoundary(sqlite3 *db, const string &buffer) {
+    Statement query(
+        db, "SELECT COALESCE(id,'local:' || seq),time FROM messages WHERE buffer=? AND pending=0 "
+            "AND ((COALESCE(id,'')<>'' AND substr(id,1,6) NOT IN ('local:','local-')) OR time<>'') "
+            "ORDER BY sort_time DESC,server_nanoseconds(time) DESC,tie_order DESC,seq DESC");
+    query.bind(1, buffer);
+    while (query.step()) {
+        HistoryCursor cursor{query.text(0), query.text(1)};
+        const bool usableId = !cursor.id.empty() && !cursor.id.starts_with("local:") &&
+                              !cursor.id.starts_with("local-");
+        if (usableId || irc::parseTimestampParts(cursor.time))
+            return cursor;
+    }
+    return {};
+}
 struct Transaction {
     sqlite3 *db;
-    bool committed = false;
-    explicit Transaction(sqlite3 *connection) : db(connection) { execute(db, "BEGIN IMMEDIATE"); }
+    bool committed = false, nested;
+    explicit Transaction(sqlite3 *connection)
+        : db(connection), nested(!sqlite3_get_autocommit(connection)) {
+        execute(db, nested ? "SAVEPOINT storage_write" : "BEGIN IMMEDIATE");
+    }
     ~Transaction() {
         if (!committed)
-            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            sqlite3_exec(db,
+                         nested ? "ROLLBACK TO storage_write; RELEASE storage_write" : "ROLLBACK",
+                         nullptr, nullptr, nullptr);
     }
     void commit() {
-        execute(db, "COMMIT");
+        execute(db, nested ? "RELEASE storage_write" : "COMMIT");
         committed = true;
     }
 };
@@ -1218,6 +1239,8 @@ struct Storage::Impl {
     fs::path data = xdgDirectory("XDG_DATA_HOME", ".local/share");
     sqlite3 *db = nullptr;
     int retentionDays = 30, maxMessages = 100000;
+    unsigned historyWriteDepth = 0;
+    vector<string> historyInvalidations;
     bool configSafe = true;
     struct MentionScan {
         string nick, mapping;
@@ -1265,7 +1288,7 @@ struct Storage::Impl {
                 if (query.step())
                     version = query.integer(0);
             }
-            if (version > 9)
+            if (version > 11)
                 fail("database schema " + std::to_string(version) +
                      " is newer than this BlastIRC supports; schema was not modified");
             if (version < 1)
@@ -1324,6 +1347,61 @@ struct Storage::Impl {
                 execute(db, "ALTER TABLE buffers ADD muted INTEGER NOT NULL DEFAULT 0;"
                             "ALTER TABLE buffers ADD archived INTEGER NOT NULL DEFAULT 0;"
                             "PRAGMA user_version=9;");
+            if (version < 10)
+                execute(
+                    db,
+                    "CREATE TABLE history_state(buffer TEXT PRIMARY KEY,oldest_id TEXT NOT NULL,"
+                    "oldest_time TEXT NOT NULL,newest_id TEXT NOT NULL,newest_time TEXT NOT NULL,"
+                    "beginning INTEGER NOT NULL);"
+                    "CREATE TABLE history_gaps(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "buffer TEXT NOT NULL,older_id TEXT NOT NULL,older_time TEXT NOT NULL,"
+                    "newer_id TEXT NOT NULL,newer_time TEXT NOT NULL,unavailable INTEGER NOT NULL);"
+                    "CREATE INDEX history_gaps_buffer ON history_gaps(buffer);"
+                    "CREATE TABLE history_discovery(server TEXT PRIMARY KEY,watermark TEXT NOT "
+                    "NULL,"
+                    "backfill_upper TEXT NOT NULL,backfill_complete INTEGER NOT NULL);"
+                    "ALTER TABLE closed_buffers ADD discarded_at TEXT NOT NULL DEFAULT '';"
+                    "PRAGMA user_version=10;");
+            if (version < 11)
+                execute(db,
+                        "ALTER TABLE messages ADD tie_order INTEGER NOT NULL DEFAULT 0 "
+                        "CHECK(tie_order>=0);"
+                        "ALTER TABLE messages ADD tie_order_confirmed INTEGER NOT NULL DEFAULT 0 "
+                        "CHECK(tie_order_confirmed IN (0,1));"
+                        "UPDATE messages SET tie_order=seq;"
+                        "DROP INDEX messages_buffer_order; DROP INDEX messages_order;"
+                        "DROP INDEX messages_time;"
+                        "CREATE INDEX messages_buffer_order ON messages(buffer,sort_time,"
+                        "server_nanoseconds(time),tie_order,seq);"
+                        "CREATE INDEX messages_order ON messages(sort_time,"
+                        "server_nanoseconds(time),tie_order,seq);"
+                        "CREATE INDEX messages_time ON messages(buffer,time,sort_time,"
+                        "server_nanoseconds(time),tie_order,seq);"
+                        "CREATE INDEX messages_chat_activity ON messages(buffer,sort_time,"
+                        "server_nanoseconds(time),seq) WHERE presence=0 AND deleted=0;"
+                        "PRAGMA user_version=11;");
+            if (version < 10) {
+                // Keep legacy cache intact, but establish its pre-network tail before a
+                // new live event can become the fallback boundary of an offline gap.
+                Statement buffers(db, "SELECT id FROM buffers WHERE server<>'' AND target<>'' "
+                                      "AND kind IN ('channel','query') AND target<>'*server*' "
+                                      "AND NOT EXISTS(SELECT 1 FROM closed_buffers "
+                                      "WHERE closed_buffers.id=buffers.id)");
+                while (buffers.step()) {
+                    const string id = buffers.text(0);
+                    auto cursor = latestStoredHistoryBoundary(db, id);
+                    if (!cursor)
+                        continue;
+                    if (!irc::parseTimestampParts(cursor->time))
+                        cursor->time.clear();
+                    Statement seed(db, "INSERT INTO history_state "
+                                       "VALUES(?,'','',?,?,0)");
+                    seed.bind(1, id);
+                    seed.bind(2, cursor->id);
+                    seed.bind(3, cursor->time);
+                    seed.step();
+                }
+            }
             migration.commit();
         } catch (...) {
             sqlite3_close(db);
@@ -1335,8 +1413,26 @@ struct Storage::Impl {
         if (db)
             sqlite3_close(db);
     }
-    void trim() {
+    void invalidateHistory(const string &buffer) {
+        Statement state(db, "DELETE FROM history_state WHERE buffer=?");
+        state.bind(1, buffer);
+        state.step();
+        const bool hadState = sqlite3_changes(db) != 0;
+        Statement gaps(db, "DELETE FROM history_gaps WHERE buffer=?");
+        gaps.bind(1, buffer);
+        gaps.step();
+        if (hadState || sqlite3_changes(db) != 0)
+            historyInvalidations.push_back(buffer);
+    }
+    void trim(bool completedPage = false) {
+        if (historyWriteDepth && !completedPage)
+            return;
+        // Expiry destroys continuity proof, not merely the visible in-memory tail.
         if (retentionDays > 0) {
+            Statement affected(db, "SELECT DISTINCT buffer FROM messages WHERE sort_time<?");
+            affected.bind(1, nowSeconds() - static_cast<int64_t>(retentionDays) * 86400);
+            while (affected.step())
+                invalidateHistory(affected.text(0));
             Statement expired(db, "DELETE FROM messages WHERE sort_time < ?");
             expired.bind(1, nowSeconds() - static_cast<int64_t>(retentionDays) * 86400);
             expired.step();
@@ -1348,8 +1444,15 @@ struct Storage::Impl {
                 count = query.integer(0);
         }
         if (count > maxMessages) {
-            Statement excess(db, "DELETE FROM messages WHERE seq IN (SELECT seq FROM messages "
-                                 "ORDER BY sort_time,server_nanoseconds(time),seq LIMIT ?)");
+            Statement affected(
+                db, "SELECT DISTINCT buffer FROM (SELECT buffer FROM messages "
+                    "ORDER BY sort_time,server_nanoseconds(time),tie_order,seq LIMIT ?)");
+            affected.bind(1, count - maxMessages);
+            while (affected.step())
+                invalidateHistory(affected.text(0));
+            Statement excess(db,
+                             "DELETE FROM messages WHERE seq IN (SELECT seq FROM messages "
+                             "ORDER BY sort_time,server_nanoseconds(time),tie_order,seq LIMIT ?)");
             excess.bind(1, count - maxMessages);
             excess.step();
         }
@@ -1421,7 +1524,9 @@ struct Storage::Impl {
         remove.step();
     }
     void closeBuffer(const string &buffer, const vector<string> &submissions = {}) {
-        Statement close(db, "INSERT OR IGNORE INTO closed_buffers(id) VALUES(?)");
+        Statement close(db, "INSERT INTO closed_buffers(id,discarded_at) "
+                            "VALUES(?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+                            "ON CONFLICT(id) DO UPDATE SET discarded_at=excluded.discarded_at");
         close.bind(1, buffer);
         close.step();
         // Retain authoritative source context, never a closed composer's private draft.
@@ -1440,7 +1545,7 @@ struct Storage::Impl {
     }
     bool persist(const string &buffer, const Message &message, const string &completedSend,
                  size_t completedParts, bool confirmed, const Buffer *source,
-                 int64_t *storedSequence) {
+                 int64_t *storedSequence, int64_t *storedOrder) {
         if (buffer.empty())
             fail("cannot store a message without a buffer ID");
         if (source && source->id != buffer)
@@ -1460,12 +1565,14 @@ struct Storage::Impl {
             context.step();
         }
         int64_t sequence = 0, received = nowSeconds();
+        int64_t order = -1, orderConfirmed = 0, oldSortTime = 0, oldNanoseconds = 0;
         bool deleted = message.deleted;
         // 0: server-confirmed, 1: provisional, 2: written without an echo acknowledgement.
         int64_t localEcho = message.pending && message.own ? 1 : 0;
         {
             Statement existing(
-                db, "SELECT seq,deleted,received_at,local_echo,id FROM messages WHERE "
+                db, "SELECT seq,deleted,received_at,local_echo,id,tie_order,sort_time,time,"
+                    "tie_order_confirmed FROM messages WHERE "
                     "buffer=? AND ((id IS NOT NULL AND id=?) OR (local_echo IN (1,2) AND "
                     "label<>'' AND label=? AND ?=1)) ORDER BY (id=?) DESC LIMIT 1");
             existing.bind(1, buffer);
@@ -1477,6 +1584,11 @@ struct Storage::Impl {
                 sequence = existing.integer(0);
                 deleted = deleted || existing.integer(1) != 0;
                 received = existing.integer(2);
+                order = existing.integer(5);
+                oldSortTime = existing.integer(6);
+                if (const auto time = irc::parseTimestampParts(existing.text(7)))
+                    oldNanoseconds = time->nanoseconds;
+                orderConfirmed = existing.integer(8);
                 if (!localEcho && existing.text(4) == message.id)
                     localEcho = existing.integer(3);
             }
@@ -1484,7 +1596,8 @@ struct Storage::Impl {
         // IDs assigned to otherwise unidentified rows remain usable after a restart.
         if (!sequence)
             if (const auto local = localSequence(message.id)) {
-                Statement existing(db, "SELECT seq,deleted,received_at,local_echo FROM messages "
+                Statement existing(db, "SELECT seq,deleted,received_at,local_echo,id,tie_order,"
+                                       "sort_time,time,tie_order_confirmed FROM messages "
                                        "WHERE buffer=? AND seq=? AND id IS NULL");
                 existing.bind(1, buffer);
                 existing.bind(2, *local);
@@ -1492,6 +1605,11 @@ struct Storage::Impl {
                     sequence = existing.integer(0);
                     deleted = deleted || existing.integer(1) != 0;
                     received = existing.integer(2);
+                    order = existing.integer(5);
+                    oldSortTime = existing.integer(6);
+                    if (const auto time = irc::parseTimestampParts(existing.text(7)))
+                        oldNanoseconds = time->nanoseconds;
+                    orderConfirmed = existing.integer(8);
                     if (!localEcho)
                         localEcho = existing.integer(3);
                 }
@@ -1500,17 +1618,33 @@ struct Storage::Impl {
             localEcho = 0;
         else if (message.own && !message.pending && message.sendStatus == SendStatus::Sent)
             localEcho = 2;
+        const int64_t sortTime = message.timestamp > 0 ? message.timestamp : received;
+        const auto parsedTime = irc::parseTimestampParts(message.time);
+        const int64_t nanoseconds = parsedTime ? parsedTime->nanoseconds : 0;
+        if (order < 0 || oldSortTime != sortTime || oldNanoseconds != nanoseconds) {
+            Statement next(db, "SELECT COALESCE(MAX(tie_order),-1)+1 FROM messages "
+                               "WHERE buffer=? AND sort_time=? AND server_nanoseconds(time)=? "
+                               "AND seq<>?");
+            next.bind(1, buffer);
+            next.bind(2, sortTime);
+            next.bind(3, nanoseconds);
+            next.bind(4, sequence);
+            if (next.step())
+                order = next.integer(0);
+            orderConfirmed = 0;
+        }
         Statement write(
             db, sequence
                     ? "UPDATE messages SET "
                       "buffer=?,id=?,nick=?,text=?,time=?,reply=?,label=?,timestamp=?,"
                       "received_at=?,sort_time=?,own=?,pending=?,deleted=?,mention=MAX(mention,?),"
-                      "action=?,presence=?,local_echo=?,activity=?,activity_target=? WHERE seq=?"
+                      "action=?,presence=?,local_echo=?,activity=?,activity_target=?,"
+                      "tie_order=?,tie_order_confirmed=? WHERE seq=?"
                     : "INSERT INTO "
                       "messages(buffer,id,nick,text,time,reply,label,timestamp,"
                       "received_at,sort_time,own,pending,deleted,mention,action,"
-                      "presence,local_echo,activity,activity_target) "
-                      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                      "presence,local_echo,activity,activity_target,tie_order,tie_order_confirmed) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         write.bind(1, buffer);
         if (message.id.empty())
             write.null(2);
@@ -1533,8 +1667,10 @@ struct Storage::Impl {
         write.bind(17, static_cast<int64_t>(localEcho));
         write.bind(18, static_cast<int64_t>(message.activity));
         write.bind(19, message.activityTarget);
+        write.bind(20, order);
+        write.bind(21, orderConfirmed);
         if (sequence)
-            write.bind(20, sequence);
+            write.bind(22, sequence);
         write.step();
         if (!sequence)
             sequence = sqlite3_last_insert_rowid(db);
@@ -1574,6 +1710,8 @@ struct Storage::Impl {
         transaction.commit();
         if (storedSequence)
             *storedSequence = sequence;
+        if (storedOrder)
+            *storedOrder = order;
         if (!message.mention && !message.own && !message.presence && !deleted) {
             const auto scanned = mentionScans.find(buffer);
             if (scanned != mentionScans.end())
@@ -1582,6 +1720,287 @@ struct Storage::Impl {
         return retired;
     }
 };
+struct Storage::HistoryWrite::State {
+    Storage::Impl &owner;
+    Transaction transaction;
+    int retentionDays, maxMessages;
+    size_t invalidationCount;
+    int64_t insertedAfter = 0;
+    bool committed = false;
+    explicit State(Storage::Impl &impl)
+        : owner(impl), transaction(impl.db), retentionDays(impl.retentionDays),
+          maxMessages(impl.maxMessages), invalidationCount(impl.historyInvalidations.size()) {
+        Statement latest(impl.db, "SELECT COALESCE(MAX(seq),0) FROM messages");
+        if (latest.step())
+            insertedAfter = latest.integer(0);
+        ++owner.historyWriteDepth;
+    }
+    bool depthHeld = true;
+    ~State() {
+        if (depthHeld)
+            --owner.historyWriteDepth;
+        if (!committed) {
+            // Derived scan caches are cheap to rebuild; never retain rolled-back sequences.
+            owner.mentionScans.clear();
+            owner.retentionDays = retentionDays;
+            owner.maxMessages = maxMessages;
+            owner.historyInvalidations.resize(invalidationCount);
+        }
+    }
+};
+Storage::HistoryWrite::HistoryWrite(Storage &storage)
+    : state(std::make_unique<State>(*storage.impl)) {}
+Storage::HistoryWrite::~HistoryWrite() = default;
+void Storage::HistoryWrite::commit() {
+    if (state->owner.historyWriteDepth == 1)
+        state->owner.trim(true);
+    state->transaction.commit();
+    state->committed = true;
+    --state->owner.historyWriteDepth;
+    state->depthHeld = false;
+}
+vector<std::pair<int64_t, int64_t>>
+Storage::HistoryWrite::reconcileOrder(const string &buffer, const vector<string> &canonicalIds,
+                                      bool prepend, const vector<string> &existingCanonicalOrder) {
+    if (state->committed)
+        fail("cannot reconcile history order after its write commits");
+    if (canonicalIds.empty())
+        return {};
+    using Cohort = std::pair<int64_t, int64_t>;
+    map<Cohort, vector<int64_t>> incoming, nativeExisting;
+    Statement lookup(state->owner.db,
+                     "SELECT seq,sort_time,server_nanoseconds(time),time FROM messages "
+                     "WHERE buffer=? AND id=?");
+    Statement anonymous(state->owner.db,
+                        "SELECT seq,sort_time,server_nanoseconds(time),time FROM messages "
+                        "WHERE buffer=? AND seq=? AND id IS NULL");
+    auto collect = [&](const vector<string> &ids, map<Cohort, vector<int64_t>> &destination) {
+        set<int64_t> seen;
+        for (const auto &id : ids) {
+            lookup.bind(1, buffer);
+            lookup.bind(2, id);
+            if (lookup.step()) {
+                if (irc::parseTimestampParts(lookup.text(3))) {
+                    const auto sequence = lookup.integer(0);
+                    if (seen.insert(sequence).second)
+                        destination[{lookup.integer(1), lookup.integer(2)}].push_back(sequence);
+                }
+            } else if (const auto sequence = localSequence(id)) {
+                anonymous.bind(1, buffer);
+                anonymous.bind(2, *sequence);
+                if (anonymous.step() && irc::parseTimestampParts(anonymous.text(3))) {
+                    const auto storedSequence = anonymous.integer(0);
+                    if (seen.insert(storedSequence).second)
+                        destination[{anonymous.integer(1), anonymous.integer(2)}].push_back(
+                            storedSequence);
+                }
+                anonymous.reset();
+            }
+            lookup.reset();
+        }
+    };
+    collect(canonicalIds, incoming);
+    collect(existingCanonicalOrder, nativeExisting);
+    auto insertMissing = [](vector<int64_t> &merged, const vector<int64_t> &ordered, bool atFront) {
+        for (size_t i = 0; i < ordered.size(); ++i) {
+            const auto sequence = ordered[i];
+            if (std::find(merged.begin(), merged.end(), sequence) != merged.end())
+                continue;
+            size_t position = atFront ? 0 : merged.size();
+            bool anchored = false;
+            for (size_t previous = i; previous > 0; --previous) {
+                const auto found = std::find(merged.begin(), merged.end(), ordered[previous - 1]);
+                if (found != merged.end()) {
+                    position = static_cast<size_t>(found - merged.begin()) + 1;
+                    anchored = true;
+                    break;
+                }
+            }
+            if (!anchored)
+                for (size_t next = i + 1; next < ordered.size(); ++next) {
+                    const auto found = std::find(merged.begin(), merged.end(), ordered[next]);
+                    if (found != merged.end()) {
+                        position = static_cast<size_t>(found - merged.begin());
+                        break;
+                    }
+                }
+            merged.insert(merged.begin() + static_cast<std::ptrdiff_t>(position), sequence);
+        }
+    };
+    vector<std::pair<int64_t, int64_t>> ranks;
+    for (const auto &[cohort, wire] : incoming) {
+        const set<int64_t> wireSet(wire.begin(), wire.end());
+        Statement rows(state->owner.db,
+                       "SELECT seq,tie_order_confirmed FROM messages WHERE buffer=? AND "
+                       "sort_time=? AND server_nanoseconds(time)=? ORDER BY tie_order,seq");
+        rows.bind(1, buffer);
+        rows.bind(2, cohort.first);
+        rows.bind(3, cohort.second);
+        vector<int64_t> existing;
+        map<int64_t, bool> confirmed;
+        while (rows.step()) {
+            const auto sequence = rows.integer(0);
+            if (sequence <= state->insertedAfter)
+                existing.push_back(sequence);
+            if (wireSet.contains(sequence))
+                confirmed.emplace(sequence, rows.integer(1) != 0);
+        }
+        if (const auto native = nativeExisting.find(cohort); native != nativeExisting.end())
+            insertMissing(existing, native->second, false);
+        vector<int64_t> common, existingCommon;
+        for (auto sequence : wire)
+            if (std::find(existing.begin(), existing.end(), sequence) != existing.end())
+                common.push_back(sequence);
+        for (auto sequence : existing)
+            if (wireSet.contains(sequence))
+                existingCommon.push_back(sequence);
+        const bool conflict = common != existingCommon &&
+                              std::all_of(common.begin(), common.end(),
+                                          [&](auto sequence) { return confirmed.at(sequence); });
+        auto merged = std::move(existing);
+        insertMissing(merged, wire, prepend);
+        // Confirmed overlap ordering is sticky; contradictory later playback cannot oscillate it.
+        if (!conflict) {
+            size_t next = 0;
+            for (auto &sequence : merged)
+                if (wireSet.contains(sequence))
+                    sequence = wire[next++];
+        }
+        Statement update(state->owner.db,
+                         "UPDATE messages SET tie_order=?,tie_order_confirmed="
+                         "CASE WHEN ? THEN 1 ELSE tie_order_confirmed END WHERE seq=? "
+                         "AND (tie_order<>? OR (? AND tie_order_confirmed=0))");
+        for (size_t i = 0; i < merged.size(); ++i) {
+            const auto sequence = merged[i];
+            const auto rank = static_cast<int64_t>(i);
+            const int64_t incomingRow = wireSet.contains(sequence);
+            update.bind(1, rank);
+            update.bind(2, incomingRow);
+            update.bind(3, sequence);
+            update.bind(4, rank);
+            update.bind(5, incomingRow);
+            update.step();
+            update.reset();
+            ranks.emplace_back(sequence, rank);
+        }
+    }
+    std::sort(ranks.begin(), ranks.end());
+    return ranks;
+}
+Storage::HistoryWrite Storage::historyWrite() { return HistoryWrite(*this); }
+vector<string> Storage::takeHistoryInvalidations() {
+    if (!sqlite3_get_autocommit(impl->db))
+        fail("history invalidations cannot be drained before the outer write commits");
+    vector<string> invalidations;
+    invalidations.swap(impl->historyInvalidations);
+    std::sort(invalidations.begin(), invalidations.end());
+    invalidations.erase(std::unique(invalidations.begin(), invalidations.end()),
+                        invalidations.end());
+    return invalidations;
+}
+HistoryDiscovery Storage::historyDiscovery(const string &server) {
+    Statement query(impl->db, "SELECT watermark,backfill_upper,backfill_complete "
+                              "FROM history_discovery WHERE server=?");
+    query.bind(1, server);
+    if (!query.step())
+        return {};
+    return {query.text(0), query.text(1), query.integer(2) != 0};
+}
+void Storage::saveHistoryDiscovery(const string &server, const HistoryDiscovery &discovery) {
+    Statement write(impl->db, "INSERT INTO history_discovery VALUES(?,?,?,?) "
+                              "ON CONFLICT(server) DO UPDATE SET watermark=excluded.watermark,"
+                              "backfill_upper=excluded.backfill_upper,"
+                              "backfill_complete=excluded.backfill_complete");
+    write.bind(1, server);
+    write.bind(2, discovery.watermark);
+    write.bind(3, discovery.backfillUpper);
+    write.bind(4, static_cast<int64_t>(discovery.backfillComplete));
+    write.step();
+}
+void Storage::loadHistoryState(Buffer &buffer) {
+    buffer.historyState = {};
+    Statement query(impl->db, "SELECT oldest_id,oldest_time,newest_id,newest_time,beginning "
+                              "FROM history_state WHERE buffer=?");
+    query.bind(1, buffer.id);
+    if (query.step()) {
+        buffer.historyState.oldest = {query.text(0), query.text(1)};
+        buffer.historyState.newest = {query.text(2), query.text(3)};
+        buffer.historyState.beginning = query.integer(4) != 0;
+    }
+    Statement gaps(impl->db, "SELECT id,older_id,older_time,newer_id,newer_time,unavailable "
+                             "FROM history_gaps WHERE buffer=? ORDER BY id");
+    gaps.bind(1, buffer.id);
+    while (gaps.step())
+        buffer.historyState.gaps.push_back({gaps.integer(0),
+                                            {gaps.text(1), gaps.text(2)},
+                                            {gaps.text(3), gaps.text(4)},
+                                            gaps.integer(5) != 0});
+}
+void Storage::saveHistoryState(Buffer &buffer) {
+    if (buffer.id.empty())
+        fail("cannot store history state without a buffer ID");
+    Transaction transaction(impl->db);
+    const auto &history = buffer.historyState;
+    Statement write(impl->db, "INSERT INTO history_state VALUES(?,?,?,?,?,?) "
+                              "ON CONFLICT(buffer) DO UPDATE SET oldest_id=excluded.oldest_id,"
+                              "oldest_time=excluded.oldest_time,newest_id=excluded.newest_id,"
+                              "newest_time=excluded.newest_time,beginning=excluded.beginning");
+    write.bind(1, buffer.id);
+    write.bind(2, history.oldest.id);
+    write.bind(3, history.oldest.time);
+    write.bind(4, history.newest.id);
+    write.bind(5, history.newest.time);
+    write.bind(6, static_cast<int64_t>(history.beginning));
+    write.step();
+    // Keep durable IDs stable: UI actions refer to IDs, never vector positions.
+    vector<int64_t> ids;
+    ids.reserve(history.gaps.size());
+    for (const auto &gap : history.gaps) {
+        if (gap.id < 0)
+            fail("invalid history gap ID");
+        if (gap.id) {
+            Statement owner(impl->db, "SELECT buffer FROM history_gaps WHERE id=?");
+            owner.bind(1, gap.id);
+            if (owner.step() && owner.text(0) != buffer.id)
+                fail("history gap belongs to another buffer");
+        }
+        Statement gapWrite(impl->db,
+                           "INSERT INTO history_gaps VALUES(NULLIF(?,0),?,?,?,?,?,?) "
+                           "ON CONFLICT(id) DO UPDATE SET older_id=excluded.older_id,"
+                           "older_time=excluded.older_time,newer_id=excluded.newer_id,"
+                           "newer_time=excluded.newer_time,unavailable=excluded.unavailable");
+        gapWrite.bind(1, gap.id);
+        gapWrite.bind(2, buffer.id);
+        gapWrite.bind(3, gap.older.id);
+        gapWrite.bind(4, gap.older.time);
+        gapWrite.bind(5, gap.newer.id);
+        gapWrite.bind(6, gap.newer.time);
+        gapWrite.bind(7, static_cast<int64_t>(gap.unavailable));
+        gapWrite.step();
+        ids.push_back(gap.id ? gap.id : sqlite3_last_insert_rowid(impl->db));
+    }
+    Statement existing(impl->db, "SELECT id FROM history_gaps WHERE buffer=?");
+    existing.bind(1, buffer.id);
+    vector<int64_t> removed;
+    while (existing.step())
+        if (std::find(ids.begin(), ids.end(), existing.integer(0)) == ids.end())
+            removed.push_back(existing.integer(0));
+    for (auto id : removed) {
+        Statement erase(impl->db, "DELETE FROM history_gaps WHERE id=?");
+        erase.bind(1, id);
+        erase.step();
+    }
+    transaction.commit();
+    for (size_t i = 0; i < ids.size(); ++i)
+        buffer.historyState.gaps[i].id = ids[i];
+}
+std::optional<string> Storage::historyDiscarded(const string &buffer) {
+    Statement query(impl->db, "SELECT discarded_at FROM closed_buffers WHERE id=?");
+    query.bind(1, buffer);
+    if (query.step())
+        return query.text(0);
+    return {};
+}
 
 Storage::Storage() : impl(std::make_unique<Impl>()) {}
 Storage::~Storage() = default;
@@ -1628,12 +2047,13 @@ map<string, Buffer> Storage::mentionSources(const map<string, Network> &networks
             scan.nick = network->second.nick;
             scan.mapping = network->second.caseMapping;
         }
-        Statement rows(impl->db,
-                       "SELECT seq,COALESCE(id,'local:' || seq),nick,text,time,reply,label,"
-                       "timestamp,own,pending,deleted,mention,action,presence,local_echo,"
-                       "activity,activity_target,sort_time FROM messages WHERE buffer=? AND own=0 "
-                       "AND presence=0 AND deleted=0 AND (mention<>0 OR (?=1 AND seq>?)) "
-                       "ORDER BY sort_time,server_nanoseconds(time),seq");
+        Statement rows(
+            impl->db,
+            "SELECT seq,COALESCE(id,'local:' || seq),nick,text,time,reply,label,"
+            "timestamp,own,pending,deleted,mention,action,presence,local_echo,"
+            "activity,activity_target,sort_time,tie_order FROM messages WHERE buffer=? AND own=0 "
+            "AND presence=0 AND deleted=0 AND (mention<>0 OR (?=1 AND seq>?)) "
+            "ORDER BY sort_time,server_nanoseconds(time),tie_order,seq");
         rows.bind(1, source->id);
         rows.bind(2, static_cast<int64_t>(classify));
         rows.bind(3, scan.sequence);
@@ -1774,16 +2194,18 @@ void Storage::load(Model &model) {
     }
     recovery.commit();
     for (auto &[id, buffer] : loaded.buffers) {
+        loadHistoryState(buffer);
         seedChatActivity(buffer);
-        Statement query(impl->db,
-                        "SELECT seq,COALESCE(id,'local:' || seq),nick,text,time,reply,label,"
-                        "timestamp,own,(pending OR (own=1 AND local_echo=1)),deleted,mention,"
-                        "action,presence,local_echo,activity,activity_target,sort_time FROM "
-                        "messages WHERE seq IN "
-                        "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 ORDER BY "
-                        "sort_time DESC,server_nanoseconds(time) DESC,seq DESC LIMIT 200) "
-                        "UNION SELECT seq FROM messages WHERE buffer=?1 AND own=1 AND "
-                        "local_echo=1) ORDER BY sort_time,server_nanoseconds(time),seq");
+        Statement query(
+            impl->db,
+            "SELECT seq,COALESCE(id,'local:' || seq),nick,text,time,reply,label,"
+            "timestamp,own,(pending OR (own=1 AND local_echo=1)),deleted,mention,"
+            "action,presence,local_echo,activity,activity_target,sort_time,tie_order FROM "
+            "messages WHERE seq IN "
+            "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 ORDER BY "
+            "sort_time DESC,server_nanoseconds(time) DESC,tie_order DESC,seq DESC LIMIT 200) "
+            "UNION SELECT seq FROM messages WHERE buffer=?1 AND own=1 AND "
+            "local_echo=1) ORDER BY sort_time,server_nanoseconds(time),tie_order,seq");
         query.bind(1, id);
         while (query.step())
             buffer.messages.push_back(storedMessage(impl->db, query));
@@ -1914,42 +2336,62 @@ void Storage::closeBuffer(const Buffer &buffer, const vector<string> &submission
 }
 bool Storage::append(const string &buffer, const Message &message, const string &completedSend,
                      size_t completedParts, bool confirmed, const Buffer *source,
-                     int64_t *storedSequence) {
+                     int64_t *storedSequence, int64_t *storedOrder) {
     return impl->persist(buffer, message, completedSend, completedParts, confirmed, source,
-                         storedSequence);
+                         storedSequence, storedOrder);
 }
 bool Storage::update(const string &buffer, const Message &message, const string &completedSend,
                      size_t completedParts, bool confirmed, const Buffer *source,
-                     int64_t *storedSequence) {
+                     int64_t *storedSequence, int64_t *storedOrder) {
     return impl->persist(buffer, message, completedSend, completedParts, confirmed, source,
-                         storedSequence);
+                         storedSequence, storedOrder);
 }
 std::optional<Message> Storage::message(const string &buffer, const string &id) {
     if (id.empty())
         return {};
-    Statement query(
-        impl->db,
-        "SELECT seq,COALESCE(id,'local:' || "
-        "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,"
-        "mention,action,presence,local_echo,activity,activity_target,sort_time FROM messages WHERE "
-        "buffer=? AND id=?");
+    Statement query(impl->db, "SELECT seq,COALESCE(id,'local:' || "
+                              "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,"
+                              "mention,action,presence,local_echo,activity,activity_target,sort_"
+                              "time,tie_order FROM messages WHERE "
+                              "buffer=? AND id=?");
     query.bind(1, buffer);
     query.bind(2, id);
     if (query.step())
         return storedMessage(impl->db, query);
     if (const auto local = localSequence(id)) {
         Statement anonymous(
-            impl->db, "SELECT seq,COALESCE(id,'local:' || "
-                      "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,mention,"
-                      "action,presence,local_echo,activity,activity_target,sort_time FROM messages "
-                      "WHERE seq=? AND buffer=? "
-                      "AND id IS NULL");
+            impl->db,
+            "SELECT seq,COALESCE(id,'local:' || "
+            "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,mention,"
+            "action,presence,local_echo,activity,activity_target,sort_time,tie_order FROM messages "
+            "WHERE seq=? AND buffer=? "
+            "AND id IS NULL");
         anonymous.bind(1, *local);
         anonymous.bind(2, buffer);
         if (anonymous.step())
             return storedMessage(impl->db, anonymous);
     }
     return {};
+}
+std::optional<std::pair<int64_t, int64_t>> Storage::messagePosition(const string &buffer,
+                                                                    const string &id) {
+    Statement query(impl->db, "SELECT seq,tie_order FROM messages WHERE buffer=? AND id=?");
+    query.bind(1, buffer);
+    query.bind(2, id);
+    if (query.step())
+        return std::pair{query.integer(0), query.integer(1)};
+    if (const auto local = localSequence(id)) {
+        Statement anonymous(impl->db, "SELECT seq,tie_order FROM messages "
+                                      "WHERE buffer=? AND seq=? AND id IS NULL");
+        anonymous.bind(1, buffer);
+        anonymous.bind(2, *local);
+        if (anonymous.step())
+            return std::pair{anonymous.integer(0), anonymous.integer(1)};
+    }
+    return {};
+}
+std::optional<HistoryCursor> Storage::latestHistoryBoundary(const string &buffer) {
+    return latestStoredHistoryBoundary(impl->db, buffer);
 }
 void Storage::eraseMessage(const string &buffer, const string &id) {
     if (id.empty())
@@ -1973,6 +2415,13 @@ void Storage::renameBuffer(const string &oldId, const string &newId) {
     if (oldId == newId)
         return;
     Transaction transaction(impl->db);
+    Buffer oldHistory, mergedHistory;
+    oldHistory.id = oldId;
+    mergedHistory.id = newId;
+    loadHistoryState(oldHistory);
+    loadHistoryState(mergedHistory);
+    const auto oldDiscarded = historyDiscarded(oldId);
+    const auto newDiscarded = historyDiscarded(newId);
     bool keepClosed = false;
     {
         Statement closed(impl->db, "SELECT EXISTS(SELECT 1 FROM closed_buffers WHERE id=?1) AND "
@@ -1983,27 +2432,84 @@ void Storage::renameBuffer(const string &oldId, const string &newId) {
         if (closed.step())
             keepClosed = closed.integer(0) != 0;
     }
-    using Position = std::tuple<int64_t, int64_t, int64_t>;
+    auto before = [](const HistoryCursor &a, const HistoryCursor &b) {
+        const auto at = irc::parseTimestampParts(a.time), bt = irc::parseTimestampParts(b.time);
+        return at && bt &&
+               std::pair(at->seconds, at->nanoseconds) < std::pair(bt->seconds, bt->nanoseconds);
+    };
+    auto sameTime = [&](const HistoryCursor &a, const HistoryCursor &b) {
+        return irc::parseTimestampParts(a.time) && irc::parseTimestampParts(b.time) &&
+               !before(a, b) && !before(b, a);
+    };
+    auto sameId = [](const HistoryCursor &a, const HistoryCursor &b) {
+        return !a.id.empty() && a.id == b.id;
+    };
+    auto &source = oldHistory.historyState;
+    auto &destination = mergedHistory.historyState;
+    bool overlap =
+        sameId(source.oldest, destination.oldest) || sameId(source.oldest, destination.newest) ||
+        sameId(source.newest, destination.oldest) || sameId(source.newest, destination.newest);
+    if (!overlap) {
+        Statement shared(impl->db, "SELECT 1 FROM messages AS s JOIN messages AS d "
+                                   "ON d.buffer=? AND d.id=s.id WHERE s.buffer=? "
+                                   "AND s.id<>'' AND s.local_echo=0 AND d.local_echo=0 LIMIT 1");
+        shared.bind(1, newId);
+        shared.bind(2, oldId);
+        overlap = shared.step();
+    }
+    if (!overlap) {
+        if (before(source.newest, destination.oldest) ||
+            sameTime(source.newest, destination.oldest))
+            destination.gaps.push_back({0, source.newest, destination.oldest, false});
+        else if (before(destination.newest, source.oldest) ||
+                 sameTime(destination.newest, source.oldest))
+            destination.gaps.push_back({0, destination.newest, source.oldest, false});
+    }
+    if (destination.oldest.time.empty() || before(source.oldest, destination.oldest)) {
+        destination.oldest = source.oldest;
+        destination.beginning = source.beginning;
+    } else if (destination.oldest == source.oldest) {
+        destination.beginning = destination.beginning || source.beginning;
+    }
+    if (destination.newest.time.empty() || before(destination.newest, source.newest))
+        destination.newest = source.newest;
+    {
+        Statement move(impl->db, "UPDATE history_gaps SET buffer=? WHERE buffer=?");
+        move.bind(1, newId);
+        move.bind(2, oldId);
+        move.step();
+    }
+    destination.gaps.insert(destination.gaps.end(), source.gaps.begin(), source.gaps.end());
+    saveHistoryState(mergedHistory);
+    {
+        Statement remove(impl->db, "DELETE FROM history_state WHERE buffer=?");
+        remove.bind(1, oldId);
+        remove.step();
+    }
+    using Position = std::tuple<int64_t, int64_t, int64_t, int64_t>;
     auto positionFor = [&](const string &buffer, const string &marker) -> std::optional<Position> {
         if (marker.empty())
             return {};
-        Statement row(impl->db, "SELECT sort_time,server_nanoseconds(time),seq FROM messages "
-                                "WHERE buffer=? AND id=?");
+        Statement row(impl->db,
+                      "SELECT sort_time,server_nanoseconds(time),tie_order,seq FROM messages "
+                      "WHERE buffer=? AND id=?");
         row.bind(1, buffer);
         row.bind(2, marker);
         if (row.step())
-            return Position{row.integer(0), row.integer(1), row.integer(2)};
+            return Position{row.integer(0), row.integer(1), row.integer(2), row.integer(3)};
         if (const auto local = localSequence(marker)) {
-            Statement anonymous(impl->db,
-                                "SELECT sort_time,server_nanoseconds(time),seq FROM messages "
-                                "WHERE seq=? AND buffer=? AND id IS NULL");
+            Statement anonymous(
+                impl->db, "SELECT sort_time,server_nanoseconds(time),tie_order,seq FROM messages "
+                          "WHERE seq=? AND buffer=? AND id IS NULL");
             anonymous.bind(1, *local);
             anonymous.bind(2, buffer);
             if (anonymous.step())
-                return Position{anonymous.integer(0), anonymous.integer(1), anonymous.integer(2)};
+                return Position{anonymous.integer(0), anonymous.integer(1), anonymous.integer(2),
+                                anonymous.integer(3)};
         }
         if (const auto timestamp = irc::parseTimestampParts(marker))
             return Position{timestamp->seconds, timestamp->nanoseconds,
+                            std::numeric_limits<int64_t>::max(),
                             std::numeric_limits<int64_t>::max()};
         return {};
     };
@@ -2039,6 +2545,8 @@ void Storage::renameBuffer(const string &oldId, const string &newId) {
             "timestamp=CASE WHEN d.timestamp=0 THEN s.timestamp ELSE d.timestamp END,"
             "sort_time=CASE WHEN d.timestamp=0 AND s.timestamp<>0 THEN s.sort_time ELSE "
             "d.sort_time END,"
+            "tie_order=CASE WHEN d.timestamp=0 AND s.timestamp<>0 THEN s.tie_order ELSE "
+            "d.tie_order END,tie_order_confirmed=MAX(d.tie_order_confirmed,s.tie_order_confirmed),"
             "received_at=MIN(d.received_at,s.received_at),own=MAX(d.own,s.own),pending=MIN(d."
             "pending,s.pending),"
             "deleted=MAX(d.deleted,s.deleted),mention=MAX(d.mention,s.mention),"
@@ -2139,8 +2647,9 @@ void Storage::renameBuffer(const string &oldId, const string &newId) {
         reopen.bind(2, newId);
         reopen.step();
         if (keepClosed) {
-            Statement close(impl->db, "INSERT INTO closed_buffers(id) VALUES(?)");
+            Statement close(impl->db, "INSERT INTO closed_buffers(id,discarded_at) VALUES(?,?)");
             close.bind(1, newId);
+            close.bind(2, std::max(oldDiscarded.value_or(""), newDiscarded.value_or("")));
             close.step();
         }
         Statement active(impl->db, "UPDATE meta SET value=? WHERE key='active_buffer' AND value=?");
@@ -2152,13 +2661,14 @@ void Storage::renameBuffer(const string &oldId, const string &newId) {
     if (const auto position = positionFor(newId, marker)) {
         Statement unread(impl->db,
                          "UPDATE buffers SET unread=(SELECT COUNT(*) FROM messages WHERE buffer=? "
-                         "AND (sort_time,server_nanoseconds(time),seq)>(?,?,?) "
+                         "AND (sort_time,server_nanoseconds(time),tie_order,seq)>(?,?,?,?) "
                          "AND own=0 AND presence=0) WHERE id=?");
         unread.bind(1, newId);
         unread.bind(2, std::get<0>(*position));
         unread.bind(3, std::get<1>(*position));
         unread.bind(4, std::get<2>(*position));
-        unread.bind(5, newId);
+        unread.bind(5, std::get<3>(*position));
+        unread.bind(6, newId);
         unread.step();
     } else {
         Statement unread(impl->db, "UPDATE buffers SET unread=MIN(unread,(SELECT COUNT(*) FROM "
@@ -2178,48 +2688,54 @@ vector<Message> Storage::history(const string &buffer, int limit, const string &
         limit = std::min(limit, impl->maxMessages);
     int64_t beforeTime = std::numeric_limits<int64_t>::max(),
             beforeSequence = std::numeric_limits<int64_t>::max();
+    int64_t beforeOrder = std::numeric_limits<int64_t>::max();
     int64_t beforeNanoseconds = std::numeric_limits<int64_t>::max();
     if (!before.empty()) {
         bool found = false;
         // Opaque stored IDs take precedence even when they look like timestamps/local IDs.
-        Statement cursor(impl->db, "SELECT sort_time,server_nanoseconds(time),seq FROM messages "
-                                   "WHERE buffer=? AND id=?");
+        Statement cursor(impl->db,
+                         "SELECT sort_time,server_nanoseconds(time),tie_order,seq FROM messages "
+                         "WHERE buffer=? AND id=?");
         cursor.bind(1, buffer);
         cursor.bind(2, before);
         if (cursor.step()) {
             beforeTime = cursor.integer(0);
             beforeNanoseconds = cursor.integer(1);
-            beforeSequence = cursor.integer(2);
+            beforeOrder = cursor.integer(2);
+            beforeSequence = cursor.integer(3);
             found = true;
         } else {
             // Raw times retain their stored seconds/sequence boundary, even for legacy
             // rows whose sort_time differs from the timestamp's parsed seconds.
-            Statement rawTime(impl->db,
-                              "SELECT sort_time,server_nanoseconds(time),seq FROM messages "
-                              "WHERE buffer=? AND time=? "
-                              "ORDER BY sort_time,server_nanoseconds(time),seq LIMIT 1");
+            Statement rawTime(
+                impl->db, "SELECT sort_time,server_nanoseconds(time),tie_order,seq FROM messages "
+                          "WHERE buffer=? AND time=? "
+                          "ORDER BY sort_time,server_nanoseconds(time),tie_order,seq LIMIT 1");
             rawTime.bind(1, buffer);
             rawTime.bind(2, before);
             if (rawTime.step()) {
                 beforeTime = rawTime.integer(0);
                 beforeNanoseconds = rawTime.integer(1);
-                beforeSequence = rawTime.integer(2);
+                beforeOrder = rawTime.integer(2);
+                beforeSequence = rawTime.integer(3);
                 found = true;
             }
             // The old local-sequence/raw-time OR selected the earlier matching tuple.
             // Reject noncanonical leading zeroes, which never matched 'local:' || seq.
             if (const auto local = localSequence(before); local && before[6] != '0') {
-                Statement row(impl->db,
-                              "SELECT sort_time,server_nanoseconds(time),seq FROM messages "
-                              "WHERE buffer=? AND seq=?");
+                Statement row(
+                    impl->db,
+                    "SELECT sort_time,server_nanoseconds(time),tie_order,seq FROM messages "
+                    "WHERE buffer=? AND seq=?");
                 row.bind(1, buffer);
                 row.bind(2, *local);
                 if (row.step()) {
                     const auto position =
-                        std::tuple{row.integer(0), row.integer(1), row.integer(2)};
-                    if (!found ||
-                        position < std::tie(beforeTime, beforeNanoseconds, beforeSequence)) {
-                        std::tie(beforeTime, beforeNanoseconds, beforeSequence) = position;
+                        std::tuple{row.integer(0), row.integer(1), row.integer(2), row.integer(3)};
+                    if (!found || position < std::tie(beforeTime, beforeNanoseconds, beforeOrder,
+                                                      beforeSequence)) {
+                        std::tie(beforeTime, beforeNanoseconds, beforeOrder, beforeSequence) =
+                            position;
                         found = true;
                     }
                 }
@@ -2231,30 +2747,36 @@ vector<Message> Storage::history(const string &buffer, int limit, const string &
                 fail("history cursor '" + before + "' was not found in buffer '" + buffer + "'");
             beforeTime = timestamp->seconds;
             beforeNanoseconds = timestamp->nanoseconds;
+            beforeOrder = 0;
             beforeSequence = 0;
         }
     }
     // SQLite cannot seek every component of a row-value bound containing an expression.
     // Each disjoint tuple range contributes at most limit rows to this bounded merge.
-    Statement query(impl->db, "SELECT seq,COALESCE(id,'local:' || "
-                              "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,"
-                              "mention,action,presence,local_echo,activity,activity_target,sort_"
-                              "time FROM messages WHERE seq IN "
-                              "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
-                              "sort_time=?2 AND server_nanoseconds(time)=?3 AND seq<?4 "
-                              "ORDER BY seq DESC LIMIT ?5) UNION ALL "
-                              "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
-                              "sort_time=?2 AND server_nanoseconds(time)<?3 "
-                              "ORDER BY server_nanoseconds(time) DESC,seq DESC LIMIT ?5) UNION ALL "
-                              "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
-                              "sort_time<?2 ORDER BY sort_time DESC,server_nanoseconds(time) DESC,"
-                              "seq DESC LIMIT ?5)) ORDER BY sort_time DESC,"
-                              "server_nanoseconds(time) DESC,seq DESC LIMIT ?5");
+    Statement query(impl->db,
+                    "SELECT seq,COALESCE(id,'local:' || "
+                    "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,"
+                    "mention,action,presence,local_echo,activity,activity_target,sort_time,"
+                    "tie_order FROM messages WHERE seq IN "
+                    "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
+                    "sort_time=?2 AND server_nanoseconds(time)=?3 AND tie_order=?4 "
+                    "AND seq<?5 ORDER BY seq DESC LIMIT ?6) UNION ALL "
+                    "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
+                    "sort_time=?2 AND server_nanoseconds(time)=?3 AND tie_order<?4 "
+                    "ORDER BY tie_order DESC,seq DESC LIMIT ?6) UNION ALL "
+                    "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
+                    "sort_time=?2 AND server_nanoseconds(time)<?3 ORDER BY "
+                    "server_nanoseconds(time) DESC,tie_order DESC,seq DESC LIMIT ?6) UNION ALL "
+                    "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
+                    "sort_time<?2 ORDER BY sort_time DESC,server_nanoseconds(time) DESC,"
+                    "tie_order DESC,seq DESC LIMIT ?6)) ORDER BY sort_time DESC,"
+                    "server_nanoseconds(time) DESC,tie_order DESC,seq DESC LIMIT ?6");
     query.bind(1, buffer);
     query.bind(2, beforeTime);
     query.bind(3, beforeNanoseconds);
-    query.bind(4, beforeSequence);
-    query.bind(5, static_cast<int64_t>(limit));
+    query.bind(4, beforeOrder);
+    query.bind(5, beforeSequence);
+    query.bind(6, static_cast<int64_t>(limit));
     vector<Message> messages;
     while (query.step())
         messages.push_back(storedMessage(impl->db, query));
@@ -2278,16 +2800,24 @@ void Storage::read(const string &buffer, const string &marker) {
 }
 void Storage::clearHistory() {
     Transaction transaction(impl->db);
-    execute(impl->db, "DELETE FROM messages; UPDATE buffers SET unread=0,read_marker='';");
+    execute(impl->db, "DELETE FROM messages; DELETE FROM history_state; DELETE FROM history_gaps;"
+                      "DELETE FROM history_discovery; UPDATE buffers SET unread=0,read_marker='';");
     transaction.commit();
     // Checkpoint deletion without blocking other connections' read transactions.
-    databaseCheck(
-        impl->db,
-        sqlite3_wal_checkpoint_v2(impl->db, nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr),
-        "checkpoint cleared history");
+    if (sqlite3_get_autocommit(impl->db))
+        databaseCheck(impl->db,
+                      sqlite3_wal_checkpoint_v2(impl->db, nullptr, SQLITE_CHECKPOINT_PASSIVE,
+                                                nullptr, nullptr),
+                      "checkpoint cleared history");
 }
 void Storage::clearHistory(const string &buffer) {
     Transaction transaction(impl->db);
+    for (const auto *table : {"history_state", "history_gaps"}) {
+        const string sql = string("DELETE FROM ") + table + " WHERE buffer=?";
+        Statement remove(impl->db, sql.c_str());
+        remove.bind(1, buffer);
+        remove.step();
+    }
     {
         Statement remove(impl->db, "DELETE FROM messages WHERE buffer=?");
         remove.bind(1, buffer);

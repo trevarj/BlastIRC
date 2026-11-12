@@ -133,6 +133,8 @@ struct Message {
     string sourceText, sourceReply;
     int64_t storageSequence = 0;
     int64_t orderingTimestamp = 0;
+    // Durable tie ordering within one server timestamp; never an activity/identity sequence.
+    int64_t historyOrder = -1;
     int64_t timestamp = 0;
     double arrival = 0;
     SendStatus sendStatus = SendStatus::None;
@@ -149,6 +151,24 @@ struct Nick {
 struct ChatActivityKey {
     int64_t timestamp = 0, sequence = 0;
     string time;
+};
+struct HistoryCursor {
+    string id, time;
+    bool operator==(const HistoryCursor &) const = default;
+};
+struct HistoryGap {
+    int64_t id = 0;
+    HistoryCursor older, newer;
+    bool unavailable = false;
+};
+struct HistoryState {
+    HistoryCursor oldest, newest;
+    bool beginning = false;
+    vector<HistoryGap> gaps;
+};
+struct HistoryDiscovery {
+    string watermark, backfillUpper;
+    bool backfillComplete = false;
 };
 enum class HistorySyncState { Idle, Queued, Loading };
 struct Buffer {
@@ -175,6 +195,7 @@ struct Buffer {
     map<string, double> typing;
     int unread = 0;
     HistorySyncState initialHistorySync = HistorySyncState::Idle; // Runtime only.
+    HistoryState historyState;
     bool loading = false, joined = false;
     bool muted = false, archived = false;
 };

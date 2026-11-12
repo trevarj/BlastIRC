@@ -52,10 +52,32 @@ class Application {
         bool preserveRaw = false; // Reply prefixes belong on the wire, never in recovered drafts.
         set<string> written{}; // Completed no-echo writes, distinct from server acknowledgements.
     };
-    struct HistoryGap {
-        string cursor, next, label;
-        size_t received = 0;
-        bool active = false;
+    struct HistoryPage {
+        HistoryRequest request;
+        string buffer, server;
+        uint64_t session = 0;
+        vector<Event> events;
+        size_t bytes = 0;
+        int64_t gapId = 0;
+        unsigned budget = 0, retries = 0;
+        double started = 0;
+        bool seed = false, backfillSeed = false, unsolicited = false;
+    };
+    struct HistoryTarget {
+        string name, time;
+    };
+    struct HistorySession {
+        uint64_t generation = 0;
+        HistoryDiscovery durable;
+        map<string, HistoryTarget> advertised;
+        std::deque<string> visible, background, seeds;
+        std::deque<HistoryPage> retries;
+        string upper, lower, highwater, tieTime, checkpoint;
+        set<string> tieTargets, refused;
+        double nextTarget = 0, nextDiscovery = 0;
+        unsigned width = 6, clean = 0;
+        bool discovering = true, backfill = false, discoveryFailed = false, shortTie = false,
+             terminal = false, seedFailed = false, planned = false, visibleDone = false;
     };
     struct SearchJump {
         string label, searchBuffer, sourceBuffer, server, target, matchedId;
@@ -84,17 +106,20 @@ class Application {
     uint64_t avatarSequence_ = 0;
     map<string, string> caseMapping_, channelTypes_, prefixModes_, channelModes_,
         historyReferences_;
+    set<string> historyClassificationSettled_;
     map<string, std::deque<int64_t>> activity_;
     map<string, vector<Nick>> namesCache_;
     map<string, PresenceGroup> presenceGroups_;
     map<string, Pending> pending_;
     map<string, QueuedSend> queuedSends_;
-    map<string, HistoryGap> gaps_;
     map<string, double> failedLabels_, failedSubmissions_;
     map<string, string> activeHistory_;
     map<string, string> initialHistory_;
-    map<string, vector<string>> historyPriorities_;
-    set<string> promotedHistory_, startedHistory_;
+    map<string, HistoryPage> historyPages_;
+    map<string, HistorySession> historySessions_;
+    bool applyingHistory_ = false;
+    string historyCanonicalId_;
+    bool historyCanonicalExisting_ = false;
     map<string, SearchRequest> searchRequests_;
     std::optional<SearchJump> searchJump_;
     set<string> retiredSearchHistory_;
@@ -161,6 +186,7 @@ class Application {
                 bool confirmed = false);
     bool store(const Buffer &, Message &, bool update = false, const string &completedSend = "",
                bool confirmed = false);
+    void captureHistoryRow(const Buffer &, Message &);
     void repairChatActivity(Buffer &);
     void report(const string &, const string &server = "", const string &origin = "");
     void restoreDraft(Buffer &, const string &, bool distinctSubmission = false);
@@ -180,7 +206,14 @@ class Application {
     vector<string> historyOrder(const string &server) const;
     void scheduleHistory();
     void enqueueHistory(Buffer &, const string &cursor, bool initial);
+    void enqueueHistory(Buffer &, HistoryRequest, int64_t gapId = 0, unsigned budget = 0);
+    void submitHistory(HistoryPage);
+    bool historyEvent(const Event &);
+    bool applyHistoryPage(HistoryPage &, const Event &);
+    void finishHistoryPage(HistoryPage, const Event &, bool applied, bool progressed);
+    void planHistory(const string &, bool seeds = false);
     void cancelHistory(Buffer &);
+    void cancelHistorySession(const string &);
     void trim();
     void clear(Buffer *);
 };

@@ -2749,6 +2749,23 @@ void initialHistoryConsumerCheck() {
     ui.execute("buffer:" + std::string(edgeBuffers[0]));
     frame();
     assert(visible(*header) && !status() && !spinner->spinning());
+    buffer.loading = false;
+    buffer.historyState.gaps = {{915, {}, {cached.id, cached.time}, false}};
+    frame();
+    auto *gapArea =
+        areaWithTooltip(*paneFor(*input), "Request missing messages in this conversation");
+    assert(gapArea && visible(*gapArea));
+    model.actions.clear();
+    click(dispatcher, *gapArea);
+    assert(model.actions.size() == 1 && model.actions.back().type == "history-gap" &&
+           model.actions.back().buffer == buffer.id && model.actions.back().text == "915");
+    model.actions.clear();
+    buffer.historyState.gaps.clear();
+    click(dispatcher, *gapArea); // Dismissed metadata cannot dispatch a retained native action.
+    assert(model.actions.empty());
+    frame();
+    assert(!visible(*gapArea) && buffer.messages.size() == 1 &&
+           buffer.messages.front().id == cached.id);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -2776,7 +2793,7 @@ void statusIdentityCheck() {
     Theme theme;
     theme.update(model);
     PangoRenderer renderer;
-    ModeLine line(model);
+    ModeLine line(model, [](std::string) {});
     line.setSize(1200, 30);
     const auto frame = [&] {
         line.sync(1, SidebarMode::Expanded);
@@ -6818,6 +6835,14 @@ void hiddenUnreadStatusCheck(
     assert(other->color() != normalColor && other->font().weight > normalWeight);
     assert(other->text().find(std::to_string(model.buffers.at(mention).unread)) !=
            std::string_view::npos);
+    click(dispatcher, *other);
+    frame();
+    assert(model.activeBuffer == mention);
+    click(dispatcher, *segment("Local/#same"));
+    frame();
+    assert(model.activeBuffer == normal);
+    ui.execute("buffer:" + std::string(edgeBuffers[0]));
+    frame();
     // No new controls, and stable arrivals retain the native text nodes.
     const auto childCount = line->children().size();
     frame();
@@ -6878,7 +6903,9 @@ void hiddenUnreadStatusCheck(
     assert(fool && fool->text().front() == '@');
     ui.execute("toggle-navigation");
     frame();
-    auto *foolRow = areaWithKey(ui.root(), "buffer:" + fools);
+    sidebar = visibleNode<Sidebar>(ui.root());
+    assert(sidebar);
+    auto *foolRow = areaWithKey(*sidebar, "buffer:" + fools);
     assert(foolRow && visible(*foolRow));
     const auto badge = "@" + std::to_string(model.buffers.at(fools).unread);
     assert(labelWithText(*foolRow, badge));
@@ -6899,6 +6926,68 @@ void hiddenUnreadStatusCheck(
     for (const auto &child : line->children())
         if (visible(*child))
             assert(child->x() >= 0 && child->x() + child->width() <= line->width() + .5f);
+    width = 2000;
+    model.status.clear();
+    for (auto &[id, buffer] : model.buffers)
+        buffer.unread = 0;
+    model.buffers.at(mention).unread = 1;
+    frame();
+    auto *retained = areaWithKey(*line, "buffer:" + mention);
+    assert(retained && visible(*retained));
+    const auto retainedPoint = pointerPoint(*retained);
+    model.buffers.at(mention).unread = 0;
+    model.buffers.at(normal).unread = 1;
+    frame();
+    assert(areaWithKey(*line, "buffer:" + normal) == retained);
+    click(dispatcher, *retained);
+    frame();
+    assert(model.activeBuffer == normal);
+    ui.execute("buffer:" + mention);
+    frame();
+    dispatcher.setFocus(retained);
+    nativeKey(ui, dispatcher, XKB_KEY_Return);
+    frame();
+    assert(model.activeBuffer == normal);
+    ui.execute("buffer:" + mention);
+    frame();
+    dispatcher.setFocus(retained);
+    nativeKey(ui, dispatcher, XKB_KEY_space);
+    frame();
+    assert(model.activeBuffer == normal);
+    const auto clickPoint = [&](const std::array<float, 2> &point) {
+        dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 1001, 10010, false);
+        dispatcher.pointerButton(point[0], point[1], BTN_LEFT, false, 1002, 10020, false);
+        frame();
+    };
+    ui.execute("buffer:" + mention);
+    ui.execute("toggle-navigation");
+    frame();
+    assert(!visible(*retained));
+    clickPoint(retainedPoint);
+    assert(model.activeBuffer == mention);
+    ui.execute("toggle-navigation");
+    ui.execute("toggle-navigation");
+    frame();
+    assert(visible(*retained));
+    model.buffers.at(mention).unread = 1;
+    frame();
+    auto *overflow = areaWithKey(*line, "buffer:" + normal);
+    assert(overflow && visible(*overflow));
+    const auto overflowPoint = pointerPoint(*overflow);
+    ui.execute("buffer:" + std::string(edgeBuffers[0]));
+    width = 80;
+    frame();
+    assert(!visible(*overflow));
+    clickPoint(overflowPoint);
+    assert(model.activeBuffer == edgeBuffers[0]);
+    width = 2000;
+    frame();
+    model.buffers.at(normal).unread = 0;
+    model.buffers.at(mention).unread = 0;
+    frame();
+    assert(!visible(*retained) && !visible(*overflow));
+    clickPoint(retainedPoint);
+    assert(model.activeBuffer == edgeBuffers[0]);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }

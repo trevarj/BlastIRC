@@ -1557,9 +1557,9 @@ struct Dialogs::Impl {
         updateSpellingStatus();
         toggle(*spelling, "Predict words", model.settings.wordPrediction,
                [this](bool value) { model.settings.wordPrediction = value; });
-        label(*spelling, "Predicts words using an American English dictionary and recent words "
-                         "you sent in the current chat. Local only; no text is sent over the "
-                         "network for prediction.");
+        label(*spelling, "Predicts words using English word frequencies and the context of recent "
+                         "messages you sent in the current chat. Local only; no text is sent over "
+                         "the network for prediction.");
         auto *cursor = section("appearance.cursor", "Cursor");
         static constexpr const char *shapeIds[] = {"line", "box", "underline"};
         static constexpr const char *shapeNames[] = {"Line", "Solid box", "Underline"};

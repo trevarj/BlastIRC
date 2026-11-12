@@ -1552,7 +1552,7 @@ void checkComposerWordPrediction(Renderer &renderer) {
     assert(model.actions.size() == 1 && model.actions.back().type == "send" &&
            model.actions.back().text == "accommodatio" && input->value().empty());
 
-    // Sending through the actual editor teaches only this conversation, ahead of dictionary.
+    // Only the reducer's retained own message teaches this conversation, not shell history.
     input->setValue("quar");
     frame();
     assert(!ghost("tzite"));
@@ -1561,6 +1561,14 @@ void checkComposerWordPrediction(Renderer &renderer) {
     model.actions.clear();
     assert(editors.execute("send", pane));
     assert(model.actions.size() == 1 && model.actions.back().text == "quartzite");
+    input->setValue("quar");
+    frame();
+    assert(!ghost("tzite"));
+    Message sent;
+    sent.own = true;
+    sent.text = model.actions.back().text;
+    buffer.messages.push_back(sent);
+    ++buffer.messagesRevision;
     input->setValue("quar");
     await([&] { return ghost("tzite"); });
     assert(editors.execute("complete", pane) && input->value() == "quartzite");
@@ -1573,7 +1581,7 @@ void checkComposerWordPrediction(Renderer &renderer) {
     dispatcher.setFocus(input->inputArea());
     input->setValue("Quar");
     frame();
-    assert(!ghost("tzite")); // Own history requires the exact case-sensitive prefix.
+    assert(ghost("tzite")); // Prediction preserves the typed prefix's capitalization.
 
     // Command arguments are not ordinary sent history and must never teach secrets.
     input->setValue("/quote PASS Secretquartzword");
@@ -1599,7 +1607,7 @@ void checkComposerWordPrediction(Renderer &renderer) {
            g_utf8_validate(input->value().data(), input->value().size(), nullptr));
     input->setValue("éc");
     frame();
-    assert(!ghost("lairunique"));
+    assert(ghost("lairunique"));
     input->setValue("Éc");
     await([&] { return ghost("lairunique"); });
     buffer.messages.back().own = false;
@@ -1735,6 +1743,113 @@ void checkComposerWordPrediction(Renderer &renderer) {
     assert(editors.execute("complete", pane));
     assert(editors.execute("complete", pane));
     assert(input->value() == "quartzNick: ");
+
+    // The same prefix follows this chat's sent context, not alphabetical order.
+    buffer.nicks.clear();
+    buffer.messages.clear();
+    for (int repeat = 0; repeat < 4; ++repeat) {
+        for (const auto *body : {"can you review", "please do remember"}) {
+            Message message;
+            message.own = true;
+            message.nick = "Writer[";
+            message.text = body;
+            buffer.messages.push_back(message);
+        }
+    }
+    ++buffer.messagesRevision;
+    input->setValue("can you re");
+    await([&] { return ghost("view"); });
+    input->setValue("please do re");
+    await([&] { return ghost("member"); });
+    input->setValue("\x02"
+                    "can you\x02"
+                    " re");
+    await([&] { return ghost("view"); });
+    assert(editors.execute("complete", pane) &&
+           input->displayProjection()->text == "can you review");
+    assert(editors.execute("undo", pane));
+    assert(input->displayProjection()->text == "can you re");
+    await([&] { return ghost("view"); });
+    caret(2, 2);
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    caret(input->value().size(), input->value().size());
+    await([&] { return ghost("view"); });
+
+    // Source revisions and concealment invalidate a ghost without draft/caret edits.
+    for (auto &message : buffer.messages)
+        if (message.text == "can you review")
+            message.text = "can you recontextuniqueword";
+    ++buffer.messagesRevision;
+    frame();
+    assert(ghost("contextuniqueword"));
+    input->setValue("can you recontextunique");
+    frame();
+    assert(ghost("word"));
+    model.settings.fools.insert("writer{");
+    model.settings.foolDisplay = FoolDisplay::Hidden;
+    model.networks["test"].caseMapping = "rfc1459";
+    frame();
+    assert(!ghost("word"));
+    model.networks["test"].caseMapping = "ascii";
+    frame();
+    assert(ghost("word"));
+    model.settings.fools.clear();
+    for (auto &message : buffer.messages)
+        message.deleted = true;
+    ++buffer.messagesRevision;
+    frame();
+    assert(!ghost("word"));
+    for (auto &message : buffer.messages) {
+        message.deleted = false;
+        message.presence = true;
+    }
+    ++buffer.messagesRevision;
+    frame();
+    assert(!ghost("word"));
+    for (auto &message : buffer.messages) {
+        message.presence = false;
+        message.text = "/quote PASS can you Secretquartzword";
+    }
+    ++buffer.messagesRevision;
+    input->setValue("can you Secretquartz");
+    frame();
+    assert(!ghost("word"));
+
+    // At most 32 entries are examined, and a byte-boundary fragment cannot teach.
+    buffer.messages.clear();
+    Message bounded;
+    bounded.own = true;
+    bounded.text = "oldboundeduniqueword";
+    buffer.messages.push_back(bounded);
+    for (int entry = 0; entry < 32; ++entry) {
+        bounded.own = false;
+        bounded.text = "foreign";
+        buffer.messages.push_back(bounded);
+    }
+    ++buffer.messagesRevision;
+    input->setValue("oldboundedunique");
+    frame();
+    assert(!ghost("word"));
+    bounded.own = true;
+    bounded.text = std::string(500, ' ') + "fragmentuniqueword";
+    buffer.messages.push_back(bounded);
+    ++buffer.messagesRevision;
+    input->setValue("fragmentun");
+    frame();
+    assert(!ghost("iq"));
+
+    // Remap recovery may enter shell history, but unsent drafts never train prediction.
+    otherInput->setValue("Recovereduniqueword");
+    input->setValue("preserved draft");
+    frame();
+    buffer.draft = "preserved draft\nRecovereduniqueword";
+    otherPane.buffer = buffer.id;
+    editors.remapBuffer(other.id, buffer.id, pane.id);
+    frame();
+    input->setValue("Recoveredunique");
+    frame();
+    assert(!ghost("word"));
     editors.setOverlayHost(nullptr);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);

@@ -7517,6 +7517,7 @@ void retainedMentionFooter(TranscriptTestRenderer &renderer) {
     pane.following = false;
     view.sync();
     view.arrange(renderer, {17, 23, 900, 10000});
+    view.arrange(renderer, {17, 23, 900, scroll->height() + scroll->maxScrollOffset() + 1.f});
     assert(scroll->maxScrollOffset() == 0 && !follow->visible());
     buffer.messages.clear();
     ++buffer.messagesRevision;

@@ -16,18 +16,58 @@
           hash = "sha256-BlyXJtAI7WqXCTT3ylww8zoG0hBxaojJnQDvdQOXJPE=";
         };
       });
-      completionWordlist = (pkgs.scowl.override { singleWordlist = "en-us 60"; }).overrideAttrs (old: {
-        # The single-wordlist install phase omits the upstream postInstall hook.
-        installPhase = old.installPhase + "\nrunHook postInstall\n";
-        postInstall = (old.postInstall or "") + ''
-          ${pkgs.glibc.bin}/bin/iconv -f ISO-8859-1 -t UTF-8 \
-            "$out/share/dict/words.txt" -o "$out/share/dict/words.utf8.txt"
-          mv "$out/share/dict/words.utf8.txt" "$out/share/dict/words.txt"
-          install -Dm644 "$src/scowl/Copyright" "$out/share/licenses/scowl/Copyright"
-          printf '%s\n' 'SCOWL 2020.12.07, en-us size 60; wordlist converted from ISO-8859-1 to UTF-8 by BlastIRC.' \
-            > "$out/share/licenses/scowl/NOTICE"
-        '';
-      });
+      wordfreqSource = pkgs.python3Packages.wordfreq.src;
+      wordfreqDataLicense = pkgs.fetchurl {
+        url = "https://creativecommons.org/licenses/by-sa/4.0/legalcode.txt";
+        hash = "sha256-KKlSnH0LtNxR9L9cEWo9Fu8kegUvdZFGZ2jd9WP9HPU=";
+      };
+      completionWordlist =
+        pkgs.runCommand "blastirc-wordfreq-en-small"
+          {
+            nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.msgpack ])) ];
+            meta.license = pkgs.lib.licenses.cc-by-sa-40;
+          }
+          ''
+            mkdir -p "$out/share/dict" "$out/share/licenses/wordfreq"
+            python - "${wordfreqSource}/wordfreq/data/small_en.msgpack.gz" \
+              "$out/share/dict/wordfreq-en-small.tsv" <<'PY'
+            import gzip
+            import sys
+            import msgpack
+
+            with gzip.open(sys.argv[1], "rb") as source:
+                data = msgpack.load(source, raw=False)
+            if not isinstance(data, list) or not data or data[0] != {"format": "cB", "version": 1}:
+                raise ValueError("Unexpected wordfreq cBpack header")
+            with open(sys.argv[2], "w", encoding="utf-8", newline="\n") as output:
+                for frequency_bin, words in enumerate(data[1:]):
+                    if not isinstance(words, list):
+                        raise ValueError("Unexpected wordfreq frequency bucket")
+                    for word in words:
+                        if not isinstance(word, str) or not word or any(c in word for c in "\t\r\n\0"):
+                            raise ValueError("Word cannot be represented in frequency TSV")
+                        output.write(f"{word}\t{frequency_bin}\n")
+            PY
+            install -m644 "${wordfreqSource}/NOTICE.md" "$out/share/licenses/wordfreq/NOTICE.md"
+            install -m644 "${wordfreqSource}/LICENSE.txt" "$out/share/licenses/wordfreq/LICENSE.txt"
+            install -m644 "${wordfreqDataLicense}" "$out/share/licenses/wordfreq/CC-BY-SA-4.0.txt"
+            cat > "$out/share/licenses/wordfreq/BLASTIRC-CONVERSION.txt" <<'NOTICE'
+            BlastIRC English small frequency prior
+            Source: wordfreq 3.2.0 by Robyn Speer, copyright 2022 Robyn Speer.
+            https://github.com/rspeer/wordfreq/tree/912caf64b657478d1dff1138efdc078947d54bb1
+            Data attribution includes Marc Brysbaert et al., creators of the freely
+            available SUBTLEX lists; see the complete upstream NOTICE.md for all sources.
+            Conversion by BlastIRC: gzip-decompress wordfreq/data/small_en.msgpack.gz,
+            decode MessagePack, validate the cBpack format=cB/version=1 header, and
+            emit every token in original bucket/token order as UTF-8 token TAB bin LF.
+            Bin is the zero-based bucket index after the header; probability is
+            10^(-bin/100). No tokens are filtered or normalized during conversion.
+            The converted dataset, including any adaptation, is licensed CC BY-SA 4.0:
+            https://creativecommons.org/licenses/by-sa/4.0/
+            See CC-BY-SA-4.0.txt. The upstream LICENSE.txt applies to upstream code only.
+            BlastIRC application code remains MIT; the data is a separate aggregate.
+            NOTICE
+          '';
       dependencies =
         (with pkgs; [
           sdl3
@@ -68,7 +108,10 @@
       packages.${system}.default = pkgs.stdenv.mkDerivation {
         pname = "blastirc";
         version = "0.1.0";
-        meta.license = pkgs.lib.licenses.mit;
+        meta.license = with pkgs.lib.licenses; [
+          mit
+          cc-by-sa-40
+        ];
         src = pkgs.lib.cleanSourceWith {
           src = self;
           filter =
@@ -105,7 +148,7 @@
           "-Dfont_dir=${pkgs.nerd-fonts.jetbrains-mono}/share/fonts"
           "-Demoji_dir=${pkgs.noto-fonts-color-emoji}/share/fonts"
           "-Ddictionary_dir=${pkgs.hunspellDicts.en_US}/share/hunspell"
-          "-Dwordlist_file=${completionWordlist}/share/dict/words.txt"
+          "-Dwordlist_file=${completionWordlist}/share/dict/wordfreq-en-small.tsv"
         ];
         doCheck = true;
         preCheck = ''
@@ -127,10 +170,8 @@
         postInstall = ''
           install -Dm644 ${pkgs.hunspellDicts.en_US}/share/doc/hunspell-dict-en-us-wordlist.txt \
             $out/share/licenses/blastirc/hunspell-en_US-README.txt
-          install -Dm644 ${completionWordlist}/share/licenses/scowl/Copyright \
-            $out/share/licenses/blastirc/scowl-Copyright
-          install -Dm644 ${completionWordlist}/share/licenses/scowl/NOTICE \
-            $out/share/licenses/blastirc/scowl-NOTICE
+          mkdir -p "$out/share/licenses/blastirc"
+          cp -r ${completionWordlist}/share/licenses/wordfreq "$out/share/licenses/blastirc/wordfreq"
         '';
         postFixup = ''
           wrapProgram $out/bin/blastirc \
@@ -182,7 +223,7 @@
           BLASTIRC_FONT_DIR = "${pkgs.nerd-fonts.jetbrains-mono}/share/fonts";
           BLASTIRC_EMOJI_DIR = "${pkgs.noto-fonts-color-emoji}/share/fonts";
           BLASTIRC_SPELL_DICT_DIR = "${pkgs.hunspellDicts.en_US}/share/hunspell";
-          BLASTIRC_WORDLIST_FILE = "${completionWordlist}/share/dict/words.txt";
+          BLASTIRC_WORDLIST_FILE = "${completionWordlist}/share/dict/wordfreq-en-small.tsv";
           BLASTIRC_PORTAL = "${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal";
           BLASTIRC_PORTAL_BACKEND = "${pkgs.xdg-desktop-portal-gtk}/libexec/xdg-desktop-portal-gtk";
           BLASTIRC_PORTAL_BACKEND_DIR = "${pkgs.xdg-desktop-portal-gtk}/share/xdg-desktop-portal/portals";

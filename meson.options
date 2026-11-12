@@ -2,4 +2,4 @@ option('tests', type: 'boolean', value: true, description: 'Build core regressio
 option('font_dir', type: 'string', value: '', description: 'Additional bundled Fontconfig directory')
 option('emoji_dir', type: 'string', value: '', description: 'Additional color emoji font directory')
 option('dictionary_dir', type: 'string', value: '', description: 'Directory containing Hunspell dictionaries')
-option('wordlist_file', type: 'string', value: '', description: 'UTF-8 word-per-line dictionary for local prefix completion')
+option('wordlist_file', type: 'string', value: '', description: 'UTF-8 word TAB frequency-bin TSV for local word prediction (probability 10^(-bin/100))')

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -11,8 +12,8 @@ class WordCompletion {
     explicit WordCompletion(std::string path = {});
     ~WordCompletion();
     bool ready() const;
-    // Full, strictly longer match; the immutable view lives until this object is destroyed.
-    std::string_view complete(std::string_view prefix) const;
+    void setHistory(std::span<const std::string> newestFirst);
+    std::string complete(std::string_view before, std::string_view prefix);
 
   private:
     struct State;

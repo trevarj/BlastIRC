@@ -321,7 +321,10 @@ struct EditorStore::Impl {
         bool predictionCompeting = false;
         size_t predictionMessages = 0;
         std::uint64_t predictionMessagesRevision = 0;
-        std::string predictionBuffer;
+        std::string predictionBuffer, predictionServer, predictionTarget, predictionMapping,
+            predictionOwn;
+        std::vector<std::string> predictionHistory;
+        size_t completionCaret = 0, completionAnchor = 0;
         std::set<std::string> predictionFools;
         FoolDisplay predictionFoolDisplay = FoolDisplay::Shown;
         void updatePrediction();
@@ -2376,13 +2379,62 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
         context == owner.model.buffers.end()
             ? FoolDisplay::Shown
             : effectiveFoolDisplay(owner.model.settings, buffer, context->second.target);
+    const std::string_view server =
+        context == owner.model.buffers.end() ? std::string_view{} : context->second.server;
+    const std::string_view target =
+        context == owner.model.buffers.end() ? std::string_view{} : context->second.target;
+    const std::string_view mapping = network == owner.model.networks.end()
+                                         ? std::string_view{"rfc1459"}
+                                         : network->second.caseMapping;
+    const std::string_view own =
+        network == owner.model.networks.end() ? std::string_view{} : network->second.nick;
+    const bool sourceChanged =
+        predictionBuffer != buffer || predictionMessages != messages ||
+        predictionMessagesRevision != messagesRevision || predictionServer != server ||
+        predictionTarget != target || predictionMapping != mapping || predictionOwn != own ||
+        predictionFools != owner.model.settings.fools || predictionFoolDisplay != foolDisplay;
+    if (predict && (sourceChanged || !predictionEnabled)) {
+        predictionHistory.clear();
+        const bool concealFools =
+            foolDisplay != FoolDisplay::Shown && foolDisplay != FoolDisplay::Dimmed;
+        if (context != owner.model.buffers.end()) {
+            size_t remaining = 32;
+            for (auto entry = context->second.messages.rbegin();
+                 entry != context->second.messages.rend() && remaining; ++entry, --remaining) {
+                if (!entry->own || entry->deleted || entry->presence ||
+                    (concealFools && isFool(owner.model, server, entry->nick)))
+                    continue;
+                const std::string_view raw = entry->text;
+                auto end = std::min<size_t>(raw.size(), 512);
+                while (end && end < raw.size() &&
+                       (static_cast<unsigned char>(raw[end]) & 0xc0) == 0x80)
+                    --end;
+                auto plain = parseIrcFormatting(raw.substr(0, end), projectionForeground,
+                                                projectionBackground)
+                                 .text;
+                if (end < raw.size()) {
+                    while (!plain.empty()) {
+                        const auto previous = ui_logic::previous(plain, plain.size());
+                        if (g_unichar_isspace(g_utf8_get_char(plain.data() + previous)))
+                            break;
+                        plain.resize(previous);
+                    }
+                }
+                const auto first = plain.find_first_not_of(" \t\r\n");
+                if (first == plain.npos ||
+                    (plain[first] == '/' &&
+                     !std::string_view(plain).substr(first).starts_with("//")))
+                    continue;
+                predictionHistory.push_back(std::move(plain));
+            }
+        }
+    }
     const bool competing = predict && eligible && hasLiteralCandidate(predictionQuery);
     if (!force && emojiRevision == revision && emojiWasEligible == eligible &&
-        completionKind == kind && completionChannelTypes == channelTypes &&
-        predictionEnabled == predict && predictionReady == ready && predictionBuffer == buffer &&
-        predictionMessages == messages && predictionMessagesRevision == messagesRevision &&
-        predictionFools == owner.model.settings.fools && predictionFoolDisplay == foolDisplay &&
-        predictionCompeting == competing) {
+        completionCaret == input->cursorPosition() &&
+        completionAnchor == input->selectionAnchor() && completionKind == kind &&
+        completionChannelTypes == channelTypes && predictionEnabled == predict &&
+        predictionReady == ready && !sourceChanged && predictionCompeting == competing) {
         if (eligible)
             placeCompletion();
         return;
@@ -2395,6 +2447,12 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
     if (predictionFools != owner.model.settings.fools)
         predictionFools = owner.model.settings.fools;
     predictionFoolDisplay = foolDisplay;
+    predictionServer = server;
+    predictionTarget = target;
+    predictionMapping = mapping;
+    predictionOwn = own;
+    completionCaret = input->cursorPosition();
+    completionAnchor = input->selectionAnchor();
     completionKind = kind;
     completionChannelTypes = channelTypes;
     emojiRevision = revision;
@@ -2535,60 +2593,10 @@ void EditorStore::Impl::Composer::updatePrediction() {
     predictionCompeting = hasLiteralCandidate(prefix);
     if (predictionCompeting)
         return;
-    const auto findWord = [&](std::string_view raw) -> std::string {
-        auto end = std::min<size_t>(raw.size(), 512);
-        while (end && end < raw.size() && (static_cast<unsigned char>(raw[end]) & 0xc0) == 0x80)
-            --end;
-        const auto plain =
-            parseIrcFormatting(raw.substr(0, end), projectionForeground, projectionBackground).text;
-        for (size_t begin = 0; begin < plain.size();) {
-            const auto character = g_utf8_get_char(plain.data() + begin);
-            if (!g_unichar_isalpha(character)) {
-                begin = static_cast<size_t>(g_utf8_next_char(plain.data() + begin) - plain.data());
-                continue;
-            }
-            size_t finish = begin;
-            while (finish < plain.size()) {
-                const auto current = g_utf8_get_char(plain.data() + finish);
-                if (!g_unichar_isalpha(current) && !g_unichar_ismark(current))
-                    break;
-                finish =
-                    static_cast<size_t>(g_utf8_next_char(plain.data() + finish) - plain.data());
-            }
-            const auto word = std::string_view(plain).substr(begin, finish - begin);
-            if (!(end < raw.size() && finish == plain.size()) && word.size() <= 128 &&
-                word.size() > prefix.size() && word.starts_with(prefix))
-                return std::string(word);
-            begin = finish;
-        }
-        return {};
-    };
-    const auto &history = owner.draft(buffer).history;
-    size_t remaining = 32;
-    const bool concealFools =
-        predictionFoolDisplay != FoolDisplay::Shown && predictionFoolDisplay != FoolDisplay::Dimmed;
-    const auto network = owner.model.networks.find(context.server);
-    const bool concealHistory = concealFools && network != owner.model.networks.end() &&
-                                isFool(owner.model, context.server, network->second.nick);
-    for (auto entry = history.rbegin(); !concealHistory && entry != history.rend() && remaining;
-         ++entry, --remaining) {
-        if (!entry->starts_with('/') || entry->starts_with("//"))
-            predictedWord = findWord(*entry);
-        if (!predictedWord.empty())
-            break;
+    if (owner.words) {
+        owner.words->setHistory(predictionHistory);
+        predictedWord = owner.words->complete(std::string_view(text).substr(0, start), prefix);
     }
-    if (predictedWord.empty()) {
-        for (auto entry = context.messages.rbegin(); entry != context.messages.rend() && remaining;
-             ++entry, --remaining) {
-            if (entry->own && !entry->deleted && !entry->presence &&
-                (!concealFools || !isFool(owner.model, context.server, entry->nick)))
-                predictedWord = findWord(entry->text);
-            if (!predictedWord.empty())
-                break;
-        }
-    }
-    if (predictedWord.empty() && owner.words && owner.words->ready())
-        predictedWord = owner.words->complete(prefix);
     if (predictedWord.empty())
         return;
     predictionPrefix = prefix;

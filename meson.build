@@ -98,13 +98,13 @@ spell_dep = declare_dependency(
 )
 word_completion_lib = static_library('blastirc-word-completion', 'src/word_completion.cpp',
   include_directories: src_inc,
-  dependencies: threads_dep,
+  dependencies: [threads_dep, gio_dep],
   cpp_args: app_cpp_args,
 )
 word_completion_dep = declare_dependency(
   link_with: word_completion_lib,
   include_directories: src_inc,
-  dependencies: threads_dep,
+  dependencies: [threads_dep, gio_dep],
 )
 
 executable('blastirc',

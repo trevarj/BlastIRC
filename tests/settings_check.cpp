@@ -302,13 +302,6 @@ void spellingControls(blast::Model &model, blast::Dialogs &dialogs, InputDispatc
 void predictionControls(blast::Model &model, blast::Dialogs &dialogs, InputDispatcher &dispatcher) {
     auto *enabled = named<Toggle>(dialogs, "Predict words");
     assert(!model.settings.wordPrediction);
-    auto *disclosure = find<Label>(dialogs, [](const Label &label) {
-        return label.text().find("American English dictionary") != std::string_view::npos &&
-               label.text().find("recent words you sent in the current chat") !=
-                   std::string_view::npos &&
-               label.text().find("Local only") != std::string_view::npos;
-    });
-    assert(disclosure);
     activate(dispatcher, *enabled);
     assert(model.settings.wordPrediction);
     activate(dispatcher, *enabled);

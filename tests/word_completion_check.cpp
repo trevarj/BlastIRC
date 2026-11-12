@@ -85,6 +85,8 @@ int main() {
     completion.setHistory(contexts);
     assert(completion.complete("can you ", "re") == "review");
     assert(completion.complete("please do ", "re") == "remember");
+    assert(completion.complete("can you ", "r") == "review");
+    assert(completion.complete("please do ", "r") == "remember");
     assert(completion.complete("can you ", "re") == "review"); // Same prefix, changed context.
     completion.setHistory(contexts);
     assert(completion.complete("can you ", "re") == "review");
@@ -115,6 +117,7 @@ int main() {
     assert(local.complete("can you ", "re") == "review");
     assert(local.complete("please do ", "re") == "remember");
     assert(local.complete("", "re").empty());
+    assert(local.complete("", "r").empty()); // One letter still needs a confident winner.
     local.setHistory(std::vector<std::string>{"review review review", "remember"});
     assert(local.complete("", "re") == "review");
     std::vector<std::string> recency(32, "remember");

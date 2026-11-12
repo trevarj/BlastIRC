@@ -2574,7 +2574,7 @@ void EditorStore::Impl::Composer::updatePrediction() {
         start = previous;
     }
     const auto prefix = std::string_view(text).substr(start);
-    if (letters < 2 || prefix.size() > 128)
+    if (!letters || prefix.size() > 128)
         return;
     if (start) {
         const auto previous = g_utf8_get_char(text.data() + ui_logic::previous(text, start));

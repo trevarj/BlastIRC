@@ -1605,9 +1605,9 @@ void checkComposerWordPrediction(Renderer &renderer) {
     await([&] { return ghost("lairunique"); });
     assert(editors.execute("complete", pane) && input->value() == own.text &&
            g_utf8_validate(input->value().data(), input->value().size(), nullptr));
-    input->setValue("éc");
+    input->setValue("é");
     frame();
-    assert(ghost("lairunique"));
+    assert(ghost("clairunique"));
     input->setValue("Éc");
     await([&] { return ghost("lairunique"); });
     buffer.messages.back().own = false;
@@ -1757,10 +1757,24 @@ void checkComposerWordPrediction(Renderer &renderer) {
         }
     }
     ++buffer.messagesRevision;
-    input->setValue("can you re");
-    await([&] { return ghost("view"); });
-    input->setValue("please do re");
-    await([&] { return ghost("member"); });
+    input->setValue("can you r");
+    await([&] { return ghost("eview"); });
+    const auto firstLetter = input->editingState().current;
+    const auto firstLetterUndo = input->editingState().history->undo;
+    assert(editors.execute("complete", pane));
+    assert(input->value() == "can you review" && buffer.draft == input->value() &&
+           input->editingState().history->undo.size() == firstLetterUndo.size() + 1 &&
+           input->editingState().history->undo.back() == firstLetter);
+    assert(editors.execute("undo", pane));
+    assert(input->editingState().current == firstLetter &&
+           input->editingState().history->undo == firstLetterUndo);
+    await([&] { return ghost("eview"); });
+    buffer.nicks.push_back({.name = "reviewNick", .account = {}, .prefix = {}});
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    buffer.nicks.clear();
+    input->setValue("please do r");
+    await([&] { return ghost("emember"); });
     input->setValue("\x02"
                     "can you\x02"
                     " re");

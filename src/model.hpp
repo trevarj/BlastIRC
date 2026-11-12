@@ -90,6 +90,7 @@ struct Settings {
     string themeSource = "auto", pitchVariation = "natural";
     bool spellcheck = true;
     string spellcheckLanguage = "auto";
+    bool wordPrediction = false;
     string cursorShape = "line", cursorEffect = "off";
     float cursorTrailDurationMs = 120.f, cursorTrailStrength = .20f;
     SidebarMode peopleMode = SidebarMode::Hidden;

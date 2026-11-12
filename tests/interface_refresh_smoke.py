@@ -2508,7 +2508,14 @@ def run_typing_bubble(ctx):
                 phases.append(label)
 
             def footer_words(label):
-                return _policy_words(ctx, 'typing-bubble-' + style + '-' + label, footer)
+                words = upload.visible_words(
+                    ctx['window'], Path(ctx['destination']),
+                    label='typing-bubble-' + style + '-' + label,
+                    region=footer, min_confidence=0)
+                return [(row['text'], (int(row['left']), int(row['top']),
+                                       int(row['left']) + int(row['width']),
+                                       int(row['top']) + int(row['height'])))
+                        for row in words]
 
             typing(1)
             single = gui.SESSION.until('one real typing identity in native tray', lambda:
@@ -2568,7 +2575,9 @@ def run_typing_bubble(ctx):
                 return words if {'typing', 'now', *(nick.casefold() for nick in names)} <= found.keys() else None
 
             def closed(label):
-                return not any(text.casefold() == 'typing' for text, _ in popup_words(label))
+                typing(4)
+                return not {'typing', 'now'} <= {
+                    text.casefold() for text, _ in popup_words(label)}
 
             gui.click(w, (overflow[0] + overflow[2]) / 2,
                       (overflow[1] + overflow[3]) / 2)
@@ -4157,7 +4166,7 @@ def run_spelling(ctx):
     # Category navigation owns focus; nine theme/typography controls precede these.
     gui.framed_keys(w, *(['Tab'] * 10))
     saved_unavailable = tomllib.loads(preferences.read_text())
-    assert saved_unavailable['composer'] == {'spellcheck': True, 'spellcheck_language': 'zz_ZZ'}
+    assert saved_unavailable['composer'] == {'spellcheck': True, 'spellcheck_language': 'zz_ZZ', 'word_prediction': False}
     dialog = tuple(float(value) for value in saved_unavailable['workspace']['native_dialog_rect'].split())
     status_words = []
     status_raster = {}
@@ -4238,7 +4247,7 @@ def run_spelling(ctx):
                       lambda: unavailable_status(require_error=False))
     gui.framed_keys(w, *(['shift+Tab'] * 10))
     saved = gui.save_settings_footer(w, saved_path=preferences)
-    assert saved['composer'] == {'spellcheck': True, 'spellcheck_language': 'en_US'}, saved['composer']
+    assert saved['composer'] == {'spellcheck': True, 'spellcheck_language': 'en_US', 'word_prediction': False}, saved['composer']
     gui.close_settings_navigation(w)
     upload.focus_composer(w)
     gui._composer_native(w, '', 0, 0)

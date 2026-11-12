@@ -5,6 +5,7 @@
 #include "../render/graphics.hpp"
 #include "../spellcheck.hpp"
 #include "../theme/theme.hpp"
+#include "../word_completion.hpp"
 #include "command_completion.hpp"
 #include "emoji.hpp"
 #include "irc_format.hpp"
@@ -28,6 +29,7 @@
 #include <optional>
 #include <render/scene/input_area.h>
 #include <render/scene/input_dispatcher.h>
+#include <set>
 #include <ui/controls/button.h>
 #include <ui/controls/flex.h>
 #include <ui/controls/input.h>
@@ -313,6 +315,18 @@ struct EditorStore::Impl {
         std::vector<std::string> completionCandidates;
         std::string completionKind, completionChannelTypes;
         std::string compositionChord;
+        std::string predictedWord, predictionPrefix, predictionQuery;
+        size_t predictionCaret = 0;
+        bool predictionEnabled = false, predictionReady = false;
+        bool predictionCompeting = false;
+        size_t predictionMessages = 0;
+        std::uint64_t predictionMessagesRevision = 0;
+        std::string predictionBuffer;
+        std::set<std::string> predictionFools;
+        FoolDisplay predictionFoolDisplay = FoolDisplay::Shown;
+        void updatePrediction();
+        bool hasLiteralCandidate(std::string_view) const;
+        bool acceptPrediction();
         std::uint64_t compositionChordRevision = 0;
         std::vector<Button *> buttons;
         std::vector<std::pair<Button *, LucideIcon *>> icons;
@@ -341,6 +355,20 @@ struct EditorStore::Impl {
         std::uint64_t spellTicket = 0;
         bool spellNeedsCheck = false;
         std::chrono::steady_clock::time_point spellDue;
+        struct SpellingCycle {
+            std::string buffer, language, raw;
+            std::weak_ptr<int> identity;
+            std::uint64_t revision = 0, ticket = 0;
+            size_t caret = 0, presses = 0, index = 0;
+            SpellRange range{};
+            std::vector<std::string> suggestions{};
+        };
+        std::optional<SpellingCycle> spellingCycle;
+        bool cyclingSpelling = false;
+        bool spellingCycleValid() const;
+        std::optional<SpellRange> rawSpellingRange(SpellRange) const;
+        void cycleSpelling();
+        void applySpellingCycle();
         void updateSpelling();
         void excludeSpelling();
         bool updateNickDecoration();
@@ -393,6 +421,7 @@ struct EditorStore::Impl {
     Spellcheck spelling;
     std::uint64_t spellCounter = 0, spellInFlight = 0;
     void syncSpelling();
+    std::unique_ptr<WordCompletion> words;
     Node *overlayHost = nullptr;
     emoji::CompletionView *emojiPopup = nullptr;
     Composer *emojiOwner = nullptr;
@@ -511,6 +540,8 @@ void EditorStore::Impl::capture(Composer &view, bool publishChange) {
     // Compare the complete native document, including its committed preedit base.
     if (view.input->editingStateMatches(d.state))
         return;
+    if (!view.cyclingSpelling)
+        view.spellingCycle.reset();
     auto state = view.input->editingState();
     view.scrollPositions[view.buffer] = {state.scrollX, state.scrollY};
     const auto &previous = d.state;
@@ -951,6 +982,11 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
     }
     auto view = std::find_if(views.begin(), views.end(),
                              [&](const Composer *v) { return v->pane.id == pane.id; });
+    if (op == "cycle-spelling") {
+        if (view != views.end())
+            (*view)->cycleSpelling();
+        return true;
+    }
     if ((op == "copy" || op == "copy-region") && view != views.end()) {
         const auto &input = *(*view)->input;
         const auto start = std::min(input.cursorPosition(), input.selectionAnchor());
@@ -1066,8 +1102,10 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
         e.cursor = e.anchor = e.text.size();
         e.mark = false;
     } else if (op == "complete") {
-        if (view != views.end())
+        if (view != views.end()) {
+            (*view)->spellingCycle.reset();
             (*view)->openLiteralCompletion();
+        }
         return true;
     } else if (op == "select-all") {
         e.anchor = 0;
@@ -1601,9 +1639,159 @@ void EditorStore::Impl::Composer::updateSpelling() {
         input->refreshDisplayProjection(true);
 }
 
+bool EditorStore::Impl::Composer::spellingCycleValid() const {
+    if (!spellingCycle || !owner.model.settings.spellcheck || input->composing() || menuOpen ||
+        !visibleInScene(*this) || !owner.dispatcher ||
+        owner.dispatcher->focusedArea() != input->inputArea())
+        return false;
+    const auto &cycle = *spellingCycle;
+    const auto source = owner.model.buffers.find(buffer);
+    const auto draft = owner.drafts.find(buffer);
+    return source != owner.model.buffers.end() && draft != owner.drafts.end() &&
+           buffer == pane.buffer && buffer == cycle.buffer &&
+           cycle.language == owner.model.settings.spellcheckLanguage &&
+           cycle.identity.lock() == draft->second.identity &&
+           cycle.revision == draft->second.revision && revision == cycle.revision &&
+           source->second.draft == draft->second.published &&
+           input->editingStateMatches(draft->second.state) && input->value() == cycle.raw &&
+           input->cursorPosition() == cycle.caret && input->selectionAnchor() == cycle.caret &&
+           input->displayProjection();
+}
+
+std::optional<SpellRange> EditorStore::Impl::Composer::rawSpellingRange(SpellRange range) const {
+    const auto *projection = input->displayProjection();
+    if (!projection)
+        return std::nullopt;
+    const auto &mapping = projection->rawToDisplay;
+    const auto start = std::upper_bound(mapping.begin(), mapping.end(), range.begin);
+    const auto end = std::lower_bound(mapping.begin(), mapping.end(), range.end);
+    if (start == mapping.begin() || end == mapping.end())
+        return std::nullopt;
+    auto begin = static_cast<size_t>(start - mapping.begin() - 1);
+    const auto &raw = input->value();
+    while (begin && begin < raw.size() && (static_cast<unsigned char>(raw[begin]) & 0xc0) == 0x80)
+        --begin;
+    return SpellRange{begin, static_cast<size_t>(end - mapping.begin())};
+}
+
+void EditorStore::Impl::Composer::cycleSpelling() {
+    owner.capture(*this);
+    if (!spellingCycleValid())
+        spellingCycle.reset();
+    if (!spellingCycle) {
+        const auto &draft = owner.draft(buffer);
+        spellingCycle = SpellingCycle{.buffer = buffer,
+                                      .language = owner.model.settings.spellcheckLanguage,
+                                      .raw = input->value(),
+                                      .identity = draft.identity,
+                                      .revision = revision,
+                                      .caret = input->cursorPosition()};
+        if (!spellingCycleValid()) {
+            spellingCycle.reset();
+            return;
+        }
+        updateSpelling();
+        spellingCycle->ticket = spellTicket;
+    }
+    ++spellingCycle->presses;
+    if (spellingCycle->suggestions.empty() &&
+        (spellNeedsCheck || owner.spellInFlight == spellTicket)) {
+        spellDue = std::chrono::steady_clock::now();
+        owner.syncSpelling();
+        return;
+    }
+    applySpellingCycle();
+}
+
+void EditorStore::Impl::Composer::applySpellingCycle() {
+    if (!spellingCycleValid()) {
+        spellingCycle.reset();
+        return;
+    }
+    auto &cycle = *spellingCycle;
+    if (cycle.suggestions.empty()) {
+        if (cycle.ticket != spellTicket || !spellError.empty()) {
+            spellingCycle.reset();
+            return;
+        }
+        const auto *projection = input->displayProjection();
+        if (spellRaw != input->value() || spellText != projection->text ||
+            cycle.caret >= projection->rawToDisplay.size()) {
+            spellingCycle.reset();
+            return;
+        }
+        const auto caret = projection->rawToDisplay[cycle.caret];
+        std::optional<SpellRange> target;
+        for (const auto range : spellMisspelled) {
+            if (range.end > caret)
+                break;
+            bool adjacent = true;
+            for (auto offset = range.end; offset < caret;) {
+                const auto character = g_utf8_get_char(spellText.data() + offset);
+                if (character == '\n' || character == '\r' || character == 0x85 ||
+                    character == 0x2028 || character == 0x2029 ||
+                    (!g_unichar_isspace(character) && !g_unichar_ispunct(character))) {
+                    adjacent = false;
+                    break;
+                }
+                offset = static_cast<size_t>(g_utf8_next_char(spellText.data() + offset) -
+                                             spellText.data());
+            }
+            if (adjacent)
+                target = range;
+        }
+        if (!target) {
+            spellingCycle.reset();
+            return;
+        }
+        const auto raw = rawSpellingRange(*target);
+        if (!raw) {
+            spellingCycle.reset();
+            return;
+        }
+        cycle.range = *raw;
+        cycle.suggestions = owner.spelling.suggest(
+            std::string_view(spellText).substr(target->begin, target->end - target->begin),
+            cycle.language);
+        if (cycle.suggestions.empty()) {
+            spellingCycle.reset();
+            return;
+        }
+        cycle.index = (cycle.presses - 1) % cycle.suggestions.size();
+    } else {
+        cycle.index = (cycle.index + cycle.presses) % cycle.suggestions.size();
+    }
+    cycle.presses = 0;
+    const auto *projection = input->displayProjection();
+    const auto displayBegin = projection->rawToDisplay[cycle.range.begin];
+    const auto &suggestion = cycle.suggestions[cycle.index];
+    spellingEdit = cycle.range;
+    cyclingSpelling = true;
+    const bool replaced = input->replaceRange(cycle.range.begin, cycle.range.end, suggestion);
+    cyclingSpelling = false;
+    spellingEdit.reset();
+    if (!replaced) {
+        spellingCycle.reset();
+        return;
+    }
+    // The IRC suffix rewriter can insert controls: derive the next range from the new projection.
+    const auto range = rawSpellingRange({displayBegin, displayBegin + suggestion.size()});
+    if (!range) {
+        spellingCycle.reset();
+        return;
+    }
+    cycle.range = *range;
+    cycle.raw = input->value();
+    cycle.caret = input->cursorPosition();
+    cycle.revision = revision;
+}
+
 void EditorStore::Impl::syncSpelling() {
-    for (auto *view : views)
+    for (auto *view : views) {
+        if (view->spellingCycle && !view->spellingCycleValid())
+            view->spellingCycle.reset();
         view->updateSpelling();
+    }
     if (auto result = spelling.poll()) {
         if (result->ticket == spellInFlight)
             spellInFlight = 0;
@@ -1614,6 +1802,8 @@ void EditorStore::Impl::syncSpelling() {
                 view->spellError = std::move(result->error);
                 view->spellMisspelled = std::move(result->misspelled);
                 view->input->refreshDisplayProjection(true);
+                if (view->spellingCycle && view->spellingCycle->presses)
+                    view->applySpellingCycle();
                 break;
             }
     }
@@ -1636,6 +1826,7 @@ void EditorStore::Impl::syncSpelling() {
 }
 
 void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *pointer) {
+    spellingCycle.reset();
     const auto invocation = pointer ? std::optional(*pointer) : std::nullopt;
     pointer = invocation ? &*invocation : nullptr;
     auto *popup = input->popupContext();
@@ -1754,19 +1945,8 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
                 for (const auto range : spellMisspelled)
                     if (displayByte >= range.begin &&
                         (displayByte < range.end || (!pointer && displayByte == range.end))) {
-                        const auto &mapping = projection->rawToDisplay;
-                        const auto start =
-                            std::upper_bound(mapping.begin(), mapping.end(), range.begin);
-                        const auto end =
-                            std::lower_bound(mapping.begin(), mapping.end(), range.end);
-                        if (start != mapping.begin() && end != mapping.end()) {
-                            auto rawBegin = static_cast<size_t>(start - mapping.begin() - 1);
-                            const auto &raw = input->value();
-                            while (rawBegin && rawBegin < raw.size() &&
-                                   (static_cast<unsigned char>(raw[rawBegin]) & 0xc0) == 0x80)
-                                --rawBegin;
-                            correctionRange =
-                                SpellRange{rawBegin, static_cast<size_t>(end - mapping.begin())};
+                        correctionRange = rawSpellingRange(range);
+                        if (correctionRange) {
                             corrections = owner.spelling.suggest(
                                 std::string_view(projection->text)
                                     .substr(range.begin, range.end - range.begin),
@@ -1965,6 +2145,8 @@ void EditorStore::Impl::Composer::toggleFormatting() {
 }
 void EditorStore::Impl::Composer::hideCompletion() {
     literalCompletion = false;
+    predictedWord.clear();
+    predictionPrefix.clear();
     input->setInlineGhost({});
     if (owner.commandOwner == this) {
         owner.commandOwner = nullptr;
@@ -2008,6 +2190,8 @@ void EditorStore::Impl::Composer::openLiteralCompletion() {
             acceptCommandCompletion(commandSelected);
         return;
     }
+    if (acceptPrediction())
+        return;
     if (!owner.commandPopup || !emojiWasEligible)
         return;
     const auto *projection = input->displayProjection();
@@ -2171,6 +2355,14 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
         return;
     }
     const auto context = owner.model.buffers.find(buffer);
+    const bool predict = owner.model.settings.wordPrediction;
+    if (predict && !owner.words)
+        owner.words = std::make_unique<WordCompletion>();
+    const bool ready = owner.words && owner.words->ready();
+    const auto messages =
+        context == owner.model.buffers.end() ? 0 : context->second.messages.size();
+    const auto messagesRevision =
+        context == owner.model.buffers.end() ? 0 : context->second.messagesRevision;
     const auto network = context == owner.model.buffers.end()
                              ? owner.model.networks.end()
                              : owner.model.networks.find(context->second.server);
@@ -2180,18 +2372,37 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
     const std::string_view channelTypes = network == owner.model.networks.end()
                                               ? std::string_view("#&+!")
                                               : std::string_view(network->second.channelTypes);
+    const auto foolDisplay =
+        context == owner.model.buffers.end()
+            ? FoolDisplay::Shown
+            : effectiveFoolDisplay(owner.model.settings, buffer, context->second.target);
+    const bool competing = predict && eligible && hasLiteralCandidate(predictionQuery);
     if (!force && emojiRevision == revision && emojiWasEligible == eligible &&
-        completionKind == kind && completionChannelTypes == channelTypes) {
+        completionKind == kind && completionChannelTypes == channelTypes &&
+        predictionEnabled == predict && predictionReady == ready && predictionBuffer == buffer &&
+        predictionMessages == messages && predictionMessagesRevision == messagesRevision &&
+        predictionFools == owner.model.settings.fools && predictionFoolDisplay == foolDisplay &&
+        predictionCompeting == competing) {
         if (eligible)
             placeCompletion();
         return;
     }
+    predictionEnabled = predict;
+    predictionReady = ready;
+    predictionBuffer = buffer;
+    predictionMessages = messages;
+    predictionMessagesRevision = messagesRevision;
+    if (predictionFools != owner.model.settings.fools)
+        predictionFools = owner.model.settings.fools;
+    predictionFoolDisplay = foolDisplay;
     completionKind = kind;
     completionChannelTypes = channelTypes;
     emojiRevision = revision;
     emojiWasEligible = eligible;
     // Rebinding a token cancels an already-held row press, even if its matches are unchanged.
     hideCompletion();
+    predictionQuery.clear();
+    predictionCompeting = false;
     if (updateCommandCompletion(eligible))
         return;
     if (!eligible)
@@ -2225,8 +2436,10 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
         queryEnd = caret - 1;
         colon = locateColon(queryEnd);
     }
-    if (!colon)
+    if (!colon) {
+        updatePrediction();
         return;
+    }
     const size_t queryStart = *colon + 1;
     while (queryEnd < text.size() && queryCharacter(static_cast<unsigned char>(text[queryEnd])))
         ++queryEnd;
@@ -2266,6 +2479,137 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
     placeCompletion();
     if (owner.emojiOwner == this)
         owner.emojiPopup->setVisible(true);
+}
+
+bool EditorStore::Impl::Composer::hasLiteralCandidate(std::string_view prefix) const {
+    const auto source = owner.model.buffers.find(buffer);
+    if (prefix.empty() || source == owner.model.buffers.end())
+        return false;
+    const auto matches = [prefix](std::string_view name) {
+        return name.size() >= prefix.size() && commandEqual(prefix, name.substr(0, prefix.size()));
+    };
+    for (const auto &nick : source->second.nicks)
+        if (matches(nick.name))
+            return true;
+    for (const auto &[id, target] : owner.model.buffers)
+        if (target.server == source->second.server && matches(target.target))
+            return true;
+    return false;
+}
+
+void EditorStore::Impl::Composer::updatePrediction() {
+    if (!owner.model.settings.wordPrediction || !emojiWasEligible || menuOpen ||
+        owner.commandOwner == this || owner.emojiOwner == this ||
+        input->cursorPosition() != input->value().size())
+        return;
+    const auto *projection = input->displayProjection();
+    if (!projection || projection->text.empty() || projection->text.starts_with('/'))
+        return;
+    const auto &text = projection->text;
+    size_t start = text.size(), letters = 0;
+    while (start) {
+        const auto previous = ui_logic::previous(text, start);
+        const auto character = g_utf8_get_char(text.data() + previous);
+        if (!g_unichar_isalpha(character) && !g_unichar_ismark(character))
+            break;
+        letters += g_unichar_isalpha(character) ? 1 : 0;
+        start = previous;
+    }
+    const auto prefix = std::string_view(text).substr(start);
+    if (letters < 2 || prefix.size() > 128)
+        return;
+    if (start) {
+        const auto previous = g_utf8_get_char(text.data() + ui_logic::previous(text, start));
+        if (g_unichar_isalnum(previous) ||
+            (previous < 128 &&
+             std::string_view("#&+!/:@`_-").find(char(previous)) != std::string_view::npos))
+            return;
+    }
+    for (const auto &run : formatDocument.runs)
+        if (run.end > start && run.style.monospace)
+            return;
+    const auto &context = owner.model.buffers.at(buffer);
+    if (context.kind != "channel" && context.kind != "query")
+        return;
+    predictionQuery = prefix;
+    predictionCompeting = hasLiteralCandidate(prefix);
+    if (predictionCompeting)
+        return;
+    const auto findWord = [&](std::string_view raw) -> std::string {
+        auto end = std::min<size_t>(raw.size(), 512);
+        while (end && end < raw.size() && (static_cast<unsigned char>(raw[end]) & 0xc0) == 0x80)
+            --end;
+        const auto plain =
+            parseIrcFormatting(raw.substr(0, end), projectionForeground, projectionBackground).text;
+        for (size_t begin = 0; begin < plain.size();) {
+            const auto character = g_utf8_get_char(plain.data() + begin);
+            if (!g_unichar_isalpha(character)) {
+                begin = static_cast<size_t>(g_utf8_next_char(plain.data() + begin) - plain.data());
+                continue;
+            }
+            size_t finish = begin;
+            while (finish < plain.size()) {
+                const auto current = g_utf8_get_char(plain.data() + finish);
+                if (!g_unichar_isalpha(current) && !g_unichar_ismark(current))
+                    break;
+                finish =
+                    static_cast<size_t>(g_utf8_next_char(plain.data() + finish) - plain.data());
+            }
+            const auto word = std::string_view(plain).substr(begin, finish - begin);
+            if (!(end < raw.size() && finish == plain.size()) && word.size() <= 128 &&
+                word.size() > prefix.size() && word.starts_with(prefix))
+                return std::string(word);
+            begin = finish;
+        }
+        return {};
+    };
+    const auto &history = owner.draft(buffer).history;
+    size_t remaining = 32;
+    const bool concealFools =
+        predictionFoolDisplay != FoolDisplay::Shown && predictionFoolDisplay != FoolDisplay::Dimmed;
+    const auto network = owner.model.networks.find(context.server);
+    const bool concealHistory = concealFools && network != owner.model.networks.end() &&
+                                isFool(owner.model, context.server, network->second.nick);
+    for (auto entry = history.rbegin(); !concealHistory && entry != history.rend() && remaining;
+         ++entry, --remaining) {
+        if (!entry->starts_with('/') || entry->starts_with("//"))
+            predictedWord = findWord(*entry);
+        if (!predictedWord.empty())
+            break;
+    }
+    if (predictedWord.empty()) {
+        for (auto entry = context.messages.rbegin(); entry != context.messages.rend() && remaining;
+             ++entry, --remaining) {
+            if (entry->own && !entry->deleted && !entry->presence &&
+                (!concealFools || !isFool(owner.model, context.server, entry->nick)))
+                predictedWord = findWord(entry->text);
+            if (!predictedWord.empty())
+                break;
+        }
+    }
+    if (predictedWord.empty() && owner.words && owner.words->ready())
+        predictedWord = owner.words->complete(prefix);
+    if (predictedWord.empty())
+        return;
+    predictionPrefix = prefix;
+    predictionCaret = input->cursorPosition();
+    input->setInlineGhost(predictedWord.substr(prefix.size()));
+}
+
+bool EditorStore::Impl::Composer::acceptPrediction() {
+    if (predictedWord.empty())
+        return false;
+    const auto word = predictedWord, prefix = predictionPrefix;
+    const auto caret = predictionCaret;
+    updateCompletion(true);
+    if (predictedWord != word || predictionPrefix != prefix || predictionCaret != caret ||
+        input->cursorPosition() != caret || input->selectionAnchor() != caret ||
+        !input->editingStateMatches(owner.draft(buffer).state))
+        return false;
+    const auto suffix = word.substr(prefix.size());
+    spellingCycle.reset();
+    hideCompletion();
+    return input->replaceRange(caret, caret, suffix);
 }
 bool EditorStore::Impl::Composer::acceptCompletion(size_t index) {
     if (owner.emojiOwner != this || index >= owner.emojiMatches.size() || !owner.dispatcher ||
@@ -2383,6 +2727,7 @@ EditorStore::Impl::Composer::Composer(Impl &impl, PaneState &state)
     });
     input->setOnFocusLoss([this] {
         owner.capture(*this);
+        spellingCycle.reset();
         input->resetCaretEffects();
         compositionChord.clear();
         hideCompletion();

@@ -1,5 +1,6 @@
 #include "../src/model.hpp"
 #include "../src/render/graphics.hpp"
+#include "../src/spellcheck.hpp"
 #include "../src/theme/theme.hpp"
 #include "../src/ui/command_completion.hpp"
 #include "../src/ui/editor.hpp"
@@ -1095,6 +1096,127 @@ void checkComposerSpellcheck(Renderer &renderer) {
         assert(menu.entry("Spelling/the"));
     };
 
+    // Explicit correction captures the dictionary's actual order, not a guessed first result.
+    frame();
+    Spellcheck dictionary;
+    dictionary.request(1, "teh", "en_US");
+    await([&] {
+        const auto result = dictionary.poll();
+        if (!result)
+            return false;
+        assert(result->error.empty() && result->misspelled.size() == 1);
+        return true;
+    });
+    const auto suggestions = dictionary.suggest("teh", "en_US");
+    assert(suggestions.size() > 1);
+    input->setValue("teh");
+    caret(3, 3);
+    assert(editors.execute("cycle-spelling", pane));
+    assert(editors.execute("cycle-spelling", pane));
+    await([&] { return input->value() == suggestions[1]; });
+    for (size_t step = 2; step <= suggestions.size() + 1; ++step) {
+        const auto previous = input->editingState().current;
+        const auto undo = input->editingState().history->undo.size();
+        assert(editors.execute("cycle-spelling", pane));
+        assert(input->value() == suggestions[step % suggestions.size()]);
+        if (input->value() != previous.value)
+            assert(input->editingState().history->undo.size() == undo + 1);
+    }
+
+    // An ordinary completion request ends correction cycling, even without a candidate.
+    input->setValue("teh");
+    caret(3, 3);
+    assert(editors.execute("cycle-spelling", pane));
+    await([&] { return input->value() == suggestions[0]; });
+    assert(editors.execute("complete", pane));
+    assert(editors.execute("cycle-spelling", pane));
+    for (int tick = 0; tick != 50; ++tick) {
+        frame();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    assert(input->value() == suggestions[0]);
+
+    // Same-line punctuation and Unicode whitespace are allowed, but never a later word/line.
+    for (const std::string &suffix :
+         {std::string{}, std::string{",! \t"}, std::string{"…\u2003"}}) {
+        input->setValue("teh" + suffix);
+        caret(input->value().size(), input->value().size());
+        assert(editors.execute("cycle-spelling", pane));
+        await([&] { return input->value() == suggestions[0] + suffix; });
+    }
+    for (const std::string text : {"teh hello", "teh\n", "teh\u2028", "hello"}) {
+        input->setValue(text);
+        caret(text.size(), text.size());
+        const auto original = input->editingState();
+        assert(editors.execute("cycle-spelling", pane));
+        if (text != "hello")
+            await([&] { return errors() == Ranges{{0, 3}}; });
+        else
+            for (int tick = 0; tick != 50; ++tick) {
+                frame();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        assert(input->editingStateMatches(original));
+    }
+
+    // Formatting controls and UTF-8 offsets use the same raw/display mapping as menu correction.
+    const std::string cycleRaw = "😀 \x02t\x1d"
+                                 "eh\x1d\x02, ";
+    input->setValue(cycleRaw);
+    caret(cycleRaw.size(), cycleRaw.size());
+    const auto cycleOriginal = input->editingState().current;
+    const auto cycleDocument = parseIrcFormatting(cycleRaw, foreground, background);
+    assert(editors.execute("cycle-spelling", pane));
+    await([&] { return input->displayProjection()->text == "😀 " + suggestions[0] + ", "; });
+    assert(parseIrcFormatting(input->value(), foreground, background).runs.back().style ==
+           cycleDocument.runs.back().style);
+    assert(editors.execute("cycle-spelling", pane));
+    assert(input->displayProjection()->text == "😀 " + suggestions[1] + ", ");
+    assert(editors.execute("undo", pane));
+    assert(input->displayProjection()->text == "😀 " + suggestions[0] + ", ");
+    assert(editors.execute("undo", pane));
+    assert(input->editingState().current == cycleOriginal);
+
+    // Pending intent must compare the actual native document, even before a capture/sync.
+    for (int change = 0; change != 8; ++change) {
+        input->setValue("teh");
+        caret(3, 3);
+        dispatcher.setFocus(input->inputArea());
+        assert(editors.execute("cycle-spelling", pane));
+        if (change == 0)
+            caret(0, 0);
+        else if (change == 1)
+            caret(3, 0);
+        else if (change == 2)
+            input->setValue("hello");
+        else if (change == 3)
+            dispatcher.setFocus(nullptr);
+        else if (change == 4)
+            pane.buffer = other.id;
+        else if (change == 5)
+            model.settings.spellcheck = false;
+        else if (change == 6)
+            model.settings.spellcheckLanguage = "zz_unavailable";
+        else
+            input->textInputApplyEdit({.commitText = {},
+                                       .preeditText = "x",
+                                       .preeditCursorBegin = 1,
+                                       .preeditCursorEnd = 1,
+                                       .hasPreedit = true});
+        frame();
+        const auto unchanged = input->editingState().current;
+        for (int tick = 0; tick != 50; ++tick) {
+            frame();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(input->editingState().current == unchanged);
+        input->textInputResetPreedit();
+        pane.buffer = buffer.id;
+        model.settings.spellcheck = true;
+        model.settings.spellcheckLanguage = "en_US";
+        frame();
+        dispatcher.setFocus(input->inputArea());
+    }
     // Annotation is display-only, including raw controls, multibyte offsets and selection.
     const std::string raw = "😀 \x02"
                             "t\x1d"
@@ -1206,6 +1328,13 @@ void checkComposerSpellcheck(Renderer &renderer) {
     assert(editors.execute("undo", pane) && input->value() == unicodeRaw &&
            input->editingState().current == unicodeOriginal.current &&
            input->editingState().history->undo == unicodeUndo);
+    const std::string unicodeCycleRaw = "\x02" + unicodeWord + "\x02… ";
+    input->setValue(unicodeCycleRaw);
+    caret(unicodeCycleRaw.size(), unicodeCycleRaw.size());
+    assert(editors.execute("cycle-spelling", pane));
+    await([&] { return input->displayProjection()->text == unicodeSuggestion + "… "; });
+    assert(g_utf8_validate(input->value().data(), input->value().size(), nullptr));
+    assert(editors.execute("undo", pane) && input->value() == unicodeCycleRaw);
 
     // A later ordinary typo proves the worker completed while each earlier token is excluded.
     for (const std::string excluded : {"https://example.com/teh", "zzknownnick", "#zzchannel",
@@ -1315,6 +1444,302 @@ void checkComposerSpellcheck(Renderer &renderer) {
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
+void checkComposerWordPrediction(Renderer &renderer) {
+    using namespace blast;
+    Model model;
+    assert(!model.settings.wordPrediction);
+    model.settings.spellcheck = false;
+    auto &buffer = model.buffers["test/#room"];
+    buffer.id = "test/#room";
+    buffer.server = "test";
+    buffer.target = "#room";
+    auto &other = model.buffers["test/#other"];
+    other.id = "test/#other";
+    other.server = "test";
+    other.target = "#other";
+    model.networks["test"].channelTypes = "#&+!";
+    Theme theme;
+    theme.update(model);
+    DeferredClipboard clipboard;
+    InputDispatcher dispatcher;
+    EditorStore editors(
+        model, clipboard, [](auto) {}, [](auto) {},
+        [&](Node &node) { retireComposerPointer(dispatcher, node); });
+    PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}, .focusComposer = false};
+    PaneState otherPane{.id = 2, .buffer = other.id, .reply = {}, .focusComposer = false};
+    Node root;
+    root.setSize(640, 480);
+    editors.setOverlayHost(&root);
+    auto *composer = root.addChild(editors.composer(pane));
+    auto *otherComposer = root.addChild(editors.composer(otherPane));
+    auto *input = composerInput(*composer);
+    auto *otherInput = composerInput(*otherComposer);
+    assert(input && otherInput);
+    dispatcher.setSceneRoot(&root);
+    editors.setInputDispatcher(dispatcher);
+    dispatcher.setFocus(input->inputArea());
+    const auto frame = [&] {
+        model.now += .05;
+        editors.sync();
+        composer->arrange(renderer, {20, 300, 600, 100});
+        composer->layout(renderer);
+        otherComposer->arrange(renderer, {20, 150, 600, 100});
+        otherComposer->layout(renderer);
+    };
+    const auto await = [&](auto ready) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            frame();
+            if (ready())
+                return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } while (std::chrono::steady_clock::now() < deadline);
+        assert(false && "composer prediction did not reach its native ghost");
+    };
+    const auto visibleGhost = [&](auto &&self, Node &node) -> TextNode * {
+        if (auto *text = dynamic_cast<TextNode *>(&node);
+            text && !text->useMarkup() && !text->participatesInLayout() &&
+            !text->hitTestVisible() && nativeVisible(*text) && !text->text().empty())
+            return text;
+        for (const auto &child : node.children())
+            if (auto *text = self(self, *child))
+                return text;
+        return nullptr;
+    };
+    const auto ghost = [&](std::string_view suffix) {
+        auto *text = visibleGhost(visibleGhost, *input);
+        return text && text->text() == suffix;
+    };
+    const auto caret = [&](std::size_t position, std::size_t anchor) {
+        auto state = input->editingState();
+        state.current.cursorPos = position;
+        state.current.selectionAnchor = anchor;
+        input->restoreEditingState(state);
+    };
+
+    // The first prediction must cold-load the real dictionary, without spelling enabled.
+    input->setValue("accommodatio");
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    model.settings.wordPrediction = true;
+    const auto raw = input->editingState().current;
+    const auto undo = input->editingState().history->undo;
+    await([&] { return ghost("n"); });
+    auto *dictionaryGhost = contextText(*input, "n");
+    assert(dictionaryGhost && nativeVisible(*dictionaryGhost) && !dictionaryGhost->useMarkup() &&
+           !dictionaryGhost->participatesInLayout() && !dictionaryGhost->hitTestVisible());
+    assert(input->editingState().current == raw && input->editingState().history->undo == undo &&
+           buffer.draft == "accommodatio" &&
+           input->textInputState().surroundingText == "accommodatio" &&
+           input->displayProjection()->text == "accommodatio" && model.actions.empty());
+    assert(editors.execute("select-all", pane) && editors.execute("copy", pane));
+    assert(clipboard.copied == "accommodatio");
+    caret(raw.cursorPos, raw.selectionAnchor);
+    await([&] { return ghost("n"); });
+    const auto beforeAccept = input->editingState().current;
+    const auto undoBeforeAccept = input->editingState().history->undo;
+    assert(editors.execute("complete", pane));
+    assert(input->value() == "accommodation" && buffer.draft == "accommodation" &&
+           input->textInputState().surroundingText == "accommodation" &&
+           input->editingState().history->undo.size() == undoBeforeAccept.size() + 1 &&
+           input->editingState().history->undo.back() == beforeAccept);
+    assert(editors.execute("undo", pane));
+    assert(input->editingState().current == beforeAccept &&
+           input->editingState().history->undo == undoBeforeAccept);
+    await([&] { return ghost("n"); });
+    model.actions.clear();
+    assert(editors.execute("send", pane));
+    assert(model.actions.size() == 1 && model.actions.back().type == "send" &&
+           model.actions.back().text == "accommodatio" && input->value().empty());
+
+    // Sending through the actual editor teaches only this conversation, ahead of dictionary.
+    input->setValue("quar");
+    frame();
+    assert(!ghost("tzite"));
+    input->setValue("quartzite");
+    frame();
+    model.actions.clear();
+    assert(editors.execute("send", pane));
+    assert(model.actions.size() == 1 && model.actions.back().text == "quartzite");
+    input->setValue("quar");
+    await([&] { return ghost("tzite"); });
+    assert(editors.execute("complete", pane) && input->value() == "quartzite");
+    otherInput->setValue("quar");
+    dispatcher.setFocus(otherInput->inputArea());
+    frame();
+    auto *otherGhost = visibleGhost(visibleGhost, *otherInput);
+    assert(!otherGhost || otherGhost->text() != "tzite");
+    assert(!visibleGhost(visibleGhost, *input));
+    dispatcher.setFocus(input->inputArea());
+    input->setValue("Quar");
+    frame();
+    assert(!ghost("tzite")); // Own history requires the exact case-sensitive prefix.
+
+    // Command arguments are not ordinary sent history and must never teach secrets.
+    input->setValue("/quote PASS Secretquartzword");
+    frame();
+    model.actions.clear();
+    assert(editors.execute("send", pane));
+    assert(model.actions.size() == 1 && model.actions.back().type == "command" &&
+           model.actions.back().text == "/quote PASS Secretquartzword");
+    input->setValue("Secretquartz");
+    frame();
+    assert(!ghost("word"));
+    assert(editors.execute("complete", pane) && input->value() == "Secretquartz");
+
+    // Own model messages work too; foreign messages and changed sources do not linger.
+    Message own;
+    own.text = "Éclairunique";
+    own.own = true;
+    buffer.messages.push_back(own);
+    ++buffer.messagesRevision;
+    input->setValue("Éc");
+    await([&] { return ghost("lairunique"); });
+    assert(editors.execute("complete", pane) && input->value() == own.text &&
+           g_utf8_validate(input->value().data(), input->value().size(), nullptr));
+    input->setValue("éc");
+    frame();
+    assert(!ghost("lairunique"));
+    input->setValue("Éc");
+    await([&] { return ghost("lairunique"); });
+    buffer.messages.back().own = false;
+    ++buffer.messagesRevision;
+    // Accept before another frame: the cached visible candidate is already stale.
+    assert(editors.execute("complete", pane) && input->value() != own.text);
+    frame();
+    assert(!ghost("lairunique"));
+    buffer.messages.back().own = true;
+    buffer.messages.back().deleted = true;
+    ++buffer.messagesRevision;
+    input->setValue("Éc");
+    frame();
+    assert(!ghost("lairunique"));
+    assert(editors.execute("complete", pane) && input->value() != own.text);
+
+    // Eligibility changes invalidate the displayed candidate before any acceptance.
+    otherInput->setValue("zzqxnomatch");
+    frame();
+    for (int change = 0; change != 7; ++change) {
+        pane.buffer = buffer.id;
+        model.settings.wordPrediction = true;
+        dispatcher.setFocus(input->inputArea());
+        input->setValue("quar");
+        await([&] { return ghost("tzite"); });
+        if (change == 0)
+            caret(4, 0);
+        else if (change == 1)
+            caret(2, 2);
+        else if (change == 2)
+            dispatcher.setFocus(nullptr);
+        else if (change == 3)
+            input->textInputApplyEdit({.commitText = {},
+                                       .preeditText = "あ",
+                                       .preeditCursorBegin = 3,
+                                       .preeditCursorEnd = 3,
+                                       .hasPreedit = true});
+        else if (change == 4)
+            model.settings.wordPrediction = false;
+        else if (change == 5)
+            pane.buffer = other.id;
+        else
+            input->setValue("zzqxnomatch");
+        frame();
+        assert(!ghost("tzite"));
+        const auto unchanged = input->editingState().current;
+        const auto unchangedUndo = input->editingState().history->undo;
+        assert(editors.execute("complete", pane));
+        assert(input->editingState().current == unchanged &&
+               input->editingState().history->undo == unchangedUndo);
+        input->textInputResetPreedit();
+        pane.buffer = buffer.id;
+        frame();
+    }
+
+    // Slash/emoji contextual completion and nickname completion retain precedence.
+    model.settings.wordPrediction = true;
+    dispatcher.setFocus(input->inputArea());
+    input->setValue("/ki");
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    assert(editors.handleCompletionKey(XKB_KEY_Tab, 0) && input->value() == "/kick ");
+    frame();
+    assert(ghost("nick"));
+    input->setValue(":smi");
+    await([&] {
+        auto *popup = completionPopup(root);
+        return popup && popup->visible();
+    });
+    assert(!visibleGhost(visibleGhost, *input));
+    input->setValue("quar");
+    await([&] { return ghost("tzite"); });
+    const auto predictionState = input->editingState();
+    const auto predictionUndo = predictionState.history->undo;
+    const auto predictionRedo = predictionState.history->redo;
+    const auto messageCount = buffer.messages.size();
+    const auto messageRevision = buffer.messagesRevision;
+    const auto unchangedPrediction = [&] {
+        assert(input->editingStateMatches(predictionState) &&
+               predictionState.history->undo == predictionUndo &&
+               predictionState.history->redo == predictionRedo &&
+               buffer.messages.size() == messageCount &&
+               buffer.messagesRevision == messageRevision);
+    };
+    // NAMES and target-list updates do not edit the draft or bump message history.
+    buffer.nicks.push_back({.name = "quartzLive", .account = {}, .prefix = {}});
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    unchangedPrediction();
+    buffer.nicks.back().name = "unrelatedLive";
+    frame();
+    assert(ghost("tzite"));
+    unchangedPrediction();
+    buffer.nicks.back().name = "quartzRenamed";
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    unchangedPrediction();
+    buffer.nicks.pop_back();
+    frame();
+    assert(ghost("tzite"));
+    unchangedPrediction();
+    auto &candidate = model.buffers["test/live-query"];
+    candidate.id = "test/live-query";
+    candidate.server = "test";
+    candidate.target = "quartzTarget";
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    unchangedPrediction();
+    candidate.target = "unrelatedTarget";
+    frame();
+    assert(ghost("tzite"));
+    unchangedPrediction();
+    candidate.target = "quartzRenamedTarget";
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    unchangedPrediction();
+    candidate.server = "another-network";
+    frame();
+    assert(ghost("tzite"));
+    unchangedPrediction();
+    candidate.server = "test";
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    unchangedPrediction();
+    model.buffers.erase("test/live-query");
+    frame();
+    assert(ghost("tzite"));
+    unchangedPrediction();
+    buffer.nicks.push_back({.name = "quartzNick", .account = {}, .prefix = {}});
+    input->setValue("quar");
+    frame();
+    assert(!visibleGhost(visibleGhost, *input));
+    assert(editors.execute("complete", pane));
+    assert(editors.execute("complete", pane));
+    assert(input->value() == "quartzNick: ");
+    editors.setOverlayHost(nullptr);
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
 void checkComposerColors(Renderer &renderer) {
     using namespace blast;
     const char *oldHome = std::getenv("XDG_CONFIG_HOME");
@@ -3122,6 +3547,7 @@ void runComposerNativeCheck() {
         checkComposerReplyCard(renderer);
         checkComposerEditingCommands(renderer);
         checkComposerSpellcheck(renderer);
+        checkComposerWordPrediction(renderer);
         checkComposerColors(renderer);
         {
             emoji::Catalog catalog;

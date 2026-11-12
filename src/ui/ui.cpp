@@ -128,6 +128,7 @@ const std::map<std::string, std::string> &defaultBindings() {
         {"kill-region", "C-w"},
         {"copy-region", "M-w"},
         {"yank", "C-y"},
+        {"cycle-spelling", "C-;"},
         {"undo", "C-/"},
         {"redo", ""},
         {"copy", ""},
@@ -190,6 +191,7 @@ std::string_view commandDisplayName(std::string_view command) {
         {"kill-region", "Cut selection"},
         {"copy-region", "Copy selection"},
         {"yank", "Paste cut text"},
+        {"cycle-spelling", "Cycle spelling suggestions"},
         {"undo", "Undo edit"},
         {"redo", "Redo"},
         {"copy", "Copy selection"},
@@ -1086,7 +1088,7 @@ struct Ui::Impl {
         });
         for (const auto &[name, binding] : defaultBindings()) {
             if ((name == "jump-channel" || name == "toggle-fools" || name == "conversation-back" ||
-                 name == "conversation-forward") &&
+                 name == "conversation-forward" || name == "cycle-spelling") &&
                 !model.settings.bindings.contains(name) &&
                 std::any_of(model.settings.bindings.begin(), model.settings.bindings.end(),
                             [&](const auto &entry) {
@@ -3524,6 +3526,10 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         if (!dispatcher || !editors.ownsFocus(dispatcher->focusedArea()))
             return;
     }
+    if ((command == "cycle-spelling" || command == "complete") &&
+        (jumpOpen || paletteOpen || reactionTarget || dialogs->active() ||
+         (dispatcher && !editors.ownsFocus(dispatcher->focusedArea()))))
+        return;
     const bool insertNick = command.starts_with("insert-nick:");
     if (insertNick || command.starts_with("buffer-command:")) {
         const std::size_t prefix = insertNick ? 12 : 15;
@@ -4499,7 +4505,8 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
                 command == "history-next" || command == "message-prev" ||
                 command == "message-next" || scrolling)
                 repeatCommands[keyId] = command;
-            if (composer && !workspaceCommand(command) && command != "copy-region" && !scrolling)
+            if (composer && !workspaceCommand(command) && command != "copy-region" &&
+                command != "cycle-spelling" && !scrolling)
                 composerEdited(workspace.focused);
             run(command);
             if (command == "jump-channel" && jumpOpen)

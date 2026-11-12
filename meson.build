@@ -84,6 +84,7 @@ app_cpp_args = [
   '-DBLASTIRC_FONT_DIR="' + get_option('font_dir') + '"',
   '-DBLASTIRC_EMOJI_DIR="' + get_option('emoji_dir') + '"',
   '-DBLASTIRC_SPELL_DICT_DIR="' + get_option('dictionary_dir') + '"',
+  '-DBLASTIRC_WORDLIST_FILE="' + get_option('wordlist_file') + '"',
 ]
 spell_lib = static_library('blastirc-spellcheck', 'src/spellcheck.cpp',
   include_directories: src_inc,
@@ -94,6 +95,16 @@ spell_dep = declare_dependency(
   link_with: spell_lib,
   include_directories: src_inc,
   dependencies: [hunspell_dep, pango_dep, threads_dep],
+)
+word_completion_lib = static_library('blastirc-word-completion', 'src/word_completion.cpp',
+  include_directories: src_inc,
+  dependencies: threads_dep,
+  cpp_args: app_cpp_args,
+)
+word_completion_dep = declare_dependency(
+  link_with: word_completion_lib,
+  include_directories: src_inc,
+  dependencies: threads_dep,
 )
 
 executable('blastirc',
@@ -123,7 +134,7 @@ executable('blastirc',
   'src/theme/theme.cpp',
   'src/fx/effects.cpp',
   include_directories: src_inc,
-  dependencies: [irc_dep, avatar_dep, preview_dep, picker_dep, spell_dep, noctalia_ui_dep, noctalia_ui_codecs_dep,
+  dependencies: [irc_dep, avatar_dep, preview_dep, picker_dep, spell_dep, word_completion_dep, noctalia_ui_dep, noctalia_ui_codecs_dep,
     mpv_dep, sdl_dep, sdl_mixer_dep, fontconfig_dep] + storage_deps,
   cpp_args: app_cpp_args,
   install: true,
@@ -158,6 +169,10 @@ if get_option('tests')
   spellcheck_check = executable('blastirc-spellcheck-check', 'tests/spellcheck_check.cpp',
     dependencies: spell_dep, cpp_args: check_args + app_cpp_args)
   test('spellcheck', spellcheck_check)
+
+  word_completion_check = executable('blastirc-word-completion-check', 'tests/word_completion_check.cpp',
+    dependencies: word_completion_dep, cpp_args: check_args + app_cpp_args)
+  test('word_completion', word_completion_check)
 
   media_player_check = executable('blastirc-media-player-check',
     'tests/media_player_check.cpp', 'src/ui/media_player.cpp',
@@ -215,7 +230,7 @@ if get_option('tests')
     'src/ui/media_preview.cpp', 'src/ui/media_player.cpp',
     'src/render/graphics.cpp', 'src/theme/theme.cpp', 'src/fx/effects.cpp',
     include_directories: src_inc,
-    dependencies: [irc_dep, avatar_dep, preview_dep, picker_dep, spell_dep, noctalia_ui_dep, noctalia_ui_codecs_dep,
+    dependencies: [irc_dep, avatar_dep, preview_dep, picker_dep, spell_dep, word_completion_dep, noctalia_ui_dep, noctalia_ui_codecs_dep,
       mpv_dep, openssl_dep, sdl_dep, sdl_mixer_dep, fontconfig_dep] + storage_deps,
     cpp_args: check_args + app_cpp_args)
   test('native_rename_check', native_ui_check, args: ['rename'])

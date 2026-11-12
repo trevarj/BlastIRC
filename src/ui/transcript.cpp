@@ -635,8 +635,15 @@ struct Geometry {
     float compactAvatarInset() const {
         return compactAvatarSize() > 0 ? compactAvatarSize() + 6 * scale : 0;
     }
+    float channelNickWidth(bool clockVisible) const {
+        return std::max(1.f,
+                        nickGutter - (!inlineChannel && clockVisible ? clockWidth + 8 * scale : 0));
+    }
     float prefixWidth(bool presence) const {
-        return presence ? timeGutter : channel ? channelPrefix() : dense() ? timeGutter : 0;
+        return presence  ? timeGutter
+               : channel ? (inlineChannel ? channelPrefix() : compactAvatarInset())
+               : dense() ? timeGutter
+                         : 0;
     }
     float bodyWidth(float width, bool presence) const {
         const float minimum = channel && !presence ? 1.f : 32.f;
@@ -710,7 +717,7 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
         result.nickLine = std::max(1.f, nickStrut.bottom - nickStrut.top);
         result.nickHeader = result.nickLine + 2 * result.chipPaddingY() + 3 * result.scale;
     }
-    result.timeFont = result.font * .72f;
+    result.timeFont = result.font * (result.bubbles ? .72f : .75f);
     if (result.bubbles) {
         const auto footerStrut = renderer.measureText("Mg", result.timeFont, themeUiFont(), 0, 1);
         result.footer = std::max(1.f, footerStrut.bottom - footerStrut.top);
@@ -723,10 +730,9 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
     if (result.timestamps)
         for (const auto digit : std::string_view("0123456789-")) {
             const std::string text = std::string(2, digit) + ":" + std::string(2, digit);
-            if (result.bubbles)
-                result.clockWidth =
-                    std::max(result.clockWidth,
-                             renderer.measureText(text, result.timeFont, themeUiFont()).width);
+            result.clockWidth = std::max(
+                result.clockWidth,
+                std::ceil(renderer.measureText(text, result.timeFont, themeUiFont()).width));
             result.timeGutter =
                 std::max({result.timeGutter, 44 * result.scale,
                           renderer.measureText(text, result.metadataFont, themeUiFont()).width +
@@ -751,11 +757,12 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
     if (result.channel) {
         const float available = std::max(1.f, width - 2 * result.metrics.inset * result.scale);
         const float nickAdornment = result.compactAvatarInset() + 2 * result.chipPadding();
+        auto actorFont = themeUiFont();
+        actorFont.weight = FontWeight::Bold;
         const float preferredNick =
-            renderer.measureText("MMMMMMMMM", result.metadataFont, themeUiFont()).width +
-            nickAdornment;
+            renderer.measureText("MMMMMMMMM", result.metadataFont, actorFont).width + nickAdornment;
         const float minimumNick =
-            renderer.measureText("MMMMM", result.metadataFont, themeUiFont()).width + nickAdornment;
+            renderer.measureText("MMMMM", result.metadataFont, actorFont).width + nickAdornment;
         const float minimumBody =
             std::max(144 * result.scale,
                      renderer.measureText("MMMMMMMMMMMM", result.font, themeMessageFont()).width);
@@ -767,8 +774,7 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
         if (result.inlineChannel)
             result.nickGutter = inlineNick;
         else {
-            result.timeGutter = std::min(result.timeGutter, available * .4f);
-            result.nickGutter = std::max(1.f, available - result.timeGutter);
+            result.nickGutter = available;
         }
     }
     result.key = buffer.kind + "|" + themeMessageFont().family + "|" + themeMessageFont().features +
@@ -814,6 +820,7 @@ struct TranscriptView::Impl {
         bool projected = false, hiddenActivity = false, activitySummary = false,
              activityExpanded = false, activityOpen = false;
         size_t previousVisible = absent, activityBegin = absent, activityEnd = absent;
+        size_t activityCount = 0;
         std::string activityLabel;
         float contentWidth = 0, surfaceWidth = 0, prefixWidth = 0, bodyOffset = 0, bodyHeight = 0;
         float emotePrefix = 0;
@@ -1022,6 +1029,7 @@ struct TranscriptView::Impl {
     };
     std::vector<std::string> typingParticipants;
     std::array<Label *, 2> typingNicks{};
+    Label *typingPhrase = nullptr;
     std::array<TypingAvatar, 3> typingAvatars{};
     RectNode *typingSurface = nullptr;
     Node *typingPaint = nullptr;
@@ -1219,6 +1227,9 @@ struct TranscriptView::Impl {
             name = label(*typingPaint, "", 0, 0, 1, 12 * themeScale(), {}, themeMessageFont());
             name->setHitTestVisible(false);
         }
+        typingPhrase = label(*typingPaint, "", 0, 0, 1, 12 * themeScale(),
+                             themeForegroundColor("on_surface_variant"), themeMessageFont());
+        typingPhrase->setHitTestVisible(false);
         auto overflow = std::make_unique<Button>();
         typingOverflow = overflow.get();
         overflow->setVariant(ButtonVariant::Ghost);
@@ -2948,7 +2959,8 @@ struct TranscriptView::Impl {
         };
         for (size_t index = first; index < c.rows.size();) {
             const auto &entry = buffer.messages[index];
-            if (!sourceContext(buffer, entry)) {
+            if ((entry.presence && entry.own && entry.activity == ActivityKind::Join) ||
+                !sourceContext(buffer, entry)) {
                 project(index, true, false, false, index, index + 1, {});
                 ++index;
                 continue;
@@ -2996,33 +3008,51 @@ struct TranscriptView::Impl {
                                            ? appendFrom
                                            : index + 1;
             size_t end = retainedEnd;
+            size_t count = retainedEnd > index + 1 ? c.rows[index].activityCount : 1;
             const auto day = localDate(entry.timestamp, "%Y-%m-%d");
-            while (end < c.rows.size() && end != c.divider && typedActivity(buffer.messages[end]) &&
-                   !foolish(buffer, buffer.messages[end]) &&
-                   (mode != PresenceMode::Smart || smartEligible[end]) &&
-                   localDate(buffer.messages[end].timestamp, "%Y-%m-%d") == day)
+            while (end < c.rows.size()) {
+                const auto &next = buffer.messages[end];
+                if (next.presence && next.own && next.activity == ActivityKind::Join) {
+                    ++end;
+                    continue;
+                }
+                if (end == c.divider || !typedActivity(next) || foolish(buffer, next) ||
+                    (mode == PresenceMode::Smart && !smartEligible[end]) ||
+                    localDate(next.timestamp, "%Y-%m-%d") != day)
+                    break;
+                ++count;
                 ++end;
-            const bool summary = mode == PresenceMode::Smart && end - index > 1;
+            }
+            c.rows[index].activityCount = count;
+            const bool summary = mode == PresenceMode::Smart && count > 1;
             bool expanded = false;
             if (summary) {
                 if (retainedEnd > index + 1)
                     expanded = c.rows[index].activityExpanded;
                 for (size_t i = retainedEnd > index + 1 ? retainedEnd : index; i < end; ++i)
-                    expanded = expanded || c.rows[i].activityOpen;
+                    if (!(buffer.messages[i].presence && buffer.messages[i].own &&
+                          buffer.messages[i].activity == ActivityKind::Join))
+                        expanded = expanded || c.rows[i].activityOpen;
             }
-            const auto label = summary ? std::to_string(end - index) + " channel events" : "";
+            const auto label = summary ? std::to_string(count) + " channel events" : "";
             project(index, mode == PresenceMode::Hidden, summary, expanded, index, end, label);
             if (retainedEnd > index + 1) {
                 if (mode == PresenceMode::All || expanded) {
-                    previous = retainedEnd - 1;
+                    const auto &tail = c.rows[retainedEnd - 1];
+                    previous = tail.hiddenActivity ? tail.previousVisible : retainedEnd - 1;
                     unreadPending = false;
                 } else if (mode == PresenceMode::Hidden && c.divider >= index &&
                            c.divider < retainedEnd)
                     unreadPending = true;
             }
-            for (size_t i = retainedEnd; i < end; ++i)
-                project(i, mode == PresenceMode::Hidden || (summary && !expanded), false, expanded,
-                        index, end, {});
+            for (size_t i = retainedEnd; i < end; ++i) {
+                const auto &member = buffer.messages[i];
+                const bool ownJoin =
+                    member.presence && member.own && member.activity == ActivityKind::Join;
+                // A hidden own JOIN must not skip later visible members of an expanded run.
+                project(i, ownJoin || mode == PresenceMode::Hidden || (summary && !expanded), false,
+                        !ownJoin && expanded, index, ownJoin ? i + 1 : end, {});
+            }
             index = end;
         }
         c.projectedPresence = mode;
@@ -3516,26 +3546,36 @@ struct TranscriptView::Impl {
                            (g.channel && !entry.presence && row.showClock) ||
                            (entry.presence && row.showClock))) {
             float descent = 0;
-            auto include = [&](std::string_view text, float width, TextAlign align) {
-                const auto measured =
-                    renderer.measureText(text, notice ? g.activityFont : g.metadataFont,
-                                         notice ? g.activityStyle : themeUiFont(),
-                                         std::max(1.f, width), 1, align, TextEllipsize::End);
+            auto include = [&](std::string_view text, float width, TextAlign align, bool nick) {
+                auto font = notice && !nick ? g.activityStyle : themeUiFont();
+                if (nick && entry.action)
+                    font.weight = FontWeight::Bold;
+                const float size = nick     ? g.metadataFont
+                                   : notice ? g.activityFont
+                                   : g.channel && !g.inlineChannel && !entry.presence
+                                       ? g.timeFont
+                                       : g.metadataFont;
+                const auto measured = renderer.measureText(text, size, font, std::max(1.f, width),
+                                                           1, align, TextEllipsize::End);
                 row.prefixAscent = std::max(row.prefixAscent, -measured.top);
                 descent = std::max(descent, measured.bottom);
             };
             if (g.nickVisible(row.grouped, entry.presence)) {
                 const auto align = g.inlineChannel ? TextAlign::End : TextAlign::Start;
-                const float nickWidth =
-                    std::max(1.f, g.nickGutter - g.compactAvatarInset() - friendExtent -
-                                      (entry.own && !entry.action ? 2 * g.chipPadding() : 0));
+                const float nickWidth = std::max(
+                    1.f, g.channelNickWidth(row.showClock) - g.compactAvatarInset() - friendExtent -
+                             (entry.own && !entry.action ? 2 * g.chipPadding() : 0));
                 if (entry.action)
-                    include("↳ " + entry.nick, nickWidth, align);
+                    include("↳ " + entry.nick, nickWidth, align, true);
                 else
-                    include(entry.nick, nickWidth, align);
+                    include(entry.nick, nickWidth, align, true);
             }
             if (row.showClock)
-                include(clockText(entry), g.timeGutter - 4 * g.scale, TextAlign::Start);
+                include(clockText(entry),
+                        g.channel && !g.inlineChannel && !entry.presence
+                            ? g.clockWidth
+                            : g.timeGutter - 4 * g.scale,
+                        TextAlign::Start, false);
             const float textHeight = row.prefixAscent + descent;
             row.prefixHeight = std::max(entry.presence ? 0.f : g.metadataHeader, textHeight);
             if (g.nickVisible(row.grouped, entry.presence))
@@ -3571,20 +3611,25 @@ struct TranscriptView::Impl {
                 row.selectionWidth = row.contentWidth;
             row.selectionWidth += row.prefixWidth;
             if (g.channel && !g.inlineChannel) {
-                float metadataWidth = g.timestamps && row.showClock ? g.timeGutter : 0;
+                float metadataWidth = 0;
                 if (g.nickVisible(row.grouped, entry.presence)) {
                     const float chipPadding = entry.own && !entry.action ? g.chipPadding() : 0;
                     const float adornments =
                         g.compactAvatarInset() + 2 * chipPadding + friendExtent;
-                    const float textLimit = std::max(1.f, g.nickGutter - adornments);
+                    const float textLimit =
+                        std::max(1.f, g.channelNickWidth(row.showClock) - adornments);
                     const auto text = entry.action ? "↳ " + entry.nick : entry.nick;
+                    auto actorFont = themeUiFont();
+                    if (entry.action)
+                        actorFont.weight = FontWeight::Bold;
                     metadataWidth = std::max(
                         metadataWidth,
-                        g.timeGutter + adornments +
+                        adornments +
                             std::min(
                                 textLimit,
-                                std::ceil(renderer.measureText(text, g.metadataFont, themeUiFont())
-                                              .width)));
+                                std::ceil(
+                                    renderer.measureText(text, g.metadataFont, actorFont).width)) +
+                            (row.showClock ? g.clockWidth + 8 * g.scale : 0));
                 }
                 row.selectionWidth = std::max(row.selectionWidth, metadataWidth);
             }
@@ -3939,6 +3984,8 @@ struct TranscriptView::Impl {
                        : metrics.inset * g.scale,
                    top + (g.tight ? g.paddingY(false) : 0), metrics.avatarSize * g.scale);
         if (!collapsed && ((g.channel && !entry.presence) || (entry.presence && row.showClock))) {
+            const bool stacked = g.stackedPrefix(row.grouped, entry.presence, row.showClock);
+            float clusterEnd = surfaceX + padding;
             auto prefix = [&](std::string text, float left, float width, bool nick) {
                 auto hit = std::make_unique<InputArea>();
                 auto *area = hit.get();
@@ -3975,6 +4022,10 @@ struct TranscriptView::Impl {
                         std::ceil(renderer.measureText(text, g.metadataFont, actorFont).width));
                     const float chipWidth = textWidth + 2 * chipPadding + friendExtent;
                     const float clusterWidth = avatarInset + chipWidth;
+                    if (stacked) {
+                        clusterEnd = left + clusterWidth;
+                        area->setSize(clusterWidth, row.prefixHeight);
+                    }
                     const float clusterX =
                         g.inlineChannel ? std::max(0.f, width - clusterWidth) : 0;
                     if (avatarSize > 0)
@@ -4017,13 +4068,16 @@ struct TranscriptView::Impl {
                     auto node = std::make_unique<TextNode>();
                     slot.channelTime = node.get();
                     node->setText(std::move(text));
-                    node->setFontSize(notice ? g.activityFont : g.metadataFont);
+                    node->setFontSize(notice    ? g.activityFont
+                                      : stacked ? g.timeFont
+                                                : g.metadataFont);
                     const auto &font = notice ? g.activityStyle : themeUiFont();
                     node->setFontFamily(font.family);
                     node->setFontFeatures(font.features);
                     node->setFontWeight(font.weight);
                     node->setMaxWidth(std::max(1.f, width));
                     node->setMaxLines(1);
+                    node->setEllipsize(TextEllipsize::End);
                     node->setPosition(0, row.prefixAscent);
                     node->setSize(std::max(1.f, width), row.prefixHeight);
                     node->setHitTestVisible(false);
@@ -4031,11 +4085,14 @@ struct TranscriptView::Impl {
                 }
                 slot.content->addChild(std::move(hit));
             };
-            if (row.showClock)
+            if (row.showClock && !stacked)
                 prefix(clockText(entry), surfaceX + padding, g.timeGutter - 4 * g.scale, false);
             if (g.nickVisible(row.grouped, entry.presence))
-                prefix(entry.action ? "↳ " + entry.nick : entry.nick, surfaceX + g.timeGutter,
-                       g.nickGutter, true);
+                prefix(entry.action ? "↳ " + entry.nick : entry.nick,
+                       surfaceX + padding + (stacked ? 0 : g.timeGutter),
+                       g.channelNickWidth(row.showClock), true);
+            if (row.showClock && stacked)
+                prefix(clockText(entry), clusterEnd + 8 * g.scale, g.clockWidth, false);
             if (g.stackedPrefix(row.grouped, entry.presence, row.showClock))
                 y += row.prefixHeight;
         }
@@ -4614,7 +4671,9 @@ struct TranscriptView::Impl {
                 slot.avatarInitial->setColor(
                     nickColor(model, entry.nick, sourceServer(*buffer, entry)));
             if (slot.channelTime)
-                slot.channelTime->setColor(themeForegroundColor("on_surface_variant"));
+                slot.channelTime->setColor(
+                    withAlpha(themeForegroundColor("on_surface_variant"),
+                              g.channel && !g.inlineChannel && !entry.presence ? .7f : 1.f));
             if (slot.bubbleTime)
                 slot.bubbleTime->setColor(themeForegroundColor(
                     entry.own && !entry.action ? "on_primary_container" : "on_surface_variant"));
@@ -5363,10 +5422,23 @@ struct TranscriptView::Impl {
         const float trayWidth = std::max(1.f, bodyWidth - 16 * g.scale);
         typingPaint->setClipChildren(true);
         typingPaint->setSize(trayWidth, footerHeight);
+        typingPhrase->setText(typingParticipants.size() == 1 ? "is typing" : "are typing");
+        typingPhrase->setFontFamily(themeMessageFont().family);
+        typingPhrase->setFontFeatures(themeMessageFont().features);
+        typingPhrase->setFontWeight(themeMessageFont().weight);
+        typingPhrase->setFontSize(g.font);
+        typingPhrase->setColor(themeForegroundColor("on_surface_variant"));
+        const float dotsWidth = std::min(22 * g.scale, trayWidth);
+        const float phraseWidth = std::min(
+            std::max(0.f, trayWidth - dotsWidth),
+            std::ceil(
+                renderer.measureText(typingPhrase->text(), g.font, themeMessageFont()).width));
+        const float phraseReserve = phraseWidth + dotsWidth;
         const float avatarSize = 32 * g.scale;
         const bool avatars = model.settings.avatars && model.settings.avatarStyle != "none";
         size_t avatarCount = avatars ? std::min(typingParticipants.size(), size_t(3)) : 0;
-        while (avatarCount && (44 + 18 * (avatarCount - 1) + 60) * g.scale > trayWidth)
+        while (avatarCount &&
+               (44 + 18 * (avatarCount - 1) + 60) * g.scale + phraseReserve > trayWidth)
             --avatarCount;
         const auto typingNetwork = model.networks.find(buffer->server);
         const std::string_view typingMapping =
@@ -5419,18 +5491,19 @@ struct TranscriptView::Impl {
             }
         }
         float typingX = avatarCount ? (44 + 18 * (avatarCount - 1)) * g.scale : 10 * g.scale;
-        typingX = std::min(typingX, std::max(0.f, trayWidth - 44 * g.scale));
+        typingX = std::min(typingX, std::max(0.f, trayWidth - phraseReserve - 40 * g.scale));
         const float textStart = typingX;
         const float nameHeight = renderer.fontRowExtent(g.font, themeMessageFont());
-        const float textY = std::max(0.f, (footerHeight - nameHeight - 7 * g.scale) / 2);
+        const float textY = std::max(0.f, (footerHeight - nameHeight) / 2);
         const float overflowWidth = 40 * g.scale;
         size_t shown = 0;
         for (size_t i = 0; i < typingNicks.size(); ++i) {
             auto *name = typingNicks[i];
             const bool exists = i < typingParticipants.size();
             const bool needsOverflow = typingParticipants.size() > i + 1;
-            const float available = std::max(0.f, trayWidth - typingX - 8 * g.scale -
-                                                      (needsOverflow ? overflowWidth : 0));
+            const float available =
+                std::max(0.f, trayWidth - typingX - phraseReserve - 8 * g.scale -
+                                  (needsOverflow ? overflowWidth : 0));
             const bool visible = exists && shown == i && available >= 12 * g.scale;
             name->setVisible(visible);
             if (!visible)
@@ -5464,18 +5537,26 @@ struct TranscriptView::Impl {
         typingOverflow->setExcludeSubtreeFromTabOrder(remaining == 0);
         typingOverflow->setFontSize(g.font);
         typingOverflow->setPosition(typingX, textY);
-        typingOverflow->setSize(std::min(overflowWidth, std::max(0.f, trayWidth - typingX)),
-                                nameHeight);
+        const float overflowExtent = std::min(
+            overflowWidth, std::max(0.f, trayWidth - typingX - phraseReserve - 5 * g.scale));
+        typingOverflow->setSize(overflowExtent, nameHeight);
         typingOverflow->setControlHeight(nameHeight);
         if (remaining)
-            typingX += overflowWidth;
+            typingX += overflowExtent + 5 * g.scale;
         else
             closeTypingList();
+        typingX = std::min(typingX, std::max(0.f, trayWidth - phraseReserve));
+        typingPhrase->setMaxWidth(std::max(1.f, phraseWidth));
+        typingPhrase->setVisible(phraseWidth > 0);
+        typingPhrase->measure(renderer);
+        typingPhrase->setPosition(typingX, textY);
+        typingX += phraseWidth;
         for (size_t i = 0; i < typingDots.size(); ++i) {
-            typingDots[i]->setPosition(textStart + i * 7 * g.scale,
-                                       textY + nameHeight + 4 * g.scale);
-            typingDots[i]->setSize(3 * g.scale, 3 * g.scale);
+            typingDots[i]->setPosition(typingX + (5 + i * 7) * g.scale, textY + nameHeight * .65f);
+            typingDots[i]->setSize(std::min(3 * g.scale, trayWidth), 3 * g.scale);
+            typingDots[i]->setVisible(typingX + (8 + i * 7) * g.scale <= trayWidth);
         }
+        typingX += dotsWidth;
         typingSurface->setVisible(g.bubbles && !typingParticipants.empty());
         typingSurface->setSize(std::min(trayWidth, typingX + 8 * g.scale), footerHeight);
         auto typingStyle = typingSurface->style();
@@ -5702,6 +5783,7 @@ void TranscriptView::setReadEligible(bool eligible) {
     if (!eligible)
         for (const Node *node = this; node; node = node->parent())
             if (!node->visible()) {
+                impl->closeTypingList();
                 impl->cancelFocusReveal();
                 impl->excludeRows();
                 break;

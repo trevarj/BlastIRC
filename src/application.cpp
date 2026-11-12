@@ -1195,6 +1195,8 @@ PresenceMode Application::presenceMode(const Buffer &b) const {
     return effectivePresenceMode(model.settings, b.id, b.target);
 }
 bool Application::presenceVisible(const Buffer &b, const Event &e) const {
+    if (e.own && e.type == "join")
+        return false;
     if (flag(e, "force-presence"))
         return true;
     auto net = model.networks.find(b.server);
@@ -1221,7 +1223,7 @@ bool Application::presenceVisible(const Buffer &b, const Event &e) const {
 }
 void Application::presence(Buffer &b, Event e, const string &text, bool emit) {
     const bool eligible = presenceVisible(b, e);
-    if (!eligible && presenceMode(b) != PresenceMode::Smart)
+    if (!eligible && presenceMode(b) != PresenceMode::Smart && !(e.own && e.type == "join"))
         return;
     Message m;
     m.id = e.id.empty() ? localId() : e.id;
@@ -1658,6 +1660,11 @@ void Application::receive(Event e) {
     }
 }
 void Application::groupPresence(Event e, bool joins, bool explicitBatch) {
+    if (joins && e.own) {
+        auto &b = buffer(e.server, e.target);
+        presence(b, e, e.nick + " joined " + b.target, false);
+        return;
+    }
     const string key = e.server + "\n" + (joins ? "join\n" : "quit\n") +
                        (tag(e, "batch").empty() ? e.text : tag(e, "batch"));
     auto expired = presenceGroups_.find(key);

@@ -1,6 +1,7 @@
 #include "../src/application.hpp"
 #include "../src/model.hpp"
 #include "../src/render/graphics.hpp"
+#include "../src/spellcheck.hpp"
 #include "../src/storage.hpp"
 #include "../src/theme/theme.hpp"
 #include "../src/ui/buffer_chrome.hpp"
@@ -31,6 +32,7 @@
 #include <render/core/texture_manager.h>
 #include <render/scene/input_dispatcher.h>
 #include <render/scene/rect_node.h>
+#include <render/scene/text_node.h>
 #include <render/text/cairo_text_renderer.h>
 #include <string>
 #include <string_view>
@@ -8929,6 +8931,225 @@ void conversationHistoryMissingBindingsCheck() {
     }
 }
 
+void wordPredictionBindingsCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    model.settings.wordPrediction = true;
+    model.settings.spellcheckLanguage = "en_US";
+    model.buffers.at(edgeBuffers[0]).draft = "accommodatio";
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    auto *composer = inputWithText(ui.root(), "accommodatio");
+    assert(composer && visible(*composer));
+    dispatcher.setFocus(composer->inputArea());
+    hostKey(ui, dispatcher, XKB_KEY_End);
+    const auto ghostIn = [&](auto &&self, Node &node) -> TextNode * {
+        if (!visible(node))
+            return nullptr;
+        if (auto *text = dynamic_cast<TextNode *>(&node);
+            text && text->text() == "n" && !text->participatesInLayout() && !text->hitTestVisible())
+            return text;
+        for (const auto &child : node.children())
+            if (auto *found = self(self, *child))
+                return found;
+        return nullptr;
+    };
+    const auto ghost = [&] { return ghostIn(ghostIn, *composer); };
+    const auto awaitGhost = [&] {
+        for (int attempt = 0; attempt < 400 && !ghost(); ++attempt) {
+            g_usleep(5000);
+            frame();
+        }
+        assert(ghost());
+    };
+    const auto cold = composer->editingState();
+    const auto undo = cold.history->undo, redo = cold.history->redo;
+    // The real dictionary loads asynchronously; wait for painted ink, not readiness internals.
+    awaitGhost();
+    assert(!ghost()->useMarkup() && composer->editingStateMatches(cold) &&
+           cold.history->undo == undo && cold.history->redo == redo);
+    assert(composer->value() == "accommodatio" &&
+           composer->textInputState().surroundingText == "accommodatio" &&
+           composer->displayProjection() && composer->displayProjection()->text == "accommodatio");
+    hostKey(ui, dispatcher, XKB_KEY_Tab);
+    frame();
+    assert(composer->value() == "accommodation" &&
+           composer->editingState().history->undo.size() == undo.size() + 1 && !ghost());
+    hostKey(ui, dispatcher, XKB_KEY_slash, KeyMod::Ctrl);
+    frame();
+    assert(composer->value() == "accommodatio");
+    awaitGhost();
+
+    model.settings.bindings["complete"] = "M-F6";
+    for (const auto key : {XKB_KEY_Tab, XKB_KEY_ISO_Left_Tab}) {
+        dispatcher.setFocus(composer->inputArea());
+        awaitGhost();
+        const auto before = composer->editingState();
+        hostKey(ui, dispatcher, key, key == XKB_KEY_Tab ? 0 : KeyMod::Shift);
+        frame();
+        assert(composer->editingStateMatches(before));
+    }
+    dispatcher.setFocus(composer->inputArea());
+    awaitGhost();
+    hostKey(ui, dispatcher, XKB_KEY_F6, KeyMod::Alt);
+    frame();
+    assert(composer->value() == "accommodation");
+    hostKey(ui, dispatcher, XKB_KEY_slash, KeyMod::Ctrl);
+    frame();
+    assert(composer->value() == "accommodatio");
+
+    for (const std::string modal : {"settings", "execute-command", "jump-channel"}) {
+        dispatcher.setFocus(composer->inputArea());
+        awaitGhost();
+        ui.execute(modal);
+        frame();
+        const auto before = composer->editingState();
+        const auto modalUndo = before.history->undo, modalRedo = before.history->redo;
+        ui.execute("complete");
+        assert(composer->editingStateMatches(before) && before.history->undo == modalUndo &&
+               before.history->redo == modalRedo);
+        // An unhandled modified key intentionally cancels jump mode; test the public action
+        // before that cancellation, rather than accepting into the restored composer afterward.
+        hostKey(ui, dispatcher, XKB_KEY_F6, KeyMod::Alt);
+        frame();
+        assert(composer->editingStateMatches(before) && before.history->undo == modalUndo &&
+               before.history->redo == modalRedo);
+        hostKey(ui, dispatcher, XKB_KEY_Escape);
+        frame();
+    }
+    dispatcher.setFocus(composer->inputArea());
+    awaitGhost();
+    ui.execute("complete");
+    frame();
+    assert(composer->value() == "accommodation");
+    hostKey(ui, dispatcher, XKB_KEY_slash, KeyMod::Ctrl);
+    frame();
+    assert(composer->value() == "accommodatio");
+    awaitGhost();
+    model.settings.wordPrediction = false;
+    frame();
+    assert(!ghost());
+    const auto disabled = composer->editingState();
+    hostKey(ui, dispatcher, XKB_KEY_F6, KeyMod::Alt);
+    frame();
+    assert(!ghost() && composer->editingStateMatches(disabled));
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
+void cycleSpellingBindingsCheck() {
+    using namespace blast;
+    // UI construction also migrates models which have not passed through Storage.
+    for (const std::string conflict : {"", "C-;", "C-; a", "c-;"})
+        for (const std::string saved : {"missing", "", "M-F6"}) {
+            auto model = edgeModel();
+            model.settings.bindings["user-command"] = conflict;
+            if (saved != "missing")
+                model.settings.bindings["cycle-spelling"] = saved;
+            Clipboard clipboard;
+            Ui ui(model, clipboard);
+            assert(model.settings.bindings.at("user-command") == conflict);
+            assert(model.settings.bindings.at("cycle-spelling") == (saved != "missing" ? saved
+                                                                    : conflict.empty() ? "C-;"
+                                                                                       : ""));
+        }
+
+    auto model = edgeModel();
+    const auto languages = Spellcheck::languages();
+    assert(std::find(languages.begin(), languages.end(), "en_US") != languages.end());
+    model.settings.spellcheckLanguage = "en_US";
+    Spellcheck spelling;
+    spelling.request(1, "speling", model.settings.spellcheckLanguage);
+    std::optional<SpellResult> checked;
+    for (int attempt = 0; attempt < 400 && !checked; ++attempt) {
+        g_usleep(5000);
+        checked = spelling.poll();
+    }
+    assert(checked && checked->error.empty() && checked->misspelled.size() == 1);
+    const auto suggestions = spelling.suggest("speling", model.settings.spellcheckLanguage);
+    assert(suggestions.size() > 1);
+    model.buffers.at(edgeBuffers[0]).draft = "speling";
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    auto *composer = inputWithText(ui.root(), "speling");
+    assert(composer && visible(*composer));
+    const auto awaitText = [&](const std::string &expected) {
+        for (int attempt = 0; attempt < 400 && composer->value() != expected; ++attempt) {
+            g_usleep(5000);
+            frame();
+        }
+        assert(composer->value() == expected);
+    };
+    dispatcher.setFocus(composer->inputArea());
+    hostKey(ui, dispatcher, XKB_KEY_End);
+    hostKey(ui, dispatcher, XKB_KEY_semicolon, KeyMod::Ctrl);
+    awaitText(suggestions[0]);
+    hostKey(ui, dispatcher, XKB_KEY_semicolon, KeyMod::Ctrl);
+    awaitText(suggestions[1]);
+    hostKey(ui, dispatcher, XKB_KEY_slash, KeyMod::Ctrl);
+    assert(composer->value() == suggestions[0]);
+    hostKey(ui, dispatcher, XKB_KEY_slash, KeyMod::Ctrl);
+    assert(composer->value() == "speling");
+
+    model.settings.bindings["cycle-spelling"] = "M-F6";
+    hostKey(ui, dispatcher, XKB_KEY_semicolon, KeyMod::Ctrl);
+    assert(composer->value() == "speling");
+    hostKey(ui, dispatcher, XKB_KEY_F6, KeyMod::Alt);
+    awaitText(suggestions[0]);
+    hostKey(ui, dispatcher, XKB_KEY_slash, KeyMod::Ctrl);
+    assert(composer->value() == "speling");
+
+    for (const std::string modal : {"settings", "execute-command", "jump-channel"}) {
+        dispatcher.setFocus(composer->inputArea());
+        ui.execute(modal);
+        frame();
+        const auto before = composer->editingState();
+        const auto modalUndo = before.history->undo, modalRedo = before.history->redo;
+        ui.execute("cycle-spelling");
+        assert(composer->editingStateMatches(before) && before.history->undo == modalUndo &&
+               before.history->redo == modalRedo);
+        // Jump mode cancels on this modified key, so no public action may follow it here.
+        hostKey(ui, dispatcher, XKB_KEY_F6, KeyMod::Alt);
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            g_usleep(5000);
+            frame();
+        }
+        assert(composer->editingStateMatches(before) && before.history->undo == modalUndo &&
+               before.history->redo == modalRedo);
+        hostKey(ui, dispatcher, XKB_KEY_Escape);
+        frame();
+    }
+    dispatcher.setFocus(composer->inputArea());
+    hostKey(ui, dispatcher, XKB_KEY_F6, KeyMod::Alt);
+    awaitText(suggestions[0]);
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
 } // namespace
 
 void runModalFocusRemapChecks(
@@ -8958,6 +9179,8 @@ void runTranscriptLinkFocusCheck(
 
 void runUiIntegrationCheck() {
     codecs::installImageDecoder();
+    wordPredictionBindingsCheck();
+    cycleSpellingBindingsCheck();
     conversationHistoryNativeCheck();
     conversationHistorySelectionCheck(false);
     conversationHistorySelectionCheck(true);

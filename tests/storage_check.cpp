@@ -970,6 +970,52 @@ static void spellingPreferences(const fs::path &config) {
     }
     std::ofstream(preferences) << valid;
 }
+static void predictionPreferences(const fs::path &config) {
+    const auto preferences = config / "settings.toml";
+    const auto original = contents(preferences);
+    for (const string source : {"", "[composer]\n", "[composer]\nword_prediction = false\n",
+                                "[composer]\nword_prediction = true\n"}) {
+        std::ofstream(preferences) << "schema_version = 1\n" << source;
+        const bool enabled = source.find("true") != string::npos;
+        for (int reopen = 0; reopen < 2; ++reopen) {
+            Storage storage;
+            Model model;
+            assert(!model.settings.wordPrediction);
+            storage.load(model);
+            assert(model.settings.wordPrediction == enabled);
+            storage.save(model);
+            assert(contents(preferences)
+                       .find(enabled ? "word_prediction = true" : "word_prediction = false") !=
+                   string::npos);
+        }
+    }
+    {
+        Storage storage;
+        Model model;
+        storage.load(model);
+        assert(model.settings.wordPrediction);
+        model.settings.wordPrediction = Settings{}.wordPrediction;
+        storage.save(model);
+        model.settings.wordPrediction = true;
+        storage.load(model);
+        assert(!model.settings.wordPrediction);
+    }
+    for (const string value : {"'true'", "'false'", "0", "1", "1.0", "[]", "{}"}) {
+        std::ofstream(preferences)
+            << "schema_version = 1\n[composer]\nword_prediction = " << value << '\n';
+        Storage storage;
+        Model model;
+        model.settings.wordPrediction = true;
+        bool failed = false;
+        try {
+            storage.load(model);
+        } catch (const std::runtime_error &) {
+            failed = true;
+        }
+        assert(failed && model.settings.wordPrediction);
+    }
+    std::ofstream(preferences) << original;
+}
 static void peopleModePreferences(const fs::path &config) {
     struct Case {
         string source;
@@ -2260,6 +2306,29 @@ int main() {
         presenceInheritancePreferences(config);
         peopleModePreferences(config);
         spellingPreferences(config);
+        predictionPreferences(config);
+        // Missing spelling defaults never claim a custom shortcut or its chord prefix.
+        for (const string chord : {"", "C-;", "C-; a", "c-;"}) {
+            for (const string saved : {"missing", "", "M-F6"}) {
+                {
+                    std::ofstream output(config / "settings.toml");
+                    output << "schema_version = 1\n[bindings]\nuser-command = '" << chord << "'\n";
+                    if (saved != "missing")
+                        output << "cycle-spelling = '" << saved << "'\n";
+                }
+                for (int reopen = 0; reopen < 2; ++reopen) {
+                    Storage storage;
+                    Model migrated;
+                    storage.load(migrated);
+                    assert(migrated.settings.bindings.at("user-command") == chord);
+                    assert(migrated.settings.bindings.at("cycle-spelling") ==
+                           (saved != "missing" ? saved
+                            : chord.empty()    ? "C-;"
+                                               : ""));
+                    storage.save(migrated);
+                }
+            }
+        }
         // A newly introduced shortcut must not shadow an existing command or chord prefix.
         for (const string chord : {"C-x j", "C-x j a", "C-x"}) {
             {

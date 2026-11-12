@@ -462,6 +462,7 @@ Settings defaults() {
                          {"kill-region", "C-w"},
                          {"copy-region", "M-w"},
                          {"yank", "C-y"},
+                         {"cycle-spelling", "C-;"},
                          {"undo", "C-/"},
                          {"redo", ""},
                          {"copy", ""},
@@ -853,6 +854,7 @@ void parseSettings(const toml::table &document, Settings &settings) {
     if (const auto *row = table(document, "composer")) {
         exactField(*row, "spellcheck", settings.spellcheck);
         exactField(*row, "spellcheck_language", settings.spellcheckLanguage);
+        exactField(*row, "word_prediction", settings.wordPrediction);
     }
     if (const auto *row = table(document, "cursor")) {
         field(*row, "shape", settings.cursorShape);
@@ -934,7 +936,7 @@ void parseSettings(const toml::table &document, Settings &settings) {
                    ui_logic::bindingConflicts("C-t", entry.second);
         }))
         settings.bindings.at("transpose-chars").clear();
-    for (const char *name : {"conversation-back", "conversation-forward"}) {
+    for (const char *name : {"conversation-back", "conversation-forward", "cycle-spelling"}) {
         if (savedBindings && savedBindings->contains(name))
             continue;
         auto &binding = settings.bindings.at(name);
@@ -1111,7 +1113,8 @@ toml::table settingsDocument(const Settings &settings) {
         {"presentation", toml::table{{"message_layouts", std::move(messageLayouts)},
                                      {"pinned_buffers", array(settings.pinnedBuffers)}}},
         {"composer", toml::table{{"spellcheck", settings.spellcheck},
-                                 {"spellcheck_language", settings.spellcheckLanguage}}},
+                                 {"spellcheck_language", settings.spellcheckLanguage},
+                                 {"word_prediction", settings.wordPrediction}}},
         {"cursor",
          toml::table{
              {"shape", settings.cursorShape},

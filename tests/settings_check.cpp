@@ -299,6 +299,24 @@ void spellingControls(blast::Model &model, blast::Dialogs &dialogs, InputDispatc
     assert(model.settings.spellcheckLanguage == "auto");
 }
 
+void predictionControls(blast::Model &model, blast::Dialogs &dialogs, InputDispatcher &dispatcher) {
+    auto *enabled = named<Toggle>(dialogs, "Predict words");
+    assert(!model.settings.wordPrediction);
+    auto *disclosure = find<Label>(dialogs, [](const Label &label) {
+        return label.text().find("American English dictionary") != std::string_view::npos &&
+               label.text().find("recent words you sent in the current chat") !=
+                   std::string_view::npos &&
+               label.text().find("Local only") != std::string_view::npos;
+    });
+    assert(disclosure);
+    activate(dispatcher, *enabled);
+    assert(model.settings.wordPrediction);
+    activate(dispatcher, *enabled);
+    assert(!model.settings.wordPrediction);
+    activate(dispatcher, *enabled);
+    assert(model.settings.wordPrediction);
+}
+
 void settingsTreeControls() {
     using namespace blast;
     Model model;
@@ -1244,10 +1262,16 @@ void runSettingsCheck() {
     // and clipping are checked by the real Wayland workflow, not a fake renderer.
     category(0);
     spellingControls(model, dialogs, dispatcher);
+    predictionControls(model, dialogs, dispatcher);
     model.settings.spellcheckLanguage = "unavailable_dictionary_for_settings_check";
     dialogs.open("settings");
     sync();
     auto *missingLanguage = named<Select>(dialogs, "Spelling language");
+    assert(model.settings.wordPrediction);
+    activate(dispatcher, *named<Toggle>(dialogs, "Predict words"));
+    assert(!model.settings.wordPrediction);
+    activate(dispatcher, *named<Toggle>(dialogs, "Predict words"));
+    assert(model.settings.wordPrediction);
     assert(missingLanguage->selectedText().empty());
     auto *availability = find<Label>(dialogs, [](const Label &label) {
         return label.visible() && !dynamic_cast<const Select *>(label.parent()) &&
@@ -1419,6 +1443,33 @@ void runSettingsCheck() {
     edit(dispatcher, *bindingField, "M-F6");
     assert(model.settings.bindings.at("complete") == "M-F6");
     assert(commandLabel(model, "Complete", "complete").find("M-F6") != std::string::npos);
+    assert(defaultBindings().at("cycle-spelling") == "C-;");
+    assert(commandDisplayName("cycle-spelling") == "Cycle spelling suggestions");
+    auto *spellingRecord = keyed(dialogs, "blastirc.settings.record.cycle-spelling");
+    dispatcher.setFocus(spellingRecord);
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    assert(spellingRecord->capturesAllKeys());
+    assert(dialogs.handleKey(stroke(XKB_KEY_semicolon, KeyMod::Ctrl)));
+    assert(dialogs.handleKey(stroke(XKB_KEY_Return, KeyMod::Ctrl)));
+    assert(model.settings.bindings.at("cycle-spelling") ==
+           bindingStroke(stroke(XKB_KEY_semicolon, KeyMod::Ctrl)));
+    auto *spellingField = dynamic_cast<Input *>(
+        keyed(dialogs, "blastirc.settings.binding.cycle-spelling")->textInputClient());
+    assert(spellingField);
+    bool editingGroup = false;
+    for (auto *node = spellingField->parent(); node; node = node->parent())
+        if (find<Label>(*node, [](const Label &label) {
+                return label.text() == "Editing and selection";
+            })) {
+            editingGroup = true;
+            break;
+        }
+    assert(editingGroup);
+    edit(dispatcher, *spellingField, "M-F6");
+    assert(model.settings.bindings.at("cycle-spelling") == "M-F6");
+    press(dispatcher, *button(*spellingField->parent()->parent(), "Reset"));
+    assert(model.settings.bindings.at("cycle-spelling") == "C-;" &&
+           spellingField->value() == "C-;");
 
     category(2);
     named<Select>(dialogs, "Presence rows")->setSelectedIndex(2);
@@ -1630,6 +1681,8 @@ void runSettingsCheck() {
     assert(!find<Label>(dialogs, [&](const Label &label) { return label.text() == failedError; }));
     Model loaded;
     app.storage().load(loaded);
+    assert(loaded.settings.wordPrediction && model.settings.wordPrediction);
+    assert(fileText(preferences).find("word_prediction = true") != std::string::npos);
     assert(loaded.settings.cursorShape == "box" && loaded.settings.cursorEffect == "trail" &&
            loaded.settings.cursorTrailDurationMs == 222 &&
            std::abs(loaded.settings.cursorTrailStrength - .31f) < .001f);

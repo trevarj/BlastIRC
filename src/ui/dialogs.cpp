@@ -1555,6 +1555,11 @@ struct Dialogs::Impl {
             std::find(languages.begin(), languages.end(), savedLanguage) == languages.end())
             languagePicker->setPlaceholder(savedLanguage + " (unavailable)");
         updateSpellingStatus();
+        toggle(*spelling, "Predict words", model.settings.wordPrediction,
+               [this](bool value) { model.settings.wordPrediction = value; });
+        label(*spelling, "Predicts words using an American English dictionary and recent words "
+                         "you sent in the current chat. Local only; no text is sent over the "
+                         "network for prediction.");
         auto *cursor = section("appearance.cursor", "Cursor");
         static constexpr const char *shapeIds[] = {"line", "box", "underline"};
         static constexpr const char *shapeNames[] = {"Line", "Solid box", "Underline"};
@@ -1736,7 +1741,7 @@ struct Dialogs::Impl {
                 name == "backward-delete" || name == "copy-region" || name == "yank" ||
                 name == "undo" || name == "set-mark" || name == "redo" || name == "copy" ||
                 name == "cut" || name == "paste" || name == "select-all" ||
-                name == "transpose-chars")
+                name == "transpose-chars" || name == "cycle-spelling")
                 return 2;
             if (name == "switch-buffer" || name == "execute-command" || name == "jump-channel" ||
                 name == "conversation-back" || name == "conversation-forward" ||
@@ -1831,6 +1836,9 @@ struct Dialogs::Impl {
                 label(*tasks, "Record captures Tab and Escape; Finish or Ctrl+Enter applies "
                               "the sequence, Ctrl+G cancels, and Shift+Tab moves between "
                               "controls when not recording.");
+            if (category == 2 && tasks)
+                label(*tasks, "Cycle spelling suggestions replaces the misspelled word at the "
+                              "composer caret. Repeat the shortcut to try the next suggestion.");
         }
         button(*page, "Restore default keymap", [this] {
             stopRecording(false);

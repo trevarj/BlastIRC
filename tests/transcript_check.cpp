@@ -33,6 +33,7 @@
 #include <thread>
 #include <tuple>
 #include <ui/controls/button.h>
+#include <ui/controls/glyph.h>
 #include <ui/controls/image.h>
 #include <ui/controls/input.h>
 #include <ui/controls/label.h>
@@ -696,13 +697,19 @@ float baseline(const TextNode &text) {
 }
 
 LayoutRect sceneBounds(const Node &node);
+LayoutRect nativeTextInk(TranscriptTestRenderer &renderer, const TextNode &text);
 
 void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
     ConfigDirectory config;
     blast::Model model;
     model.settings.scale = zoom;
-    model.settings.messageScale = zoom;
+    model.settings.messageScale = .85f * zoom;
     model.settings.timestamps = false;
+    model.settings.uiFont = "sans-serif";
+    model.settings.messageFont = "serif";
+    model.settings.uiFontWeight = 700;
+    model.settings.messageFontWeight = 300;
+    model.settings.friends.insert("Peer");
     model.settings.avatars = true;
     model.settings.reducedMotion = true;
     model.settings.themeSource = "builtin";
@@ -756,6 +763,34 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 renderer.measureText(nick->text(), nick->fontSize(), nick->font(), nick->maxWidth(),
                                      1, nick->textAlign(), nick->ellipsize(), false);
             assert(ink.lineCount == 1 && ink.width <= hit->width() + .02f);
+            const auto nativeInk = nativeTextInk(renderer, *nick);
+            assert(nativeInk.width > 0 && nativeInk.height > 0);
+            const auto labelBounds = sceneBounds(*nick->parent());
+            const auto bodyBounds = sceneBounds(rendered.body);
+            const bool stacked =
+                viewport.width <= 240 * zoom ||
+                model.settings.messageLayouts.at(buffer.id) == blast::MessageLayout::Stacked;
+            if (stacked) {
+                near(bodyBounds.x, hx + (enabled ? 26 * zoom : 0));
+                near(bodyBounds.x,
+                     labelBounds.x -
+                         (i == 1 ? labelBounds.x - sceneBounds(*find<RectNode>(*hit)).x : 0));
+                assert(nativeInk.y + nativeInk.height <= bodyBounds.y + .02f);
+            } else {
+                assert(labelBounds.x + labelBounds.width <= bodyBounds.x + .02f);
+                assert(nativeInk.x + nativeInk.width <= bodyBounds.x + .02f);
+            }
+            if (i == 2) {
+                auto *badge = find<GlyphNode>(*hit);
+                assert(badge && badge->visible());
+                assert(dynamic_cast<Glyph *>(badge->parent()));
+                const auto badgeBounds = sceneBounds(*badge->parent());
+                near(badgeBounds.width, 14 * zoom);
+                near(badgeBounds.height, 14 * zoom);
+                assert(labelBounds.x + labelBounds.width <= badgeBounds.x + .02f);
+                if (!stacked)
+                    assert(badgeBounds.x + badgeBounds.width <= bodyBounds.x + .02f);
+            }
             assert(hx >= viewport.x - .02f &&
                    hx + hit->width() <= viewport.x + viewport.width + .02f);
             auto *picture = avatar(rendered);
@@ -779,6 +814,8 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                     auto *image = dynamic_cast<Image *>(picture);
                     assert(image && image->hasImage());
                 }
+                if (stacked)
+                    assert(ax + picture->width() + 5.9f * zoom <= bodyBounds.x);
             }
             if (i == 1) {
                 auto *chip = find<RectNode>(*hit);
@@ -794,8 +831,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 assert(!plainText(rendered.content, "YOU") && !plainText(rendered.content, "Sent"));
                 rail(rendered, {});
             }
-            if (viewport.width <= 240 * zoom ||
-                model.settings.messageLayouts.at(buffer.id) == blast::MessageLayout::Stacked)
+            if (stacked)
                 assert(hy + hit->height() <= bounds(rendered).top + .02f);
             else
                 near(baseline(*nick), baseline(rendered.text));
@@ -874,9 +910,14 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
 void traditionalClocks(TranscriptTestRenderer &renderer, float zoom) {
     blast::Model model;
     model.settings.scale = zoom;
-    model.settings.messageScale = zoom;
+    model.settings.messageScale = .85f * zoom;
     model.settings.timestamps = true;
     model.settings.avatars = false;
+    model.settings.uiFont = "sans-serif";
+    model.settings.messageFont = "serif";
+    model.settings.uiFontWeight = 700;
+    model.settings.messageFontWeight = 300;
+    model.settings.friends.insert("Peer");
     model.settings.presence = blast::PresenceMode::Smart;
     model.settings.foolDisplay = blast::FoolDisplay::Hidden;
     model.settings.fools.insert("Muted");
@@ -970,22 +1011,77 @@ void traditionalClocks(TranscriptTestRenderer &renderer, float zoom) {
         for (const auto token : {"ClockSameAuthor", "ClockOtherAuthor", "ClockAfterHidden",
                                  "ClockMinute", "ClockAfterActivity", "ClockNextDay"})
             near(body(view, token, true).x(), body(view, "ClockFirst", true).x());
+        const bool stacked =
+            viewport.width <= 240 * zoom ||
+            model.settings.messageLayouts.at(buffer.id) == blast::MessageLayout::Stacked;
+        for (const auto token : {"ClockFirst", "ClockMinute", "ClockFallback", "ClockUnknown"}) {
+            const auto rendered = body(view, token, true);
+            const auto value = token == std::string_view("ClockFirst")      ? firstClock
+                               : token == std::string_view("ClockMinute")   ? minuteClock
+                               : token == std::string_view("ClockFallback") ? "12:34"
+                                                                            : "--:--";
+            auto *time = plainText(rendered.content, value);
+            auto *nick = plainText(rendered.content,
+                                   token == std::string_view("ClockMinute") ? "Other" : "Peer");
+            assert(time && nick);
+            const auto timeBounds = nativeTextInk(renderer, *time);
+            const auto nickBounds = sceneBounds(*nick->parent());
+            const auto bodyBounds = sceneBounds(rendered.body);
+            const auto rowBounds = sceneBounds(rendered.row);
+            assert(timeBounds.x >= rowBounds.x - .02f &&
+                   timeBounds.x + timeBounds.width <= rowBounds.x + rowBounds.width + .02f);
+            const auto nickInk = nativeTextInk(renderer, *nick);
+            if (stacked) {
+                near(time->fontSize(), .75f * blast::messageTextSize(model.settings, buffer));
+                assert(time->font() == blast::themeUiFont());
+                float clusterRight = nickBounds.x + nickBounds.width;
+                if (auto *badge = find<GlyphNode>(*nick->parent()->parent())) {
+                    assert(dynamic_cast<Glyph *>(badge->parent()));
+                    const auto badgeBounds = sceneBounds(*badge->parent());
+                    near(badgeBounds.width, 14 * zoom);
+                    near(badgeBounds.height, 14 * zoom);
+                    clusterRight = std::max(clusterRight, badgeBounds.x + badgeBounds.width);
+                }
+                near(sceneBounds(*time->parent()).x, clusterRight + 8 * zoom);
+                assert(nickInk.x + nickInk.width <= timeBounds.x + .02f);
+                near(baseline(*time), baseline(*nick));
+                assert(timeBounds.y + timeBounds.height <= bodyBounds.y + .02f);
+            } else {
+                assert(timeBounds.x + timeBounds.width <= nickBounds.x + .02f);
+                assert(nickBounds.x + nickBounds.width <= bodyBounds.x + .02f);
+                assert(timeBounds.x + timeBounds.width <= nickInk.x + .02f);
+                assert(nickInk.x + nickInk.width <= bodyBounds.x + .02f);
+                near(baseline(*time), baseline(rendered.text));
+                near(baseline(*nick), baseline(rendered.text));
+            }
+        }
     };
-    for (const float width : {900 * zoom, 240 * zoom}) {
-        viewport.width = width;
-        arrange();
-        geometry();
-        const float bodyX = body(view, "ClockOtherAuthor", true).x();
-        model.settings.timestamps = false;
-        arrange();
-        clock("ClockFirst", firstClock, false);
-        clock("ClockMinute", minuteClock, false);
-        clock("ClockFallback", "12:34", false);
-        model.settings.timestamps = true;
-        arrange();
-        geometry();
-        near(body(view, "ClockOtherAuthor", true).x(), bodyX);
-    }
+    for (const auto layout : {blast::MessageLayout::Irc, blast::MessageLayout::Stacked})
+        for (const bool avatars : {false, true})
+            for (const char *style : {"monogram", "sprite"}) {
+                model.settings.messageLayouts[buffer.id] = layout;
+                model.settings.avatars = avatars;
+                model.settings.avatarStyle = style;
+                for (const float width : {900 * zoom, 240 * zoom}) {
+                    viewport.width = width;
+                    arrange();
+                    geometry();
+                    const float bodyX = body(view, "ClockOtherAuthor", true).x();
+                    model.settings.timestamps = false;
+                    arrange();
+                    clock("ClockFirst", firstClock, false);
+                    clock("ClockMinute", minuteClock, false);
+                    clock("ClockFallback", "12:34", false);
+                    if (width <= 240 * zoom || layout == blast::MessageLayout::Stacked)
+                        near(body(view, "ClockOtherAuthor", true).x(), bodyX);
+                    else
+                        assert(body(view, "ClockOtherAuthor", true).x() < bodyX);
+                    model.settings.timestamps = true;
+                    arrange();
+                    geometry();
+                    near(body(view, "ClockOtherAuthor", true).x(), bodyX);
+                }
+            }
     viewport.height = 140 * zoom;
     arrange();
     auto *scroll = find<ScrollView>(view);
@@ -1003,6 +1099,10 @@ void traditionalClocks(TranscriptTestRenderer &renderer, float zoom) {
     unchanged(buffer, before);
     assert(model.actions.empty());
 }
+
+void containedBounds(LayoutRect inner, LayoutRect outer,
+                     std::source_location location = std::source_location::current());
+LayoutRect nativeHistoryClip(blast::TranscriptView &view);
 
 void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
     blast::Model model;
@@ -1176,8 +1276,8 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
     auto *compactHit = nickControl(*compactAuthor);
     assert(compactHit && compactHit->y() + compactHit->height() <= compact.y() + .02f);
     assert(compact.x() < withTime);
-    assert(compact.body.x() <= compactHit->x() + .02f &&
-           compact.body.x() + compact.body.width() >= compactHit->x() + compactHit->width() - .02f);
+    near(sceneBounds(compact.body).x, sceneBounds(*compactAuthor->parent()).x);
+    assert(sceneBounds(compact.body).width + .02f >= compactAuthor->parent()->width());
     visibleNickInk(*compactAuthor, *compactHit);
     const auto compactGrouped = body(view, "GroupedLine");
     auto *groupedAuthor = plainText(compactGrouped.content, longNick);
@@ -1193,8 +1293,12 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
         assert(minimumAuthor);
         auto *prefix = nickControl(*minimumAuthor);
         assert(prefix && prefix->y() + prefix->height() <= minimum.y() + .02f);
-        assert(minimum.body.x() <= prefix->x() + .02f &&
-               minimum.body.x() + minimum.body.width() >= prefix->x() + prefix->width() - .02f);
+        const auto minimumBody = sceneBounds(minimum.body);
+        const auto minimumNick = sceneBounds(*minimumAuthor->parent());
+        near(minimumBody.x, minimumNick.x);
+        assert(minimumNick.x + minimumNick.width <= minimumBody.x + minimumBody.width + .02f);
+        containedBounds(minimumBody, nativeHistoryClip(view));
+        containedBounds(sceneBounds(*prefix), nativeHistoryClip(view));
         visibleNickInk(*minimumAuthor, *prefix);
     }
     unchanged(buffer, before);
@@ -1495,8 +1599,7 @@ LayoutRect intersectBounds(LayoutRect a, LayoutRect b) {
     return {a.x, a.y, right - a.x, bottom - a.y};
 }
 
-void containedBounds(LayoutRect inner, LayoutRect outer,
-                     std::source_location location = std::source_location::current()) {
+void containedBounds(LayoutRect inner, LayoutRect outer, std::source_location location) {
     const bool positive = inner.width > 0 && inner.height > 0;
     const bool contained = inner.x >= outer.x - .02f && inner.y >= outer.y - .02f &&
                            inner.x + inner.width <= outer.x + outer.width + .02f &&
@@ -3838,7 +3941,7 @@ void smartPresenceEligibility(TranscriptTestRenderer &renderer) {
             message.text = std::string(scenario.name) + "-" + id;
             message.timestamp = eventTime;
             message.presence = true;
-            message.activity = blast::ActivityKind::Join;
+            message.activity = own ? blast::ActivityKind::Part : blast::ActivityKind::Join;
             message.own = own;
             buffer.messages.push_back(std::move(message));
         };
@@ -3907,6 +4010,133 @@ void smartPresenceEligibility(TranscriptTestRenderer &renderer) {
         dispatcher.setFocus(nullptr);
         dispatcher.setSceneRoot(nullptr);
     }
+}
+
+void ownJoinProjection(TranscriptTestRenderer &renderer) {
+    for (int layout = 0; layout < 3; ++layout)
+        for (const bool history : {false, true}) {
+            blast::Model model;
+            model.settings.timestamps = model.settings.avatars = false;
+            model.settings.reducedMotion = true;
+            model.settings.presence = blast::PresenceMode::Smart;
+            blast::Theme theme;
+            theme.update(model);
+            auto &buffer = model.buffers["own-join"];
+            buffer.id = buffer.target = "own-join";
+            buffer.kind = "channel";
+            buffer.server = "network";
+            model.networks[buffer.server].nick = "CurrentNick";
+            if (layout)
+                model.settings.messageLayouts[buffer.id] =
+                    layout == 1 ? blast::MessageLayout::Irc : blast::MessageLayout::Stacked;
+            const auto append = [&](const char *id, bool own, bool presence,
+                                    blast::ActivityKind kind, bool action = false) {
+                blast::Message message;
+                message.id = message.text = id;
+                // Persisted ownership must not depend on today's nickname or notice prose.
+                message.nick = own ? "OldNick" : "Participant";
+                message.timestamp = 1000;
+                message.own = own;
+                message.presence = presence;
+                message.activity = kind;
+                message.history = history;
+                message.action = action;
+                buffer.messages.push_back(std::move(message));
+            };
+            append("OwnJoinAlone", true, true, blast::ActivityKind::Join);
+            blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
+            Clipboard clipboard;
+            blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+            view.setReadEligible(false);
+            InputDispatcher dispatcher;
+            dispatcher.setSceneRoot(&view);
+            view.setInputDispatcher(dispatcher);
+            const auto arrange = [&] {
+                view.sync();
+                view.arrange(renderer, {17, 23, 1200, 2000});
+            };
+            const auto summaries = [&](std::string_view tooltip) {
+                std::vector<InputArea *> found;
+                const auto visit = [&](auto &&self, Node &node) -> void {
+                    if (!node.visible())
+                        return;
+                    if (auto *area = dynamic_cast<InputArea *>(&node)) {
+                        const auto content = area->tooltipContent();
+                        if (const auto *text = std::get_if<std::string>(&content);
+                            text && *text == tooltip)
+                            found.push_back(area);
+                    }
+                    for (const auto &child : node.children())
+                        self(self, *child);
+                };
+                visit(visit, view);
+                return found;
+            };
+            const auto noOwnJoins = [&] {
+                for (const char *id : {"OwnJoinAlone", "OwnJoinBetween", "OwnJoinTail"}) {
+                    assert(!bodyText(view, id));
+                    assert(!view.messageReadable(std::string("message:") + id));
+                }
+            };
+            for (const auto mode : {blast::PresenceMode::Smart, blast::PresenceMode::All,
+                                    blast::PresenceMode::Hidden}) {
+                model.settings.presence = mode;
+                arrange();
+                noOwnJoins();
+                assert(summaries("Expand channel activity").empty());
+                assert(summaries("Collapse channel activity").empty());
+            }
+            model.settings.presence = blast::PresenceMode::Smart;
+            append("ParticipantChat", false, false, blast::ActivityKind::None);
+            append("ParticipantJoinFirst", false, true, blast::ActivityKind::Join);
+            arrange();
+            assert(bodyText(view, "ParticipantJoinFirst"));
+            append("OwnJoinBetween", true, true, blast::ActivityKind::Join);
+            arrange();
+            noOwnJoins();
+            assert(bodyText(view, "ParticipantJoinFirst"));
+            assert(summaries("Expand channel activity").empty());
+            append("ParticipantJoinSecond", false, true, blast::ActivityKind::Join);
+            arrange();
+            auto folded = summaries("Expand channel activity");
+            assert(folded.size() == 1 && bodyText(*folded.front(), "2"));
+            append("OwnJoinTail", true, true, blast::ActivityKind::Join);
+            arrange();
+            noOwnJoins();
+            folded = summaries("Expand channel activity");
+            assert(folded.size() == 1 && bodyText(*folded.front(), "2") &&
+                   !bodyText(*folded.front(), "3"));
+            assert(!bodyText(view, "ParticipantJoinFirst") &&
+                   !bodyText(view, "ParticipantJoinSecond"));
+            dispatcher.setFocus(folded.front());
+            dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+            dispatcher.keyEvent(XKB_KEY_Return, 0, 0, false);
+            arrange();
+            noOwnJoins();
+            assert(bodyText(view, "ParticipantJoinFirst") &&
+                   bodyText(view, "ParticipantJoinSecond"));
+            assert(summaries("Collapse channel activity").size() == 1);
+            append("OwnChat", true, false, blast::ActivityKind::None);
+            append("OwnAction", true, false, blast::ActivityKind::None, true);
+            append("OwnLegacy joined the channel.", true, true, blast::ActivityKind::None);
+            append("OwnPart", true, true, blast::ActivityKind::Part);
+            const auto before = buffer;
+            for (const auto mode : {blast::PresenceMode::All, blast::PresenceMode::Hidden,
+                                    blast::PresenceMode::Smart}) {
+                model.settings.presence = mode;
+                arrange();
+                noOwnJoins();
+                for (const char *id :
+                     {"OwnChat", "OwnAction", "OwnLegacy joined the channel.", "ParticipantChat"})
+                    assert(bodyText(view, id));
+                for (const char *id : {"ParticipantJoinFirst", "ParticipantJoinSecond", "OwnPart"})
+                    assert(bool(bodyText(view, id)) == (mode != blast::PresenceMode::Hidden));
+                unchanged(buffer, before);
+            }
+            assert(model.actions.empty());
+            dispatcher.setFocus(nullptr);
+            dispatcher.setSceneRoot(nullptr);
+        }
 }
 
 void messageTextSelection(TranscriptTestRenderer &renderer, float zoom) {
@@ -6188,6 +6418,10 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             model.now = 100;
             model.settings.scale = zoom;
             model.settings.messageScale = zoom;
+            model.settings.uiFont = "sans-serif";
+            model.settings.messageFont = "serif";
+            model.settings.uiFontWeight = 700;
+            model.settings.messageFontWeight = 300;
             model.settings.timestamps = model.settings.avatars = false;
             model.settings.reducedMotion = true;
             model.settings.typingReceive = true;
@@ -6223,6 +6457,68 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             const auto arrange = [&] {
                 view.sync();
                 view.arrange(renderer, viewport);
+            };
+            const auto typingRow = [&](const std::vector<std::string> &participants) {
+                auto *phrase =
+                    plainText(view, participants.size() == 1 ? "is typing" : "are typing");
+                assert(phrase && dynamic_cast<Label *>(phrase->parent()));
+                assert(!plainText(view, participants.size() == 1 ? "are typing" : "is typing"));
+                assert(phrase->font() == blast::themeMessageFont());
+                near(phrase->fontSize(), messageSize);
+                assert(phrase->color() == blast::themeForegroundColor("on_surface_variant"));
+                auto *footer = phrase->parent()->parent();
+                const auto phraseBounds = sceneBounds(*phrase->parent());
+                const auto footerBounds = sceneBounds(*footer);
+                containedBounds(phraseBounds, footerBounds);
+                containedBounds(phraseBounds, ancestorPaintClip(*phrase));
+                size_t shown = 0;
+                for (const auto &nick : participants)
+                    if (auto *name = plainText(*footer, nick)) {
+                        ++shown;
+                        near(baseline(*name), baseline(*phrase));
+                        const auto nameBounds = sceneBounds(*name->parent());
+                        assert(nameBounds.x + nameBounds.width + 4.9f * zoom <= phraseBounds.x);
+                        containedBounds(nameBounds, footerBounds);
+                    }
+                if (shown < participants.size()) {
+                    auto *more = plainText(*footer->parent(),
+                                           "+" + std::to_string(participants.size() - shown));
+                    auto *moreLabel = dynamic_cast<Label *>(more ? more->parent() : nullptr);
+                    auto *moreButton =
+                        moreLabel ? dynamic_cast<Button *>(moreLabel->parent()) : nullptr;
+                    assert(moreLabel && moreLabel->visible());
+                    assert(moreButton && moreButton->visible() && moreButton->enabled());
+                    const auto moreBounds = sceneBounds(*moreLabel);
+                    assert(moreBounds.x + moreBounds.width <= phraseBounds.x + .02f);
+                    containedBounds(moreBounds, footerBounds);
+                    containedBounds(nativeTextInk(renderer, *more), footerBounds);
+                    containedBounds(sceneBounds(*moreButton), footerBounds);
+                }
+                float previousRight = phraseBounds.x + phraseBounds.width;
+                size_t dots = 0;
+                for (const auto &child : footer->children())
+                    if (auto *dot = dynamic_cast<RectNode *>(child.get());
+                        dot && dot->visible() && dot->width() <= 3 * zoom &&
+                        dot->height() <= 3 * zoom) {
+                        const auto dotBounds = sceneBounds(*dot);
+                        assert(dotBounds.x >= previousRight + 3.9f * zoom);
+                        assert(dotBounds.y >= phraseBounds.y - .02f &&
+                               dotBounds.y + dotBounds.height <=
+                                   phraseBounds.y + phraseBounds.height + .02f);
+                        containedBounds(dotBounds, footerBounds);
+                        containedBounds(dotBounds, ancestorPaintClip(*dot));
+                        if (model.settings.reducedMotion ||
+                            model.settings.fx == blast::FxLevel::Off)
+                            near(dot->opacity(), .65f);
+                        else
+                            near(dot->opacity(),
+                                 .35f + .65f * float((1 + std::sin(model.now * 2.1 - dots * .9)) *
+                                                     .5));
+                        previousRight = dotBounds.x + dotBounds.width;
+                        ++dots;
+                    }
+                assert(dots == 3);
+                near(footer->height(), typingHeight);
             };
             arrange();
             auto *scroll = find<ScrollView>(view);
@@ -6313,26 +6609,22 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                             assert(name->color() == nickColor);
                             near(name->fontSize(), messageSize);
                             assert(name->font() == blast::themeMessageFont());
-                            size_t dots = 0;
-                            for (const auto &child : footer->children())
-                                if (auto *rect = dynamic_cast<RectNode *>(child.get());
-                                    rect && rect->visible() && rect->width() <= 3 * zoom &&
-                                    rect->height() <= 3 * zoom) {
-                                    ++dots;
-                                    assert(sceneBounds(*rect).y >= ink.y + ink.height - .5f);
-                                }
-                            assert(dots == 3);
-                            // Both lines remain inside the one fixed reserved tray.
+                            // Names, neutral phrase and dots share the fixed reserved tray.
                             containedBounds(ink, sceneBounds(*footer));
                             containedBounds(ink, ancestorPaintClip(*name));
                             containedBounds(ink, {viewport.x,
                                                   viewport.y + viewport.height - typingHeight,
                                                   viewport.width, typingHeight});
                         }
+                        std::vector<std::string> participants;
+                        for (const auto &[nick, at] : buffer.typing)
+                            participants.push_back(nick);
+                        typingRow(participants);
                     }
-                    if (phase == 2)
+                    if (phase != 1)
                         assert(!plainText(view, "TypingPeer") &&
-                               !plainText(view, "OtherTypingPeer"));
+                               !plainText(view, "OtherTypingPeer") &&
+                               !plainText(view, "is typing") && !plainText(view, "are typing"));
                 }
             }
             InputDispatcher dispatcher;
@@ -6403,6 +6695,7 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                 return count;
             };
             assert(avatarCount() == 3);
+            typingRow(eligible);
             size_t surfaces = 0;
             for (const auto &child : tray->children())
                 if (auto *rect = dynamic_cast<RectNode *>(child.get());
@@ -6413,19 +6706,62 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             model.settings.avatars = false;
             arrange();
             assert(avatarCount() == 0 && plainText(view, "Alice") && plainText(view, "Bob"));
+            typingRow(eligible);
             near(scroll->scrollOffset(), manyOffset);
             near(scroll->maxScrollOffset(), manyMaximum);
+            for (const bool avatars : {false, true})
+                for (const float width : {160.f, 200.f, 240.f}) {
+                    model.settings.avatars = avatars;
+                    arrange();
+                    view.arrange(renderer, {viewport.x, viewport.y, width * zoom, viewport.height});
+                    size_t narrowNames = 0;
+                    for (const auto &nick : eligible)
+                        narrowNames += plainText(view, nick) != nullptr;
+                    assert(narrowNames <= 2);
+                    assert(plainText(view, "+" + std::to_string(eligible.size() - narrowNames)));
+                    typingRow(eligible);
+                    near(view.height(), viewport.height);
+                    near(tray->height(), typingHeight);
+                }
             model.settings.avatars = true;
             arrange();
-            view.arrange(renderer, {viewport.x, viewport.y, 160 * zoom, viewport.height});
-            size_t narrowNames = 0;
-            for (const auto &nick : eligible)
-                narrowNames += plainText(view, nick) != nullptr;
-            assert(narrowNames <= 2);
-            assert(plainText(view, "+" + std::to_string(eligible.size() - narrowNames)));
-            near(view.height(), viewport.height);
-            near(tray->height(), typingHeight);
+            const auto savedTyping = buffer.typing;
+            for (const auto &participants :
+                 {std::vector<std::string>{"Alice"}, std::vector<std::string>{"Alice", "Bob"}}) {
+                buffer.typing.clear();
+                for (const auto &nick : participants)
+                    buffer.typing[nick] = model.now;
+                for (const bool avatars : {false, true})
+                    for (const float width : {160.f, 240.f, 800.f}) {
+                        model.settings.avatars = avatars;
+                        arrange();
+                        view.arrange(renderer,
+                                     {viewport.x, viewport.y, width * zoom, viewport.height});
+                        typingRow(participants);
+                    }
+            }
+            buffer.typing = savedTyping;
+            model.settings.avatars = true;
             arrange();
+            const float motionOffset = scroll->scrollOffset(),
+                        motionMaximum = scroll->maxScrollOffset();
+            const auto motionBody = bounds(body(view, "FooterRow-30"));
+            for (const bool reduced : {false, true})
+                for (const auto fx : {blast::FxLevel::Full, blast::FxLevel::Off}) {
+                    model.settings.reducedMotion = reduced;
+                    model.settings.fx = fx;
+                    for (int frame = 0; frame < 2; ++frame) {
+                        model.now += .25;
+                        arrange();
+                        typingRow(eligible);
+                        near(scroll->scrollOffset(), motionOffset);
+                        near(scroll->maxScrollOffset(), motionMaximum);
+                        near(bounds(body(view, "FooterRow-30")).top, motionBody.top);
+                        near(scroll->height(), viewport.height);
+                    }
+                }
+            model.settings.reducedMotion = true;
+            model.settings.fx = blast::FxLevel::Full;
             // Width reflow changes offscreen height estimates and absolute scroll.
             // Opening the list must preserve the restored viewport, not undo reflow.
             const float popupOffset = scroll->scrollOffset(),
@@ -6463,6 +6799,32 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             assert(view.handleKey({.sym = XKB_KEY_Escape, .pressed = true}));
             arrange();
             assert(!plainText(view, "Eve"));
+            dispatcher.setFocus(nullptr);
+            clickOverflow();
+            // Retained panes are hidden without syncing their transcript on a buffer switch.
+            // Keep the same participants alive so expiry cannot accidentally close the list.
+            model.now += .25;
+            for (const auto &nick : eligible)
+                buffer.typing[nick] = model.now;
+            view.setReadEligible(false);
+            arrange();
+            assert(plainText(view, "Eve"));
+            auto *typingFocus = dispatcher.focusedArea();
+            const bool typingComposerFocus = pane.focusComposer;
+            const auto typingBuffer = pane.buffer;
+            const auto selectedBuffer = model.activeBuffer;
+            model.activeBuffer = "typing-other-query";
+            view.setVisible(false);
+            view.setReadEligible(false);
+            assert(pane.buffer == typingBuffer && buffer.typing.at("Eve") == model.now);
+            model.activeBuffer = selectedBuffer;
+            view.setVisible(true);
+            arrange();
+            assert(!plainText(view, "Eve") && plainText(view, "+3"));
+            assert(dispatcher.focusedArea() == typingFocus &&
+                   pane.focusComposer == typingComposerFocus);
+            near(scroll->scrollOffset(), popupOffset);
+            near(scroll->maxScrollOffset(), popupMaximum);
             clickOverflow();
             buffer.typing.erase("Eve");
             arrange();
@@ -8545,6 +8907,15 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
                     const auto bodyBounds = sceneBounds(rendered.body);
                     if (!traditional)
                         assert(actorBounds.x + actorBounds.width + 7.9f <= bodyBounds.x);
+                    else if (width > 240) {
+                        assert(actorBounds.x + actorBounds.width + 7.9f <= bodyBounds.x);
+                        near(baseline(*actor), baseline(rendered.text));
+                    } else {
+                        assert(sceneBounds(*actor->parent()).y +
+                                   sceneBounds(*actor->parent()).height <=
+                               bodyBounds.y + .02f);
+                        near(sceneBounds(*actor->parent()).x, bodyBounds.x);
+                    }
                     for (const auto &child : rendered.content.children())
                         if (auto *rect = dynamic_cast<RectNode *>(child.get());
                             rect && rect->visible() && rect->style().fill.a > 0 &&
@@ -8810,7 +9181,9 @@ void nativeReactionRow(TranscriptTestRenderer &renderer) {
                 message.text = message.own ? "QR" : "PR";
                 message.reactions = {{"☀", {"Peer"}}, {"☁", {"Peer"}}};
             }
-            for (const auto activity : {blast::ActivityKind::None, blast::ActivityKind::Join}) {
+            // Own JOINs are projected out; PART keeps typed activity geometry visible for both
+            // authors.
+            for (const auto activity : {blast::ActivityKind::None, blast::ActivityKind::Part}) {
                 for (auto &message : buffer.messages)
                     message.activity = activity;
                 ++buffer.messagesRevision;
@@ -9027,6 +9400,7 @@ void runTranscriptCheck() {
     channelActivity(renderer, 1);
     channelActivity(renderer, 2);
     smartPresenceEligibility(renderer);
+    ownJoinProjection(renderer);
     tailAppendKeepsActions(renderer);
     focusRevealIntents(renderer);
     mergeArrivalBaseline(renderer);

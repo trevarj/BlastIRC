@@ -3374,6 +3374,58 @@ struct ApplicationRegression {
                room.messages.back().activity == ActivityKind::None);
         app.model.effects.clear();
 
+        // Casemapped self JOINs retain typed history and membership, never live activity.
+        app.model.networks["activity"].nick = "[Me]";
+        app.model.networks["activity"].caseMapping = "rfc1459";
+        room.joined = false;
+        event.type = "join";
+        event.nick = "{mE}";
+        event.id = "own-live-join";
+        event.tags = {{"account", "live-account"}};
+        app.reduce(event);
+        expectRow(event, ActivityKind::Join, "{mE} joined #activity");
+        const auto self = std::find_if(room.nicks.begin(), room.nicks.end(),
+                                       [&](const auto &nick) { return nick.name == event.nick; });
+        assert(room.joined && self != room.nicks.end() && self->account == "live-account" &&
+               room.messages.back().own && app.model.effects.empty());
+        const auto members = room.nicks.size();
+        room.joined = false;
+        event.history = true;
+        event.id = "own-history-join";
+        event.tags["account"] = "historical-account";
+        app.reduce(event);
+        const auto historicalSelf =
+            std::find_if(room.messages.begin(), room.messages.end(),
+                         [&](const auto &row) { return row.id == event.id; });
+        assert(historicalSelf != room.messages.end() && historicalSelf->own &&
+               historicalSelf->history && historicalSelf->activity == ActivityKind::Join &&
+               !room.joined && room.nicks.size() == members && self->account == "live-account" &&
+               app.model.effects.empty());
+        event.history = false;
+        app.model.networks["activity"].nick = "Me";
+
+        // Neither ordering lets a self JOIN consume the other member's aggregate effect.
+        for (const bool selfFirst : {true, false}) {
+            const auto before = room.messages.size();
+            event.tags = {{"batch", selfFirst ? "self-first" : "self-last"},
+                          {"batch-type", "netjoin"}};
+            for (int i = 0; i < 2; ++i) {
+                const bool own = (i == 0) == selfFirst;
+                event.nick = own ? "mE" : "Other";
+                event.id = (selfFirst ? "self-first-" : "self-last-") + std::to_string(i);
+                app.reduce(event);
+                expectRow(event, ActivityKind::Join, event.nick + " joined #activity");
+                assert(room.messages.back().own == own);
+                if (own && i == 0)
+                    assert(app.model.effects.empty());
+            }
+            assert(room.messages.size() == before + 2 && app.model.effects.size() == 1 &&
+                   app.model.effects.front().type == "join" &&
+                   app.model.effects.front().nick == "Other" && !app.model.effects.front().own);
+            app.tick(app.model.now + 11);
+            assert(app.model.effects.empty());
+        }
+
         // Explicit batches retain every original member, never a synthetic summary row.
         for (const bool joins : {true, false}) {
             const auto before = room.messages.size();
@@ -3425,13 +3477,23 @@ struct ApplicationRegression {
         event.id = "hidden-own";
         app.reduce(event);
         expectRow(event, ActivityKind::Join, "Me joined #activity");
-        assert(room.messages.back().own);
+        assert(room.messages.back().own && app.model.effects.empty());
+        event.type = "part";
+        event.id = "hidden-own-part";
+        event.own = true;
+        app.reduce(event);
+        expectRow(event, ActivityKind::Part, "Me left #activity — hidden reason");
+        assert(room.messages.back().own && app.model.effects.size() == 1 &&
+               app.model.effects.front().type == "part");
+        event.type = "join";
+        event.own = false;
         event.nick = "Forced";
         event.id = "hidden-forced";
         event.tags["force-presence"] = "1";
         app.reduce(event);
         expectRow(event, ActivityKind::Join, "Forced joined #activity");
-        assert(room.messages.size() == beforeHidden + 2 && app.model.effects.size() == 2);
+        assert(room.messages.size() == beforeHidden + 3 && app.model.effects.size() == 2 &&
+               app.model.effects.back().nick == "Forced");
 
         app.model.settings.presence = PresenceMode::Smart;
         app.model.effects.clear();

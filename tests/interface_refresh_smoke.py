@@ -5,7 +5,7 @@ Run inside nix develop: python tests/interface_refresh_smoke.py BINARY --scope N
 Each scope owns a fresh private compositor/profile; no desktop or production profile
 is reused. BLASTIRC_SMOKE_SCREENSHOT selects the artifact basename.
 The startup-history-sync scope holds genuine private Ergo history on the wire;
-it proves discovery/LATEST, cached-chat/loading state, and native-demand BEFORE gap fill.
+it proves discovery/LATEST, cached-chat/loading state, and automatic visible-seam BEFORE gap fill.
 The jump-bottom scope proves the zero-arrival native FAB click and resumed following.
 """
 import argparse
@@ -8428,7 +8428,7 @@ def run_soju_search_context(ctx):
 
 
 def run_startup_history_sync(ctx):
-    """Real discovery/LATEST leaves a durable gap, filled only after native scroll demand."""
+    """Real discovery/LATEST leaves an offscreen gap, filled automatically when exposed."""
     destination = Path(ctx['destination'])
     config = Path(ctx['preferences']).with_name('config.toml')
     _policy_focus(ctx, ctx['channel_id'])
@@ -8607,23 +8607,14 @@ def run_startup_history_sync(ctx):
                for request in before_demand), ('History fetched before native gap demand', before_demand)
     assert offline_rows() == latest_rows, 'Missing interval filled before native navigation'
     gap_capture = str(_policy_capture(ctx, 'startup-history-gap-before-demand'))
-    scrolls = []
+    navigation_offset = gui.framed_keys(ctx['window'], 'alt+less')
 
-    def scroll_demand():
+    def exposed_demand():
         relay.ready(relay.completed)
-        if any(request.startswith('CHATHISTORY BEFORE ')
-               for request in relay.requests[len(before_demand):]):
-            return True
-        gui.move_pointer(ctx['window'], x + width / 2, y + height / 2)
-        offset = gui.GUI_DEBUG[ctx['window']][1].stat().st_size
-        gui.POINTER.scroll(-3)
-        gui.await_native_frame(ctx['window'], offset, re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
-        scrolls.append({'point': (x + width / 2, y + height / 2), 'wheel_steps': -3,
-                        'native_frame_after_debug_offset': offset})
-        return None
+        return any(request.startswith('CHATHISTORY BEFORE ')
+                   for request in relay.requests[len(before_demand):])
 
-    gui.SESSION.until('actual native scrolling toward the seam demands BEFORE', scroll_demand)
-    assert scrolls, 'Gap fetch preceded native scrolling'
+    gui.SESSION.until('beginning-of-buffer exposure automatically demands BEFORE', exposed_demand)
 
     def filled_gap():
         relay.ready(relay.completed)
@@ -8666,7 +8657,7 @@ def run_startup_history_sync(ctx):
     assert display_order == remote, {
         'actual_text_order': display_order, 'diagnostic': str(order_diagnostic_path)}
     gui.SESSION.until('native gap marker retires after committed fill', lambda:
-        not upload.label_rect(ctx['window'], destination, 'Load missing messages',
+        not upload.label_rect(ctx['window'], destination, 'Missing messages',
                               region=layout['conversation']['rect']))
     filled_capture = str(_policy_capture(ctx, 'startup-history-gap-filled'))
     prefix_scrolls = []
@@ -8698,7 +8689,9 @@ def run_startup_history_sync(ctx):
     return _refresh_return(ctx, 'startup-history-sync', {
         'actual_requests': list(relay.requests), 'actual_held_batch': relay.held_batch,
         'actual_pages': list(relay.pages), 'requests_before_native_gap_demand': before_demand,
-        'native_gap_scroll_demand': scrolls, 'durable_gap_before_demand': gap,
+        'native_gap_reveal': {'keys': 'M-<', 'trace_offset': navigation_offset,
+                              'upward_wheel': False, 'load_button_click': False},
+        'durable_gap_before_demand': gap,
         'previous_protocol_newest': previous_newest,
         'offline_seed_count': len(remote), 'latest_fixture_count': len(latest_rows),
         'missing_until_native_demand': missing, 'filled_fixture_count': len(filled),

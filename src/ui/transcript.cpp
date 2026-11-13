@@ -72,6 +72,18 @@ bool replyAllowed(const Model &model, const Buffer &buffer) {
            capability(model, buffer, "message-tags") &&
            irc::clientTagAllowed(network->second.clientTagDeny, "+reply");
 }
+bool historyReady(const Model &model, const Buffer &buffer) {
+    const auto network = model.networks.find(buffer.server);
+    if (network == model.networks.end() || network->second.state != "Ready" ||
+        (buffer.kind != "query" && (buffer.kind != "channel" || !buffer.joined)))
+        return false;
+    if (capability(model, buffer, "chathistory") || capability(model, buffer, "draft/chathistory"))
+        return true;
+    return capability(model, buffer, "znc.in/playback") &&
+           std::any_of(model.servers.begin(), model.servers.end(), [&](const auto &server) {
+               return server.name == buffer.server && server.bouncer == "znc";
+           });
+}
 bool ownReaction(const Network &network, const Message &message, std::string_view emoji) {
     const auto reaction = std::find_if(message.reactions.begin(), message.reactions.end(),
                                        [&](const auto &entry) { return entry.first == emoji; });
@@ -866,6 +878,11 @@ struct TranscriptView::Impl {
         bool following = true, windowActive = false, initialized = false;
         bool historyDemandActive = false;
         std::set<std::string> historyDemandKeys;
+        struct GapApproach {
+            uint64_t identity, navigation;
+        };
+        std::unordered_map<int64_t, GapApproach> gapDemandAnchors;
+        uint64_t gapNavigation = 0;
         PresenceMode projectedPresence = PresenceMode::Smart;
         uint64_t participationRevision = 0;
         uint64_t mediaParticipationRevision = 0;
@@ -1176,6 +1193,8 @@ struct TranscriptView::Impl {
             if (cache)
                 cache->scroll = value;
             if (!arranging) {
+                if (cache)
+                    ++cache->gapNavigation;
                 cancelFocusReveal();
                 pane.following = scroll->maxScrollOffset() - value <= 1;
                 if (pane.following)
@@ -1599,6 +1618,7 @@ struct TranscriptView::Impl {
         if (cache) {
             cache->historyDemandActive = false;
             cache->historyDemandKeys.clear();
+            ++cache->gapNavigation;
         }
         pane.following = false;
         mentionCursorBuffer = buffer->id;
@@ -2341,6 +2361,8 @@ struct TranscriptView::Impl {
         cache->historyDemandActive = direction < 0;
         if (cache->historyDemandActive)
             cache->historyDemandKeys.clear();
+        if (offset != scroll->scrollOffset())
+            ++cache->gapNavigation;
         const bool wasArranging = std::exchange(arranging, true);
         scroll->setScrollOffset(offset);
         arranging = wasArranging;
@@ -2363,6 +2385,8 @@ struct TranscriptView::Impl {
             pane.unseen = 0;
         } else {
             const bool wasArranging = std::exchange(arranging, true);
+            if (scroll->scrollOffset() != 0)
+                ++cache->gapNavigation;
             scroll->setScrollOffset(0);
             arranging = wasArranging;
         }
@@ -5535,7 +5559,22 @@ struct TranscriptView::Impl {
                 return action.buffer == buffer->id &&
                        (action.type == "history" || action.type == "history-gap");
             });
+        const bool gapReady = effectivelyVisible() && historyReady(model, *buffer);
         float edgeOffset = olderExtent;
+        // The newest visible event is stable across inserts and body remeasurement.
+        size_t approachRow =
+            c.rows.empty() ? absent
+                           : std::min(c.rows.size() - 1,
+                                      c.heights.at(std::max(0., desired + height - c.header)));
+        // A gap/header-only edge has no nameable event; do not invent one.
+        if (approachRow != absent &&
+            (c.rows[approachRow].hiddenActivity ||
+             c.header + c.heights.prefix(approachRow) + c.rows[approachRow].gapHeight >=
+                 desired + height ||
+             c.header + c.heights.prefix(approachRow + 1) <= desired))
+            approachRow = absent;
+        const uint64_t approachIdentity =
+            approachRow < c.rows.size() ? c.rows[approachRow].focusIdentity : 0;
         for (size_t i = 0; i < c.gaps.size(); ++i) {
             if (i == gapButtons.size()) {
                 auto button = std::make_unique<Button>();
@@ -5547,11 +5586,11 @@ struct TranscriptView::Impl {
             auto *button = control.button;
             const auto &gap = c.gaps[i];
             button->setVisible(true);
-            button->setEnabled(!gap.unavailable && !buffer->loading);
-            button->setText(gap.unavailable ? "Missing messages unavailable"
-                                            : "Load missing messages");
-            button->setTooltip(gap.unavailable ? "The server could not supply this missing history"
-                                               : "Request missing messages in this conversation");
+            button->setEnabled(false);
+            button->setText(gap.unavailable ? "Missing messages unavailable" : "Missing messages");
+            button->setTooltip(gap.unavailable
+                                   ? "The server could not supply this missing history"
+                                   : "Missing history loads when this interval is visible");
             button->setFontSize(g.uiFont);
             button->setControlHeight(gapExtent);
             if (control.source != buffer->id || control.id != gap.id) {
@@ -5563,11 +5602,16 @@ struct TranscriptView::Impl {
                 const auto id = gap.id;
                 button->setOnClick([this, source, id] {
                     auto *buffer = current();
-                    if (!buffer || buffer->id != source || buffer->loading)
+                    if (!buffer || buffer->id != source || buffer->loading ||
+                        !effectivelyVisible() || !historyReady(model, *buffer))
                         return;
-                    const auto &gaps = buffer->historyState.gaps;
-                    if (std::none_of(gaps.begin(), gaps.end(), [id](const auto &gap) {
-                            return gap.id == id && !gap.unavailable;
+                    const auto metadata = std::find_if(
+                        buffer->historyState.gaps.begin(), buffer->historyState.gaps.end(),
+                        [id](const auto &gap) { return gap.id == id; });
+                    if (metadata == buffer->historyState.gaps.end() || metadata->unavailable ||
+                        std::any_of(model.actions.begin(), model.actions.end(), [&](const auto &a) {
+                            return a.buffer == source &&
+                                   (a.type == "history" || a.type == "history-gap");
                         }))
                         return;
                     focus(pane.id);
@@ -5583,19 +5627,29 @@ struct TranscriptView::Impl {
             button->setSize(bodyWidth, gapExtent);
             if (!gap.unavailable && top + gapExtent > desired && top < desired + height) {
                 visibleGap = true;
-                const auto metadata =
-                    std::find_if(buffer->historyState.gaps.begin(), buffer->historyState.gaps.end(),
-                                 [&](const auto &item) { return item.id == gap.id; });
-                if (metadata != buffer->historyState.gaps.end()) {
-                    const auto key = "gap:" + std::to_string(gap.id) + ":" + metadata->newer.id +
-                                     ":" + metadata->newer.time;
-                    if (c.historyDemandActive && !historyPending &&
-                        c.historyDemandKeys.insert(key).second) {
-                        model.actions.push_back(
-                            {"history-gap", buffer->id, std::to_string(gap.id), {}});
-                        historyPending = true;
-                    }
+                const auto attempted = c.gapDemandAnchors.find(gap.id);
+                const size_t previousRow = attempted == c.gapDemandAnchors.end()
+                                               ? absent
+                                               : identityIndex(attempted->second.identity);
+                // Moving/reflowing the seam is not navigation. Require an actual
+                // viewport move AND a strictly older canonical event (including ties).
+                const bool deeper = previousRow != absent && approachRow < previousRow &&
+                                    attempted->second.navigation != c.gapNavigation;
+                if (attempted != c.gapDemandAnchors.end() && gapReady && !historyPending)
+                    attempted->second.navigation = c.gapNavigation;
+                if (gapReady && !historyPending &&
+                    (attempted == c.gapDemandAnchors.end() || deeper)) {
+                    c.gapDemandAnchors[gap.id] = {approachIdentity, c.gapNavigation};
+                    model.actions.push_back(
+                        {"history-gap", buffer->id, std::to_string(gap.id), {}});
+                    historyPending = true;
                 }
+            }
+            if (!gap.unavailable && historyPending)
+                button->setText("Loading missing messages…");
+            else if (!gap.unavailable && gapReady && c.gapDemandAnchors.contains(gap.id)) {
+                button->setEnabled(true);
+                button->setText("Retry missing messages");
             }
         }
         for (size_t i = c.gaps.size(); i < gapButtons.size(); ++i)

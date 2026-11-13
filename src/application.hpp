@@ -54,6 +54,7 @@ class Application {
     };
     struct HistoryPage {
         HistoryRequest request;
+        HistoryCursor gapBoundary; // Canonical edge captured before wire selector normalization.
         string buffer, server;
         uint64_t session = 0;
         vector<Event> events;
@@ -201,6 +202,7 @@ class Application {
     void recount(Buffer &);
     bool markRead(Buffer &);
     string historyCursor(const Buffer &, const string &) const;
+    bool historyUsesMsgid(const string &server, const string &id) const;
     bool zncPlayback(const string &server) const;
     void requestHistory(Buffer &, const string &before, bool initial);
     vector<string> historyOrder(const string &server) const;

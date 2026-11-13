@@ -2730,7 +2730,10 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
             auto &buffer = model.buffers["gap-room"];
             buffer.id = buffer.target = "gap-room";
             buffer.kind = "query";
-            buffer.server = "retained-offline-network"; // No live Network entry is required.
+            buffer.server = "history-network";
+            auto &network = model.networks[buffer.server];
+            network.state = scale == 2.f ? "Ready" : "Disconnected";
+            network.caps = {"draft/chathistory"};
             model.settings.messageLayouts[buffer.id] = layout;
             // Dense IRC needs a real tail long enough to put the seam above a 160px viewport.
             for (int i = 0; i < 20; ++i) {
@@ -2742,7 +2745,8 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
                 message.time = "2026-11-07T12:34:56Z";
                 buffer.messages.push_back(std::move(message));
             }
-            buffer.historyState.gaps.push_back({73, {"gap-row-2", {}}, {"gap-row-3", {}}, false});
+            buffer.historyState.gaps.push_back(
+                {73, {"gap-row-2", {}}, {"gap-row-3", "2026-11-07T12:34:56.123456789Z"}, false});
             const auto before = buffer;
             blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
             Clipboard clipboard;
@@ -2781,64 +2785,130 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
             };
             arrange();
             auto *gap = control(":history-gap:73");
-            assert(gap && gap->visible() && gap->enabled());
-            assert(plainText(*gap, "Load missing messages"));
+            assert(gap && gap->visible() && !gap->enabled());
+            assert(!plainText(*gap, "Load missing messages"));
             const auto gapBounds = sceneBounds(*gap);
             assert(gapBounds.y >= sceneBounds(body(view, "GapBody2").row).y +
                                       body(view, "GapBody2").row.height() - .02f);
             assert(gapBounds.y + gapBounds.height <=
                    sceneBounds(body(view, "GapBody3").row).y + .02f);
             containedBounds(gapBounds, nativeHistoryClip(view));
-            click(gap);
+            if (scale == 1.f) {
+                assert(model.actions.empty()); // Unready layouts must not consume the boundary.
+                network.state = "Ready";
+                network.caps.clear();
+                arrange();
+                assert(model.actions.empty());
+                network.caps = {"draft/chathistory"};
+                buffer.kind = "channel";
+                buffer.joined = false;
+                arrange();
+                assert(model.actions.empty());
+                buffer.kind = "query";
+                buffer.loading = true;
+                arrange();
+                assert(model.actions.empty());
+                buffer.loading = false;
+                arrange(); // Readiness alone wakes the visible seam, without a gesture.
+            }
             assert(model.actions.size() == 1 && model.actions.back().type == "history-gap" &&
                    model.actions.back().buffer == buffer.id && model.actions.back().text == "73");
             unchanged(buffer, before);
             model.actions.clear();
+            // MOVED and saturated/no-progress completions do not authorize another
+            // wave at the same viewport, even if both canonical selector fields change.
+            buffer.historyState.gaps.front().newer = {"gap-row-4",
+                                                      "2026-11-07T12:34:57.987654321Z"};
+            for (int frame = 0; frame < 20; ++frame) {
+                arrange();
+                assert(model.actions.empty());
+            }
+            auto inserted = buffer.messages.front();
+            inserted.id = inserted.text = "gap-inserted-history";
+            buffer.messages.insert(buffer.messages.begin(), inserted);
+            ++buffer.messagesRevision;
+            arrange();
+            assert(model.actions.empty()); // History insertion shifts indices, not the anchor.
+            auto equalTime = buffer.messages.back();
+            equalTime.id = equalTime.text = "gap-equal-time-newest";
+            buffer.messages.push_back(equalTime);
+            ++buffer.messagesRevision;
+            arrange();
+            assert(model.actions.empty()); // A distinct equal-time bottom event is not an approach.
+            buffer.messages.pop_back();
+            ++buffer.messagesRevision;
+            arrange();
+            assert(model.actions.empty());
+            view.arrange(renderer,
+                         {viewport.x, viewport.y, viewport.width - 20 * scale, viewport.height});
+            arrange();
+            assert(model.actions.empty()); // Remeasurement is not a new approach.
+            pane.following = false;
+            view.arrange(renderer, {viewport.x, viewport.y, viewport.width, 160 * scale});
+            assert(model.actions.empty()); // Resize exposing an older bottom row is not navigation.
+            arrange();
+            assert(model.actions.empty());
+            buffer.messages.erase(buffer.messages.begin());
+            ++buffer.messagesRevision;
+            buffer.historyState.gaps = before.historyState.gaps;
+            arrange();
+            assert(model.actions.empty());
             dispatcher.setFocus(nullptr);
-            // Real upward intent also works at the clamp. Two unchanged gaps are each
-            // attempted once, not alternated forever after no-progress completions.
+            // Initial layout/readiness demand is serialized and unchanged boundaries do not
+            // retry on frames, wheel gestures, source jumps, or cached viewport restoration.
             auto *clampedScroll = find<ScrollView>(view);
             assert(clampedScroll && clampedScroll->maxScrollOffset() == 0);
             buffer.historyState.gaps.push_back({74, {"gap-row-5", {}}, {"gap-row-6", {}}, false});
+            buffer.loading = true;
             arrange();
+            assert(model.actions.empty());
+            buffer.loading = false;
             const auto wheelUp = [&] {
                 dispatcher.pointerAxis(viewport.x + 60 * scale, viewport.y + 80 * scale,
                                        WL_POINTER_AXIS_VERTICAL_SCROLL,
                                        WL_POINTER_AXIS_SOURCE_WHEEL, -15, 0, -120, -1.f);
             };
-            wheelUp();
-            std::set<std::string> attempted;
+            arrange();
+            assert(model.actions.size() == 1 && model.actions.back().text == "74");
+            arrange();
+            assert(model.actions.size() == 1); // One queued flight despite repeated layouts.
+            model.actions.clear();
             for (int frame = 0; frame < 6; ++frame) {
                 arrange();
-                if (frame < 2) {
-                    assert(model.actions.size() == 1 && model.actions.back().type == "history-gap");
-                    assert(attempted.insert(model.actions.back().text).second);
-                } else
-                    assert(model.actions.empty());
-                model.actions.clear();
+                assert(model.actions.empty());
             }
-            assert(attempted == std::set<std::string>({"73", "74"}));
-            near(clampedScroll->scrollOffset(), 0);
-            // A source jump cancels demand even when a new boundary becomes eligible.
-            assert(view.jumpToSourceMessage("gap-row-4"));
-            buffer.historyState.gaps.front().newer.time = "changed-after-source-jump";
-            arrange();
-            assert(model.actions.empty());
-            // Leaving and restoring the cached viewport likewise cannot revive demand.
             wheelUp();
             arrange();
-            assert(model.actions.size() == 1);
-            model.actions.clear();
+            assert(model.actions.empty());
+            near(clampedScroll->scrollOffset(), 0);
+            assert(view.jumpToSourceMessage("gap-row-4"));
+            arrange();
+            assert(model.actions.empty());
             auto &other = model.buffers["gap-other"];
             other.id = other.target = "gap-other";
             other.kind = "query";
             pane.buffer = other.id;
             arrange();
-            buffer.historyState.gaps.back().newer.time = "changed-while-away";
             pane.buffer = buffer.id;
             arrange();
+            assert(model.actions.empty());
+            // Hidden/exposed already-attempted seams do not rearm at the same anchor.
+            view.setVisible(false);
+            buffer.historyState.gaps.front().newer.id = "advanced-boundary";
             arrange();
             assert(model.actions.empty());
+            view.setVisible(true);
+            arrange();
+            assert(model.actions.empty());
+            // An unattempted seam first exposed by visibility changes still auto-loads.
+            view.setVisible(false);
+            buffer.historyState.gaps.front().id = 75;
+            arrange();
+            assert(model.actions.empty());
+            view.setVisible(true);
+            arrange();
+            assert(model.actions.size() == 1 && model.actions.back().text == "75");
+            model.actions.clear();
             buffer.historyState.gaps = before.historyState.gaps;
             assert(view.scrollToBoundary(true));
             arrange();
@@ -2846,18 +2916,39 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
             arrange();
             auto *demandScroll = find<ScrollView>(view);
             assert(demandScroll && gap->y() < demandScroll->scrollOffset());
+            buffer.historyState.gaps.front().newer.id = "offscreen-boundary";
+            arrange();
+            assert(model.actions.empty()); // Hidden seams never auto-drain.
             demandScroll->setScrollOffset(gap->y());
-            arrange();
-            assert(model.actions.empty()); // A raw geometry setter is not user intent.
-            wheelUp();
-            arrange();
+            arrange(); // Geometry exposure, not wheel/PageUp, demands the seam.
             assert(model.actions.size() == 1 && model.actions.back().type == "history-gap" &&
                    model.actions.back().text == "73");
             arrange();
-            assert(model.actions.size() == 1); // One logical flight despite repeated layouts.
+            assert(model.actions.size() == 1);
             model.actions.clear();
             arrange();
-            assert(model.actions.empty()); // A no-progress completion does not frame-retry.
+            assert(model.actions.empty());
+            buffer.historyState.gaps.front().newer.time = "2026-11-07T12:34:59.999999999Z";
+            for (int frame = 0; frame < 20; ++frame) {
+                arrange();
+                assert(model.actions.empty()); // An advancing edge cannot bypass a page stop.
+            }
+            const float approached = demandScroll->scrollOffset();
+            demandScroll->setScrollOffset(std::max(0.f, approached - 60 * scale));
+            arrange();
+            assert(model.actions.size() == 1 && model.actions.back().text == "73");
+            model.actions.clear();
+            arrange();
+            assert(model.actions.empty());
+            gap = control(":history-gap:73");
+            assert(gap && gap->enabled() && plainText(*gap, "Retry missing messages"));
+            click(gap); // Explicit retry remains available after a stalled bounded wave.
+            assert(model.actions.size() == 1 && model.actions.back().text == "73");
+            arrange();
+            assert(model.actions.size() == 1);
+            model.actions.clear();
+            arrange();
+            assert(model.actions.empty());
             assert(view.scrollToBoundary(true));
             arrange();
             viewport.height = 1800 * scale;
@@ -2876,10 +2967,15 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
             buffer.historyState.gaps.push_back({0, {}, {}, false});
             arrange();
             assert(!gap->visible()); // Unsaved/invalid IDs cannot become requests.
-            buffer.historyState.gaps = {{74, {}, {"pruned-boundary", {}}, false}};
+            buffer.historyState.gaps = {{76, {}, {"pruned-boundary", {}}, false}};
             arrange();
-            gap = control(":history-gap:74");
-            assert(gap && gap->visible() && gap->enabled());
+            gap = control(":history-gap:76");
+            assert(gap && gap->visible() && !gap->enabled());
+            model.actions.clear(); // The newly exposed pruned edge automatically queued once.
+            for (int frame = 0; frame < 20; ++frame) {
+                arrange();
+                assert(model.actions.empty()); // A gap at the beginning cannot frame-loop.
+            }
             assert(sceneBounds(*gap).y + gap->height() <=
                    sceneBounds(body(view, "GapBody0").row).y + .02f);
             viewport.height = 160 * scale;
@@ -2895,7 +2991,7 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
             arrange();
             near(sceneBounds(body(view, "GapBody4", true).row).y, anchoredY);
             viewport.height = 1800 * scale;
-            buffer.historyState.gaps = {{74, {}, {"pruned-boundary", {}}, false}};
+            buffer.historyState.gaps = {{76, {}, {"pruned-boundary", {}}, false}};
             arrange();
             buffer.loading = true;
             arrange();

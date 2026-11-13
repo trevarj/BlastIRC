@@ -2750,13 +2750,15 @@ void initialHistoryConsumerCheck() {
     frame();
     assert(visible(*header) && !status() && !spinner->spinning());
     buffer.loading = false;
+    auto &network = model.networks.at(buffer.server);
+    network.state = "Ready";
+    network.caps.insert("draft/chathistory");
+    model.actions.clear();
     buffer.historyState.gaps = {{915, {}, {cached.id, cached.time}, false}};
     frame();
     auto *gapArea =
-        areaWithTooltip(*paneFor(*input), "Request missing messages in this conversation");
+        areaWithTooltip(*paneFor(*input), "Missing history loads when this interval is visible");
     assert(gapArea && visible(*gapArea));
-    model.actions.clear();
-    click(dispatcher, *gapArea);
     assert(model.actions.size() == 1 && model.actions.back().type == "history-gap" &&
            model.actions.back().buffer == buffer.id && model.actions.back().text == "915");
     model.actions.clear();

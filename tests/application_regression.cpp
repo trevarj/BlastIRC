@@ -5322,6 +5322,181 @@ struct ApplicationRegression {
                !room.historyState.beginning);
         app.storage_.loadHistoryState(restored);
         assert(restored.historyState.gaps.empty());
+        // A canonical local edge is sent as a timestamp, but its owned BEFORE
+        // still joins that edge. Interior wire IDs must advance the same gap.
+        auto &localRoom = app.buffer(server.name, "LocalGap", "query");
+        const auto retainLocal = [&](const string &id, const string &time) {
+            Message row;
+            row.id = id;
+            row.time = time;
+            row.timestamp = id == "gap-cached-older" ? 1793491200 : 1793577600;
+            row.text = "same body";
+            app.storage_.append(localRoom.id, row);
+            localRoom.messages.push_back(row);
+        };
+        retainLocal("gap-cached-older", "2026-11-01T00:00:00.000000001Z");
+        retainLocal("local:gap-newer", "2026-11-02T00:00:00.000000009Z");
+        localRoom.historyState.oldest = {localRoom.messages.front().id,
+                                         localRoom.messages.front().time};
+        localRoom.historyState.newest = {localRoom.messages.back().id,
+                                         localRoom.messages.back().time};
+        localRoom.historyState.gaps.push_back(
+            {0, localRoom.historyState.oldest, localRoom.historyState.newest, false});
+        app.storage_.saveHistoryState(localRoom);
+        const auto localGap = localRoom.historyState.gaps.front();
+        app.action({"history-gap", localRoom.id, std::to_string(localGap.id), {}});
+        peer.expect("CHATHISTORY",
+                    {"BEFORE", "LocalGap", "timestamp=2026-11-02T00:00:00.000Z", "50"});
+        peer.send(":server BATCH +localinterior chathistory LocalGap");
+        for (const auto &id : {"gap-wire-a", "gap-wire-b"})
+            peer.send("@batch=localinterior;msgid=" + string(id) +
+                      ";time=2026-11-01T12:00:00.000000007Z "
+                      ":Other!u@h PRIVMSG LocalGap :same body");
+        peer.send(":server BATCH -localinterior");
+        wait([&] { return app.storage_.message(localRoom.id, "gap-wire-a").has_value(); });
+        assert(localRoom.historyState.gaps.size() == 1 &&
+               localRoom.historyState.gaps.front().id == localGap.id &&
+               localRoom.historyState.gaps.front().newer.id == "gap-wire-a");
+        peer.expect("CHATHISTORY", {"BEFORE", "LocalGap", "msgid=gap-wire-a", "50"});
+        // Repeating that page inserts nothing and must not start another wave.
+        peer.send(":server BATCH +localrepeat chathistory LocalGap");
+        for (const auto &id : {"gap-wire-a", "gap-wire-b"})
+            peer.send("@batch=localrepeat;msgid=" + string(id) +
+                      ";time=2026-11-01T12:00:00.000000007Z "
+                      ":Other!u@h PRIVMSG LocalGap :same body");
+        peer.send(":server BATCH -localrepeat");
+        wait([&] { return !localRoom.loading; });
+        peer.fence();
+        assert(localRoom.messages.size() == 4);
+        localRoom.messages.clear(); // Replay must also deduplicate unloaded durable rows.
+        app.action({"history-gap", localRoom.id, std::to_string(localGap.id), {}});
+        peer.expect("CHATHISTORY", {"BEFORE", "LocalGap", "msgid=gap-wire-a", "50"});
+        peer.send(":server BATCH +localcomplete chathistory LocalGap");
+        peer.send("@batch=localcomplete;msgid=gap-cached-older;"
+                  "time=2026-11-01T00:00:00.000000001Z "
+                  ":Other!u@h PRIVMSG LocalGap :same body");
+        for (const auto &id : {"gap-wire-a", "gap-wire-b"})
+            peer.send("@batch=localcomplete;msgid=" + string(id) +
+                      ";time=2026-11-01T12:00:00.000000007Z "
+                      ":Other!u@h PRIVMSG LocalGap :same body");
+        peer.send(":server BATCH -localcomplete");
+        wait([&] { return !localRoom.loading; });
+        assert(localRoom.historyState.gaps.empty());
+        Storage localReopened;
+        const auto localRows = localReopened.history(localRoom.id, -1);
+        assert(localRows.size() == 4);
+        for (const auto &id : {"gap-wire-a", "gap-wire-b"})
+            assert(std::count_if(localRows.begin(), localRows.end(), [&](const auto &row) {
+                       return row.id == id && row.time == "2026-11-01T12:00:00.000000007Z";
+                   }) == 1);
+        Buffer localRestored = localRoom;
+        localRestored.historyState = {};
+        localReopened.loadHistoryState(localRestored);
+        assert(localRestored.historyState.gaps.empty());
+
+        // Timestamp-only negotiation makes a new ID at the same instant no
+        // paging progress, even though reconciliation inserted a durable row.
+        localRoom.historyState.gaps.push_back({0,
+                                               localRoom.historyState.oldest,
+                                               {"gap-wire-a", "2026-11-01T12:00:00.000000007Z"},
+                                               false});
+        app.storage_.saveHistoryState(localRoom);
+        peer.send(":server 005 Me MSGREFTYPES=timestamp :supported");
+        wait([&] { return app.historyReferences_[server.name] == "timestamp"; });
+        app.action({"history-gap",
+                    localRoom.id,
+                    std::to_string(localRoom.historyState.gaps.front().id),
+                    {}});
+        peer.expect("CHATHISTORY",
+                    {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.000Z", "50"});
+        peer.send(":server BATCH +localequal chathistory LocalGap");
+        peer.send("@batch=localequal;msgid=gap-wire-c;"
+                  "time=2026-11-01T12:00:00.000000007Z "
+                  ":Other!u@h PRIVMSG LocalGap :same body");
+        peer.send(":server BATCH -localequal");
+        wait([&] { return !localRoom.loading; });
+        assert(app.storage_.message(localRoom.id, "gap-wire-c").has_value() &&
+               localRoom.historyState.gaps.size() == 1);
+        peer.fence(); // No identical effective BEFORE may precede this PONG.
+        peer.send(":server 005 Me MSGREFTYPES=msgid,timestamp :supported");
+        wait([&] { return app.historyReferences_[server.name] == "msgid,timestamp"; });
+        // Runtime msgid rejection has the same effective no-progress rule as
+        // advertised timestamp-only support, and updates the shared policy.
+        app.action({"history-gap",
+                    localRoom.id,
+                    std::to_string(localRoom.historyState.gaps.front().id),
+                    {}});
+        peer.expect("CHATHISTORY", {"BEFORE", "LocalGap", "msgid=gap-wire-c", "50"});
+        peer.send(":server FAIL CHATHISTORY INVALID_MSGREFTYPE LocalGap :use timestamp");
+        peer.expect("CHATHISTORY",
+                    {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.000Z", "50"});
+        peer.send(":server BATCH +localfallback chathistory LocalGap");
+        peer.send("@batch=localfallback;msgid=gap-wire-d;"
+                  "time=2026-11-01T12:00:00.000000007Z "
+                  ":Other!u@h PRIVMSG LocalGap :same body");
+        peer.send(":server BATCH -localfallback");
+        wait([&] { return !localRoom.loading; });
+        assert(app.storage_.message(localRoom.id, "gap-wire-d").has_value());
+        peer.fence();
+        app.action({"history-gap",
+                    localRoom.id,
+                    std::to_string(localRoom.historyState.gaps.front().id),
+                    {}});
+        peer.expect("CHATHISTORY",
+                    {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.000Z", "50"});
+        peer.send(":server BATCH +localfallbackrepeat chathistory LocalGap");
+        peer.send("@batch=localfallbackrepeat;msgid=gap-wire-d;"
+                  "time=2026-11-01T12:00:00.000000007Z "
+                  ":Other!u@h PRIVMSG LocalGap :same body");
+        peer.send(":server BATCH -localfallbackrepeat");
+        wait([&] { return !localRoom.loading; });
+        peer.fence();
+        peer.send(":server 005 Me MSGREFTYPES=msgid,timestamp :supported");
+        wait([&] { return app.historyReferences_[server.name] == "msgid,timestamp"; });
+        // Gap identity alone is insufficient: timestamp admission must still
+        // refer to the unchanged canonical edge, even for equal-time edges.
+        for (int mismatch = 0; mismatch < 3; ++mismatch) {
+            localRoom.historyState.gaps = {
+                {0,
+                 {"gap-cached-older", "2026-11-01T00:00:00.000000001Z"},
+                 {"local:current-edge", "2026-11-02T00:00:00.000000009Z"},
+                 false}};
+            app.storage_.saveHistoryState(localRoom);
+            const auto owned = localRoom.historyState.gaps.front();
+            Application::HistoryPage stale;
+            stale.server = server.name;
+            stale.buffer = localRoom.id;
+            stale.gapId = mismatch == 0 ? owned.id + 1 : owned.id;
+            stale.gapBoundary = mismatch == 2 ? HistoryCursor{} : owned.newer;
+            if (mismatch == 1)
+                stale.gapBoundary.id = "local:stale-edge";
+            stale.request.direction = HistoryDirection::Before;
+            stale.request.first.time = owned.newer.time;
+            Event interior;
+            interior.type = "message";
+            interior.server = server.name;
+            interior.target = localRoom.target;
+            interior.nick = "Other";
+            interior.id = "unowned-interior-" + std::to_string(mismatch);
+            interior.time = "2026-11-01T18:00:00.000000005Z";
+            interior.timestamp = 1793556000;
+            interior.text = "interior is not continuity proof";
+            interior.history = true;
+            stale.events.push_back(interior);
+            Event boundary;
+            boundary.tags = {{"direction", "before"},
+                             {"count", "1"},
+                             {"limit", "50"},
+                             {"ref-type", "timestamp"},
+                             {"oldest-id", interior.id},
+                             {"newest-id", interior.id},
+                             {"oldest-time", interior.time},
+                             {"newest-time", interior.time}};
+            assert(!app.applyHistoryPage(stale, boundary));
+            assert(localRoom.historyState.gaps.size() == 1 &&
+                   localRoom.historyState.gaps.front().id == owned.id &&
+                   localRoom.historyState.gaps.front().newer == owned.newer);
+        }
         // Failed correlated pages discard partial data and never alter discovery proof.
         app.requestHistory(room, "cached-tail", false);
         peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=cached-tail", "50"});

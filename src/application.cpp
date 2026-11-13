@@ -2038,6 +2038,24 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
     auto identical = [](const HistoryCursor &a, const HistoryCursor &z) {
         return !a.id.empty() && a.id == z.id;
     };
+    if (tag(end, "ref-type") == "timestamp" && !page.request.first.id.empty())
+        historyReferences_[b->server] = "timestamp";
+    const bool timestampRequest =
+        tag(end, "ref-type") == "timestamp" || zncPlayback(b->server) ||
+        (tag(end, "ref-type").empty() && !historyUsesMsgid(b->server, page.request.first.id));
+    auto sameWireTime = [](const HistoryCursor &a, const HistoryCursor &z) {
+        const auto x = irc::parseTimestampParts(a.time), y = irc::parseTimestampParts(z.time);
+        return x && y && x->seconds == y->seconds &&
+               x->nanoseconds / 1000000 == y->nanoseconds / 1000000;
+    };
+    auto ownsNewer = [&](const HistoryGap &gap) {
+        const bool unchanged = usable(page.gapBoundary) ? page.gapBoundary == gap.newer
+                                                        : identical(page.request.first, gap.newer);
+        return page.request.direction == HistoryDirection::Before && page.gapId == gap.id &&
+               unchanged &&
+               (timestampRequest ? sameWireTime(page.request.first, gap.newer)
+                                 : identical(page.request.first, gap.newer));
+    };
     // MOTD prefers the persisted protocol cursor, not the newest live cache island.
     auto previousNewest = before.newest;
     std::optional<HistoryCursor> durableNewest;
@@ -2212,7 +2230,6 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
         auto &state = b->historyState;
         state.oldest = before.oldest;
         state.newest = before.newest;
-        const bool inserted = b->messages.size() != savedSize;
         if (count && bounded) {
             HistoryCursor gapOlder = previousNewest;
             if (gapOlder.id.empty())
@@ -2248,14 +2265,11 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
             for (auto gap : state.gaps) {
                 const bool reachesOlder =
                     ids.contains(gap.older.id) || timeLess(gapNewer, gap.older);
-                const bool reachesNewer =
-                    ids.contains(gap.newer.id) || timeLess(gap.newer, newestBoundary) ||
-                    (page.gapId == gap.id && identical(page.request.first, gap.newer));
+                const bool reachesNewer = ids.contains(gap.newer.id) ||
+                                          timeLess(gap.newer, newestBoundary) || ownsNewer(gap);
                 const bool insideOlder = timeLess(gap.older, gapNewer);
                 const bool insideNewer = timeLess(newestBoundary, gap.newer);
-                const bool joinsNewer =
-                    ids.contains(gap.newer.id) ||
-                    (page.gapId == gap.id && identical(page.request.first, gap.newer));
+                const bool joinsNewer = ids.contains(gap.newer.id) || ownsNewer(gap);
                 const bool tiedNewer = irc::parseTimestampParts(gapNewer.time) &&
                                        irc::parseTimestampParts(gap.newer.time) &&
                                        !timeLess(gapNewer, gap.newer) &&
@@ -2318,14 +2332,24 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
             } catch (const std::exception &error) {
                 report(error.what(), b->server);
             }
-        bool gapsChanged = state.gaps.size() != before.gaps.size();
-        if (!gapsChanged)
-            for (size_t i = 0; i < state.gaps.size(); ++i)
-                gapsChanged = gapsChanged || state.gaps[i].older != before.gaps[i].older ||
-                              state.gaps[i].newer != before.gaps[i].newer ||
-                              state.gaps[i].unavailable != before.gaps[i].unavailable;
-        return inserted || state.oldest != before.oldest || state.newest != before.newest ||
-               gapsChanged;
+        if (!page.gapId)
+            return false;
+        const auto prior = std::find_if(before.gaps.begin(), before.gaps.end(),
+                                        [&](const auto &gap) { return gap.id == page.gapId; });
+        const auto current = std::find_if(state.gaps.begin(), state.gaps.end(),
+                                          [&](const auto &gap) { return gap.id == page.gapId; });
+        if (prior == before.gaps.end() || current == state.gaps.end() || !ownsNewer(*prior) ||
+            current->newer == prior->newer)
+            return false;
+        const bool nextMsgid = historyUsesMsgid(b->server, current->newer.id);
+        if (nextMsgid && (timestampRequest || current->newer.id != page.request.first.id))
+            return !timeLess(page.request.first, current->newer);
+        const auto previousTime = irc::parseTimestampParts(page.request.first.time);
+        const auto nextTime = irc::parseTimestampParts(current->newer.time);
+        return previousTime && nextTime &&
+               (nextTime->seconds < previousTime->seconds ||
+                (nextTime->seconds == previousTime->seconds &&
+                 nextTime->nanoseconds / 1000000 < previousTime->nanoseconds / 1000000));
     } catch (...) {
         applyingHistory_ = false;
         historyCanonicalId_.clear();
@@ -2708,8 +2732,7 @@ void Application::reduce(const Event &input) {
             snapshot(prefixModes_, "PREFIX");
             snapshot(channelModes_, "CHANMODES");
             n.clientTagDeny = tag(e, "CLIENTTAGDENY");
-            auto refs = e.tags.find("MSGREFTYPES");
-            if (refs != e.tags.end())
+            if (const auto refs = e.tags.find("MSGREFTYPES"); refs != e.tags.end())
                 historyReferences_[e.server] = refs->second;
             else
                 historyReferences_.erase(e.server);
@@ -3341,17 +3364,21 @@ bool Application::zncPlayback(const string &server) const {
         return config.name == server && config.bouncer == "znc";
     });
 }
+bool Application::historyUsesMsgid(const string &server, const string &id) const {
+    if (id.empty() || id.starts_with("local:") || id.starts_with("local-") || zncPlayback(server))
+        return false;
+    const auto refs = historyReferences_.find(server);
+    return refs == historyReferences_.end() || refs->second == "msgid" ||
+           refs->second.starts_with("msgid,") || refs->second.ends_with(",msgid") ||
+           refs->second.find(",msgid,") != string::npos;
+}
 string Application::historyCursor(const Buffer &b, const string &cursor) const {
     if (cursor.empty())
         return {};
     string selector = cursor;
     if (!selector.starts_with("timestamp=")) {
         const string id = selector.starts_with("msgid=") ? selector.substr(6) : selector;
-        auto refs = historyReferences_.find(b.server);
-        const bool timestampOnly =
-            zncPlayback(b.server) ||
-            (refs != historyReferences_.end() && refs->second.find("msgid") == string::npos &&
-             refs->second.find("timestamp") != string::npos);
+        const bool timestampOnly = !historyUsesMsgid(b.server, id);
         auto message = timestampOnly ? std::find_if(b.messages.begin(), b.messages.end(),
                                                     [&](const Message &m) { return m.id == id; })
                                      : b.messages.end();
@@ -3455,14 +3482,15 @@ void Application::submitHistory(HistoryPage page) {
 void Application::enqueueHistory(Buffer &b, HistoryRequest request, int64_t gapId,
                                  unsigned budget) {
     request.target = b.target;
+    auto gapBoundary = gapId ? request.first : HistoryCursor{};
+    const auto &network = model.networks[b.server];
     for (auto *cursor : {&request.first, &request.second})
-        if (cursor->id.starts_with("local:") || cursor->id.starts_with("local-"))
+        if (!historyUsesMsgid(b.server, cursor->id))
             cursor->id.clear();
     if (request.direction == HistoryDirection::Latest && request.first.id.empty() &&
         request.first.time.empty() && b.kind == "query")
         if (const auto floor = storage_.historyDiscarded(b.id); floor && !floor->empty())
             request.first.time = *floor;
-    const auto &network = model.networks[b.server];
     if (network.state != "Ready" || !client(b.server) ||
         (!network.caps.contains("chathistory") && !network.caps.contains("draft/chathistory") &&
          !zncPlayback(b.server)))
@@ -3486,6 +3514,7 @@ void Application::enqueueHistory(Buffer &b, HistoryRequest request, int64_t gapI
             return;
         }
     HistoryPage page;
+    page.gapBoundary = std::move(gapBoundary);
     page.request = std::move(request);
     page.server = b.server;
     page.buffer = b.id;

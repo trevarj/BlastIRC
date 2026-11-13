@@ -140,7 +140,7 @@ struct Message {
     SendStatus sendStatus = SendStatus::None;
     ActivityKind activity = ActivityKind::None;
     bool own = false, history = false, pending = false, deleted = false, mention = false,
-         action = false, presence = false;
+         action = false, presence = false, timestampFromHistory = false;
     map<string, vector<string>> reactions;
 };
 struct Nick {

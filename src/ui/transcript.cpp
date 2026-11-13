@@ -3203,8 +3203,8 @@ struct TranscriptView::Impl {
         if (changed && !buffer.messages.empty())
             newest = ui_logic::messageKey(buffer.messages.back());
         const bool unsettled = focusRevealTarget || c.pendingArrivals > 0;
-        const bool observeArrivals = classifyArrivals && !newest.empty() && !c.newest.empty() &&
-                                     newest != c.newest && (!pane.following || unsettled);
+        const bool observeArrivals =
+            classifyArrivals && c.initialized && (!pane.following || unsettled);
         auto observeArrival = [&](size_t index, Row &row) {
             const auto &entry = buffer.messages[index];
             // Restored unread survives hydration; later history replay is not a new arrival.

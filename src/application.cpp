@@ -109,9 +109,21 @@ bool historyTieLess(const Message &a, const Message &b) {
         b.storageSequence > 0 ? b.storageSequence : std::numeric_limits<int64_t>::max();
     return aSequence < bSequence;
 }
+int64_t orderingTime(const Message &message) {
+    return message.orderingTimestamp > 0 ? message.orderingTimestamp : message.timestamp;
+}
+bool chronologyKnown(const Message &message) {
+    return ((message.history || message.timestampFromHistory) && message.timestamp > 0) ||
+           irc::parseTimestampParts(message.time).has_value();
+}
+bool chronologyLess(const Message &a, const Message &b) {
+    if (orderingTime(a) != orderingTime(b))
+        return orderingTime(a) < orderingTime(b);
+    return markerFraction(a.time) < markerFraction(b.time);
+}
 bool historyMessageLess(const Message &a, const Message &b) {
-    if (a.timestamp != b.timestamp)
-        return a.timestamp < b.timestamp;
+    if (orderingTime(a) != orderingTime(b))
+        return orderingTime(a) < orderingTime(b);
     const auto aFraction = markerFraction(a.time), bFraction = markerFraction(b.time);
     if (aFraction != bFraction)
         return aFraction < bFraction;
@@ -121,10 +133,11 @@ bool reorderHistoryTies(Buffer &buffer, const vector<size_t> &positions) {
     bool changed = false;
     vector<size_t> order;
     for (size_t first = 0; first < positions.size();) {
-        const auto timestamp = buffer.messages[positions[first]].timestamp;
+        const auto timestamp = orderingTime(buffer.messages[positions[first]]);
         const auto fraction = markerFraction(buffer.messages[positions[first]].time);
         size_t last = first + 1;
-        while (last < positions.size() && buffer.messages[positions[last]].timestamp == timestamp &&
+        while (last < positions.size() &&
+               orderingTime(buffer.messages[positions[last]]) == timestamp &&
                markerFraction(buffer.messages[positions[last]].time) == fraction)
             ++last;
         auto begin = positions.begin() + first;
@@ -697,7 +710,11 @@ void Application::renameBuffer(string oldId, string target) {
                     if (keep.timestamp == 0) {
                         keep.timestamp = m.timestamp;
                         keep.time = m.time;
+                        keep.timestampFromHistory = m.timestampFromHistory || m.history;
                     }
+                    if (keep.timestamp > 0 && keep.timestamp == m.timestamp &&
+                        (m.timestampFromHistory || m.history))
+                        keep.timestampFromHistory = true;
                     if (keep.reply.empty())
                         keep.reply = m.reply;
                     if (keep.label.empty())
@@ -1453,7 +1470,7 @@ bool Application::insert(Buffer &b, Message m, bool persist, const string &compl
                 break;
             }
     if (m.orderingTimestamp <= 0)
-        m.orderingTimestamp = m.timestamp > 0 ? m.timestamp : epoch();
+        m.orderingTimestamp = m.timestamp;
     const bool stored = !persist || store(b, m, false, completedSend, confirmed);
     if (persist && m.history && !m.presence && !m.deleted && !durableReplay && stored &&
         m.storageSequence > 0 && (b.kind == "channel" || b.kind == "query"))
@@ -1462,34 +1479,35 @@ bool Application::insert(Buffer &b, Message m, bool persist, const string &compl
         recordChatActivity(b, m);
     activity(b, m);
     bool appendOnly = true;
-    if (m.history) {
-        auto pos = b.messages.begin();
-        const auto incomingTime = irc::parseTimestampParts(m.time);
-        auto earlierThan = [&](const Message &existing) {
-            if (m.timestamp != existing.timestamp)
-                return m.timestamp < existing.timestamp;
-            const auto existingTime = irc::parseTimestampParts(existing.time);
-            const auto incomingFraction = incomingTime ? incomingTime->nanoseconds : 0;
-            const auto existingFraction = existingTime ? existingTime->nanoseconds : 0;
-            if (incomingFraction != existingFraction)
-                return incomingFraction < existingFraction;
-            // Receipt-time placeholders retain native arrival order, not playback authority.
-            return incomingTime && existingTime && m.historyOrder >= 0 &&
-                   existing.historyOrder >= 0 && historyTieLess(m, existing);
-        };
-        if (m.timestamp > 0) {
-            while (pos != b.messages.end() && ((pos->history && pos->timestamp == 0) ||
-                                               (pos->timestamp > 0 && !earlierThan(*pos))))
-                ++pos;
-        } else {
-            while (pos != b.messages.end() && pos->history && pos->timestamp == 0 &&
-                   !earlierThan(*pos))
-                ++pos;
-        }
-        appendOnly = pos == b.messages.end();
-        b.messages.insert(pos, std::move(m));
-    } else
+    const auto incomingTime = irc::parseTimestampParts(m.time);
+    const bool incomingKnown =
+        incomingTime || ((m.history || m.timestampFromHistory) && m.timestamp > 0);
+    auto earlierThan = [&](const Message &existing) {
+        if (existing.history && existing.timestamp == 0)
+            return false;
+        if (m.history && m.timestamp == 0)
+            return !(existing.history && existing.timestamp == 0);
+        if (!incomingKnown || !chronologyKnown(existing))
+            return false;
+        if (chronologyLess(m, existing))
+            return true;
+        if (chronologyLess(existing, m))
+            return false;
+        return m.history && incomingTime && irc::parseTimestampParts(existing.time) &&
+               m.historyOrder >= 0 && existing.historyOrder >= 0 && historyTieLess(m, existing);
+    };
+    auto lastTimed = b.messages.rbegin();
+    if (incomingKnown && !(m.history && m.timestamp == 0))
+        while (lastTimed != b.messages.rend() && !chronologyKnown(*lastTimed) &&
+               !(lastTimed->history && lastTimed->timestamp == 0))
+            ++lastTimed;
+    if (lastTimed == b.messages.rend() || !earlierThan(*lastTimed))
         b.messages.push_back(std::move(m));
+    else {
+        auto pos = std::find_if(b.messages.begin(), b.messages.end(), earlierThan);
+        appendOnly = false;
+        b.messages.insert(pos, std::move(m));
+    }
     if (b.kind == "search") {
         const auto limit = static_cast<size_t>(std::clamp(model.settings.maxMessages, 1, 2000));
         if (b.messages.size() > limit)
@@ -1697,6 +1715,11 @@ void Application::receive(Event e) {
             }
             pending_.erase(b.id + "\n" + old->id);
             const bool idChanged = !e.id.empty() && old->id != e.id;
+            const auto previousTimestamp = old->timestamp;
+            const auto previousOrdering = orderingTime(*old);
+            const auto previousFraction = markerFraction(old->time);
+            const bool previouslyKnown = chronologyKnown(*old);
+            const bool timeChanged = !e.time.empty() && old->time != e.time;
             const bool labelChanged = !e.history && !e.label.empty() && old->label != e.label;
             if (idChanged || labelChanged)
                 reviseMessages(b);
@@ -1706,10 +1729,11 @@ void Application::receive(Event e) {
                 old->label = e.label;
             old->pending = false;
             old->sendStatus = SendStatus::Confirmed;
-            if (e.timestamp > 0)
+            if (e.timestamp > 0) {
                 old->timestamp = e.timestamp;
-            if (e.timestamp > 0)
                 old->orderingTimestamp = e.timestamp;
+                old->timestampFromHistory = e.history;
+            }
             if (!e.time.empty())
                 old->time = e.time;
             old->text = e.text;
@@ -1742,6 +1766,50 @@ void Application::receive(Event e) {
                 if (!applyingHistory_ && markerTime(b.readMarker) > 0)
                     if (auto c = client(b.server))
                         c->markRead(b.target, b.readMarker);
+            }
+            if (chronologyKnown(*old) &&
+                (previousTimestamp != old->timestamp || previousOrdering != orderingTime(*old) ||
+                 timeChanged || !previouslyKnown)) {
+                const bool durableCohortEntry = previouslyKnown && stored &&
+                                                old->storageSequence > 0 &&
+                                                old->historyOrder >= 0 &&
+                                                (previousOrdering != orderingTime(*old) ||
+                                                 previousFraction != markerFraction(old->time));
+                auto confirmationLess = [&](const Message &a, const Message &other) {
+                    if (chronologyLess(a, other))
+                        return true;
+                    return durableCohortEntry && !chronologyLess(other, a) &&
+                           a.storageSequence > 0 && other.storageSequence > 0 &&
+                           a.historyOrder >= 0 && other.historyOrder >= 0 &&
+                           historyTieLess(a, other);
+                };
+                auto destination = old;
+                auto candidate = old;
+                while (candidate != b.messages.begin()) {
+                    --candidate;
+                    if (candidate->history && candidate->timestamp == 0)
+                        break;
+                    if (!chronologyKnown(*candidate))
+                        continue;
+                    if (!confirmationLess(*old, *candidate))
+                        break;
+                    destination = candidate;
+                }
+                if (destination != old)
+                    std::rotate(destination, old, std::next(old));
+                else {
+                    destination = std::next(old);
+                    for (candidate = destination; candidate != b.messages.end(); ++candidate) {
+                        if (!chronologyKnown(*candidate))
+                            continue;
+                        if (!confirmationLess(*candidate, *old))
+                            break;
+                        destination = std::next(candidate);
+                    }
+                    if (destination != std::next(old))
+                        std::rotate(old, std::next(old), destination);
+                }
+                reviseMessages(b);
             }
             effect(e, b);
             recount(b);
@@ -1806,9 +1874,14 @@ void Application::receive(Event e) {
     std::erase_if(b.typing, [&](const auto &item) {
         return fold(e.server, item.first) == fold(e.server, e.nick);
     });
-    if (!e.history && !b.messages.empty() && b.messages.back().id == id &&
-        b.messages.back().deleted)
-        return;
+    if (!e.history && !b.messages.empty()) {
+        const auto &last = b.messages.back();
+        if (last.id == id ? last.deleted
+                          : std::any_of(b.messages.begin(), b.messages.end(), [&](const auto &row) {
+                                return row.id == id && row.deleted;
+                            }))
+            return;
+    }
     e.id = id;
     if (pending)
         e.type = "send";
@@ -2191,7 +2264,7 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
             for (const auto &row : b->messages)
                 if (existingCanonicalIds.contains(row.id))
                     if (const auto time = irc::parseTimestampParts(row.time))
-                        affectedTimes.emplace(row.timestamp, time->nanoseconds);
+                        affectedTimes.emplace(orderingTime(row), time->nanoseconds);
             vector<int64_t> originalSequences;
             originalSequences.reserve(originalOrder.size());
             for (const auto &[identity, rank] : originalOrder)
@@ -2200,7 +2273,7 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
             std::sort(originalSequences.begin(), originalSequences.end());
             for (const auto &row : b->messages) {
                 const auto time = irc::parseTimestampParts(row.time);
-                if (!time || !affectedTimes.contains({row.timestamp, time->nanoseconds}))
+                if (!time || !affectedTimes.contains({orderingTime(row), time->nanoseconds}))
                     continue;
                 if (existingCanonicalIds.contains(row.id) ||
                     std::binary_search(originalSequences.begin(), originalSequences.end(),

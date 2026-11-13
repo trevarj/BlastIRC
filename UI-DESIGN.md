@@ -43,6 +43,8 @@ Commit complete history pages, protocol boundaries, and interior gaps atomically
 
 Completed playback reconciles equal server-time rows in wire order using a separate durable tie rank, following MOTD's canonical playback-order reconciliation. Unanchored BEFORE/AROUND rows prepend and LATEST/AFTER rows append; confirmed contradictory overlap cannot oscillate the established order. Schema 11 adds this rank without changing original timestamps, message IDs, stable storage identities, activity keys, or existing version-10 history metadata.
 
+Use durable effective timestamps and original server-time fractions before cohort-local playback ranks. Untimed live rows keep native arrival order; numeric history timestamps remain authoritative after own confirmation. Retimed known rows use the destination cohort's stored tie order, while same-cohort confirmations stay stable. Count new live arrivals even when the tail stays unchanged.
+
 ## Appearance and transparency
 
 Use a continuous cohesive shell behind the titlebar, server rail, channel sidebar, and status, with very faint thin dividers between the two left bars and chat. Give chat breathing room with larger gaps, quiet selection, roughly 12-unit control and 16-unit bubble radii scaled once. Do not paint separate rounded card plates around the left bars/titlebar or add another frame inside the conversation. Compact layouts reclaim decoration before native controls/fonts. Native keyboard focus remains visibly distinct from selection.

@@ -18,6 +18,7 @@
 #include <string_view>
 #include <sys/socket.h>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <utility>
 
@@ -1712,26 +1713,36 @@ struct ApplicationRegression {
         assert(room.messages[1].sendStatus == SendStatus::Confirmed);
         admission.label = "history-status-id";
         app.reduce(admission);
-        history.id = room.messages.back().id;
+        const auto exactIdPending =
+            std::find_if(room.messages.begin(), room.messages.end(),
+                         [&](const auto &m) { return m.label == admission.label; });
+        assert(exactIdPending != room.messages.end() && exactIdPending->id.starts_with("local:"));
+        history.id = exactIdPending->id;
         history.label = "history-request-label";
         completeOwnedHistory(app, room, history, "history-owner-exact-id");
-        assert(room.messages.size() == 4 && room.messages.back().id == history.id &&
-               room.messages.back().label == admission.label &&
-               room.messages.back().sendStatus == SendStatus::Confirmed);
+        const auto *exactIdConfirmed = sourceMessage(app.model, room.id, history.id);
+        assert(room.messages.size() == 4 && exactIdConfirmed &&
+               exactIdConfirmed->id == history.id && exactIdConfirmed->label == admission.label &&
+               exactIdConfirmed->sendStatus == SendStatus::Confirmed);
         assertReopenedOwnHistoryOrder(
             {"matched-history-status", "unmatched-history-status", history.id});
         // A stale explicit owner must not fall back to a child's valid send label.
         admission.label = "still-queued-after-stale-owner";
         app.reduce(admission);
-        const string stalePendingId = room.messages.back().id;
+        const auto stalePending =
+            std::find_if(room.messages.begin(), room.messages.end(),
+                         [&](const auto &m) { return m.label == admission.label; });
+        assert(stalePending != room.messages.end());
+        const string stalePendingId = stalePending->id;
         const auto staleCount = room.messages.size();
         Event stale = history;
         stale.label = admission.label;
         stale.id = "stale-history-must-not-confirm";
         stale.tags["history-owner"] = "retired-history-owner";
         app.reduce(stale);
-        assert(room.messages.size() == staleCount && room.messages.back().id == stalePendingId &&
-               room.messages.back().sendStatus == SendStatus::Queued &&
+        const auto *stillQueued = sourceMessage(app.model, room.id, stalePendingId);
+        assert(room.messages.size() == staleCount && stillQueued &&
+               stillQueued->id == stalePendingId && stillQueued->sendStatus == SendStatus::Queued &&
                !app.storage_.message(room.id, stale.id));
 
         admission.label = "failed-status-label";
@@ -1756,9 +1767,12 @@ struct ApplicationRegression {
         const auto afterFailureCount = room.messages.size();
         sent.label = failure.label;
         app.reduce(sent);
+        const auto replacement =
+            std::find_if(room.messages.begin(), room.messages.end(),
+                         [&](const auto &m) { return m.label == admission.label; });
         assert(room.messages.size() == afterFailureCount && room.draft == recoveredDraft &&
-               room.messages.back().label == admission.label &&
-               room.messages.back().sendStatus == SendStatus::Queued);
+               replacement != room.messages.end() && replacement->label == admission.label &&
+               replacement->sendStatus == SendStatus::Queued);
 
         Event incoming = echo;
         incoming.own = false;
@@ -1766,8 +1780,9 @@ struct ApplicationRegression {
         incoming.id = "incoming-status";
         incoming.label.clear();
         app.reduce(incoming);
-        assert(room.messages.back().id == incoming.id &&
-               room.messages.back().sendStatus == SendStatus::None);
+        const auto *incomingRow = sourceMessage(app.model, room.id, incoming.id);
+        assert(incomingRow && incomingRow->id == incoming.id &&
+               incomingRow->sendStatus == SendStatus::None);
         app.clear(&room);
         sent.label = admission.label;
         app.reduce(sent);
@@ -3061,8 +3076,10 @@ struct ApplicationRegression {
         renamed.id = "structured-nick-change";
         renamed.text = "NewFriend[";
         app.reduce(renamed);
-        assert(room.messages.back().activity == ActivityKind::Nick &&
-               room.messages.back().activityTarget == renamed.text);
+        const auto nickRow = std::find_if(room.messages.begin(), room.messages.end(),
+                                          [&](const auto &row) { return row.id == renamed.id; });
+        assert(nickRow != room.messages.end() && nickRow->activity == ActivityKind::Nick &&
+               nickRow->activityTarget == renamed.text);
         const auto savedNick = app.storage_.message(room.id, renamed.id);
         assert(savedNick && savedNick->activity == ActivityKind::Nick &&
                savedNick->activityTarget == renamed.text);
@@ -3441,11 +3458,16 @@ struct ApplicationRegression {
         event.target = room.target;
         event.timestamp = 1770000000;
         event.time = "2026-02-02T02:40:00Z";
-        auto expectRow = [&](const Event &input, ActivityKind kind, const string &text) {
-            const auto &row = room.messages.back();
+        auto expectRow = [&](const Event &input, ActivityKind kind,
+                             const string &text) -> const Message & {
+            const auto found = std::find_if(room.messages.begin(), room.messages.end(),
+                                            [&](const auto &row) { return row.id == input.id; });
+            assert(found != room.messages.end());
+            const auto &row = *found;
             assert(row.id == input.id && row.nick == input.nick && row.time == input.time &&
                    row.timestamp == input.timestamp && row.text == text && row.presence &&
                    row.activity == kind && !row.action && row.history == input.history);
+            return row;
         };
         event.type = "join";
         event.nick = "Quiet";
@@ -3467,8 +3489,9 @@ struct ApplicationRegression {
         event.id = "quiet-nick";
         event.text = "Renamed";
         app.reduce(event);
-        expectRow(event, ActivityKind::Nick, "Quiet is now known as Renamed");
-        assert(room.messages.back().activityTarget == "Renamed");
+        assert(
+            expectRow(event, ActivityKind::Nick, "Quiet is now known as Renamed").activityTarget ==
+            "Renamed");
         event.type = "quit";
         event.id = "quiet-quit";
         event.nick = "Renamed";
@@ -3484,9 +3507,10 @@ struct ApplicationRegression {
         event.id = "real-action";
         event.text = "joined the dance";
         app.reduce(event);
-        assert(room.messages.back().id == event.id && room.messages.back().action &&
-               !room.messages.back().presence &&
-               room.messages.back().activity == ActivityKind::None);
+        const auto action = std::find_if(room.messages.begin(), room.messages.end(),
+                                         [&](const auto &row) { return row.id == event.id; });
+        assert(action != room.messages.end() && action->action && !action->presence &&
+               action->activity == ActivityKind::None);
         app.model.effects.clear();
 
         // Casemapped self JOINs retain typed history and membership, never live activity.
@@ -3498,11 +3522,11 @@ struct ApplicationRegression {
         event.id = "own-live-join";
         event.tags = {{"account", "live-account"}};
         app.reduce(event);
-        expectRow(event, ActivityKind::Join, "{mE} joined #activity");
+        const auto &ownJoin = expectRow(event, ActivityKind::Join, "{mE} joined #activity");
         const auto self = std::find_if(room.nicks.begin(), room.nicks.end(),
                                        [&](const auto &nick) { return nick.name == event.nick; });
         assert(room.joined && self != room.nicks.end() && self->account == "live-account" &&
-               room.messages.back().own && app.model.effects.empty());
+               ownJoin.own && app.model.effects.empty());
         const auto members = room.nicks.size();
         room.joined = false;
         event.history = true;
@@ -3529,8 +3553,8 @@ struct ApplicationRegression {
                 event.nick = own ? "mE" : "Other";
                 event.id = (selfFirst ? "self-first-" : "self-last-") + std::to_string(i);
                 app.reduce(event);
-                expectRow(event, ActivityKind::Join, event.nick + " joined #activity");
-                assert(room.messages.back().own == own);
+                assert(expectRow(event, ActivityKind::Join, event.nick + " joined #activity").own ==
+                       own);
                 if (own && i == 0)
                     assert(app.model.effects.empty());
             }
@@ -3591,15 +3615,14 @@ struct ApplicationRegression {
         event.nick = "Me";
         event.id = "hidden-own";
         app.reduce(event);
-        expectRow(event, ActivityKind::Join, "Me joined #activity");
-        assert(room.messages.back().own && app.model.effects.empty());
+        assert(expectRow(event, ActivityKind::Join, "Me joined #activity").own &&
+               app.model.effects.empty());
         event.type = "part";
         event.id = "hidden-own-part";
         event.own = true;
         app.reduce(event);
-        expectRow(event, ActivityKind::Part, "Me left #activity — hidden reason");
-        assert(room.messages.back().own && app.model.effects.size() == 1 &&
-               app.model.effects.front().type == "part");
+        assert(expectRow(event, ActivityKind::Part, "Me left #activity — hidden reason").own &&
+               app.model.effects.size() == 1 && app.model.effects.front().type == "part");
         event.type = "join";
         event.own = false;
         event.nick = "Forced";
@@ -4501,6 +4524,456 @@ struct ApplicationRegression {
                     {"newest-time", rows.back().time}};
         app.reduce(end);
         assert(!app.historyPages_.contains(owner));
+    }
+    static void mixedTimeOwnConfirmation() {
+        for (const bool history : {true, false}) {
+            Application app;
+            app.model = Model{};
+            app.messageCount_ = 0;
+            app.model.settings.retentionDays = 0;
+            app.storage_.prune(app.model.settings);
+            auto &room = app.buffer(history ? "mixed-own-page" : "mixed-own-live", "#room");
+            app.model.networks[room.server].nick = "Me";
+            auto own = tiedHistoryRow(room, "local:mixed-own");
+            own.nick = "Me";
+            own.own = true;
+            own.history = false;
+            own.label = "mixed-own-label";
+            own.time = "2026-11-01T00:00:31.123456789Z";
+            own.timestamp += 31;
+            own.tags["pending"] = "1";
+            app.reduce(own);
+            const auto provisional = room.messages.front();
+            auto second = tiedHistoryRow(room, "mixed-32");
+            second.time = "2026-11-01T00:00:32.123456789Z";
+            second.timestamp += 32;
+            auto fourth = tiedHistoryRow(room, "mixed-34");
+            fourth.time = "2026-11-01T00:00:34.123456789Z";
+            fourth.timestamp += 34;
+            own.id = "mixed-own-35";
+            own.tags.clear();
+            own.time = "2026-11-01T00:00:35.123456789Z";
+            own.timestamp += 4;
+            own.history = history;
+            if (history)
+                completeTiedHistory(app, room, {second, fourth, own}, HistoryDirection::Latest,
+                                    "mixed-own-owned-page");
+            else {
+                second.history = fourth.history = false;
+                app.reduce(second);
+                app.reduce(fourth);
+                app.reduce(own);
+            }
+            const vector<string> expected{second.id, fourth.id, own.id};
+            assertHistoryIds(room.messages, expected);
+            assertHistoryIds(app.storage_.history(room.id, -1), expected);
+            Storage reopened;
+            assertHistoryIds(reopened.history(room.id, -1), expected);
+            const auto &confirmed = room.messages.back();
+            assert(confirmed.time == own.time && confirmed.timestamp == own.timestamp &&
+                   confirmed.orderingTimestamp == own.timestamp &&
+                   confirmed.label == provisional.label && confirmed.own && !confirmed.pending &&
+                   confirmed.sendStatus == SendStatus::Confirmed && confirmed.storageSequence > 0 &&
+                   app.messageCount_ == 3);
+            for (const auto &row : room.messages) {
+                const auto durable = reopened.message(room.id, row.id);
+                assert(durable && durable->time == row.time &&
+                       durable->timestamp == row.timestamp &&
+                       durable->orderingTimestamp == row.orderingTimestamp &&
+                       durable->storageSequence == row.storageSequence &&
+                       durable->label == row.label && durable->sendStatus == row.sendStatus);
+                assert(sourceMessage(app.model, room.id, row.id));
+            }
+            assert(!sourceMessage(app.model, room.id, provisional.id));
+            const auto sequence = confirmed.storageSequence;
+            const auto revision = room.messagesRevision;
+            own.history = false;
+            own.timestamp = second.timestamp;
+            own.time = "2026-11-01T00:00:32.123456788Z";
+            app.reduce(own);
+            const vector<string> nanos{own.id, second.id, fourth.id};
+            assertHistoryIds(room.messages, nanos);
+            assertHistoryIds(reopened.history(room.id, -1), nanos);
+            assert(room.messagesRevision > revision &&
+                   room.messages.front().storageSequence == sequence &&
+                   room.messages.front().label == provisional.label &&
+                   room.messages.front().time == own.time);
+            // Same-ID, same-second corrections must relocate by the original nanoseconds.
+            own.time = "2026-11-01T00:00:32.123456790Z";
+            app.reduce(own);
+            const vector<string> corrected{second.id, own.id, fourth.id};
+            assertHistoryIds(room.messages, corrected);
+            assertHistoryIds(reopened.history(room.id, -1), corrected);
+            assert(room.messages[1].storageSequence == sequence);
+            sqlite3 *fault = nullptr;
+            const auto database =
+                std::filesystem::path(std::getenv("XDG_DATA_HOME")) / "blastirc/state.sqlite3";
+            assert(sqlite3_open(database.c_str(), &fault) == SQLITE_OK);
+            assert(
+                sqlite3_exec(fault,
+                             "CREATE TRIGGER reject_chronology_move BEFORE INSERT ON "
+                             "history_state BEGIN SELECT RAISE(ABORT,'chronology move rejected'); "
+                             "END;",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+            Application::HistoryPage page;
+            page.server = room.server;
+            page.buffer = room.id;
+            page.request.target = room.target;
+            page.request.direction = HistoryDirection::Around;
+            auto moved = own;
+            moved.history = true;
+            moved.timestamp = fourth.timestamp + 1;
+            moved.time = "2026-11-01T00:00:35.123456789Z";
+            page.events = {moved};
+            Event end;
+            end.tags = {{"direction", "around"}, {"count", "1"},
+                        {"oldest-id", moved.id}, {"oldest-time", moved.time},
+                        {"newest-id", moved.id}, {"newest-time", moved.time}};
+            bool failed = false;
+            try {
+                app.applyHistoryPage(page, end);
+            } catch (const std::exception &error) {
+                failed = string(error.what()).find("chronology move rejected") != string::npos;
+            }
+            assert(failed);
+            assertHistoryIds(room.messages, corrected);
+            assertHistoryIds(reopened.history(room.id, -1), corrected);
+            const auto &restored = room.messages[1];
+            assert(restored.id == own.id && restored.time == own.time &&
+                   restored.timestamp == own.timestamp && restored.storageSequence == sequence &&
+                   restored.label == provisional.label && !restored.pending &&
+                   restored.sendStatus == SendStatus::Confirmed &&
+                   sourceMessage(app.model, room.id, own.id)->time == own.time);
+            assert(sqlite3_exec(fault, "DROP TRIGGER reject_chronology_move", nullptr, nullptr,
+                                nullptr) == SQLITE_OK);
+            sqlite3_close(fault);
+        }
+    }
+    static void lateLiveChronology() {
+        Application app;
+        app.model = Model{};
+        app.messageCount_ = 0;
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("mixed-late-live", "#room");
+        auto fifth = tiedHistoryRow(room, "late-35");
+        fifth.history = false;
+        fifth.time = "2026-11-01T00:00:35.123456789Z";
+        fifth.timestamp += 35;
+        auto second = fifth;
+        second.id = "late-32";
+        second.time = "2026-11-01T00:00:32.123456789Z";
+        second.timestamp -= 3;
+        app.reduce(fifth);
+        const auto fifthSequence = room.messages.front().storageSequence;
+        app.reduce(second);
+        assertHistoryIds(room.messages, {second.id, fifth.id});
+        auto fourth = second;
+        fourth.id = "late-34";
+        fourth.time = "2026-11-01T00:00:34.123456789Z";
+        fourth.timestamp += 2;
+        fourth.history = true;
+        completeTiedHistory(app, room, {fourth}, HistoryDirection::Around, "late-live-page");
+        const vector<string> expected{second.id, fourth.id, fifth.id};
+        assertHistoryIds(room.messages, expected);
+        assertHistoryIds(app.storage_.history(room.id, -1), expected);
+        Storage reopened;
+        assertHistoryIds(reopened.history(room.id, -1), expected);
+        assert(room.messages.back().storageSequence == fifthSequence && app.messageCount_ == 3);
+        {
+            Application edge;
+            edge.model = Model{};
+            edge.messageCount_ = 0;
+            edge.model.settings.retentionDays = 0;
+            auto &rows = edge.buffer("own-retime-cohort", "#room");
+            edge.model.networks[rows.server].nick = "Me";
+            auto peer = tiedHistoryRow(rows, "peer-cohort-35");
+            peer.history = false;
+            peer.timestamp += 35;
+            peer.time = "2026-11-01T00:00:35Z";
+            edge.reduce(peer);
+            auto own = peer;
+            own.id = "local:own-cohort-32";
+            own.nick = "Me";
+            own.own = true;
+            own.label = "own-cohort-label";
+            own.timestamp -= 3;
+            own.time = "2026-11-01T00:00:32Z";
+            own.tags["pending"] = "1";
+            edge.reduce(own);
+            assert(rows.messages.front().label == own.label && rows.messages.back().id == peer.id);
+            own.id = "own-cohort-35";
+            own.timestamp = peer.timestamp;
+            own.time = peer.time;
+            own.tags.clear();
+            edge.reduce(own);
+            const vector<string> ordered{peer.id, own.id};
+            assertHistoryIds(rows.messages, ordered);
+            Storage reopened;
+            assertHistoryIds(reopened.history(rows.id, -1), ordered);
+        }
+        for (const bool saving : {true, false})
+            for (const bool positive : {true, false}) {
+                Application edge;
+                edge.model = Model{};
+                edge.messageCount_ = 0;
+                edge.savingAllowed_ = saving;
+                edge.model.settings.retentionDays = 0;
+                const string server =
+                    string(positive ? "numeric-own-history" : "untimed-own-history") +
+                    (saving ? "-saved" : "-unsaved");
+                auto &rows = edge.buffer(server, "#room");
+                edge.model.networks[rows.server].nick = "Me";
+                auto own = tiedHistoryRow(rows, "local:numeric-own");
+                const auto base = own.timestamp;
+                own.nick = "Me";
+                own.own = true;
+                own.history = false;
+                own.time.clear();
+                own.timestamp += positive ? 31 : 999;
+                own.label = "numeric-own-label";
+                own.tags["pending"] = "1";
+                edge.reduce(own);
+                own.id = rows.messages.back().id;
+                own.label.clear();
+                own.timestamp = positive ? base + 35 : 0;
+                own.history = true;
+                own.tags.clear();
+                edge.reduce(own);
+                assert(rows.messages.size() == 1 && !rows.messages.front().history &&
+                       rows.messages.front().time.empty() &&
+                       rows.messages.front().sendStatus == SendStatus::Confirmed &&
+                       rows.messages.front().timestampFromHistory == positive);
+                auto earlier = own;
+                earlier.id = "numeric-history-32";
+                earlier.timestamp = base + 32;
+                earlier.nick = "Other";
+                earlier.own = false;
+                earlier.label.clear();
+                edge.reduce(earlier);
+                const vector<string> ordered = positive ? vector<string>{earlier.id, own.id}
+                                                        : vector<string>{own.id, earlier.id};
+                assertHistoryIds(rows.messages, ordered);
+                if (saving && positive)
+                    assertHistoryIds(edge.storage_.history(rows.id, -1), ordered);
+                if (positive) {
+                    own.history = false;
+                    own.timestamp = 0;
+                    edge.reduce(own);
+                    assert(rows.messages.back().timestampFromHistory);
+                    own.timestamp = base + 35;
+                    edge.reduce(own);
+                    assert(!rows.messages.back().timestampFromHistory);
+                }
+            }
+        for (const bool missing : {true, false}) {
+            Application edge;
+            edge.model = Model{};
+            edge.messageCount_ = 0;
+            edge.savingAllowed_ = false;
+            auto &destination = edge.buffer("numeric-rename", "#new");
+            auto &source = edge.buffer("numeric-rename", "#old");
+            Message retained;
+            retained.id = "numeric-rename-own";
+            retained.own = true;
+            retained.timestamp = missing ? 0 : 35;
+            edge.insert(destination, retained, false);
+            auto incoming = retained;
+            incoming.timestamp = 35;
+            incoming.history = true;
+            edge.insert(source, incoming, false);
+            const string sourceId = source.id;
+            edge.renameBuffer(sourceId, destination.target);
+            assert(destination.messages.size() == 1 &&
+                   destination.messages.front().timestampFromHistory &&
+                   !destination.messages.front().history);
+            incoming.id = "numeric-rename-earlier";
+            incoming.timestamp = 32;
+            edge.insert(destination, incoming, false);
+            assertHistoryIds(destination.messages, {incoming.id, retained.id});
+        }
+        for (const bool existingZero : {false, true}) {
+            Application edge;
+            edge.model = Model{};
+            edge.messageCount_ = 0;
+            edge.savingAllowed_ = false;
+            auto &rows = edge.buffer("untimed-history-zero", "#room");
+            Message zero;
+            zero.id = "existing-zero";
+            zero.history = true;
+            if (existingZero)
+                edge.insert(rows, zero, false);
+            Message live;
+            live.id = "untimed-live";
+            live.timestamp = 999;
+            edge.insert(rows, live, false);
+            zero.id = "incoming-zero";
+            edge.insert(rows, zero, false);
+            if (existingZero)
+                assertHistoryIds(rows.messages, {"existing-zero", "incoming-zero", live.id});
+            else
+                assertHistoryIds(rows.messages, {"incoming-zero", live.id});
+        }
+        for (const bool untimedFirst : {false, true}) {
+            Application edge;
+            edge.model = Model{};
+            edge.messageCount_ = 0;
+            edge.savingAllowed_ = false;
+            auto &rows = edge.buffer("untimed-live", "#room");
+            auto unknown = [&](const string &id, int64_t clock) {
+                Message row;
+                row.id = id;
+                row.timestamp = clock;
+                edge.insert(rows, std::move(row), false);
+            };
+            auto known = [&](const string &id, int seconds) {
+                auto row = tiedHistoryRow(rows, id);
+                row.history = false;
+                row.timestamp += seconds;
+                row.time = "2026-11-01T00:00:" + std::to_string(seconds) + ".123456789Z";
+                edge.reduce(row);
+            };
+            if (untimedFirst) {
+                unknown("clock-999", 1793492199);
+                known("known-30", 30);
+            }
+            known("known-35", 35);
+            unknown("clock-zero", 0);
+            unknown("clock-tail", 1);
+            known("known-32", 32);
+            known("known-34", 34);
+            if (untimedFirst)
+                assertHistoryIds(rows.messages, {"clock-999", "known-30", "known-32", "known-34",
+                                                 "known-35", "clock-zero", "clock-tail"});
+            else
+                assertHistoryIds(rows.messages,
+                                 {"known-32", "known-34", "known-35", "clock-zero", "clock-tail"});
+        }
+        for (const bool newlyTimed : {false, true}) {
+            Application edge;
+            edge.model = Model{};
+            edge.messageCount_ = 0;
+            edge.savingAllowed_ = false;
+            auto &rows = edge.buffer("untimed-own", "#room");
+            edge.model.networks[rows.server].nick = "Me";
+            auto row = tiedHistoryRow(rows, "known-35");
+            row.history = false;
+            row.timestamp += 35;
+            row.time = "2026-11-01T00:00:35Z";
+            auto own = row;
+            own.id = "local:untimed-own";
+            own.nick = "Me";
+            own.own = true;
+            own.label = "untimed-own-label";
+            own.timestamp -= 3;
+            own.time = newlyTimed ? "" : "2026-11-01T00:00:32Z";
+            own.tags["pending"] = "1";
+            if (!newlyTimed)
+                edge.reduce(own);
+            if (newlyTimed)
+                edge.reduce(row);
+            Message placeholder;
+            placeholder.id = "untimed-interleaver";
+            placeholder.timestamp = row.timestamp + 999;
+            edge.insert(rows, placeholder, false);
+            if (newlyTimed) {
+                edge.reduce(own);
+                assert(rows.messages.back().pending && rows.messages.back().label == own.label);
+                assert(rows.messages[0].id == row.id && rows.messages[1].id == placeholder.id);
+            } else
+                edge.reduce(row);
+            own.tags.clear();
+            own.id = "confirmed-own";
+            own.time = newlyTimed ? "2026-11-01T00:00:32Z" : "2026-11-01T00:00:36Z";
+            if (!newlyTimed)
+                own.timestamp += 4;
+            edge.reduce(own);
+            if (newlyTimed)
+                assertHistoryIds(rows.messages, {own.id, row.id, placeholder.id});
+            else
+                assertHistoryIds(rows.messages, {placeholder.id, row.id, own.id});
+            own.timestamp = row.timestamp;
+            own.time = row.time;
+            edge.reduce(own);
+            if (newlyTimed)
+                assertHistoryIds(rows.messages, {own.id, row.id, placeholder.id});
+            else
+                assertHistoryIds(rows.messages, {placeholder.id, row.id, own.id});
+            own.timestamp = row.timestamp - 3;
+            own.time = "2026-11-01T00:00:32Z";
+            edge.reduce(own);
+            if (newlyTimed)
+                assertHistoryIds(rows.messages, {own.id, row.id, placeholder.id});
+            else
+                assertHistoryIds(rows.messages, {placeholder.id, own.id, row.id});
+        }
+    }
+    static void effectiveOrderingChronology() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("effective-ordering-chronology", "#room");
+        sqlite3 *fixture = nullptr;
+        const auto database =
+            std::filesystem::path(std::getenv("XDG_DATA_HOME")) / "blastirc/state.sqlite3";
+        assert(sqlite3_open(database.c_str(), &fixture) == SQLITE_OK);
+        sqlite3_stmt *displayTimestamp = nullptr;
+        assert(sqlite3_prepare_v2(fixture,
+                                  "UPDATE messages SET timestamp=? WHERE buffer=? AND id=?", -1,
+                                  &displayTimestamp, nullptr) == SQLITE_OK);
+        for (const auto &[id, display, ordering] : vector<std::tuple<string, int, int>>{
+                 {"effective-35", 31, 35}, {"effective-32", 32, 32}, {"effective-34", 31, 34}}) {
+            Message row;
+            row.id = id;
+            row.nick = "Other";
+            row.time = "2026-11-01T00:00:" + std::to_string(display) + ".123456789Z";
+            // Seed a legacy durable display/order split: append writes sort_time from
+            // timestamp, then change only the display timestamp, leaving sort_time intact.
+            row.timestamp = 1793491200 + ordering;
+            app.storage_.append(room.id, row);
+            assert(sqlite3_bind_int64(displayTimestamp, 1, 1793491200 + display) == SQLITE_OK);
+            assert(sqlite3_bind_text(displayTimestamp, 2, room.id.c_str(), -1, SQLITE_TRANSIENT) ==
+                   SQLITE_OK);
+            assert(sqlite3_bind_text(displayTimestamp, 3, id.c_str(), -1, SQLITE_TRANSIENT) ==
+                   SQLITE_OK);
+            assert(sqlite3_step(displayTimestamp) == SQLITE_DONE);
+            assert(sqlite3_changes(fixture) == 1);
+            assert(sqlite3_reset(displayTimestamp) == SQLITE_OK);
+            const auto durable = app.storage_.message(room.id, id);
+            assert(durable && durable->time == row.time &&
+                   durable->timestamp == 1793491200 + display &&
+                   durable->orderingTimestamp == 1793491200 + ordering &&
+                   durable->storageSequence > 0);
+            app.insert(room, *durable, false);
+        }
+        assert(sqlite3_finalize(displayTimestamp) == SQLITE_OK);
+        assert(sqlite3_close(fixture) == SQLITE_OK);
+        const vector<string> expected{"effective-32", "effective-34", "effective-35"};
+        assertHistoryIds(room.messages, expected);
+        assertHistoryIds(app.storage_.history(room.id, -1), expected);
+        Storage reopened;
+        assertHistoryIds(reopened.history(room.id, -1), expected);
+        vector<Event> replay;
+        for (const auto &row : room.messages) {
+            auto event = tiedHistoryRow(room, row.id);
+            event.time = row.time;
+            event.timestamp = row.timestamp;
+            replay.push_back(std::move(event));
+        }
+        completeTiedHistory(app, room, replay, HistoryDirection::Around,
+                            "effective-ordering-distinct-cohorts");
+        assertHistoryIds(room.messages, expected);
+        assertHistoryIds(reopened.history(room.id, -1), expected);
+        Model restored;
+        reopened.load(restored);
+        assertHistoryIds(restored.buffers.at(room.id).messages, expected);
+        for (const auto &row : room.messages) {
+            const auto &restoredRow = *sourceMessage(restored, room.id, row.id);
+            assert(restoredRow.time == row.time && restoredRow.timestamp == row.timestamp &&
+                   restoredRow.orderingTimestamp == row.orderingTimestamp &&
+                   restoredRow.storageSequence == row.storageSequence);
+        }
     }
     static void unknownTimeAroundPreservesNativeOrder() {
         Application app;
@@ -5566,6 +6039,9 @@ struct ApplicationRegression {
         unknownTimeAroundPreservesNativeOrder();
         historyReconciliationPreservesUnrelatedGhostPositions();
         materializedOwnHistoryKeepsConfirmedNativeNeighbors();
+        mixedTimeOwnConfirmation();
+        lateLiveChronology();
+        effectiveOrderingChronology();
         historyWavePlanning();
         historyBackfillCheckpoints();
         saturatedDiscoveryFailsSafely();

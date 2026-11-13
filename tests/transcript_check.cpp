@@ -3296,6 +3296,55 @@ void focusRevealIntents(TranscriptTestRenderer &renderer) {
                model.actions.empty());
     }
 
+    // A live middle insertion is an arrival even when the tail identity stays unchanged.
+    tail();
+    scroll->setScrollOffset(scroll->maxScrollOffset() * .5f);
+    arrange();
+    const std::string unchangedTail = buffer.messages.back().id;
+    auto insertMiddle = [&](const char *id, bool history = false) {
+        blast::Message message;
+        message.id = message.text = id;
+        message.nick = "Peer";
+        message.time = "2026-11-07T12:34:56Z";
+        message.timestamp = 1794054896;
+        message.history = history;
+        buffer.messages.insert(buffer.messages.begin() + 5, std::move(message));
+        ++buffer.messagesRevision;
+        assert(buffer.messages.back().id == unchangedTail);
+    };
+    insertMiddle("middle-live");
+    arrange();
+    assert(!pane.following && pane.unseen == 1 && model.actions.empty());
+    arrange();
+    assert(!pane.following && pane.unseen == 1 && model.actions.empty());
+
+    // History and retimed/reordered retained IDs must not become additional arrivals.
+    insertMiddle("middle-history", true);
+    arrange();
+    assert(!pane.following && pane.unseen == 1 && model.actions.empty());
+    assert(buffer.messages[6].id == "middle-live");
+    ++buffer.messages[6].timestamp;
+    buffer.messages[6].time = "2026-11-07T12:34:57Z";
+    std::rotate(buffer.messages.begin() + 6, buffer.messages.begin() + 7,
+                buffer.messages.begin() + 9);
+    ++buffer.messagesRevision;
+    arrange();
+    assert(buffer.messages.back().id == unchangedTail);
+    assert(!pane.following && pane.unseen == 1 && model.actions.empty());
+
+    // A middle arrival during a queued reveal waits for layout and is counted only once.
+    tail();
+    queueReveal();
+    insertMiddle("middle-during-reveal");
+    view.sync();
+    view.sync();
+    assert(pane.unseen == 0 && model.actions.empty());
+    view.arrange(renderer, viewport);
+    assert(buffer.messages.back().id == unchangedTail);
+    assert(!pane.following && pane.unseen == 1 && model.actions.empty());
+    arrange();
+    assert(!pane.following && pane.unseen == 1 && model.actions.empty());
+
     // Repeated syncs before layout must neither mark unseen arrivals read nor count them twice.
     tail();
     model.now = 10;

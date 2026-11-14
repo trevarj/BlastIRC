@@ -10,6 +10,8 @@
 #include <cmath>
 #include <core/input/key_modifiers.h>
 #include <map>
+#include <render/animation/animation_manager.h>
+#include <render/animation/motion_service.h>
 #include <render/core/renderer.h>
 #include <render/scene/input_dispatcher.h>
 #include <string>
@@ -546,6 +548,7 @@ struct TopicPopover::Impl {
     ChromeButton *close;
     LayoutRect anchor{};
     float scale = 1;
+    bool motionEnabled = true;
     std::string appliedFamily, appliedFeatures;
     std::function<void()> dismiss;
 
@@ -655,7 +658,9 @@ void TopicPopover::setInputDispatcher(InputDispatcher &dispatcher) {
     impl->dispatcher = &dispatcher;
 }
 void TopicPopover::show(std::string_view topic, LayoutRect anchor, std::function<void()> dismiss) {
-    hide();
+    const bool opening = !active();
+    if (opening)
+        hide();
     impl->anchor = anchor;
     impl->dismiss = std::move(dismiss);
     impl->text->setValue(topic);
@@ -664,8 +669,21 @@ void TopicPopover::show(std::string_view topic, LayoutRect anchor, std::function
     impl->geometry();
     if (impl->dispatcher)
         impl->dispatcher->setFocus(impl->text->inputArea());
+    if (opening && impl->motionEnabled && MotionService::instance().enabled() &&
+        animationManager()) {
+        impl->panel->setOpacity(.6f);
+        auto *panel = impl->panel;
+        animationManager()->animate(
+            .6f, 1.f, 150, Easing::EaseOutCubic,
+            [panel](float opacity) { panel->setOpacity(opacity); }, {}, panel);
+    }
 }
 void TopicPopover::hide() {
+    if (active() && impl->dispatcher)
+        impl->dispatcher->cancelPointerCapture();
+    if (auto *manager = animationManager())
+        manager->cancelForOwner(impl->panel);
+    impl->panel->setOpacity(1);
     impl->blocker->dispatchCancel();
     impl->panel->dispatchCancel();
     impl->text->inputArea()->dispatchCancel();
@@ -678,9 +696,15 @@ void TopicPopover::hide() {
     impl->dismiss = {};
 }
 bool TopicPopover::active() const { return visible(); }
-void TopicPopover::sync(float width, float height, float scale) {
+void TopicPopover::sync(float width, float height, float scale, bool motionEnabled) {
     setSize(std::max(0.f, width), std::max(0.f, height));
     impl->scale = std::max(.1f, scale);
+    impl->motionEnabled = motionEnabled;
+    if (!motionEnabled || !MotionService::instance().enabled()) {
+        if (auto *manager = animationManager())
+            manager->cancelForOwner(impl->panel);
+        impl->panel->setOpacity(1);
+    }
     if (active())
         impl->geometry();
 }

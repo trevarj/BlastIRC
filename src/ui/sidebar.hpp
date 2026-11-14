@@ -38,6 +38,7 @@ class Sidebar final : public Node {
     ~Sidebar() override;
     void sync(std::string_view selectedServer, std::string_view focusedBuffer, float width,
               float height, float scale, SidebarMode effectiveMode);
+    void setInteractionMode(SidebarMode mode, const std::function<void(Node &)> &retire);
     void remapBuffer(std::string_view oldId, std::string_view newId);
     // Passive selected-server hints override the view only, never stored search/filter state.
     void setHintCandidates(std::span<const std::string_view> buffers);
@@ -64,6 +65,7 @@ class People final : public Node {
     ~People() override;
     void sync(std::string_view focusedBuffer, float width, float height, float scale,
               SidebarMode effectiveMode);
+    void setInteractionMode(SidebarMode mode, const std::function<void(Node &)> &retire);
     void remapBuffer(std::string_view oldId, std::string_view newId);
 
   private:

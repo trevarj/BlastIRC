@@ -142,6 +142,7 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
 
   m_surface = std::make_unique<PopupSurface>(m_wayland);
   m_surface->setRenderContext(&m_renderContext);
+  m_surface->setAnimationManager(&m_animations);
 
   auto* self = this;
 
@@ -193,6 +194,7 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
 
     self->m_inputDispatcher.setSceneRoot(nullptr);
     self->m_sceneRoot = std::make_unique<Node>();
+    self->m_sceneRoot->setAnimationManager(&self->m_animations);
     self->m_sceneRoot->setSize(fw, fh);
     self->m_sceneRoot->setClipChildren(true);
     if (Style::popupShadowsEnabled()) {
@@ -252,6 +254,7 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
     });
     self->m_surface->setSceneRoot(self->m_sceneRoot.get());
     popup_chrome::setContentInputRegion(*self->m_surface, fittedChrome);
+    self->applyOpeningMotion();
   });
 
   m_surface->setDismissedCallback([self] { self->deferClose(); });
@@ -281,10 +284,39 @@ void ContextMenuPopup::open(ContextMenuPopupRequest request) {
   s_openMenu = rootMenu();
 }
 
+void ContextMenuPopup::applyOpeningMotion() {
+  if (m_sceneRoot == nullptr) {
+    return;
+  }
+  m_sceneRoot->setOpacity(m_openingOpacity);
+  if (m_openingStarted) {
+    return;
+  }
+  m_openingStarted = true;
+  m_openingOpacity = 0.6F;
+  m_sceneRoot->setOpacity(m_openingOpacity);
+  m_animations.animate(
+      m_openingOpacity, 1.0F, 150.0F, Easing::EaseOutCubic,
+      [this](float opacity) {
+        m_openingOpacity = opacity;
+        if (m_sceneRoot != nullptr) {
+          m_sceneRoot->setOpacity(opacity);
+        }
+      },
+      {}, this
+  );
+  if (m_surface != nullptr) {
+    m_surface->requestRedraw();
+  }
+}
+
 void ContextMenuPopup::close() {
   if (m_alive) {
     *m_alive = false;
   }
+  m_animations.cancelAll();
+  m_openingOpacity = 1.0F;
+  m_openingStarted = false;
   m_child.reset();
   m_childIndex = static_cast<std::size_t>(-1);
   const bool wasOpen = m_surface != nullptr;

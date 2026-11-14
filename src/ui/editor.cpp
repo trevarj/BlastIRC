@@ -27,15 +27,19 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <render/animation/animation_manager.h>
+#include <render/animation/motion_service.h>
 #include <render/scene/input_area.h>
 #include <render/scene/input_dispatcher.h>
 #include <set>
+#include <ui/controls/box.h>
 #include <ui/controls/button.h>
 #include <ui/controls/flex.h>
 #include <ui/controls/input.h>
 #include <ui/controls/label.h>
 #include <ui/controls/scroll_view.h>
 #include <ui/controls/select_popup_context.h>
+#include <ui/style.h>
 #include <utility>
 
 namespace blast {
@@ -390,6 +394,7 @@ struct EditorStore::Impl {
         void sendPaste();
         void cancelPaste(bool restoreFocus = true);
         void toggleFormatting();
+        void resetFormattingMotion();
         std::string focusKey(std::string_view role) const {
             return "composer:" + std::to_string(pane.id) + ":" + std::string(role);
         }
@@ -2126,14 +2131,31 @@ void EditorStore::Impl::Composer::cancelPaste(bool restoreFocus) {
         pane.focusComposer = true;
     markLayoutDirty();
 }
+void EditorStore::Impl::Composer::resetFormattingMotion() {
+    if (auto *manager = formatting->animationManager())
+        manager->cancelForOwner(formatting);
+    formatting->setOpacity(1);
+}
 void EditorStore::Impl::Composer::toggleFormatting() {
     const bool keyboard =
         owner.dispatcher && owner.dispatcher->focusedArea() == formatButton->inputArea();
     if (formattingOpen && owner.dispatcher && pointerPressedIn(*formatting))
         owner.dispatcher->cancelPointerCapture();
     formattingOpen = !formattingOpen;
+    resetFormattingMotion();
     shown(*formatting, formattingOpen);
     formatButton->setSelected(formattingOpen);
+    const auto &settings = owner.model.settings;
+    if (formattingOpen && !settings.reducedMotion && settings.fx != FxLevel::Off &&
+        MotionService::instance().enabled()) {
+        if (auto *manager = formatting->animationManager()) {
+            formatting->setOpacity(.6f);
+            auto *panel = formatting;
+            manager->animate(
+                .6f, 1.f, 150, Easing::EaseOutCubic,
+                [panel](float opacity) { panel->setOpacity(opacity); }, {}, panel);
+        }
+    }
     if (keyboard && owner.dispatcher) {
         if (formattingOpen) {
             owner.dispatcher->setFocus(formatButtons.front().first->inputArea());
@@ -2928,6 +2950,7 @@ EditorStore::Impl::Composer::Composer(Impl &impl, PaneState &state)
     sync();
 }
 EditorStore::Impl::Composer::~Composer() {
+    resetFormattingMotion();
     if (replyRow->parent() != this) {
         owner.retirePointer(*replyRow);
         replyRow->parent()->removeChild(replyRow);
@@ -3204,6 +3227,10 @@ void EditorStore::Impl::Composer::doLayout(Renderer &renderer) {
     Flex::doLayout(renderer);
 }
 void EditorStore::Impl::Composer::sync() {
+    if (!formattingOpen || !visibleInScene(*this) || buffer != pane.buffer ||
+        owner.model.settings.reducedMotion || owner.model.settings.fx == FxLevel::Off ||
+        !MotionService::instance().enabled())
+        resetFormattingMotion();
     if (!input->composing() || !visibleInScene(*this))
         compositionChord.clear();
     if (owner.dispatcher && ((!visibleInScene(*this) && pointerPressedIn(*this)) ||
@@ -3311,7 +3338,7 @@ void EditorStore::Impl::Composer::sync() {
         }
         replyRow->setGap(4 * scale);
         replyRow->setPadding(6 * scale, 8 * scale);
-        replyRow->setRadius(themeCornerRadius());
+        replyRow->setRadius(Style::radiusLg * scale);
         replyText->setGap(2 * scale);
         replyRail->setMinWidth(2 * scale);
         replyRail->setMaxWidth(2 * scale);
@@ -3399,10 +3426,14 @@ void EditorStore::Impl::Composer::sync() {
         button->setSelected(active);
         button->setEnabled(!input->composing());
     }
-    tools->setFill(themeSurfaceColor("surface_container_high"));
-    tools->setBorder(
-        themeForegroundColor(input->inputArea()->focused() ? "primary" : "outline_variant"),
-        input->inputArea()->focused() ? std::max(1.f, 2 * scale) : std::max(1.f, scale));
+    const auto styleSurface = [&](auto &surface) {
+        surface.setFill(themeSurfaceColor("surface_container_high"));
+        surface.setRadius(themeCornerRadius());
+        surface.setBorder(
+            themeForegroundColor(input->inputArea()->focused() ? "primary" : "outline_variant"),
+            input->inputArea()->focused() ? std::max(1.f, 2 * scale) : std::max(1.f, scale));
+    };
+    styleSurface(*tools);
     input->setTextColors({}, themeSurfaceColor("primary_container"),
                          themeForegroundColor("on_primary_container"),
                          themeForegroundColor("on_surface"));
@@ -3871,8 +3902,12 @@ bool EditorStore::handleCompositionKey(std::uint32_t sym, std::uint32_t utf32,
 }
 bool EditorStore::handleCompletionKey(std::uint32_t sym, std::uint32_t modifiers) {
     auto &store = *impl_;
-    if (modifiers || !store.dispatcher)
+    const bool ctrlNext = modifiers == KeyMod::Ctrl && (sym == 'n' || sym == 'N');
+    const bool ctrlPrevious = modifiers == KeyMod::Ctrl && (sym == 'p' || sym == 'P');
+    if ((modifiers && !ctrlNext && !ctrlPrevious) || !store.dispatcher)
         return false;
+    const bool previous = ctrlPrevious || KeySymbol::isUp(sym);
+    const bool next = ctrlNext || KeySymbol::isDown(sym);
     for (auto *view : store.views) {
         if (store.dispatcher->focusedArea() != view->input->inputArea())
             continue;
@@ -3887,9 +3922,9 @@ bool EditorStore::handleCompletionKey(std::uint32_t sym, std::uint32_t modifiers
                 view->acceptCommandCompletion(view->commandSelected);
                 return true;
             }
-            if (KeySymbol::isUp(sym) || KeySymbol::isDown(sym)) {
+            if (previous || next) {
                 view->commandSelected =
-                    (view->commandSelected + (KeySymbol::isUp(sym) ? store.commandCount - 1 : 1)) %
+                    (view->commandSelected + (previous ? store.commandCount - 1 : 1)) %
                     store.commandCount;
                 store.commandPopup->setMatches({store.commandMatches.data(), store.commandCount},
                                                view->commandSelected);
@@ -3923,10 +3958,9 @@ bool EditorStore::handleCompletionKey(std::uint32_t sym, std::uint32_t modifiers
             view->acceptCompletion(view->emojiSelected);
             return true;
         }
-        if (KeySymbol::isUp(sym) || KeySymbol::isDown(sym)) {
+        if (previous || next) {
             const size_t count = store.emojiMatches.size();
-            view->emojiSelected =
-                (view->emojiSelected + (KeySymbol::isUp(sym) ? count - 1 : 1)) % count;
+            view->emojiSelected = (view->emojiSelected + (previous ? count - 1 : 1)) % count;
             store.emojiPopup->setMatches(store.emojiMatches, view->emojiSelected);
             view->placeCompletion();
             return true;

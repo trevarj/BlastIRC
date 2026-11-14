@@ -5,6 +5,8 @@
 #include <array>
 #include <core/input/key_modifiers.h>
 #include <core/input/key_symbols.h>
+#include <render/animation/animation_manager.h>
+#include <render/animation/motion_service.h>
 #include <render/scene/input_dispatcher.h>
 #include <ui/controls/box.h>
 #include <ui/controls/input.h>
@@ -44,6 +46,7 @@ struct Picker::Impl {
     std::size_t count = 0, selected = 0;
     LayoutRect anchor{};
     float scale = 1;
+    bool motionEnabled = true;
     std::function<void(std::string)> onChoose;
     std::function<void()> onCancel;
 
@@ -173,7 +176,9 @@ void Picker::setInputDispatcher(InputDispatcher &dispatcher) { impl_->dispatcher
 void Picker::show(std::string_view title, LayoutRect anchor,
                   std::function<void(std::string)> choose, std::function<void()> cancel) {
     auto &state = *impl_;
-    hide();
+    const bool opening = !active();
+    if (opening)
+        hide();
     state.anchor = anchor;
     state.onChoose = std::move(choose);
     state.onCancel = std::move(cancel);
@@ -185,12 +190,26 @@ void Picker::show(std::string_view title, LayoutRect anchor,
     state.geometry();
     if (state.dispatcher)
         state.dispatcher->setFocus(state.query->inputArea());
+    if (opening && state.motionEnabled && MotionService::instance().enabled() &&
+        animationManager()) {
+        state.panel->setOpacity(.6f);
+        auto *panel = state.panel;
+        animationManager()->animate(
+            .6f, 1.f, 150, Easing::EaseOutCubic,
+            [panel](float opacity) { panel->setOpacity(opacity); }, {}, panel);
+    }
 }
 void Picker::hide() {
     auto &state = *impl_;
+    if (active() && state.dispatcher)
+        state.dispatcher->cancelPointerCapture();
     state.results->setVisible(false);
+    if (auto *manager = animationManager())
+        manager->cancelForOwner(state.panel);
+    state.panel->setOpacity(1);
     state.blocker->dispatchCancel();
     state.panel->dispatchCancel();
+    state.query->inputArea()->dispatchCancel();
     if (state.dispatcher && state.dispatcher->focusedArea() == state.query->inputArea())
         state.dispatcher->setFocus(nullptr);
     setVisible(false);
@@ -199,9 +218,15 @@ void Picker::hide() {
     state.onCancel = {};
 }
 bool Picker::active() const { return visible(); }
-void Picker::sync(float width, float height, float scale) {
+void Picker::sync(float width, float height, float scale, bool motionEnabled) {
     setSize(std::max(0.f, width), std::max(0.f, height));
     impl_->scale = std::max(.1f, scale);
+    impl_->motionEnabled = motionEnabled;
+    if (!motionEnabled || !MotionService::instance().enabled()) {
+        if (auto *manager = animationManager())
+            manager->cancelForOwner(impl_->panel);
+        impl_->panel->setOpacity(1);
+    }
     if (active())
         impl_->geometry();
 }

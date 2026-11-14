@@ -234,7 +234,7 @@ void MaterialNode::setMessage(const MessageSurface &surface) {
 }
 void MaterialNode::sync() {
     const float radius =
-        impl->kind == MaterialKind::Message ? themeBubbleRadius() : themeCornerRadius();
+        impl->kind == MaterialKind::Message ? themeBubbleRadius() * .75f : themeCornerRadius();
     if (impl->theme != themeRevision() || impl->radius != radius) {
         impl->theme = themeRevision();
         impl->radius = radius;
@@ -273,7 +273,9 @@ void MaterialNode::draw(RenderBackend &backend, const CustomDrawContext &incomin
         return;
     const float scale = themeScale();
     const float radius =
-        p.kind == MaterialKind::Message ? themeBubbleRadius() : themeCornerRadius();
+        p.kind == MaterialKind::Message
+            ? std::min({themeBubbleRadius() * .75f, context.width * .5f, context.height * .5f})
+            : themeCornerRadius();
     // Routine events share the reading surface, not a conversational bubble/accent.
     if (p.kind == MaterialKind::Message && p.presence && !p.hovered && !p.highlight)
         return;

@@ -6,6 +6,7 @@
 #include "channel_avatar.hpp"
 #include "foundry_avatar.hpp"
 #include "logic.hpp"
+#include "transcript.hpp"
 #include "ui.hpp"
 #include <algorithm>
 #include <array>
@@ -65,6 +66,13 @@ void labelFont(Label &label, float size, bool monospace = false, bool emphasized
 
 bool menuKey(const InputArea::KeyData &key) {
     return key.sym == XKB_KEY_Menu || (key.sym == XKB_KEY_F10 && (key.modifiers & KeyMod::Shift));
+}
+
+void expandedInteraction(Node &node, bool eligible, const std::function<void(Node &)> &retire) {
+    if (!eligible && node.hitTestVisible() && retire)
+        retire(node);
+    node.setHitTestVisible(eligible);
+    node.setExcludeSubtreeFromTabOrder(!eligible || !node.visible());
 }
 
 // Retained text rows keep their keys, callbacks and text storage across model updates.
@@ -205,10 +213,11 @@ class Row final : public InputArea {
         pinIcon->setHitTestVisible(false);
         friendIcon->setHitTestVisible(false);
     }
-    void syncSpriteAvatar(bool enabled, std::string_view mapping) {
-        if (spriteAvatar != enabled || avatarMapping != mapping) {
+    void syncSpriteAvatar(bool enabled, std::string_view mapping, const Color &color) {
+        if (spriteAvatar != enabled || avatarMapping != mapping || avatarColor != color) {
             spriteAvatar = enabled;
             avatarMapping.assign(mapping);
+            avatarColor = color;
             markLayoutDirty();
         }
     }
@@ -342,12 +351,14 @@ class Row final : public InputArea {
                 std::max(1, int(std::ceil(avatarSize * std::max(1.f, renderer.renderScale()))));
             if (spriteAvatar && avatarSource.empty()) {
                 if (!loadedSprite || loadedSpriteNick != avatarCaption ||
-                    loadedSpriteMapping != avatarMapping) {
+                    loadedSpriteMapping != avatarMapping || loadedSpriteColor != avatarColor) {
                     avatarImage->clear(renderer);
-                    setFoundryAvatar(*avatarImage, renderer, avatarCaption, avatarMapping);
+                    setFoundryAvatar(*avatarImage, renderer, avatarCaption, avatarColor,
+                                     avatarMapping);
                     loadedSprite = true;
                     loadedSpriteNick = avatarCaption;
                     loadedSpriteMapping = avatarMapping;
+                    loadedSpriteColor = avatarColor;
                 }
             } else if (loadedSprite || loadedAvatarSource != avatarSource ||
                        loadedAvatarSize != target) {
@@ -507,6 +518,7 @@ class Row final : public InputArea {
     std::string tooltipText, avatarSource, loadedAvatarSource, avatarCaption;
     int loadedAvatarSize = 0;
     std::string avatarMapping, loadedSpriteNick, loadedSpriteMapping;
+    Color avatarColor{}, loadedSpriteColor{};
     bool spriteAvatar = false, loadedSprite = false;
     NativeAvatarLabelPlacement avatarInitialsPlacement;
     float zoom = 1;
@@ -1206,6 +1218,7 @@ struct Sidebar::Impl {
     float zoom = 1, rowWidth = 0, viewportHeight = 0;
     float nativeConversationHeight = 0;
     SidebarMode mode = SidebarMode::Expanded;
+    bool expandedInteractive = true;
     bool hintsActive = false, revealFocused = false;
     bool restoringHintFocus = false;
     float hintScroll = 0, hintScrollPosition = 0, hintMaxScroll = 0;
@@ -1547,7 +1560,7 @@ struct Sidebar::Impl {
         const bool expanded = mode == SidebarMode::Expanded;
         const bool details = expanded && !hintsActive;
         group.header->setVisible(details);
-        group.header->setExcludeSubtreeFromTabOrder(!details);
+        group.header->setExcludeSubtreeFromTabOrder(!details || !expandedInteractive);
         const std::string_view state = net ? std::string_view(net->state) : "Disconnected";
         if (group.state != state) {
             group.state = state;
@@ -1565,7 +1578,7 @@ struct Sidebar::Impl {
             place(*group.header, y, std::max(32.f, 36 * zoom));
         const bool hasError = details && net && !net->error.empty();
         group.error->setVisible(hasError);
-        group.error->setExcludeSubtreeFromTabOrder(!hasError);
+        group.error->setExcludeSubtreeFromTabOrder(!hasError || !expandedInteractive);
         if (hasError) {
             group.error->title->setText(
                 net->state == "Disconnected" || net->state == "Failed" ? "Connect" : "Reconnect");
@@ -1664,7 +1677,7 @@ struct Sidebar::Impl {
         for (std::size_t i = 0; i < buttons.size(); ++i) {
             auto *button = buttons[i];
             button->setVisible(tabsFit);
-            button->setExcludeSubtreeFromTabOrder(!tabsFit);
+            button->setExcludeSubtreeFromTabOrder(!tabsFit || !expandedInteractive);
             button->setPosition(x, button->y());
             button->setSize(filterWidths[i], button->height());
             x += filterWidths[i] + gap;
@@ -1974,7 +1987,7 @@ struct Sidebar::Impl {
         const bool showClear =
             showEmpty && (!search->value().empty() || filter != ui_logic::SidebarFilter::All);
         clear->setVisible(showClear);
-        clear->setExcludeSubtreeFromTabOrder(!showClear);
+        clear->setExcludeSubtreeFromTabOrder(!showClear || !expandedInteractive);
         if (showEmpty) {
             orderChild(*empty);
             const char *filterName = filter == ui_logic::SidebarFilter::Unread ? "Unread"
@@ -2055,6 +2068,19 @@ void Sidebar::doLayout(Renderer &renderer) {
 void Sidebar::sync(std::string_view selectedServer, std::string_view focusedBuffer, float width,
                    float height, float scale, SidebarMode effectiveMode) {
     impl_->sync(selectedServer, focusedBuffer, width, height, scale, effectiveMode);
+}
+void Sidebar::setInteractionMode(SidebarMode mode, const std::function<void(Node &)> &retire) {
+    auto &s = *impl_;
+    s.expandedInteractive = mode == SidebarMode::Expanded;
+    for (auto *control :
+         std::array<Node *, 6>{s.search, s.all, s.unread, s.dms, s.archived, s.clear})
+        expandedInteraction(*control, s.expandedInteractive, retire);
+    for (auto &[name, group] : s.groups)
+        for (auto *control : {group.header, group.error})
+            expandedInteraction(*control, s.expandedInteractive, retire);
+    for (const auto &child : s.scroll->children())
+        if (auto *scrollbar = dynamic_cast<Scrollbar *>(child.get()))
+            expandedInteraction(*scrollbar, s.expandedInteractive, retire);
 }
 void Sidebar::setHintCandidates(std::span<const std::string_view> buffers) {
     auto &s = *impl_;
@@ -2206,7 +2232,7 @@ struct People::Impl final : VirtualListAdapter {
         double arrived = 0;
         std::uint32_t hash = 2166136261u;
         std::uint64_t key = 0, revision = 1, seen = 0;
-        Color color{};
+        Color color{}, avatarColor{};
     };
     People &owner;
     Model &model;
@@ -2313,7 +2339,8 @@ struct People::Impl final : VirtualListAdapter {
             row.avatarLaneVisible = avatars;
             row.markLayoutDirty();
         }
-        row.syncSpriteAvatar(model.settings.avatarStyle == "sprite", cachedFriendMapping);
+        row.syncSpriteAvatar(model.settings.avatarStyle == "sprite", cachedFriendMapping,
+                             member.avatarColor);
         row.syncAvatar({}, member.name);
         const auto privilege = std::string_view(member.prefix).substr(0, 1);
         row.badge->setText(compact ? privilege : std::string_view{});
@@ -2437,6 +2464,12 @@ struct People::Impl final : VirtualListAdapter {
                     ++member.revision;
                     changed = true;
                 }
+                const auto avatarColor = nickColor(model, member.name, found->second.server);
+                if (member.avatarColor != avatarColor) {
+                    member.avatarColor = avatarColor;
+                    ++member.revision;
+                    changed = true;
+                }
                 auto color = memberColor(model, member.name, member.hash);
                 float fade = member.away ? .4f : 1.f;
                 if (!model.settings.reducedMotion && model.settings.fx != FxLevel::Off &&
@@ -2536,6 +2569,14 @@ People::~People() = default;
 void People::sync(std::string_view focusedBuffer, float width, float height, float scale,
                   SidebarMode effectiveMode) {
     impl_->sync(focusedBuffer, width, height, scale, effectiveMode);
+}
+void People::setInteractionMode(SidebarMode mode, const std::function<void(Node &)> &retire) {
+    auto &s = *impl_;
+    const bool expanded = mode == SidebarMode::Expanded;
+    expandedInteraction(*s.header, expanded, retire);
+    for (const auto &child : s.list->scrollView().children())
+        if (auto *scrollbar = dynamic_cast<Scrollbar *>(child.get()))
+            expandedInteraction(*scrollbar, expanded, retire);
 }
 void People::remapBuffer(std::string_view oldId, std::string_view newId) {
     if (oldId != newId && impl_->buffer == oldId) {

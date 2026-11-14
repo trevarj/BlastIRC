@@ -57,7 +57,7 @@ class TopicPopover final : public Node {
     void show(std::string_view topic, LayoutRect anchor, std::function<void()> dismiss);
     void hide();
     bool active() const;
-    void sync(float width, float height, float scale);
+    void sync(float width, float height, float scale, bool motionEnabled = true);
     bool handleKey(const InputArea::KeyData &);
     Input &topicInput();
 

@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <core/files/resource_paths.h>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <openssl/sha.h>
 #include <render/core/image_decoder.h>
 #include <render/core/texture_manager.h>
@@ -17,6 +19,68 @@ namespace atlas = foundryAtlas;
 constexpr std::size_t tileBytes = atlas::tileSize * atlas::tileSize * 4;
 static_assert(atlas::fuseCount == 12 && atlas::bodyCount == 24 && atlas::accessoryCount == 30 &&
               atlas::markCount == 8 && atlas::tileCount == 74);
+
+using Rgb = std::array<float, 3>;
+constexpr std::array<std::array<Rgb, 3>, 6> bodyPalettes{{
+    {{{72, 81, 89}, {120, 134, 140}, {48, 55, 63}}},
+    {{{174, 99, 66}, {228, 164, 107}, {113, 61, 50}}},
+    {{{224, 131, 50}, {255, 193, 107}, {157, 77, 40}}},
+    {{{40, 110, 118}, {100, 169, 165}, {32, 72, 80}}},
+    {{{110, 135, 144}, {164, 192, 196}, {64, 91, 101}}},
+    {{{178, 139, 61}, {231, 194, 107}, {118, 90, 49}}},
+}};
+
+std::array<Rgb, 6> bodyRoles(std::size_t palette) {
+    const auto &colors = bodyPalettes[palette];
+    return {colors[0],       colors[1],          colors[2],
+            Rgb{32, 39, 43}, Rgb{246, 223, 173}, Rgb{169, 164, 154}};
+}
+
+std::array<Rgb, 6> tintedRoles(const std::array<Rgb, 6> &source, const Color &color) {
+    auto target = source;
+    target[0] = {255 * std::clamp(color.r, 0.f, 1.f), 255 * std::clamp(color.g, 0.f, 1.f),
+                 255 * std::clamp(color.b, 0.f, 1.f)};
+    for (int channel = 0; channel < 3; ++channel) {
+        const float highlight =
+            (source[1][channel] - source[0][channel]) / (255 - source[0][channel]);
+        target[1][channel] = target[0][channel] + (255 - target[0][channel]) * highlight;
+        target[2][channel] = target[0][channel] * source[2][channel] / source[0][channel];
+    }
+    return target;
+}
+
+Rgb tintBodyPixel(const std::uint8_t *pixel, const std::array<Rgb, 6> &source,
+                  const std::array<Rgb, 6> &target) {
+    for (std::size_t role = 0; role < source.size(); ++role)
+        if (std::equal(source[role].begin(), source[role].end(), pixel))
+            return target[role];
+    float best = std::numeric_limits<float>::max();
+    Rgb result{float(pixel[0]), float(pixel[1]), float(pixel[2])};
+    for (std::size_t a = 0; a < source.size(); ++a) {
+        for (std::size_t b = a + 1; b < source.size(); ++b) {
+            float dot = 0, length = 0;
+            for (int c = 0; c < 3; ++c) {
+                const float delta = source[b][c] - source[a][c];
+                dot += (pixel[c] - source[a][c]) * delta;
+                length += delta * delta;
+            }
+            const float mix = std::clamp(dot / length, 0.f, 1.f);
+            float distance = 0;
+            Rgb correction{};
+            for (int c = 0; c < 3; ++c) {
+                const float original = std::lerp(source[a][c], source[b][c], mix);
+                distance += (pixel[c] - original) * (pixel[c] - original);
+                correction[c] = std::lerp(target[a][c], target[b][c], mix) - original;
+            }
+            if (distance < best) {
+                best = distance;
+                for (int c = 0; c < 3; ++c)
+                    result[c] = std::clamp(pixel[c] + correction[c], 0.f, 255.f);
+            }
+        }
+    }
+    return result;
+}
 
 const DecodedRasterImage &foundryAtlasImage() {
     static const DecodedRasterImage image = [] {
@@ -88,14 +152,17 @@ std::array<std::size_t, 4> foundryAvatarLayers(std::string_view nick, std::strin
 }
 
 bool composeFoundryAvatar(std::span<std::uint8_t> rgba, std::string_view nick,
-                          std::string_view mapping) {
+                          const Color &bodyColor, std::string_view mapping) {
     if (rgba.size() != tileBytes)
         return false;
     const auto &atlasImage = foundryAtlasImage();
     if (atlasImage.pixels.empty())
         return false;
     std::fill(rgba.begin(), rgba.end(), 0);
-    for (const auto tile : foundryAvatarLayers(nick, mapping)) {
+    const auto layers = foundryAvatarLayers(nick, mapping);
+    const auto sourceRoles = bodyRoles((layers[1] - atlas::bodyOffset) % 6);
+    const auto targetRoles = tintedRoles(sourceRoles, bodyColor);
+    for (const auto tile : layers) {
         const auto x = (tile % atlas::columns) * atlas::tileSize;
         const auto y = (tile / atlas::columns) * atlas::tileSize;
         for (std::size_t row = 0; row < atlas::tileSize; ++row) {
@@ -106,11 +173,14 @@ bool composeFoundryAvatar(std::span<std::uint8_t> rgba, std::string_view nick,
                 const unsigned outAlpha = alpha * 255 + dest[3] * inverse;
                 if (!outAlpha)
                     continue;
+                const auto rgb = alpha && tile == layers[1]
+                                     ? tintBodyPixel(source, sourceRoles, targetRoles)
+                                     : Rgb{float(source[0]), float(source[1]), float(source[2])};
                 for (int channel = 0; channel < 3; ++channel)
-                    dest[channel] = static_cast<std::uint8_t>((source[channel] * alpha * 255 +
-                                                               dest[channel] * dest[3] * inverse +
-                                                               outAlpha / 2) /
-                                                              outAlpha);
+                    dest[channel] = static_cast<std::uint8_t>(
+                        (std::lround(rgb[channel]) * alpha * 255 +
+                         dest[channel] * dest[3] * inverse + outAlpha / 2) /
+                        outAlpha);
                 dest[3] = static_cast<std::uint8_t>((outAlpha + 127) / 255);
             }
         }
@@ -119,10 +189,10 @@ bool composeFoundryAvatar(std::span<std::uint8_t> rgba, std::string_view nick,
 }
 
 bool setFoundryAvatar(Image &image, Renderer &renderer, std::string_view nick,
-                      std::string_view mapping) {
+                      const Color &bodyColor, std::string_view mapping) {
     // ponytail: one reusable UI-thread scratch tile; Image keeps its own bounded slot copy.
     static std::array<std::uint8_t, tileBytes> pixels;
-    if (!composeFoundryAvatar(pixels, nick, mapping))
+    if (!composeFoundryAvatar(pixels, nick, bodyColor, mapping))
         return false;
     return image.setSourceRaw(renderer, pixels.data(), pixels.size(), atlas::tileSize,
                               atlas::tileSize, atlas::tileSize * 4, PixmapFormat::RGBA);

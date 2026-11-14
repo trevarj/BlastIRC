@@ -59,6 +59,10 @@ class TranscriptView final : public Node {
     // Scroll the actual history viewport without transferring composer focus.
     bool scrollHalfPage(int direction);
     bool scrollToBoundary(bool newest);
+    // Host-routed mouse intent; no native capture or composer focus transfer.
+    bool beginAutoscroll(float sceneX, float sceneY);
+    void moveAutoscroll(float sceneY);
+    bool cancelAutoscroll();
     // Core has validated and materialized the original history; never changes composer state.
     bool jumpToSourceMessage(std::string_view id);
     std::optional<TranscriptMessageTarget> selectedMessage() const;
@@ -86,8 +90,7 @@ class TranscriptView final : public Node {
     void setWindowActive(bool active);
     // Actual native composer top-center, in scene-logical coordinates.
     void setComposerOrigin(float sceneX, float sceneY);
-    // Only typing reserves content; active reply occlusion affects controls/reveal, not scrolling.
-    void setContextInset(float typingInset, float typingRowHeight, float replyOverlayHeight);
+    void setContextInset(float replyInset = 0);
     // Pane-owned overlay, detached before its native subtree is retired.
     void setMotionHost(Node *host);
 

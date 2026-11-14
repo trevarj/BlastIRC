@@ -24,7 +24,7 @@ class Picker final : public Node {
     // Silent dismissal for controller teardown/source invalidation; no callback is invoked.
     void hide();
     bool active() const;
-    void sync(float width, float height, float scale);
+    void sync(float width, float height, float scale, bool motionEnabled = true);
     bool handleKey(const InputArea::KeyData &);
     Input &searchInput();
 

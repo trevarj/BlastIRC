@@ -609,6 +609,102 @@ void settingsTreeAnimatedSelection() {
     motion.setEnabled(priorEnabled);
 }
 
+void dialogOpeningMotion() {
+    using namespace blast;
+    auto &motion = MotionService::instance();
+    const bool priorEnabled = motion.enabled();
+    const float priorSpeed = motion.speed();
+    Model model;
+    model.firstRun = false;
+    model.settings.fx = FxLevel::Full;
+    model.settings.reducedMotion = false;
+    Theme theme;
+    theme.update(model);
+    motion.setSpeed(.1f);
+    AnimationManager animations;
+    PangoRenderer renderer;
+    InputDispatcher dispatcher;
+    Dialogs dialogs(model, [](std::string) {});
+    dialogs.setAnimationManager(&animations);
+    dispatcher.setSceneRoot(&dialogs);
+    dialogs.setInputDispatcher(dispatcher);
+    const auto frame = [&] {
+        dialogs.sync(1000, 800, 1);
+        dialogs.layout(renderer);
+    };
+    const auto advance = [&](int milliseconds) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+        animations.tick(0);
+    };
+    dialogs.open("settings");
+    frame();
+    auto *panel = find<Node>(dialogs, [](const Node &node) { return node.opacity() < 1.f; });
+    assert(panel && panel->opacity() >= .59f && panel->opacity() <= .61f);
+    auto *focus = dispatcher.focusedArea();
+    assert(focus && dialogs.hitTestVisible() && !dialogs.excludeSubtreeFromTabOrder());
+    const auto bounds = std::array{panel->x(), panel->y(), panel->width(), panel->height()};
+    advance(30);
+    assert(panel->opacity() > .6f && panel->opacity() < 1.f);
+    frame();
+    assert(dispatcher.focusedArea() == focus &&
+           (std::array{panel->x(), panel->y(), panel->width(), panel->height()} == bounds));
+    advance(1550);
+    assert(panel->opacity() == 1.f);
+    dialogs.dismiss();
+    assert(!dialogs.visible() && !dialogs.hitTestVisible() &&
+           dialogs.excludeSubtreeFromTabOrder() && panel->opacity() == 1.f);
+
+    dialogs.open("settings");
+    frame();
+    panel = find<Node>(dialogs, [](const Node &node) { return node.opacity() < 1.f; });
+    assert(panel);
+    dialogs.dismiss();
+    assert(panel->opacity() == 1.f && !dialogs.visible());
+    advance(170);
+    assert(panel->opacity() == 1.f && !dialogs.visible());
+
+    auto &profile = model.whoisProfile;
+    profile.requestId = "motion-profile";
+    profile.server = "network";
+    profile.target = "Alice";
+    profile.open = profile.loading = true;
+    ++profile.revision;
+    frame();
+    panel = find<Node>(dialogs, [](const Node &node) { return node.opacity() < 1.f; });
+    assert(panel && dispatcher.focusedArea());
+    advance(30);
+    const float profileOpacity = panel->opacity();
+    assert(profileOpacity > .6f);
+    profile.loading = false;
+    ++profile.revision;
+    frame();
+    assert(panel->opacity() == profileOpacity);
+    dialogs.dismiss();
+    assert(!profile.open && !dialogs.visible() && panel->opacity() == 1.f);
+
+    dialogs.open("settings");
+    frame();
+    panel = find<Node>(dialogs, [](const Node &node) { return node.opacity() < 1.f; });
+    assert(panel);
+    model.settings.reducedMotion = true;
+    frame();
+    assert(panel->opacity() == 1.f);
+    dialogs.dismiss();
+    dialogs.open("settings");
+    frame();
+    assert(!find<Node>(dialogs, [](const Node &node) { return node.opacity() < 1.f; }));
+    dialogs.dismiss();
+    model.settings.reducedMotion = false;
+    model.settings.fx = FxLevel::Off;
+    dialogs.open("settings");
+    frame();
+    assert(!find<Node>(dialogs, [](const Node &node) { return node.opacity() < 1.f; }));
+    dialogs.dismiss();
+    dialogs.setAnimationManager(nullptr);
+    motion.setSpeed(priorSpeed);
+    motion.setEnabled(priorEnabled);
+}
+
 void bindingGeometryControls() {
     using namespace blast;
     PangoRenderer renderer;
@@ -939,7 +1035,8 @@ void whoisProfileControls() {
                                   std::string_view mapping) {
         assert(image.width() == 40 && image.height() == 40);
         std::array<std::uint8_t, foundryAtlas::tileSize * foundryAtlas::tileSize * 4> expected{};
-        assert(composeFoundryAvatar(expected, nick, mapping));
+        assert(composeFoundryAvatar(expected, nick,
+                                    nickColor(model, std::string(nick), profile.server), mapping));
         assert(renderer.pixels(image) ==
                std::vector<std::uint8_t>(expected.begin(), expected.end()));
     };
@@ -947,6 +1044,22 @@ void whoisProfileControls() {
     const auto firstTexture = aliceAvatar->textureId();
     layout();
     assert(aliceAvatar->textureId() == firstTexture);
+    const auto initialAvatarPixels = renderer.pixels(*aliceAvatar);
+    model.settings.nickColors["aLiCe"] = "#3399cc";
+    layout();
+    aliceAvatar = find<Image>(*dialogs, [](const Image &) { return true; });
+    assert(aliceAvatar);
+    expectAvatar(*aliceAvatar, alice.nick, "rfc1459");
+    assert(renderer.pixels(*aliceAvatar) != initialAvatarPixels);
+    const auto recoloredTexture = aliceAvatar->textureId();
+    layout();
+    assert(aliceAvatar->textureId() == recoloredTexture);
+    model.settings.nickColors.erase("aLiCe");
+    layout();
+    aliceAvatar = find<Image>(*dialogs, [](const Image &) { return true; });
+    assert(aliceAvatar);
+    expectAvatar(*aliceAvatar, alice.nick, "rfc1459");
+    assert(renderer.pixels(*aliceAvatar) == initialAvatarPixels);
     assert(find<Label>(*dialogs, [&](const Label &candidate) {
         return candidate.text() == alice.nick && candidate.font().weight == FontWeight::Bold &&
                candidate.color() == nickColor(model, alice.nick, profile.server);
@@ -1172,6 +1285,7 @@ void runSettingsCheck() {
     nativePopupFonts();
     settingsTreeControls();
     settingsTreeAnimatedSelection();
+    dialogOpeningMotion();
     bindingGeometryControls();
     bindingSearchRevealGeometry();
     Application app;

@@ -10,6 +10,7 @@
 #include <string_view>
 
 class InputArea;
+class Box;
 class InputDispatcher;
 class Node;
 class Renderer;

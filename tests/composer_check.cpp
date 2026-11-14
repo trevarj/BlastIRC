@@ -5,6 +5,7 @@
 #include "../src/ui/command_completion.hpp"
 #include "../src/ui/editor.hpp"
 #include "../src/ui/emoji.hpp"
+#include "../src/ui/emoji_picker.hpp"
 #include "../src/ui/irc_format.hpp"
 #include "../src/ui/irc_palette.hpp"
 #include "../src/ui/logic.hpp"
@@ -24,6 +25,8 @@
 #include <filesystem>
 #include <linux/input-event-codes.h>
 #include <pango/pango.h>
+#include <render/animation/animation_manager.h>
+#include <render/animation/motion_service.h>
 #include <render/codecs/codecs.h>
 #include <render/gl_shared_context.h>
 #include <render/render_context.h>
@@ -690,7 +693,6 @@ void checkComposerReplyCard(Renderer &renderer) {
                actual.preeditLength == ime.preeditLength &&
                actual.preeditCaretHidden == ime.preeditCaretHidden && actual.history == ime.history;
     };
-    // Pending paste consumes the composer budget; reply remains a fixed two-line overlay.
     frame(640, 260);
     auto *replyCancel = composerAction(*composer, ":reply-cancel");
     auto *replyAuthor = contextText(*composer, "作者");
@@ -2743,6 +2745,97 @@ void runComposerCheck() {
     }
     auto *actions = tooltipAction(*first, "Formatting toolbar");
     assert(actions);
+    {
+        auto &motion = MotionService::instance();
+        const bool wasEnabled = motion.enabled();
+        const float previousSpeed = motion.speed();
+        const auto previousFx = model.settings.fx;
+        model.settings.reducedMotion = false;
+        model.settings.fx = FxLevel::Full;
+        motion.setEnabled(true);
+        motion.setSpeed(1);
+        AnimationManager animations;
+        root.setAnimationManager(&animations);
+        auto *bold = tooltipAction(*first, "Bold");
+        assert(bold);
+        ScrollView *panel = nullptr;
+        for (auto *node = bold->parent(); node && node != first; node = node->parent())
+            if (auto *scroll = dynamic_cast<ScrollView *>(node))
+                panel = scroll;
+        assert(panel);
+        const auto before = input->editingState();
+        const auto open = [&] {
+            dispatcher.setFocus(actions->inputArea());
+            activateTooltip(*first, "Formatting toolbar");
+            editors.sync();
+            assert(panel->visible() && dispatcher.focusedArea() == bold->inputArea());
+        };
+        const auto close = [&] {
+            activateTooltip(*first, "Formatting toolbar");
+            editors.sync();
+            assert(!panel->visible() && !panel->participatesInLayout() && panel->opacity() == 1 &&
+                   dispatcher.focusedArea() == input->inputArea());
+        };
+        open();
+        assert(panel->opacity() == .6f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        animations.tick(0);
+        assert(panel->opacity() > .6f && panel->opacity() < 1);
+        assert(input->editingStateMatches(before));
+        close();
+        open(); // Rapid reversal starts a fresh opening, never a delayed close.
+        assert(panel->opacity() == .6f);
+        model.settings.fx = FxLevel::Off;
+        editors.sync();
+        assert(panel->opacity() == 1 && panel->visible());
+        close();
+        open();
+        assert(panel->opacity() == 1);
+        close();
+        model.settings.fx = previousFx;
+        model.settings.reducedMotion = true;
+        open();
+        assert(panel->opacity() == 1);
+        close();
+        model.settings.reducedMotion = false;
+        model.settings.fx = FxLevel::Full;
+        open();
+        model.settings.reducedMotion = true;
+        editors.sync();
+        assert(panel->opacity() == 1);
+        close();
+        model.settings.reducedMotion = false;
+        open();
+        motion.setEnabled(false);
+        assert(panel->opacity() == 1);
+        close();
+        motion.setEnabled(true);
+        open();
+        a.buffer = other.id;
+        editors.sync();
+        assert(!panel->visible() && panel->opacity() == 1);
+        a.buffer = buffer.id;
+        editors.sync();
+        assert(input->editingStateMatches(before));
+        open();
+        std::this_thread::sleep_for(std::chrono::milliseconds(160));
+        animations.tick(0);
+        assert(panel->opacity() == 1);
+        close();
+        {
+            auto transient = editors.composer(a);
+            transient->setAnimationManager(&animations);
+            activateTooltip(*transient, "Formatting toolbar");
+            transient.reset();
+            std::this_thread::sleep_for(std::chrono::milliseconds(160));
+            animations.tick(0); // No callback may retain the destroyed toolbar.
+        }
+        root.setAnimationManager(nullptr);
+        model.settings.reducedMotion = true;
+        model.settings.fx = previousFx;
+        motion.setSpeed(previousSpeed);
+        motion.setEnabled(wasEnabled);
+    }
     activateTooltip(*first, "Formatting toolbar");
     editors.sync();
     // Activate the native toolbar itself; every action is one shared raw-document undo.
@@ -3596,6 +3689,8 @@ void runComposerCheck() {
         editors.sync();
         assert(!completion->visible() && !editors.handleCompletionKey(XKB_KEY_Return, 0) &&
                input->value() == literal);
+        assert(!editors.handleCompletionKey(XKB_KEY_n, KeyMod::Ctrl) &&
+               !editors.handleCompletionKey(XKB_KEY_p, KeyMod::Ctrl) && input->value() == literal);
     }
     openCompletion(":smle", *input);
     auto selectedCompletion = input->editingState();
@@ -3605,7 +3700,7 @@ void runComposerCheck() {
     selectedCompletion = input->editingState();
     assert(!completion->visible());
     for (const auto key : {XKB_KEY_Up, XKB_KEY_Down, XKB_KEY_Tab, XKB_KEY_Return, XKB_KEY_Escape,
-                           XKB_KEY_Left, XKB_KEY_Right}) {
+                           XKB_KEY_Left, XKB_KEY_Right, XKB_KEY_n, XKB_KEY_p}) {
         assert(!editors.handleCompletionKey(key, 0) &&
                !editors.handleCompletionKey(key, KeyMod::Ctrl) &&
                input->editingStateMatches(selectedCompletion));
@@ -3620,8 +3715,9 @@ void runComposerCheck() {
     const auto completionPreedit = input->editingState();
     assert(input->composing() && !completion->visible());
     for (const auto key : {XKB_KEY_Up, XKB_KEY_Down, XKB_KEY_Tab, XKB_KEY_Return, XKB_KEY_Escape,
-                           XKB_KEY_Left, XKB_KEY_Right})
+                           XKB_KEY_Left, XKB_KEY_Right, XKB_KEY_n, XKB_KEY_p})
         assert(!editors.handleCompletionKey(key, 0) &&
+               !editors.handleCompletionKey(key, KeyMod::Ctrl) &&
                input->editingStateMatches(completionPreedit));
     input->textInputResetPreedit();
     openCompletion(":smle", *shared);
@@ -3678,6 +3774,67 @@ void runComposerNativeCheck() {
         checkComposerSpellcheck(renderer);
         checkComposerWordPrediction(renderer);
         checkComposerColors(renderer);
+        {
+            auto &motion = MotionService::instance();
+            const bool wasEnabled = motion.enabled();
+            const float previousSpeed = motion.speed();
+            motion.setEnabled(true);
+            motion.setSpeed(1);
+            AnimationManager animations;
+            emoji::Catalog catalog;
+            emoji::Picker picker(catalog);
+            picker.setAnimationManager(&animations);
+            InputDispatcher dispatcher;
+            dispatcher.setSceneRoot(&picker);
+            picker.setInputDispatcher(dispatcher);
+            picker.sync(800, 600, 1);
+            picker.show("React", {20, 20, 40, 30}, [](auto) {}, [] {});
+            picker.layout(renderer);
+            auto *panel = picker.children().at(1).get();
+            const auto x = panel->x(), y = panel->y(), width = panel->width();
+            assert(panel->opacity() >= .5f && panel->opacity() < 1 &&
+                   dispatcher.focusedArea() == picker.searchInput().inputArea());
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            animations.tick(0);
+            const float halfway = panel->opacity();
+            assert(halfway > .6f && halfway < 1);
+            picker.show("React", {20, 20, 40, 30}, [](auto) {}, [] {});
+            picker.layout(renderer);
+            assert(panel->opacity() == halfway && panel->x() == x && panel->y() == y &&
+                   panel->width() == width);
+            std::this_thread::sleep_for(std::chrono::milliseconds(160));
+            animations.tick(0);
+            assert(panel->opacity() == 1);
+            picker.hide();
+            picker.show("React", {}, [](auto) {}, [] {});
+            animations.tick(20);
+            picker.sync(800, 600, 1, false);
+            assert(panel->opacity() == 1 && picker.active());
+            picker.hide();
+            picker.show("React", {}, [](auto) {}, [] {});
+            assert(panel->opacity() == 1);
+            picker.hide();
+            picker.sync(800, 600, 1, true);
+            picker.show("React", {}, [](auto) {}, [] {});
+            motion.setEnabled(false);
+            assert(panel->opacity() == 1);
+            picker.hide();
+            motion.setEnabled(true);
+            picker.show("React", {}, [](auto) {}, [] {});
+            picker.layout(renderer);
+            float inputX = 0, inputY = 0;
+            Node::mapToScene(picker.searchInput().inputArea(), 5, 5, inputX, inputY);
+            dispatcher.pointerButton(inputX, inputY, BTN_LEFT, true, 1, 1, false);
+            assert(dispatcher.pointerCaptured());
+            picker.hide();
+            assert(!picker.active() && panel->opacity() == 1 && !dispatcher.pointerCaptured() &&
+                   !dispatcher.focusedArea());
+            animations.tick(200);
+            assert(panel->opacity() == 1 && !picker.hitTestVisible());
+            dispatcher.setSceneRoot(nullptr);
+            motion.setSpeed(previousSpeed);
+            motion.setEnabled(wasEnabled);
+        }
         {
             emoji::Catalog catalog;
             emoji::CompletionView completion;
@@ -4551,7 +4708,6 @@ void runComposerNativeCheck() {
                     assert(cancel && nativeVisible(*cancel));
                     assert(cancel->inputArea()->width() >= 32 &&
                            cancel->inputArea()->height() >= 32);
-                    // Reply is a sibling overlay, not part of the composer material.
                     within(*cancel, *pane);
                     within(*cancel->inputArea(), *pane);
                 }
@@ -5845,6 +6001,68 @@ void runComposerNativeCheck() {
             batchKey(XKB_KEY_Tab, KEY_TAB, '\t', 0);
             assert(input->value() == "Alice: " && !nickPopup->visible() && model.actions.empty() &&
                    dispatcher.focusedArea() == input->inputArea());
+            // Real host capture must own C-n/p only while results are open, without editing.
+            emoji::Catalog cyclingCatalog;
+            const auto cyclingEmoji = cyclingCatalog.matches("");
+            assert(cyclingEmoji.size() > 1);
+            for (const auto &[typed, second, last] :
+                 {std::tuple<std::string, std::string, std::string>{"Al", "Alice: ", "Alice: "},
+                  {"/q", "/query ", "/quote "},
+                  {":", std::string(cyclingEmoji[1].glyph),
+                   std::string(cyclingEmoji.back().glyph)}}) {
+                for (const bool acceptLast : {false, true}) {
+                    input->setValue(typed + "x");
+                    frame(); // Rebind the query so each exercise starts at the first result.
+                    input->setValue(typed);
+                    frame();
+                    if (typed == "Al")
+                        batchKey(XKB_KEY_Tab, KEY_TAB, '\t', 0);
+                    assert((typed == ":" ? popup : static_cast<Node *>(nickPopup))->visible());
+                    const auto cycling = input->editingState();
+                    const auto undo = cycling.history->undo, redo = cycling.history->redo;
+                    const auto draft = model.buffers.at("test/#channel").draft;
+                    const auto cycle = [&](std::uint32_t sym, std::uint32_t code) {
+                        batchKey(sym, code, sym == XKB_KEY_n ? 14 : 16, KeyMod::Ctrl);
+                        assert(input->editingStateMatches(cycling) &&
+                               cycling.history->undo == undo && cycling.history->redo == redo &&
+                               model.buffers.at("test/#channel").draft == draft &&
+                               model.activeBuffer == "test/#channel" && model.actions.empty() &&
+                               dispatcher.focusedArea() == input->inputArea());
+                    };
+                    if (acceptLast) {
+                        cycle(XKB_KEY_n, KEY_N);
+                        cycle(XKB_KEY_p, KEY_P); // Second -> first.
+                        cycle(XKB_KEY_p, KEY_P); // First -> last.
+                        batchKey(XKB_KEY_Tab, KEY_TAB, '\t', 0);
+                    } else {
+                        cycle(XKB_KEY_p, KEY_P); // First -> last.
+                        cycle(XKB_KEY_n, KEY_N); // Last -> first.
+                        cycle(XKB_KEY_n, KEY_N); // First -> second.
+                        batchKey(XKB_KEY_Return, KEY_ENTER, '\r', 0);
+                    }
+                    assert(input->value() == (acceptLast ? last : second) && model.actions.empty());
+                }
+            }
+            input->setValue("/q");
+            frame();
+            assert(nickPopup->visible());
+            input->textInputApplyEdit({.commitText = {},
+                                       .preeditText = "猫",
+                                       .preeditCursorBegin = 3,
+                                       .preeditCursorEnd = 3,
+                                       .hasPreedit = true});
+            frame();
+            const auto cyclingPreedit = input->editingState();
+            const auto preeditUndo = cyclingPreedit.history->undo,
+                       preeditRedo = cyclingPreedit.history->redo;
+            assert(input->composing() && !nickPopup->visible());
+            batchKey(XKB_KEY_n, KEY_N, 14, KeyMod::Ctrl);
+            batchKey(XKB_KEY_p, KEY_P, 16, KeyMod::Ctrl);
+            assert(input->editingStateMatches(cyclingPreedit) &&
+                   cyclingPreedit.history->undo == preeditUndo &&
+                   cyclingPreedit.history->redo == preeditRedo &&
+                   model.activeBuffer == "test/#channel" && model.actions.empty());
+            input->textInputResetPreedit();
             input->setValue("Al");
             frame();
             batchKey(XKB_KEY_Tab, KEY_TAB, '\t', 0);

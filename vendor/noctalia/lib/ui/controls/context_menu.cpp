@@ -1,6 +1,7 @@
 #include "ui/controls/context_menu.h"
 
 #include "core/ui_phase.h"
+#include "render/animation/animation_manager.h"
 #include "render/scene/input_area.h"
 #include "ui/builders.h"
 #include "ui/controls/box.h"
@@ -149,9 +150,46 @@ std::size_t ContextMenuControl::firstInteractiveIndex() const noexcept {
 
 void ContextMenuControl::applyHighlightVisuals() {
   for (std::size_t i = 0; i < m_rows.size(); ++i) {
-    if (m_rows[i].apply) {
-      m_rows[i].apply(i == m_highlightedIndex && m_rows[i].interactive);
+    auto& visual = m_rows[i];
+    if (!visual.apply) {
+      continue;
     }
+    const bool highlighted = i == m_highlightedIndex && visual.interactive;
+    const auto background = highlighted ? colorSpecFromRole(ColorRole::Hover) : clearColorSpec();
+    const auto foreground = highlighted ? colorSpecFromRole(ColorRole::OnHover) : visual.normalForeground;
+    if (visual.initialized && background == visual.targetBackground && foreground == visual.targetForeground) {
+      continue;
+    }
+    auto* manager = animationManager();
+    if (manager != nullptr && visual.animation != 0) {
+      manager->cancel(visual.animation);
+      visual.animation = 0;
+    }
+    visual.targetBackground = background;
+    visual.targetForeground = foreground;
+    if (!visual.initialized || manager == nullptr) {
+      visual.apply(background, foreground);
+    } else {
+      const Color targetBackground = resolveColorSpec(background);
+      const Color targetForeground = resolveColorSpec(foreground);
+      const Color fromBackground = visual.background->style().fill;
+      const Color fromForeground = visual.foreground->color();
+      visual.animation = manager->animate(
+          0.0F, 1.0F, Style::animFast, Easing::EaseOutCubic,
+          [&visual, fromBackground, fromForeground, targetBackground, targetForeground](float t) {
+            visual.apply(
+                t >= 1.0F ? visual.targetBackground : fixedColorSpec(lerpColor(fromBackground, targetBackground, t)),
+                t >= 1.0F ? visual.targetForeground : fixedColorSpec(lerpColor(fromForeground, targetForeground, t))
+            );
+          },
+          {}, visual.owner
+      );
+      markPaintDirty();
+      if (m_redrawCallback) {
+        m_redrawCallback();
+      }
+    }
+    visual.initialized = true;
   }
 }
 
@@ -486,39 +524,32 @@ void ContextMenuControl::rebuildRows(Renderer& renderer) {
     }
 
     RowVisual visual{
+        .owner = row.get(),
+        .normalForeground = separator || entry.header ? colorSpecFromRole(ColorRole::OnSurfaceVariant)
+            : interactive                             ? enabledItemColor()
+                                                      : disabledItemColor(),
+        .background = rowBgPtr,
+        .foreground = labelPtr,
         .y = currentY,
         .height = rowHeight,
         .interactive = interactive,
     };
     if (rowBgPtr != nullptr && labelPtr != nullptr) {
-      visual.apply = [rowBgPtr, labelPtr, togglePtr, iconPtr, chevronPtr, interactive, separator,
-                      header = entry.header](bool highlighted) {
-        rowBgPtr->setFill(highlighted ? colorSpecFromRole(ColorRole::Hover) : clearColorSpec());
-        if (separator || header) {
-          labelPtr->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
-        } else {
-          labelPtr->setColor(
-              highlighted ? colorSpecFromRole(ColorRole::OnHover)
-                          : (interactive ? enabledItemColor() : disabledItemColor())
-          );
-        }
+      visual.apply = [rowBgPtr, labelPtr, togglePtr, iconPtr, chevronPtr, header = entry.header,
+                      normalGlyph = interactive
+                          ? enabledItemColor()
+                          : disabledItemColor()](const ColorSpec& background, const ColorSpec& foreground) {
+        rowBgPtr->setFill(background);
+        labelPtr->setColor(foreground);
+        const auto& glyphForeground = header ? normalGlyph : foreground;
         if (togglePtr != nullptr) {
-          togglePtr->setColor(
-              highlighted ? colorSpecFromRole(ColorRole::OnHover)
-                          : (interactive ? enabledItemColor() : disabledItemColor())
-          );
+          togglePtr->setColor(glyphForeground);
         }
         if (iconPtr != nullptr) {
-          iconPtr->setColor(
-              highlighted ? colorSpecFromRole(ColorRole::OnHover)
-                          : (interactive ? enabledItemColor() : disabledItemColor())
-          );
+          iconPtr->setColor(glyphForeground);
         }
         if (chevronPtr != nullptr) {
-          chevronPtr->setColor(
-              highlighted ? colorSpecFromRole(ColorRole::OnHover)
-                          : (interactive ? enabledItemColor() : disabledItemColor())
-          );
+          chevronPtr->setColor(glyphForeground);
         }
       };
 

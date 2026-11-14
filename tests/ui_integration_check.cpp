@@ -28,6 +28,8 @@
 #include <glib.h>
 #include <iterator>
 #include <optional>
+#include <render/animation/animation_manager.h>
+#include <render/animation/motion_service.h>
 #include <render/codecs/codecs.h>
 #include <render/core/texture_manager.h>
 #include <render/scene/input_dispatcher.h>
@@ -36,6 +38,7 @@
 #include <render/text/cairo_text_renderer.h>
 #include <string>
 #include <string_view>
+#include <ui/controls/box.h>
 #include <ui/controls/button.h>
 #include <ui/controls/image.h>
 #include <ui/controls/input.h>
@@ -456,6 +459,214 @@ InputArea *headerTool(Input &input, std::string_view actionLabel) {
         }
     assert(false && "Expected the conversation's actual header tool");
     return nullptr;
+}
+void shellMotionCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    model.settings.reducedMotion = false;
+    model.settings.fx = FxLevel::Full;
+    auto &buffer = model.buffers.at(edgeBuffers[0]);
+    buffer.kind = "channel";
+    buffer.joined = true;
+    buffer.nicks.push_back({.name = "Person", .account = {}, .prefix = {}});
+    Theme theme;
+    theme.update(model);
+    auto &motion = MotionService::instance();
+    const bool oldEnabled = motion.enabled();
+    const float oldSpeed = motion.speed();
+    motion.setEnabled(true);
+    motion.setSpeed(.25f);
+    Clipboard clipboard;
+    PangoRenderer renderer;
+    AnimationManager animations;
+    InputDispatcher dispatcher;
+    Ui ui(model, clipboard);
+    ui.root().setAnimationManager(&animations);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&](float width = 2000.f) {
+        ui.update(width, 1200, 1);
+        ui.root().layout(renderer);
+    };
+    const auto advance = [&](unsigned milliseconds) {
+        g_usleep(milliseconds * 1000);
+        animations.tick(0);
+        ui.root().layout(renderer);
+    };
+    frame();
+    Sidebar *sidebar = nullptr;
+    People *people = nullptr;
+    for (const auto &child : ui.root().children()) {
+        if (auto *panel = dynamic_cast<Sidebar *>(child.get()))
+            sidebar = panel;
+        if (auto *panel = dynamic_cast<People *>(child.get()))
+            people = panel;
+    }
+    auto *composer = inputWithText(ui.root(), edgeDrafts[0]);
+    assert(sidebar && people && composer);
+    auto *pane = paneFor(*composer);
+    const float expanded = sidebar->width();
+    model.settings.reducedMotion = true;
+    ui.execute("toggle-navigation");
+    const float compact = sidebar->width();
+    ui.execute("toggle-navigation");
+    ui.execute("toggle-navigation");
+    ui.execute("toggle-people");
+    const float peopleExpanded = people->width();
+    ui.execute("toggle-people");
+    const float peopleCompact = people->width();
+    ui.execute("toggle-people");
+    model.settings.reducedMotion = false;
+    const float chatLeft = pane->x();
+    auto *searchArea = areaWithKey(ui.root(), "sidebar-search");
+    auto *search = searchArea ? dynamic_cast<Input *>(searchArea->textInputClient()) : nullptr;
+    assert(search && visible(*search));
+    dispatcher.setFocus(searchArea);
+    nativeKey(ui, dispatcher, 'f', 0, 'f');
+    frame();
+    const auto filterValue = search->value();
+    const auto draftValue = composer->value();
+    pointerButton(dispatcher, pointerPoint(*searchArea), BTN_LEFT, true);
+    ui.execute("toggle-navigation");
+    assert(model.settings.workspace.at("native_navigation_mode") == "compact");
+    assert(sidebar->width() == expanded);
+    assert(dispatcher.focusedArea() == composer->inputArea() && !dispatcher.pointerCaptured());
+    assert(search->value() == filterValue && composer->value() == draftValue);
+    assert(!dispatcher.firstTabFocusUnder(search));
+    const auto interactive = [](const Node *node) {
+        for (; node; node = node->parent())
+            if (!node->visible() || !node->hitTestVisible())
+                return false;
+        return true;
+    };
+    assert(visible(*search) && !interactive(searchArea));
+    advance(60);
+    const float halfway = sidebar->width();
+    assert(halfway > compact && halfway < expanded);
+    assert(pane->x() < chatLeft && pane->width() >= 360);
+    auto *handle = areaWithKey(ui.root(), "channel-sidebar-resize");
+    float handleX = 0, handleY = 0;
+    assert(handle);
+    Node::mapToScene(handle, handle->width() / 2, handle->height() / 2, handleX, handleY);
+    assert(std::abs(handleX - (sidebar->x() + sidebar->width() + pane->x()) / 2) < .1f);
+    ui.execute("toggle-navigation");
+    assert(sidebar->width() == halfway);
+    assert(sidebar->visible() && !sidebar->hitTestVisible() &&
+           sidebar->excludeSubtreeFromTabOrder());
+    assert(!dispatcher.firstTabFocusUnder(sidebar));
+    ui.execute("toggle-navigation");
+    assert(sidebar->width() == halfway && sidebar->hitTestVisible());
+    assert(interactive(searchArea) && dispatcher.firstTabFocusUnder(search) == searchArea);
+    assert(search->value() == filterValue && composer->value() == draftValue);
+    advance(800);
+    assert(sidebar->width() == expanded);
+    ui.execute("toggle-people");
+    advance(60);
+    assert(people->width() > 0 && people->width() < peopleExpanded && pane->width() >= 360);
+    const float peopleHalfway = people->width();
+    ui.execute("toggle-people");
+    assert(people->width() == peopleHalfway);
+    advance(800);
+    assert(people->width() == peopleCompact);
+    auto *person = memberRow(ui.root(), "Person");
+    assert(person && visible(*person));
+    dispatcher.setFocus(person);
+    pointerButton(dispatcher, pointerPoint(*person), BTN_LEFT, true);
+    ui.execute("toggle-people");
+    assert(!dispatcher.pointerCaptured() && dispatcher.focusedArea() != person);
+    assert(people->visible() && !people->hitTestVisible() && people->excludeSubtreeFromTabOrder());
+    advance(800);
+    assert(!people->visible());
+    ui.execute("toggle-navigation");
+    advance(60);
+    dispatcher.setFocus(handle);
+    nativeKey(ui, dispatcher, XKB_KEY_Right);
+    frame();
+    const float resizedCompact = sidebar->width();
+    assert(resizedCompact > compact && resizedCompact < halfway);
+    advance(800);
+    assert(sidebar->width() == resizedCompact);
+    ui.execute("toggle-navigation");
+    advance(60);
+    frame(720);
+    const float resized = sidebar->width();
+    advance(800);
+    assert(sidebar->width() == resized);
+    frame();
+    model.settings.reducedMotion = true;
+    ui.execute("toggle-navigation");
+    assert(sidebar->width() == expanded);
+    model.settings.reducedMotion = false;
+    ui.execute("toggle-navigation");
+    advance(60);
+    model.settings.fx = FxLevel::Off;
+    frame();
+    assert(sidebar->width() == resizedCompact);
+    advance(800);
+    assert(sidebar->width() == resizedCompact);
+    model.settings.fx = FxLevel::Full;
+    ui.execute("toggle-navigation");
+    advance(60);
+    motion.setEnabled(false);
+    ui.root().layout(renderer);
+    assert(!sidebar->visible() && sidebar->width() == 0);
+    motion.setEnabled(true);
+    ui.execute("toggle-navigation");
+    advance(800);
+    assert(sidebar->width() == expanded);
+    dispatcher.setFocus(composer->inputArea());
+    ui.execute("execute-command");
+    Node *palettePanel = dispatcher.focusedArea();
+    while (palettePanel && palettePanel->opacity() == 1.f)
+        palettePanel = palettePanel->parent();
+    assert(palettePanel && palettePanel->opacity() == .6f);
+    assert(dispatcher.focusedArea() != composer->inputArea());
+    frame();
+    const std::array paletteBounds{palettePanel->x(), palettePanel->y(), palettePanel->width(),
+                                   palettePanel->height()};
+    advance(60);
+    assert(palettePanel->opacity() > .6f && palettePanel->opacity() < 1.f);
+    assert((paletteBounds == std::array{palettePanel->x(), palettePanel->y(), palettePanel->width(),
+                                        palettePanel->height()}));
+    ui.execute("cancel");
+    assert(dispatcher.focusedArea() == composer->inputArea());
+    assert(palettePanel->opacity() == 1.f && !visible(*palettePanel));
+    ui.execute("jump-channel");
+    auto *jump = areaWithKey(ui.root(), "channel-jump");
+    assert(jump && visible(*jump) && jump->opacity() == .6f && dispatcher.focusedArea() == jump);
+    advance(60);
+    assert(jump->opacity() > .6f && jump->opacity() < 1.f);
+    model.settings.reducedMotion = true;
+    frame();
+    assert(jump->opacity() == 1.f);
+    ui.execute("cancel");
+    assert(!visible(*jump) && jump->opacity() == 1.f);
+    model.settings.reducedMotion = false;
+    auto *commandButton = areaWithKey(ui.root(), "topbar-command");
+    assert(commandButton);
+    auto *buttonFill = dynamic_cast<Box *>(commandButton->children().front().get());
+    assert(buttonFill);
+    dispatcher.pointerMotion(0, 0, 4000);
+    frame();
+    const auto restingFill = buttonFill->style().fill;
+    const auto hoverPoint = pointerPoint(*commandButton);
+    dispatcher.pointerMotion(hoverPoint[0], hoverPoint[1], 4001);
+    frame();
+    assert(commandButton->hovered() && buttonFill->style().fill == restingFill);
+    advance(60);
+    const auto intermediateFill = buttonFill->style().fill;
+    assert(intermediateFill != restingFill && intermediateFill != themeSurfaceColor("hover"));
+    dispatcher.pointerMotion(0, 0, 4002);
+    frame();
+    assert(buttonFill->style().fill == intermediateFill);
+    model.settings.fx = FxLevel::Off;
+    frame();
+    assert(buttonFill->style().fill == restingFill);
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+    motion.setSpeed(oldSpeed);
+    motion.setEnabled(oldEnabled);
 }
 
 void presentation(blast::Ui &ui, const blast::Model &model, std::string_view active,
@@ -5185,6 +5396,372 @@ void deferredSettingsTouchGeometryCheck() {
     }
 }
 
+void animatedHistoryFooterCheck() {
+    using namespace blast;
+    auto &motion = MotionService::instance();
+    const bool oldEnabled = motion.enabled();
+    const float oldSpeed = motion.speed();
+    motion.setEnabled(true);
+    motion.setSpeed(1);
+    struct FooterCase {
+        MessageLayout layout;
+        float zoom, messageZoom;
+    };
+    for (const auto &[layout, zoom, messageZoom] :
+         {FooterCase{MessageLayout::Bubbles, 1, 1}, FooterCase{MessageLayout::Irc, 1.6f, 1},
+          FooterCase{MessageLayout::Stacked, 1, 1.6f},
+          FooterCase{MessageLayout::Bubbles, 1.6f, 1.6f}}) {
+        auto model = edgeModel();
+        model.settings.scale = zoom;
+        model.settings.messageScale = messageZoom;
+        model.settings.typingReceive = true;
+        model.settings.reducedMotion = false;
+        model.settings.fx = FxLevel::Full;
+        auto &buffer = model.buffers.at(edgeBuffers[0]);
+        const std::string draft = zoom > 1 ? "first draft\nsecond row" : edgeDrafts[0];
+        buffer.draft = draft;
+        model.settings.messageLayouts[buffer.id] = layout;
+        constexpr int historyRows = 160;
+        const auto tailText = "Footer history " + std::to_string(historyRows - 1);
+        const auto olderText = "Footer history " + std::to_string(historyRows - 10);
+        for (int i = 0; i < historyRows; ++i) {
+            Message message;
+            message.id = message.text = "Footer history " + std::to_string(i);
+            message.nick = "HistoryPeer";
+            buffer.messages.push_back(std::move(message));
+        }
+        Theme theme;
+        theme.update(model);
+        Clipboard clipboard;
+        PangoRenderer renderer;
+        AnimationManager animations;
+        InputDispatcher dispatcher;
+        {
+            Ui ui(model, clipboard);
+            ui.root().setAnimationManager(&animations);
+            dispatcher.setSceneRoot(&ui.root());
+            ui.setInputDispatcher(dispatcher);
+            ui.setWindowActive(true);
+            const auto frame = [&](float width = 1400.f) {
+                ui.update(width * zoom, 1000 * zoom, 1);
+                ui.root().layout(renderer);
+            };
+            const auto advance = [&](unsigned milliseconds) {
+                g_usleep(milliseconds * 1000);
+                animations.tick(0);
+                ui.root().layout(renderer);
+            };
+            const auto rect = [](Node &node) {
+                float left, top, right, bottom;
+                Node::transformedBounds(&node, left, top, right, bottom);
+                return std::array{left, top, right, bottom};
+            };
+            const auto nearRect = [](const std::array<float, 4> &actual,
+                                     const std::array<float, 4> &expected) {
+                for (size_t i = 0; i < actual.size(); ++i)
+                    if (std::abs(actual[i] - expected[i]) >= .1f)
+                        return false;
+                return true;
+            };
+            frame();
+            auto *input = inputWithText(ui.root(), draft);
+            assert(input);
+            auto *pane = paneFor(*input);
+            auto *transcript = visibleNode<TranscriptView>(*pane);
+            auto *history = transcript ? visibleNode<ScrollView>(*transcript) : nullptr;
+            assert(transcript && history);
+            Node *replyCard = nullptr;
+            if (messageZoom > 1) {
+                auto *plus = composerControl(*pane, ":plus");
+                assert(plus);
+                click(dispatcher, *plus);
+                frame();
+            }
+            if (zoom > 1) {
+                dispatcher.setFocus(input->inputArea());
+                assert(transcript->navigateMessage(-1));
+                const auto target = transcript->selectedMessage();
+                assert(target && transcript->replyToMessage(*target));
+                frame();
+                replyCard = composerControl(*pane, ":reply-cancel");
+                while (replyCard && !labelWithText(*replyCard, buffer.messages.back().text))
+                    replyCard = replyCard->parent();
+                assert(replyCard && visible(*replyCard));
+            }
+            auto selected = input->editingState();
+            selected.current.cursorPos = 8;
+            selected.current.selectionAnchor = 2;
+            input->restoreEditingState(selected);
+            dispatcher.setFocus(input->inputArea());
+            input->textInputApplyEdit({.commitText = {},
+                                       .preeditText = "猫",
+                                       .preeditCursorBegin = 3,
+                                       .preeditCursorEnd = 3,
+                                       .hasPreedit = true});
+            frame();
+            const auto document = input->editingState();
+            const auto undo = document.history->undo, redo = document.history->redo;
+            const auto caret = input->textInputState();
+            const auto inputRect = rect(*input), historyRect = rect(*history);
+            const auto replyRect = replyCard ? rect(*replyCard) : std::array<float, 4>{};
+            Node *composer = input;
+            while (composer->parent() != pane)
+                composer = composer->parent();
+            const auto composerRect = rect(*composer);
+            const auto viewport = history->contentViewportHeight();
+            const auto bodyRect = [&](std::string_view value) {
+                TextNode *found = nullptr;
+                const auto visit = [&](auto &&self, Node &node) -> void {
+                    if (!visible(node))
+                        return;
+                    if (auto *text = dynamic_cast<TextNode *>(&node);
+                        text && text->text().contains(value))
+                        found = text;
+                    for (const auto &child : node.children())
+                        self(self, *child);
+                };
+                visit(visit, *transcript);
+                assert(found);
+                return rect(*found);
+            };
+            const auto unchanged = [&] {
+                assert(nearRect(rect(*composer), composerRect));
+                assert(nearRect(rect(*input), inputRect));
+                assert(nearRect(rect(*history), historyRect));
+                if (replyCard) {
+                    assert(nearRect(rect(*replyCard), replyRect));
+                    assert(std::abs(composerRect[1] - replyRect[3] - 4 * zoom) < .1f);
+                }
+                assert(history->contentViewportHeight() == viewport);
+                assert(dispatcher.focusedArea() == input->inputArea() && input->composing());
+                assert(input->editingStateMatches(document));
+                assert(document.history->undo == undo && document.history->redo == redo);
+                assert(buffer.draft == draft);
+                const auto actual = input->textInputState();
+                assert(actual.cursorRectX == caret.cursorRectX &&
+                       actual.cursorRectY == caret.cursorRectY &&
+                       actual.cursorRectWidth == caret.cursorRectWidth &&
+                       actual.cursorRectHeight == caret.cursorRectHeight);
+            };
+            assert(transcript->scrollToBoundary(true));
+            frame();
+            assert(std::abs(history->scrollOffset() - history->maxScrollOffset()) < .1f);
+            float idle = history->maxScrollOffset();
+            assert(idle >
+                   typingIndicatorHeight(renderer, zoom, messageTextSize(model.settings, buffer)));
+            const auto tail = bodyRect(tailText);
+            const auto extent = [&] { return history->maxScrollOffset() - idle; };
+            const auto tailMoved = [&](float height) {
+                assert(std::abs(bodyRect(tailText)[1] - tail[1] + height) < .1f);
+                assert(std::abs(history->scrollOffset() - history->maxScrollOffset()) < .1f);
+                unchanged();
+            };
+            for (const auto *nick : {"TypingAlice", "TypingBob", "TypingCarol", "TypingDave"})
+                buffer.typing[nick] = model.now;
+            frame();
+            assert(std::abs(extent()) < .1f);
+            const auto composerKey = std::string(input->inputArea()->tabFocusKey());
+            const auto paneKey = composerKey.substr(9, composerKey.rfind(':') - 9);
+            auto *overflow = areaWithKey(ui.root(), "transcript:" + paneKey + ":typing-overflow");
+            assert(overflow);
+            const auto concealedOverflow = [&] {
+                const auto point = pointerPoint(*overflow);
+                assert(dispatcher.inputAreaAt(point[0], point[1]) != overflow);
+                assert(!dispatcher.pointerCaptured());
+                assert(!dispatcher.cycleTabFocusInSubtree(overflow->parent(), false));
+                assert(!dispatcher.cycleTabFocusInSubtree(overflow->parent(), true));
+                auto *last = labelWithText(ui.root(), "TypingDave");
+                assert(!last || !visible(*last));
+                unchanged();
+            };
+            concealedOverflow();
+            advance(40);
+            const float growing = extent();
+            assert(growing > .1f);
+            tailMoved(growing);
+            concealedOverflow();
+            buffer.typing["TypingEve"] = model.now;
+            frame();
+            assert(std::abs(extent() - growing) < .1f);
+            buffer.typing.clear();
+            frame();
+            assert(std::abs(extent() - growing) < .1f);
+            advance(40);
+            const float shrinking = extent();
+            assert(shrinking > 0 && shrinking < growing);
+            tailMoved(shrinking);
+            for (const auto *nick : {"TypingAlice", "TypingBob", "TypingCarol", "TypingDave"})
+                buffer.typing[nick] = model.now;
+            frame();
+            assert(std::abs(extent() - shrinking) < .1f);
+            advance(250);
+            const float expanded = extent();
+            assert(expanded > growing);
+            tailMoved(expanded);
+            buffer.typing["TypingEve"] = model.now;
+            frame();
+            assert(std::abs(extent() - expanded) < .1f);
+            const auto overflowPoint = pointerPoint(*overflow);
+            assert(dispatcher.inputAreaAt(overflowPoint[0], overflowPoint[1]) == overflow);
+            click(dispatcher, *overflow);
+            frame();
+            auto *last = labelWithText(ui.root(), "TypingDave");
+            assert(last && visible(*last));
+            unchanged();
+            history->setScrollOffset(history->maxScrollOffset() - 300 * zoom);
+            frame();
+            assert(history->scrollOffset() < history->maxScrollOffset() - 1);
+            last = labelWithText(ui.root(), "TypingDave");
+            assert(!last || !visible(*last));
+            concealedOverflow();
+            const auto older = bodyRect(olderText);
+            const float olderOffset = history->scrollOffset();
+            for (const bool active : {false, true, false}) {
+                buffer.typing.clear();
+                if (active)
+                    buffer.typing["TypingAlice"] = model.now;
+                frame();
+                advance(250);
+                assert(nearRect(bodyRect(olderText), older));
+                assert(std::abs(history->scrollOffset() - olderOffset) < .1f);
+                assert(history->scrollOffset() < history->maxScrollOffset() - 1);
+                unchanged();
+            }
+            assert(transcript->scrollToBoundary(true));
+            frame();
+            tailMoved(0);
+            assert(buffer.typing.empty());
+            idle = history->maxScrollOffset();
+            motion.setSpeed(.25f);
+            buffer.typing["TypingAlice"] = model.now;
+            frame();
+            advance(60);
+            const float slowGrow = extent();
+            assert(slowGrow > 0 && slowGrow < expanded);
+            motion.setSpeed(4);
+            ui.root().layout(renderer);
+            assert(std::abs(extent() - slowGrow) < .1f);
+            advance(80);
+            assert(std::abs(extent() - expanded) < .1f);
+            tailMoved(expanded);
+            motion.setSpeed(1);
+            frame();
+            buffer.typing.clear();
+            frame();
+            advance(40);
+            const float fastShrink = extent();
+            assert(fastShrink > 0 && fastShrink < expanded);
+            motion.setSpeed(.1f);
+            ui.root().layout(renderer);
+            assert(std::abs(extent() - fastShrink) < .1f);
+            advance(250);
+            const float slowShrink = extent();
+            assert(slowShrink > 0 && slowShrink < fastShrink);
+            tailMoved(slowShrink);
+            motion.setSpeed(4);
+            ui.root().layout(renderer);
+            advance(80);
+            assert(std::abs(extent()) < .1f);
+            motion.setSpeed(1);
+            for (const bool reduced : {false, true}) {
+                model.settings.fx = FxLevel::Full;
+                model.settings.reducedMotion = false;
+                buffer.typing["TypingAlice"] = model.now;
+                frame();
+                advance(40);
+                assert(extent() > 0 && extent() < expanded);
+                model.settings.reducedMotion = reduced;
+                model.settings.fx = reduced ? FxLevel::Full : FxLevel::Off;
+                frame();
+                assert(std::abs(extent() - expanded) < .1f);
+                buffer.typing.clear();
+                frame();
+                assert(std::abs(extent()) < .1f);
+                tailMoved(0);
+            }
+            model.settings.fx = FxLevel::Full;
+            model.settings.reducedMotion = false;
+            buffer.typing["TypingAlice"] = model.now;
+            frame();
+            advance(40);
+            motion.setEnabled(false);
+            ui.root().layout(renderer);
+            assert(std::abs(extent() - expanded) < .1f);
+            motion.setEnabled(true);
+            buffer.typing.clear();
+            frame();
+            advance(250);
+            for (const bool doneBeforeMessage : {false, true}) {
+                const float restingMaximum = history->maxScrollOffset();
+                buffer.typing["TypingAlice"] = model.now;
+                frame();
+                advance(250);
+                if (doneBeforeMessage) {
+                    buffer.typing.clear();
+                    frame();
+                    advance(40);
+                }
+                const float remaining = history->maxScrollOffset() - restingMaximum;
+                assert(remaining > 0);
+                Message message;
+                message.id = message.text =
+                    doneBeforeMessage ? "Footer handoff done" : "Footer handoff active";
+                message.nick = "TypingAlice";
+                buffer.messages.push_back(std::move(message));
+                ++buffer.messagesRevision;
+                buffer.typing.clear();
+                frame();
+                const float handedOff = history->maxScrollOffset();
+                const auto oldBody = bodyRect(tailText);
+                advance(250);
+                assert(std::abs(history->maxScrollOffset() - handedOff) < .1f);
+                assert(nearRect(bodyRect(tailText), oldBody));
+                assert(std::abs(history->scrollOffset() - handedOff) < .1f);
+                unchanged();
+            }
+            if (layout == MessageLayout::Bubbles && zoom == 1 && messageZoom == 1)
+                for (const bool own : {true, false}) {
+                    const float restingMaximum = history->maxScrollOffset();
+                    buffer.typing["TypingAlice"] = model.now;
+                    frame();
+                    advance(250);
+                    buffer.typing.clear();
+                    frame();
+                    advance(40);
+                    const float remaining = history->maxScrollOffset() - restingMaximum;
+                    assert(remaining > .1f);
+                    Message message;
+                    message.id = message.text =
+                        own ? "Footer own exclusion" : "Footer history exclusion";
+                    message.nick = "TypingAlice";
+                    message.own = own;
+                    message.history = !own;
+                    buffer.messages.push_back(std::move(message));
+                    ++buffer.messagesRevision;
+                    frame();
+                    const float arrivalMaximum = history->maxScrollOffset();
+                    const auto arrivalBody = bodyRect(tailText);
+                    advance(20);
+                    const float continuingMaximum = history->maxScrollOffset();
+                    assert(continuingMaximum < arrivalMaximum - .1f);
+                    assert(continuingMaximum > arrivalMaximum - remaining + .1f);
+                    advance(250);
+                    assert(std::abs(history->maxScrollOffset() - (arrivalMaximum - remaining)) <
+                           .1f);
+                    assert(std::abs(bodyRect(tailText)[1] - (arrivalBody[1] + remaining)) < .1f);
+                    assert(std::abs(history->scrollOffset() - history->maxScrollOffset()) < .1f);
+                    unchanged();
+                }
+            dispatcher.setFocus(nullptr);
+            dispatcher.setSceneRoot(nullptr);
+        }
+        animations.tick(0);
+        assert(!animations.hasActive());
+    }
+    motion.setSpeed(oldSpeed);
+    motion.setEnabled(oldEnabled);
+}
+
 void typingOverflowFocusCheck() {
     using namespace blast;
     auto model = edgeModel();
@@ -5265,7 +5842,7 @@ void typingOverflowFocusCheck() {
     auto *transcript = visibleNode<TranscriptView>(*paneFor(*input));
     auto *history = transcript ? visibleNode<ScrollView>(*transcript) : nullptr;
     assert(history && history->maxScrollOffset() > 0);
-    history->setScrollOffset(0);
+    assert(transcript->scrollToBoundary(true));
     frame();
     const float historyOffset = history->scrollOffset();
     dispatcher.setFocus(overflow);
@@ -5284,6 +5861,38 @@ void typingOverflowFocusCheck() {
     }
     assert(!labelWithText(ui.root(), "TypingDave") ||
            !visible(*labelWithText(ui.root(), "TypingDave")));
+    for (const bool offscreen : {true, false}) {
+        assert(transcript->scrollToBoundary(true));
+        frame();
+        dispatcher.setFocus(overflow);
+        hostKey(ui, dispatcher, XKB_KEY_Return);
+        frame();
+        assert(labelWithText(ui.root(), "TypingDave") &&
+               visible(*labelWithText(ui.root(), "TypingDave")));
+        hostKey(ui, dispatcher, XKB_KEY_Escape);
+        frame();
+        assert(!labelWithText(ui.root(), "TypingDave") ||
+               !visible(*labelWithText(ui.root(), "TypingDave")));
+        const auto point = pointerPoint(*overflow);
+        assert(dispatcher.inputAreaAt(point[0], point[1]) == overflow);
+        pointerButton(dispatcher, point, BTN_LEFT, true);
+        assert(dispatcher.capturedArea() == overflow);
+        if (offscreen)
+            history->setScrollOffset(0);
+        else
+            buffer.typing.clear();
+        frame();
+        assert(!dispatcher.pointerCaptured() && !overflow->pressed());
+        assert(dispatcher.focusedArea() == input->inputArea());
+        assert(!dispatcher.cycleTabFocusInSubtree(overflow->parent(), false));
+        assert(!dispatcher.cycleTabFocusInSubtree(overflow->parent(), true));
+        dispatcher.pointerButton(point[0], point[1], BTN_LEFT, false, 60002, 600020, false);
+        frame();
+        assert(!labelWithText(ui.root(), "TypingDave") ||
+               !visible(*labelWithText(ui.root(), "TypingDave")));
+        assert(input->editingStateMatches(keyboardDocument));
+        assert(!menu.open && !dispatcher.pointerCaptured());
+    }
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -6422,6 +7031,172 @@ void deferredAvyRenameFocusCheck(
     assert(model.buffers.at(model.activeBuffer).draft == edgeDrafts[0]);
     for (std::size_t i = 1; i < edgeBuffers.size(); ++i)
         assert(model.buffers.at(edgeBuffers[i]).draft == edgeDrafts[i]);
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
+void messageAutoscrollCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    model.settings.fx = FxLevel::Off;
+    model.settings.typingReceive = true;
+    auto &buffer = model.buffers.at(edgeBuffers[0]);
+    for (int i = 0; i < 100; ++i) {
+        Message message;
+        message.id = "autoscroll-" + std::to_string(i);
+        message.nick = "Peer";
+        message.text = "Retained message history " + std::string(80, 'x');
+        message.time = "2026-11-07T12:34:56Z";
+        message.timestamp = i + 1;
+        buffer.messages.push_back(std::move(message));
+    }
+    ++buffer.messagesRevision;
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    InputArea *autoscrollFocus = nullptr;
+    const auto frame = [&] {
+        model.now += .025;
+        ui.update(1200, 700, 1);
+        ui.root().layout(renderer);
+        if (autoscrollFocus)
+            assert(dispatcher.focusedArea() == autoscrollFocus);
+    };
+    frame();
+    auto *input = inputWithText(ui.root(), edgeDrafts[0]);
+    auto *transcript = visibleNode<TranscriptView>(ui.root());
+    auto *scroll = transcript ? visibleNode<ScrollView>(*transcript) : nullptr;
+    assert(input && transcript && scroll && scroll->maxScrollOffset() > 1000);
+    dispatcher.setFocus(input->inputArea());
+    auto editing = input->editingState();
+    editing.current.cursorPos = 8;
+    editing.current.selectionAnchor = 2;
+    input->restoreEditingState(editing);
+    editing = input->editingState();
+    scroll->setScrollOffset(scroll->maxScrollOffset() * .5f);
+    frame();
+    autoscrollFocus = areaWithKey(ui.root(), std::string("buffer:") + edgeBuffers[1]);
+    assert(autoscrollFocus && visible(*autoscrollFocus));
+    dispatcher.setFocus(autoscrollFocus);
+    frame();
+    const auto anchor = pointerPoint(*scroll);
+    std::uint32_t serial = 71000;
+    const auto button = [&](std::uint32_t code, bool pressed, const auto &point) {
+        if (pressed)
+            ui.beginPointerInteraction(point[0], point[1]);
+        return ui.handlePointerButton(code, pressed, point[0], point[1], false);
+    };
+    const auto start = [&] {
+        assert(button(BTN_MIDDLE, true, anchor));
+        assert(button(BTN_MIDDLE, false, anchor));
+        assert(!dispatcher.pointerCaptured());
+        if (autoscrollFocus)
+            assert(dispatcher.focusedArea() == autoscrollFocus);
+    };
+    const auto move = [&](float delta) {
+        ui.handlePointerMotion(anchor[0], anchor[1] + delta, false);
+        dispatcher.pointerMotion(anchor[0], anchor[1] + delta, ++serial);
+    };
+    start();
+    const float initial = scroll->scrollOffset();
+    move(4);
+    frame();
+    frame();
+    assert(scroll->scrollOffset() == initial); // Deadzone, even with effects disabled.
+    move(-60);
+    frame();
+    const float older = scroll->scrollOffset();
+    frame();
+    assert(older < initial && scroll->scrollOffset() < older);
+    move(60);
+    frame();
+    const float newer = scroll->scrollOffset();
+    frame();
+    assert(scroll->scrollOffset() > newer);
+    assert(input->editingStateMatches(editing) && buffer.draft == edgeDrafts[0]);
+    hostKey(ui, dispatcher, XKB_KEY_Escape);
+    const float stopped = scroll->scrollOffset();
+    frame();
+    assert(scroll->scrollOffset() == stopped);
+    for (const auto code : {BTN_MIDDLE, BTN_LEFT, BTN_RIGHT}) {
+        start();
+        move(-60);
+        assert(button(code, true, anchor));
+        assert(button(code, false, anchor));
+        frame();
+        assert(scroll->scrollOffset() == stopped);
+    }
+    std::array<float, 2> historyBottomPoint;
+    Node::mapToScene(transcript, transcript->width() * .6f, transcript->height() - 1,
+                     historyBottomPoint[0], historyBottomPoint[1]);
+    assert(button(BTN_MIDDLE, true, historyBottomPoint));
+    assert(button(BTN_MIDDLE, false, historyBottomPoint));
+    hostKey(ui, dispatcher, XKB_KEY_Escape);
+    frame();
+    assert(scroll->scrollOffset() == stopped);
+    buffer.typing["AutoscrollTyper"] = model.now;
+    assert(transcript->scrollToBoundary(true));
+    frame();
+    auto *typingPhrase = labelWithText(*transcript, "is typing");
+    assert(typingPhrase && visible(*typingPhrase));
+    const auto typingPoint = pointerPoint(*typingPhrase);
+    assert(!button(BTN_MIDDLE, true, typingPoint));
+    assert(!button(BTN_MIDDLE, false, typingPoint));
+    buffer.typing.clear();
+    frame();
+    scroll->setScrollOffset(stopped);
+    ui.update(1200, 700, 1);
+    ui.root().layout(renderer);
+    assert(dispatcher.focusedArea() == input->inputArea());
+    dispatcher.setFocus(autoscrollFocus);
+    frame();
+    assert(input->editingStateMatches(editing));
+    const auto composerPoint = pointerPoint(*input->inputArea());
+    assert(!button(BTN_MIDDLE, true, composerPoint)); // Composer remains native, not autoscroll.
+    assert(!button(BTN_MIDDLE, false, composerPoint));
+    auto *sidebar = areaWithKey(ui.root(), std::string("buffer:") + edgeBuffers[1]);
+    assert(sidebar);
+    const auto sidebarPoint = pointerPoint(*sidebar);
+    assert(!button(BTN_MIDDLE, true, sidebarPoint));
+    assert(!button(BTN_MIDDLE, false, sidebarPoint));
+    frame();
+    assert(scroll->scrollOffset() == stopped);
+    start();
+    move(-60);
+    ui.beginPointerInteraction(anchor[0], anchor[1], false); // Wheel intent supersedes it.
+    frame();
+    assert(scroll->scrollOffset() == stopped);
+    start();
+    move(-60);
+    ui.setWindowActive(false);
+    frame();
+    ui.setWindowActive(true);
+    frame();
+    assert(scroll->scrollOffset() == stopped);
+    autoscrollFocus = nullptr; // Settings intentionally takes native keyboard ownership.
+    start();
+    move(-60);
+    ui.execute("settings");
+    frame();
+    assert(scroll->scrollOffset() == stopped && !transcript->cancelAutoscroll());
+    hostKey(ui, dispatcher, XKB_KEY_Escape);
+    frame();
+    dispatcher.setFocus(input->inputArea());
+    assert(input->editingStateMatches(editing) && buffer.draft == edgeDrafts[0]);
+    start();
+    move(-60);
+    model.activeBuffer = edgeBuffers[1];
+    frame();
+    assert(!transcript->cancelAutoscroll());
+    assert(buffer.draft == edgeDrafts[0]);
+    assert(std::none_of(model.actions.begin(), model.actions.end(),
+                        [](const Action &action) { return action.type == "send"; }));
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -7952,7 +8727,6 @@ void messageReplyCheck() {
         // Keep the body marker separate from nick-token styling: native text is fragmented.
         model.buffers.at(model.activeBuffer).messages[1].text =
             "ReplyTailBody real conversation message";
-        // Overflow from the first frame: reply must cover real tail text, not an empty history.
         auto &replyMessages = model.buffers.at(model.activeBuffer).messages;
         for (int i = 0; i < 48; ++i) {
             Message message{};
@@ -8055,29 +8829,32 @@ void messageReplyCheck() {
         const auto latestBeforeReply = latestBounds();
         const float contentViewportHeight = historyScroll->contentViewportHeight();
         const float historyHeight = history->height(), viewportHeight = historyScroll->height();
-        const float historyOffset = historyScroll->scrollOffset();
-        const float historyMaximum = historyScroll->maxScrollOffset();
-        const auto stableHistory = [&] {
-            assert(std::abs(history->height() - historyHeight) < .5f &&
-                   std::abs(historyScroll->height() - viewportHeight) < .5f &&
-                   std::abs(viewportHeight - historyHeight) < .5f &&
-                   std::abs(historyScroll->scrollOffset() - historyOffset) < .5f &&
-                   std::abs(historyScroll->maxScrollOffset() - historyMaximum) < .5f &&
-                   std::abs(historyScroll->contentViewportHeight() - contentViewportHeight) < .5f);
+        const auto historyBounds = bounds(*history);
+        Node *card = nullptr;
+        const auto stableReplyGeometry = [&](bool replying = true) {
+            const float reserved =
+                replying ? std::max(0.f, historyBounds[3] - bounds(*card)[1]) : 0;
+            assert(std::abs(history->height() - historyHeight) < .1f &&
+                   std::abs(historyScroll->height() - (viewportHeight - reserved)) < .1f &&
+                   std::abs(historyScroll->contentViewportHeight() -
+                            (contentViewportHeight - reserved)) < .1f);
             const auto latest = latestBounds(), currentComposer = bounds(*composer),
                        currentInput = bounds(*input);
+            assert(std::abs(latest[1] - latestBeforeReply[1]) < 1.f);
             for (std::size_t i = 0; i < latest.size(); ++i) {
-                assert(std::abs(latest[i] - latestBeforeReply[i]) < .5f);
                 assert(std::abs(currentComposer[i] - composerBounds[i]) < .5f);
                 assert(std::abs(currentInput[i] - inputBounds[i]) < .5f);
             }
+            if (replying)
+                assert(std::abs(bounds(*historyScroll)[3] - bounds(*card)[1]) < .1f &&
+                       std::abs(bounds(*composer)[1] - bounds(*card)[3] -
+                                4 * model.settings.scale) < .1f);
         };
         hostKey(ui, dispatcher, 'r', KeyMod::Ctrl);
         frame();
         assert(dispatcher.focusedArea() == input->inputArea());
         auto *cancelReply = composerControl(*pane, ":reply-cancel");
         assert(cancelReply);
-        stableHistory();
         const auto beforeUndo = before.history->undo, beforeRedo = before.history->redo;
         assert(visible(*cancelReply) && input->editingStateMatches(before) &&
                before.history->undo == beforeUndo && before.history->redo == beforeRedo);
@@ -8087,7 +8864,7 @@ void messageReplyCheck() {
                          [](const Message &message) { return message.id == "message-newest"; });
         assert(source != buffer.messages.end());
         // Locate the shared native card by its content, not its private child ordering.
-        Node *card = cancelReply;
+        card = cancelReply;
         while (card && !labelWithText(*card, source->text))
             card = card->parent();
         assert(card && card != composer && visible(*card));
@@ -8112,11 +8889,7 @@ void messageReplyCheck() {
                    child[2] <= parent[2] + .5f && child[3] <= parent[3] + .5f);
         };
         within(*card, *pane);
-        within(*card, *history);
-        assert(bounds(*card)[3] <= bounds(*composer)[1] + .5f);
-        const auto latestUnderCard = latestBounds(), activeCard = bounds(*card);
-        assert(latestUnderCard[0] < activeCard[2] && latestUnderCard[2] > activeCard[0] &&
-               latestUnderCard[1] < activeCard[3] && latestUnderCard[3] > activeCard[1]);
+        stableReplyGeometry();
         for (const Node *node : std::array<const Node *, 3>{heading, excerpt, cancelReply})
             within(*node, *card);
         const auto headingBounds = bounds(*heading), excerptBounds = bounds(*excerpt),
@@ -8125,8 +8898,6 @@ void messageReplyCheck() {
                headingBounds[2] <= cancelBounds[0] + .5f &&
                excerptBounds[2] <= cancelBounds[0] + .5f);
         assert(headingText->maxLines() == 1 && excerptText->maxLines() == 1);
-        // Exercise the real Pane consumer, including its zero-bounds overlay host.
-        // The generic root pass after arrange used to replace the constrained Flex width.
         const Message originalSource = *source;
         auto &longSource =
             model.buffers.at(origin)
@@ -8151,14 +8922,13 @@ void messageReplyCheck() {
                 for (int pass = 0; pass < 3; ++pass) {
                     ui.root().layout(renderer);
                     within(*card, *pane);
-                    within(*card, *history);
                     within(*cancelReply, *card);
-                    within(*cancelReply, *history);
                     within(*cancelReply, *pane);
                     const auto cardBounds = bounds(*card), hit = bounds(*cancelReply);
-                    const auto historyBounds = bounds(*history);
+                    const auto historyBounds = bounds(*historyScroll);
                     assert(cardBounds[0] + .5f >= historyBounds[0] &&
                            cardBounds[2] <= historyBounds[2] + .5f &&
+                           cardBounds[1] + .5f >= historyBounds[3] &&
                            cardBounds[3] <= bounds(*composer)[1] + .5f);
                     assert(dispatcher.inputAreaAt((hit[0] + hit[2]) / 2, (hit[1] + hit[3]) / 2) ==
                            cancelReply);
@@ -8176,7 +8946,6 @@ void messageReplyCheck() {
                     };
                     findOutline(findOutline, *card);
                     assert(outline);
-                    within(*outline, *history);
                     within(*outline, *pane);
                     int lines = 0;
                     for (auto *text : {headingText, excerptText}) {
@@ -8214,11 +8983,11 @@ void messageReplyCheck() {
         ++model.buffers.at(origin).messagesRevision;
         windowWidth = 1600;
         frame();
-        stableHistory();
+        stableReplyGeometry();
         // Cancel removes only the local reply selection, never draft text or native undo.
         click(dispatcher, *cancelReply);
         frame();
-        stableHistory();
+        stableReplyGeometry(false);
         const auto hiddenCardBounds = bounds(*card);
         const float emptyX = (hiddenCardBounds[0] + hiddenCardBounds[2]) * .5f;
         const float emptyY = (hiddenCardBounds[1] + hiddenCardBounds[3]) * .5f;
@@ -8230,8 +8999,8 @@ void messageReplyCheck() {
         hostKey(ui, dispatcher, 'r', KeyMod::Ctrl);
         frame();
         assert(visible(*cancelReply) && input->editingStateMatches(before));
-        stableHistory();
-        // Typing appears, expires and is disabled without reallocating the reply/history zone.
+        stableReplyGeometry();
+        const float idleReplyMaximum = historyScroll->maxScrollOffset();
         for (const int phase : {0, 1, 2, 3, 0}) {
             auto &live = model.buffers.at(origin);
             live.typing.clear();
@@ -8239,7 +9008,9 @@ void messageReplyCheck() {
             if (phase != 0)
                 live.typing["OverlayPeer"] = model.now - (phase == 2 ? 30 : 0);
             frame();
-            stableHistory();
+            stableReplyGeometry();
+            if (phase == 1)
+                assert(historyScroll->maxScrollOffset() > idleReplyMaximum + .1f);
             assert(visible(*cancelReply) && input->editingStateMatches(before) &&
                    before.history->undo == beforeUndo && before.history->redo == beforeRedo);
         }
@@ -8264,11 +9035,12 @@ void messageReplyCheck() {
         assert(visible(*cancelReply) && dispatcher.focusedArea() == input->inputArea());
         for (const bool following : {true, false}) {
             historyScroll->setScrollOffset(historyScroll->maxScrollOffset() -
-                                           (following ? 0.f : 24.f));
+                                           (following ? 0.f : 240.f));
             frame();
             const float offset = historyScroll->scrollOffset(),
                         maximum = historyScroll->maxScrollOffset(),
-                        viewport = historyScroll->contentViewportHeight();
+                        viewport = historyScroll->contentViewportHeight(),
+                        reserved = std::max(0.f, historyBounds[3] - bounds(*card)[1]);
             const auto latest = latestBounds(), editor = bounds(*input),
                        composerRect = bounds(*composer);
             for (const bool replying : {false, true, false, true}) {
@@ -8277,24 +9049,28 @@ void messageReplyCheck() {
                 else
                     click(dispatcher, *cancelReply);
                 frame();
+                const float reclaimed = replying ? 0 : reserved;
                 assert(visible(*cancelReply) == replying &&
-                       std::abs(historyScroll->scrollOffset() - offset) < .5f &&
-                       std::abs(historyScroll->maxScrollOffset() - maximum) < .5f &&
-                       std::abs(historyScroll->height() - viewportHeight) < .5f &&
-                       std::abs(historyScroll->contentViewportHeight() - viewport) < .5f &&
+                       std::abs(historyScroll->maxScrollOffset() - (maximum - reclaimed)) < 1.f &&
+                       std::abs(historyScroll->contentViewportHeight() - (viewport + reclaimed)) <
+                           .1f &&
+                       std::abs(historyScroll->height() - (viewport + reclaimed)) < .1f &&
+                       std::abs(historyScroll->scrollOffset() -
+                                (following ? historyScroll->maxScrollOffset() : offset)) < 1.f &&
                        input->editingStateMatches(before) && live.draft == draft);
                 const auto current = latestBounds(), currentEditor = bounds(*input),
                            currentComposer = bounds(*composer);
                 for (std::size_t i = 0; i < latest.size(); ++i) {
-                    assert(std::abs(current[i] - latest[i]) < .5f);
                     assert(std::abs(currentEditor[i] - editor[i]) < .5f);
                     assert(std::abs(currentComposer[i] - composerRect[i]) < .5f);
                 }
-                if (replying && following) {
-                    const auto band = bounds(*card);
-                    assert(current[0] < band[2] && current[2] > band[0] && current[1] < band[3] &&
-                           current[3] > band[1]);
-                }
+                assert(std::abs(current[1] - (latest[1] + (following ? reclaimed : 0))) < 1.f);
+                if (replying && following)
+                    assert(current[3] <= bounds(*historyScroll)[3] + .5f);
+                if (replying)
+                    assert(std::abs(bounds(*historyScroll)[3] - bounds(*card)[1]) < .1f &&
+                           std::abs(bounds(*composer)[1] - bounds(*card)[3] -
+                                    4 * model.settings.scale) < .1f);
             }
         }
         const float beforeHistoryScroll = historyScroll->scrollOffset();
@@ -8308,6 +9084,8 @@ void messageReplyCheck() {
                visible(*cancelReply) && dispatcher.focusedArea() == input->inputArea());
         const float scrolledOffset = historyScroll->scrollOffset();
         const float scrolledMaximum = historyScroll->maxScrollOffset();
+        const float scrolledViewport = historyScroll->height();
+        const float scrolledReplySpace = std::max(0.f, bounds(*history)[3] - bounds(*card)[1]);
         const auto replyTarget = history->resolveMessage(*originalTarget);
         assert(replyTarget && replyTarget->nick == "NewestPeer" && !replyTarget->anchor);
         const auto scrolledEditor = input->editingState();
@@ -8317,9 +9095,13 @@ void messageReplyCheck() {
             const auto current = input->editingState();
             assert(current.scrollX == scrolledEditor.scrollX &&
                    current.scrollY == scrolledEditor.scrollY);
-            assert(std::abs(historyScroll->scrollOffset() - scrolledOffset) < .5f &&
-                   std::abs(historyScroll->maxScrollOffset() - scrolledMaximum) < .5f &&
-                   std::abs(historyScroll->height() - viewportHeight) < .5f);
+            const float reclaimed = visible(*cancelReply) ? 0 : scrolledReplySpace;
+            assert(
+                std::abs(historyScroll->scrollOffset() - scrolledOffset) < .5f &&
+                std::abs(historyScroll->maxScrollOffset() - (scrolledMaximum - reclaimed)) < .5f &&
+                std::abs(historyScroll->height() - (scrolledViewport + reclaimed)) < .1f &&
+                std::abs(historyScroll->contentViewportHeight() - (scrolledViewport + reclaimed)) <
+                    .1f);
         };
         const auto beforeKeyboardCancel = model.actions.size();
         const auto noOutgoing = [&] {
@@ -9310,7 +10092,9 @@ void runUiIntegrationCheck() {
     titlebarGeometryCheck();
     staleUploadHostMenuCheck();
     nativePanelResizeCheck();
+    shellMotionCheck();
     halfPageChatKeysCheck();
+    messageAutoscrollCheck();
     retainedBufferStateCheck(true, blast::SidebarMode::Expanded);
     retainedBufferStateCheck(false, blast::SidebarMode::Compact);
     retainedBufferStateCheck(true, blast::SidebarMode::Hidden);
@@ -9318,6 +10102,7 @@ void runUiIntegrationCheck() {
     tightSearchFocusCheck();
     ordinaryTypingFocusCheck();
     typingOverflowFocusCheck();
+    animatedHistoryFooterCheck();
     channelTopicCheck();
     queuedBufferMergeCheck(false);
     queuedBufferMergeCheck(true);

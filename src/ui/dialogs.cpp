@@ -14,6 +14,7 @@
 #include <core/input/key_modifiers.h>
 #include <core/input/keybind_matcher.h>
 #include <fontconfig/fontconfig.h>
+#include <render/animation/animation_manager.h>
 #include <render/scene/input_dispatcher.h>
 #include <ui/controls/box.h>
 #include <ui/controls/button.h>
@@ -156,7 +157,12 @@ class ProfileAvatar final : public Node {
             useSprite = sprite;
             markLayoutDirty();
         }
-        initials->setColor(nickColor(model, nick, server));
+        const auto color = nickColor(model, nick, server);
+        if (bodyColor != color) {
+            bodyColor = color;
+            markLayoutDirty();
+        }
+        initials->setColor(color);
         initials->setFontFamily(themeUiFont().family);
         initials->setFontFeatures(themeUiFont().features);
         initials->setFontSize(17 * scale);
@@ -168,12 +174,14 @@ class ProfileAvatar final : public Node {
     }
 
     void doLayout(Renderer &renderer) override {
-        if (useSprite && (!loaded || loadedNick != name || loadedMapping != caseMapping)) {
+        if (useSprite && (!loaded || loadedNick != name || loadedMapping != caseMapping ||
+                          loadedColor != bodyColor)) {
             image->clear(renderer);
-            setFoundryAvatar(*image, renderer, name, caseMapping);
+            setFoundryAvatar(*image, renderer, name, bodyColor, caseMapping);
             loaded = true;
             loadedNick = name;
             loadedMapping = caseMapping;
+            loadedColor = bodyColor;
         }
         const bool picture = useSprite && image->hasImage();
         image->setVisible(picture);
@@ -189,6 +197,7 @@ class ProfileAvatar final : public Node {
     Label *initials = nullptr;
     NativeAvatarLabelPlacement placement;
     std::string name, caseMapping, loadedNick, loadedMapping;
+    Color bodyColor{}, loadedColor{};
     float extent = 40;
     bool useSprite = false, loaded = false;
 };
@@ -243,6 +252,8 @@ struct Dialogs::Impl {
     InputArea *blocker = nullptr;
     Box *dim = nullptr;
     Box *panel = nullptr;
+    Box *openingPanel = nullptr;
+    AnimationManager::Id openingAnimation = 0;
     Flex *chrome = nullptr;
     ScrollView *scroll = nullptr;
     RovingListNavHost *categoryNavigation = nullptr;
@@ -822,10 +833,30 @@ struct Dialogs::Impl {
         retired.push_back(parent.removeChild(child));
     }
 
+    void stopOpening() {
+        if (openingAnimation && owner.animationManager())
+            owner.animationManager()->cancel(openingAnimation);
+        openingAnimation = 0;
+        if (openingPanel)
+            openingPanel->setOpacity(1.f);
+        openingPanel = nullptr;
+    }
+
     void showOverlay() {
         owner.setVisible(true);
         owner.setHitTestVisible(true);
         owner.setExcludeSubtreeFromTabOrder(false);
+        stopOpening();
+        auto *target = confirmation.empty() ? panel : confirmPanel;
+        auto *animations = owner.animationManager();
+        if (target && animations && !model.settings.reducedMotion &&
+            model.settings.fx != FxLevel::Off) {
+            openingPanel = target;
+            target->setOpacity(.6f);
+            openingAnimation = animations->animate(
+                .6f, 1.f, 150.f, Easing::EaseOutCubic,
+                [target](float opacity) { target->setOpacity(opacity); }, {}, target);
+        }
     }
 
     void focusFirst() {
@@ -1037,6 +1068,7 @@ struct Dialogs::Impl {
             returnFocus = dispatcher->captureTabFocus();
         hideConfirmation();
         stopRecording(false);
+        stopOpening();
         detach(panel, owner);
         panel = nullptr;
         page = nullptr;
@@ -3039,6 +3071,7 @@ struct Dialogs::Impl {
     void hideConfirmation() {
         if (confirmation.empty())
             return;
+        stopOpening();
         confirmation.clear();
         confirmAction = {};
         confirmPanel->setVisible(false);
@@ -3307,6 +3340,7 @@ struct Dialogs::Impl {
             hideConfirmation();
             return;
         }
+        stopOpening();
         stopRecording(false);
         if (mode == "whois") {
             model.whoisProfile.open = false;
@@ -3324,6 +3358,8 @@ struct Dialogs::Impl {
     }
 
     void sync(float width, float height, float scale) {
+        if (model.settings.reducedMotion || model.settings.fx == FxLevel::Off)
+            stopOpening();
         const auto &profile = model.whoisProfile;
         if (mode == "whois" && !profile.open)
             dismiss();
@@ -3593,6 +3629,7 @@ struct Dialogs::Impl {
 Dialogs::Dialogs(Model &model, std::function<void(std::string)> execute)
     : impl_(std::make_unique<Impl>(*this, model, std::move(execute))) {}
 Dialogs::~Dialogs() {
+    impl_->stopOpening();
     if (impl_->dispatcher)
         impl_->dispatcher->setFocus(nullptr);
     while (!children().empty())

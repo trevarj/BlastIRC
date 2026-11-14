@@ -3481,8 +3481,6 @@ void focusRevealIntents(TranscriptTestRenderer &renderer) {
     assert(pane.following && pane.unseen == 0 && model.actions.empty());
     assert(!bodyText(view, removedText));
     assert(bounds(body(view, "TallAfterFocusRemoval")).height > viewport.height);
-    // An explicit native-action reveal must bind the corrected viewport in this pass,
-    // even when reply occlusion moves it farther than the normal row overscan.
     dispatcher.setFocus(keyboard);
     buffer.messages.clear();
     for (int i = 0; i < 80; ++i) {
@@ -3495,51 +3493,42 @@ void focusRevealIntents(TranscriptTestRenderer &renderer) {
     }
     ++buffer.messagesRevision;
     const LayoutRect tallViewport{17, 23, 700, 700};
-    view.setContextInset(0, 0, 500);
+    view.setContextInset(500);
     view.sync();
     view.arrange(renderer, tallViewport);
     scroll->setScrollOffset(scroll->maxScrollOffset() * .25f);
     view.arrange(renderer, tallViewport);
-    std::vector<bool> beforeReveal;
     std::string overlayTarget;
+    const auto replyClip = nativeHistoryClip(view);
+    const float replyClipBottom = replyClip.y + replyClip.height;
     for (const auto &entry : buffer.messages) {
-        beforeReveal.push_back(bodyText(view, entry.text, true) != nullptr);
-        if (!beforeReveal.back())
+        if (!bodyText(view, entry.text, true))
             continue;
         const auto rect = bounds(body(view, entry.text, true));
-        if (rect.top >= tallViewport.y + tallViewport.height - 120 &&
-            rect.top + rect.height <= tallViewport.y + tallViewport.height)
+        if (rect.top >= replyClipBottom && rect.top + rect.height <= replyClipBottom + 120)
             overlayTarget = entry.text;
     }
     assert(!overlayTarget.empty());
     retainedLink = nullptr;
     findLink(findLink, body(view, overlayTarget, true).content);
     assert(retainedLink);
+    const auto linkBeforeReveal = sceneBounds(*retainedLink);
+    const float revealTravel = linkBeforeReveal.y + linkBeforeReveal.height - replyClipBottom;
+    assert(revealTravel > 0);
     dispatcher.setFocus(retainedLink);
     pane.focusComposer = false;
     scroll->requestScrollIntoView(retainedLink);
     view.noteFocusReveal();
     const float beforeOverlayReveal = scroll->scrollOffset();
     view.arrange(renderer, tallViewport);
-    assert(scroll->scrollOffset() > beforeOverlayReveal + 150 &&
+    assert(scroll->scrollOffset() >= beforeOverlayReveal + revealTravel - .1f &&
            dispatcher.focusedArea() == retainedLink);
     const auto revealedInk = nativeTextInk(renderer, body(view, overlayTarget, true).text);
-    containedBounds(revealedInk, {tallViewport.x, tallViewport.y, tallViewport.width,
-                                  tallViewport.height - 500});
-    std::vector<bool> materialized;
-    bool entered = false;
-    for (std::size_t i = 0; i < buffer.messages.size(); ++i) {
-        materialized.push_back(bodyText(view, buffer.messages[i].text, true) != nullptr);
-        entered |= materialized.back() && !beforeReveal[i];
-    }
-    assert(entered);
+    containedBounds(revealedInk, replyClip);
     const float settledOffset = scroll->scrollOffset();
     view.arrange(renderer, tallViewport);
     near(scroll->scrollOffset(), settledOffset);
-    for (std::size_t i = 0; i < buffer.messages.size(); ++i)
-        if (bodyText(view, buffer.messages[i].text, true))
-            assert(materialized[i]);
-    view.setContextInset(0, 0, 0);
+    view.setContextInset();
 
     // Neither an empty transcript nor one fitting on screen needs a history fetch
     // or a focus handoff to implement either boundary.
@@ -5598,13 +5587,12 @@ void keyboardMenus(TranscriptTestRenderer &renderer, bool traditional = false,
         auto *material = find<blast::MaterialNode>(row);
         assert(material);
         const auto surface = sceneBounds(*material);
-        near(bounds.x, surface.x);
-        near(bounds.y, surface.y);
-        near(bounds.height, surface.height);
+        assert(bounds.x < surface.x);
+        assert(bounds.y <= surface.y);
+        assert(bounds.y + bounds.height >= surface.y + surface.height);
+        assert(bounds.height > surface.height);
         if (blast::messageBubbles(model.settings, buffer))
-            near(bounds.width, surface.width);
-        else
-            assert(bounds.width > 0 && bounds.width <= surface.width + .02f);
+            containedBounds(surface, bounds);
         containedBounds(bounds, sceneBounds(row));
         const auto clip = nativeHistoryClip(view);
         containedBounds(intersectBounds(bounds, clip), clip);
@@ -5998,7 +5986,6 @@ void smoothWheel(TranscriptTestRenderer &renderer, std::string_view renameTarget
             assert(!pane.following);
         }
     }
-    assert(!animations.hasActive());
     view.sync();
     view.arrange(renderer, rect);
     near(scroll->scrollOffset(), target);
@@ -6020,6 +6007,128 @@ void smoothWheel(TranscriptTestRenderer &renderer, std::string_view renameTarget
     near(scroll->scrollOffset(), target);
     near(bounds(body(view, "WheelTail35")).top, anchorAfter.top);
     unchanged(buffer, before);
+    dispatcher.setSceneRoot(nullptr);
+}
+
+void transcriptAffordanceMotion(TranscriptTestRenderer &renderer) {
+    struct MotionState {
+        bool enabled = MotionService::instance().enabled();
+        float speed = MotionService::instance().speed();
+        ~MotionState() {
+            MotionService::instance().setSpeed(speed);
+            MotionService::instance().setEnabled(enabled);
+        }
+    } motion;
+    blast::Model model;
+    model.settings.timestamps = model.settings.avatars = false;
+    model.settings.reducedMotion = false;
+    model.settings.fx = blast::FxLevel::Full;
+    blast::Theme theme;
+    theme.update(model);
+    MotionService::instance().setEnabled(true);
+    MotionService::instance().setSpeed(1);
+    auto &buffer = model.buffers["affordance-network/#room"];
+    buffer.id = "affordance-network/#room";
+    buffer.server = "affordance-network";
+    buffer.target = "#room";
+    buffer.kind = "channel";
+    for (int i = 0; i < 40; ++i) {
+        blast::Message entry;
+        entry.id = entry.text = "AffordanceRow-" + std::to_string(i);
+        entry.nick = "Peer";
+        entry.mention = i == 0;
+        buffer.messages.push_back(std::move(entry));
+    }
+    buffer.unread = 1;
+    model.mentionSources[buffer.id] = buffer;
+    AnimationManager animations;
+    blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
+    pane.following = true;
+    Clipboard clipboard;
+    blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+    view.setReadEligible(false);
+    view.setAnimationManager(&animations);
+    InputDispatcher dispatcher;
+    dispatcher.setSceneRoot(&view);
+    view.setInputDispatcher(dispatcher);
+    const LayoutRect viewport{17, 23, 800, 400};
+    const auto arrange = [&] {
+        view.sync();
+        view.arrange(renderer, viewport);
+    };
+    const auto control = [&](std::string_view suffix) {
+        Button *found = nullptr;
+        const auto visit = [&](auto &&self, Node &node) -> void {
+            if (auto *button = dynamic_cast<Button *>(&node);
+                button && button->inputArea()->tabFocusKey().ends_with(suffix))
+                found = button;
+            for (const auto &child : node.children())
+                self(self, *child);
+        };
+        visit(visit, view);
+        assert(found);
+        return found;
+    };
+    arrange();
+    auto *scroll = find<ScrollView>(view);
+    auto *jump = control(":follow-newest");
+    auto *mention = control(":mention-read");
+    auto *rail = mention->parent();
+    assert(scroll && scroll->maxScrollOffset() > 0);
+    assert(rail->visible());
+    assert(!jump->visible());
+    assert(rail->opacity() > 0 && rail->opacity() < 1);
+    scroll->setScrollOffset(scroll->maxScrollOffset() - 80);
+    arrange();
+    assert(jump->visible() && jump->opacity() > 0 && jump->opacity() < 1);
+    const auto jumpBounds = sceneBounds(*jump), railBounds = sceneBounds(*rail);
+    const auto offset = scroll->scrollOffset();
+    float x, y;
+    Node::mapToScene(jump->inputArea(), jump->inputArea()->width() / 2,
+                     jump->inputArea()->height() / 2, x, y);
+    assert(dispatcher.inputAreaAt(x, y) == jump->inputArea());
+    dispatcher.setFocus(jump->inputArea());
+    const float opening = jump->opacity();
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    animations.tick(40);
+    assert(jump->opacity() > opening && jump->opacity() < 1);
+    assert(rail->opacity() > opening && rail->opacity() < 1);
+    const auto partial = jump->opacity();
+    arrange();
+    near(jump->opacity(), partial);
+    near(sceneBounds(*jump).x, jumpBounds.x);
+    near(sceneBounds(*jump).y, jumpBounds.y);
+    near(sceneBounds(*rail).x, railBounds.x);
+    near(sceneBounds(*rail).y, railBounds.y);
+    near(scroll->scrollOffset(), offset);
+    assert(dispatcher.focusedArea() == jump->inputArea());
+    model.settings.reducedMotion = true;
+    arrange();
+    near(jump->opacity(), 1);
+    near(rail->opacity(), 1);
+    model.settings.reducedMotion = false;
+    view.arrange(renderer, {17, 23, 40, 80});
+    assert(!jump->visible() && !rail->visible());
+    near(jump->opacity(), 1);
+    near(rail->opacity(), 1);
+    arrange();
+    scroll->setScrollOffset(0);
+    arrange();
+    assert(jump->visible() && rail->visible() && jump->opacity() < 1 && rail->opacity() < 1);
+    view.arrange(renderer, {17, 23, 40, 80});
+    std::this_thread::sleep_for(std::chrono::milliseconds(170));
+    animations.tick(170);
+    assert(!jump->visible() && !rail->visible());
+    near(jump->opacity(), 1);
+    near(rail->opacity(), 1);
+    arrange();
+    scroll->setScrollOffset(0);
+    arrange();
+    model.settings.fx = blast::FxLevel::Off;
+    arrange();
+    near(jump->opacity(), 1);
+    near(rail->opacity(), 1);
+    dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
 
@@ -6100,10 +6209,12 @@ void check(TranscriptTestRenderer &renderer, float zoom, bool traditional) {
 } // namespace
 
 void bubbleNickBoundaries(TranscriptTestRenderer &renderer) {
-    for (const float zoom : {1.f, 1.25f, 2.f}) {
+    for (const auto &[zoom, messageZoom] :
+         {std::pair{1.f, 1.f}, std::pair{1.25f, 1.25f}, std::pair{2.f, 2.f}, std::pair{1.f, 2.f},
+          std::pair{2.f, 1.f}}) {
         blast::Model model;
         model.settings.scale = zoom;
-        model.settings.messageScale = zoom;
+        model.settings.messageScale = messageZoom;
         model.settings.timestamps = true;
         model.settings.avatars = false;
         model.settings.reducedMotion = true;
@@ -6125,8 +6236,8 @@ void bubbleNickBoundaries(TranscriptTestRenderer &renderer) {
         for (const char *family : {"sans-serif", "serif", "monospace"}) {
             model.settings.uiFont = family;
             theme.update(model);
-            for (const std::string nick :
-                 {"Wi", "Alice", "i_l", "WWWWW", "長い名前оченьдлинноеимяLongNativeNickname"}) {
+            for (const std::string nick : {"Wi", "trev", "WWWW", "Alice", "i_l", "WWWWW",
+                                           "長い名前оченьдлинноеимяLongNativeNickname"}) {
                 buffer.messages.front().nick = nick;
                 for (const float width : {800.f * zoom, 240.f}) {
                     for (const bool avatars : {false, true}) {
@@ -6151,7 +6262,7 @@ void bubbleNickBoundaries(TranscriptTestRenderer &renderer) {
                                 const auto bounded = renderer.measureText(
                                     nick, text->fontSize(), text->font(), text->maxWidth(), 1);
                                 assert(bounded.lineCount == 1);
-                                assert(bounded.width <= text->maxWidth() + .02f);
+                                assert(bounded.width <= label->width() + .02f);
                                 const auto *surface = bubbleSurface(rendered);
                                 float x, y, sx, sy;
                                 Node::absolutePosition(text, x, y);
@@ -6217,11 +6328,20 @@ void bubbleNickBoundaries(TranscriptTestRenderer &renderer) {
                                 const float availableWidth =
                                     compactAvatar ? chipBounds.width - 2 * horizontalPadding
                                                   : contentBounds.width - 2 * horizontalPadding;
-                                near(text->maxWidth(), chipBounds.width - 2 * horizontalPadding);
-                                // Ellipsis is legitimate when the actual compact header cannot
-                                // fit the native nickname, regardless of its byte length.
-                                if (natural.width <= availableWidth + .02f)
+                                if (text->maxWidth() > 0)
+                                    assert(text->maxWidth() <= availableWidth + .02f);
+                                if (nick.size() == 4)
+                                    assert(natural.width <= availableWidth + .02f);
+                                if (natural.width <= availableWidth + .02f) {
                                     near(bounded.width, natural.width);
+                                    near(bounded.inkLeft, natural.inkLeft);
+                                    near(bounded.inkRight, natural.inkRight);
+                                    near(bounded.inkTop, natural.inkTop);
+                                    near(bounded.inkBottom, natural.inkBottom);
+                                } else {
+                                    assert(text->maxWidth() > 0);
+                                    assert(bounded.width < natural.width);
+                                }
                                 containedBounds(nativeTextInk(renderer, *text), chipBounds);
                                 command.clear();
                                 InputDispatcher dispatcher;
@@ -6865,12 +6985,15 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                 return nullptr;
         return visit(visit, root);
     };
-    for (const bool traditional : {false, true})
-        for (const float zoom : {1.f, 2.f}) {
+    for (const auto layout :
+         {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc, blast::MessageLayout::Stacked})
+        for (const auto &[zoom, messageZoom] :
+             {std::pair{1.f, 1.f}, std::pair{2.f, 2.f}, std::pair{1.f, 2.f}, std::pair{2.f, 1.f}}) {
+            const bool traditional = layout != blast::MessageLayout::Bubbles;
             blast::Model model;
             model.now = 100;
             model.settings.scale = zoom;
-            model.settings.messageScale = zoom;
+            model.settings.messageScale = messageZoom;
             model.settings.uiFont = "sans-serif";
             model.settings.messageFont = "serif";
             model.settings.uiFontWeight = 700;
@@ -6885,27 +7008,24 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             auto &buffer = model.buffers["typing-footer"];
             buffer.id = buffer.target = "typing-footer";
             buffer.kind = "query";
-            if (traditional)
-                model.settings.messageLayouts[buffer.id] = blast::MessageLayout::Irc;
+            model.settings.messageLayouts[buffer.id] = layout;
             for (int i = 0; i < 32; ++i) {
                 blast::Message message;
                 message.id = message.text = "FooterRow-" + std::to_string(i);
                 message.nick = "Peer";
                 buffer.messages.push_back(std::move(message));
             }
+            buffer.messages.back().nick = "AvatarPeer";
             blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
             Clipboard clipboard;
             blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
             view.setReadEligible(false);
             const float messageSize = blast::messageTextSize(model.settings, buffer);
-            const float typingHeight = blast::typingIndicatorHeight(renderer, zoom, messageSize),
-                        replyHeight = 64 * zoom;
-            near(typingHeight, std::max(32 * zoom, renderer.fontRowExtent(
-                                                       messageSize, blast::themeMessageFont()) +
-                                                       7 * zoom) +
-                                   8 * zoom);
-            const float obstruction = typingHeight + 4 * zoom + replyHeight;
-            view.setContextInset(typingHeight, typingHeight, 0);
+            const float typingSize = traditional ? messageSize * 14.f / 15.f : messageSize * .82f;
+            const float dotScale = typingSize / 14.f;
+            const float typingHeight = blast::typingIndicatorHeight(renderer, zoom, messageSize);
+            assert(typingHeight >= renderer.fontRowExtent(typingSize, blast::themeMessageFont()));
+            view.setContextInset();
             const LayoutRect viewport{17, 23, 800 * zoom, 400 * zoom};
             const auto arrange = [&] {
                 view.sync();
@@ -6917,21 +7037,45 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                 assert(phrase && dynamic_cast<Label *>(phrase->parent()));
                 assert(!plainText(view, participants.size() == 1 ? "are typing" : "is typing"));
                 assert(phrase->font() == blast::themeMessageFont());
-                near(phrase->fontSize(), messageSize);
+                near(phrase->fontSize(), typingSize);
+                if (auto *author = plainText(view, "AvatarPeer"))
+                    near(phrase->fontSize(), author->fontSize());
                 assert(phrase->color() == blast::themeForegroundColor("on_surface_variant"));
                 auto *footer = phrase->parent()->parent();
                 const auto phraseBounds = sceneBounds(*phrase->parent());
                 const auto footerBounds = sceneBounds(*footer);
                 containedBounds(phraseBounds, footerBounds);
                 containedBounds(phraseBounds, ancestorPaintClip(*phrase));
+                const auto phraseInk = nativeTextInk(renderer, *phrase);
+                containedBounds(phraseInk, footerBounds);
+                containedBounds(phraseInk, ancestorPaintClip(*phrase));
+                float previousNameRight = footerBounds.x;
+                float previousNameInkRight = footerBounds.x;
                 size_t shown = 0;
                 for (const auto &nick : participants)
                     if (auto *name = plainText(*footer, nick)) {
                         ++shown;
                         near(baseline(*name), baseline(*phrase));
                         const auto nameBounds = sceneBounds(*name->parent());
-                        assert(nameBounds.x + nameBounds.width + 4.9f * zoom <= phraseBounds.x);
+                        const auto nameInk = nativeTextInk(renderer, *name);
+                        if (nameBounds.x + nameBounds.width > phraseBounds.x + .02f ||
+                            nameInk.x + nameInk.width > phraseInk.x + .02f)
+                            std::fprintf(stderr,
+                                         "typing overlap layout=%d ui=%.2f message=%.2f width=%.2f "
+                                         "nick=%s name-right=%.3f ink-right=%.3f phrase=%.3f "
+                                         "phrase-ink=%.3f\n",
+                                         int(layout), zoom, messageZoom, view.width(), nick.c_str(),
+                                         nameBounds.x + nameBounds.width, nameInk.x + nameInk.width,
+                                         phraseBounds.x, phraseInk.x);
+                        assert(nameBounds.x >= previousNameRight - .02f);
+                        assert(nameInk.x >= previousNameInkRight - .02f);
+                        assert(nameBounds.x + nameBounds.width <= phraseBounds.x + .02f);
+                        assert(nameInk.x + nameInk.width <= phraseInk.x + .02f);
+                        previousNameRight = nameBounds.x + nameBounds.width;
+                        previousNameInkRight = nameInk.x + nameInk.width;
                         containedBounds(nameBounds, footerBounds);
+                        containedBounds(nameInk, footerBounds);
+                        containedBounds(nameInk, ancestorPaintClip(*name));
                     }
                 if (shown < participants.size()) {
                     auto *more = plainText(*footer->parent(),
@@ -6942,19 +7086,24 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                     assert(moreLabel && moreLabel->visible());
                     assert(moreButton && moreButton->visible() && moreButton->enabled());
                     const auto moreBounds = sceneBounds(*moreLabel);
+                    const auto moreInk = nativeTextInk(renderer, *more);
+                    assert(moreBounds.x >= previousNameRight - .02f);
+                    assert(moreInk.x >= previousNameInkRight - .02f);
+                    assert(moreInk.x + moreInk.width <= phraseInk.x + .02f);
                     assert(moreBounds.x + moreBounds.width <= phraseBounds.x + .02f);
                     containedBounds(moreBounds, footerBounds);
                     containedBounds(nativeTextInk(renderer, *more), footerBounds);
                     containedBounds(sceneBounds(*moreButton), footerBounds);
                 }
-                float previousRight = phraseBounds.x + phraseBounds.width;
+                float previousRight =
+                    std::max(phraseBounds.x + phraseBounds.width, phraseInk.x + phraseInk.width);
                 size_t dots = 0;
                 for (const auto &child : footer->children())
                     if (auto *dot = dynamic_cast<RectNode *>(child.get());
-                        dot && dot->visible() && dot->width() <= 3 * zoom &&
-                        dot->height() <= 3 * zoom) {
+                        dot && dot->visible() && dot->width() <= 3 * dotScale + .02f &&
+                        dot->height() <= 3 * dotScale + .02f) {
                         const auto dotBounds = sceneBounds(*dot);
-                        assert(dotBounds.x >= previousRight + 3.9f * zoom);
+                        assert(dotBounds.x >= previousRight - .02f);
                         assert(dotBounds.y >= phraseBounds.y - .02f &&
                                dotBounds.y + dotBounds.height <=
                                    phraseBounds.y + phraseBounds.height + .02f);
@@ -6977,10 +7126,22 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             auto *scroll = find<ScrollView>(view);
             assert(scroll && scroll->maxScrollOffset() > 0);
             near(scroll->height(), viewport.height);
+            const auto visibleAnchor = [&]() -> std::string {
+                const auto clip = nativeHistoryClip(view);
+                for (const auto &message : buffer.messages)
+                    if (auto *text = bodyText(view, message.text, true)) {
+                        const auto ink = nativeTextInk(renderer, *text);
+                        if (ink.y >= clip.y && ink.y + ink.height <= clip.y + clip.height)
+                            return message.text;
+                    }
+                assert(false && "typing invariant needs a painted history anchor");
+                return {};
+            };
             near(scroll->contentViewportHeight(), viewport.height);
             near(nativeHistoryClip(view).height, viewport.height);
             const auto tail = bounds(body(view, "FooterRow-31"));
-            assert(tail.top + tail.height <= viewport.y + viewport.height - typingHeight + .5f);
+            assert(tail.top + tail.height <= viewport.y + viewport.height + .5f);
+            assert(viewport.y + viewport.height - tail.top - tail.height < typingHeight);
             for (const bool following : {true, false}) {
                 scroll->setScrollOffset(following ? scroll->maxScrollOffset()
                                                   : scroll->maxScrollOffset() - 80 * zoom);
@@ -6988,25 +7149,6 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                 const float offset = scroll->scrollOffset(), maximum = scroll->maxScrollOffset();
                 const auto baseline = bounds(body(view, "FooterRow-30"));
                 const float rowHeight = body(view, "FooterRow-30").row.height();
-                const auto latest = bounds(body(view, "FooterRow-31"));
-                for (const bool replying : {true, false, true, false}) {
-                    view.setContextInset(typingHeight, typingHeight, replying ? obstruction : 0);
-                    arrange();
-                    near(scroll->scrollOffset(), offset);
-                    near(scroll->maxScrollOffset(), maximum);
-                    near(scroll->height(), viewport.height);
-                    near(scroll->contentViewportHeight(), viewport.height);
-                    near(nativeHistoryClip(view).height, viewport.height);
-                    const auto current = bounds(body(view, "FooterRow-31"));
-                    near(current.top, latest.top);
-                    near(current.height, latest.height);
-                    assert(pane.following == following);
-                    if (replying && following) {
-                        const float cardTop = viewport.y + viewport.height - obstruction;
-                        const float cardBottom = cardTop + replyHeight;
-                        assert(current.top < cardBottom && current.top + current.height > cardTop);
-                    }
-                }
                 int typingCycle = 0;
                 for (const int phase : {0, 1, 2, 1, 2, 1, 2, 0}) {
                     if (phase == 0)
@@ -7029,14 +7171,16 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                     near(view.y(), viewport.y);
                     near(view.width(), viewport.width);
                     near(view.height(), viewport.height);
-                    near(scroll->scrollOffset(), offset);
-                    near(scroll->maxScrollOffset(), maximum);
+                    const float extent = phase == 1 ? typingHeight : 0;
+                    assert(std::abs(scroll->scrollOffset() - (offset + (following ? extent : 0))) <
+                           .1f);
+                    assert(std::abs(scroll->maxScrollOffset() - (maximum + extent)) < .1f);
                     const auto current = bounds(body(view, "FooterRow-30"));
-                    near(current.top, baseline.top);
+                    assert(std::abs(current.top - (baseline.top - (following ? extent : 0))) < .1f);
                     near(current.height, baseline.height);
                     near(body(view, "FooterRow-30").row.height(), rowHeight);
                     assert(pane.following == following);
-                    if (phase == 1) {
+                    if (phase == 1 && following) {
                         for (const auto &[nick, at] : buffer.typing) {
                             auto *name = plainText(view, nick);
                             auto *label = name ? dynamic_cast<Label *>(name->parent()) : nullptr;
@@ -7060,9 +7204,9 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                             auto *footer = label->parent();
                             assert(footer && footer->visible());
                             assert(name->color() == nickColor);
-                            near(name->fontSize(), messageSize);
+                            near(name->fontSize(), typingSize);
                             assert(name->font() == blast::themeMessageFont());
-                            // Names, neutral phrase and dots share the fixed reserved tray.
+                            // Names, neutral phrase and dots share one history footer row.
                             containedBounds(ink, sceneBounds(*footer));
                             containedBounds(ink, ancestorPaintClip(*name));
                             containedBounds(ink, {viewport.x,
@@ -7074,6 +7218,13 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                             participants.push_back(nick);
                         typingRow(participants);
                     }
+                    if (phase == 1 && !following) {
+                        auto *phrase =
+                            plainText(view, buffer.typing.size() == 1 ? "is typing" : "are typing");
+                        assert(phrase);
+                        assert(sceneBounds(*phrase->parent()).y >= viewport.y + viewport.height);
+                        assert(!pane.following);
+                    }
                     if (phase != 1)
                         assert(!plainText(view, "TypingPeer") &&
                                !plainText(view, "OtherTypingPeer") &&
@@ -7083,21 +7234,20 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             InputDispatcher dispatcher;
             dispatcher.setSceneRoot(&view);
             view.setInputDispatcher(dispatcher);
-            view.setContextInset(typingHeight, typingHeight, obstruction);
+            view.setContextInset();
             assert(view.jumpToSourceMessage("FooterRow-26"));
             arrange();
             const auto jumped = bounds(body(view, "FooterRow-26"));
             assert(jumped.top >= viewport.y - .5f &&
-                   jumped.top + jumped.height <= viewport.y + viewport.height - obstruction + .5f);
+                   jumped.top + jumped.height <= viewport.y + viewport.height + .5f);
             dispatcher.setFocus(&body(view, "FooterRow-26").row);
             assert(view.navigateMessage(1));
             arrange();
             const auto navigated = bounds(body(view, "FooterRow-27"));
             assert(navigated.top >= viewport.y - .5f &&
-                   navigated.top + navigated.height <=
-                       viewport.y + viewport.height - obstruction + .5f);
+                   navigated.top + navigated.height <= viewport.y + viewport.height + .5f);
             dispatcher.setFocus(nullptr);
-            view.setContextInset(typingHeight, typingHeight, 0);
+            view.setContextInset();
             arrange();
             MenuHost host;
             view.setPopupContext(&host);
@@ -7121,6 +7271,8 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                 arrange();
                 assert(!host.open && host.request.menu.empty() && host.request.options.empty());
             };
+            assert(view.scrollToBoundary(true));
+            arrange();
             const std::vector<std::string> eligible{"Alice", "Bob", "Carol", "Dave", "Eve"};
             buffer.typing.clear();
             for (const auto &nick : eligible)
@@ -7131,37 +7283,49 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             model.settings.avatars = true;
             model.settings.avatarStyle = "monogram";
             arrange();
-            const auto manyOffset = scroll->scrollOffset(), manyMaximum = scroll->maxScrollOffset();
+            assert(pane.following);
             assert(plainText(view, "Alice") && plainText(view, "Bob") && plainText(view, "+3"));
             assert(!plainText(view, "Carol") && !plainText(view, "Expired") &&
                    !plainText(view, "Muted"));
             auto *inlineName = plainText(view, "Alice");
             assert(inlineName && inlineName->parent() && inlineName->parent()->parent());
             auto *tray = inlineName->parent()->parent();
+            const auto avatarSize = [&] {
+                return (traditional ? 20.f : view.width() < 400 * zoom ? 24.f : 32.f) * zoom;
+            };
             const auto avatarCount = [&] {
                 size_t count = 0;
                 for (const auto &child : tray->children())
                     if (auto *rect = dynamic_cast<RectNode *>(child.get());
-                        rect && rect->visible() && std::abs(rect->width() - 32 * zoom) < .5f &&
-                        std::abs(rect->height() - 32 * zoom) < .5f)
+                        rect && rect->visible() && std::abs(rect->width() - avatarSize()) < .5f &&
+                        std::abs(rect->height() - avatarSize()) < .5f) {
+                        containedBounds(sceneBounds(*rect), sceneBounds(*tray));
+                        containedBounds(sceneBounds(*rect), ancestorPaintClip(*rect));
                         ++count;
+                    }
                 return count;
             };
             assert(avatarCount() == 3);
             typingRow(eligible);
-            size_t surfaces = 0;
-            for (const auto &child : tray->children())
-                if (auto *rect = dynamic_cast<RectNode *>(child.get());
-                    rect && rect->visible() && rect->style().fill.a > 0 &&
-                    rect->width() > 32 * zoom + 1 && rect->height() > 7 * zoom)
-                    ++surfaces;
-            assert(surfaces == (traditional ? 0u : 1u));
+            for (const bool avatars : {false, true}) {
+                model.settings.avatars = avatars;
+                arrange();
+                const float offset = scroll->scrollOffset(), maximum = scroll->maxScrollOffset();
+                buffer.typing.erase("Eve");
+                arrange();
+                typingRow({"Alice", "Bob", "Carol", "Dave"});
+                near(scroll->scrollOffset(), offset);
+                near(scroll->maxScrollOffset(), maximum);
+                buffer.typing["Eve"] = model.now;
+                arrange();
+                typingRow(eligible);
+                near(scroll->scrollOffset(), offset);
+                near(scroll->maxScrollOffset(), maximum);
+            }
             model.settings.avatars = false;
             arrange();
             assert(avatarCount() == 0 && plainText(view, "Alice") && plainText(view, "Bob"));
             typingRow(eligible);
-            near(scroll->scrollOffset(), manyOffset);
-            near(scroll->maxScrollOffset(), manyMaximum);
             for (const bool avatars : {false, true})
                 for (const float width : {160.f, 200.f, 240.f}) {
                     model.settings.avatars = avatars;
@@ -7185,20 +7349,71 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                 for (const auto &nick : participants)
                     buffer.typing[nick] = model.now;
                 for (const bool avatars : {false, true})
-                    for (const float width : {160.f, 240.f, 800.f}) {
+                    for (const float width : {160.f, 240.f, 360.f, 800.f}) {
                         model.settings.avatars = avatars;
                         arrange();
                         view.arrange(renderer,
                                      {viewport.x, viewport.y, width * zoom, viewport.height});
                         typingRow(participants);
+                        if (avatars && width >= 360) {
+                            assert(avatarCount() == participants.size());
+                            scroll->setScrollOffset(scroll->maxScrollOffset());
+                            view.arrange(renderer,
+                                         {viewport.x, viewport.y, width * zoom, viewport.height});
+                            const auto &message = body(view, "FooterRow-31");
+                            const auto matchingAvatar = [&](auto &&self, Node &node) -> bool {
+                                if (auto *rect = dynamic_cast<RectNode *>(&node);
+                                    rect && rect->visible() &&
+                                    std::abs(rect->width() - avatarSize()) < .02f &&
+                                    std::abs(rect->height() - avatarSize()) < .02f)
+                                    return true;
+                                for (const auto &child : node.children())
+                                    if (self(self, *child))
+                                        return true;
+                                return false;
+                            };
+                            assert(matchingAvatar(matchingAvatar, message.row));
+                        }
                     }
+            }
+            if (zoom == 1 && messageZoom == 1) {
+                buffer.typing.clear();
+                buffer.typing["i"] = model.now;
+                model.settings.avatars = false;
+                arrange();
+                auto *shortPhrase = plainText(view, "is typing");
+                assert(shortPhrase && plainText(view, "i"));
+                const auto fullPhrase = renderer.measureText(
+                    shortPhrase->text(), shortPhrase->fontSize(), shortPhrase->font());
+                containedBounds(nativeTextInk(renderer, *shortPhrase),
+                                sceneBounds(*shortPhrase->parent()));
+                float paintedRight = sceneBounds(*shortPhrase->parent()).x +
+                                     sceneBounds(*shortPhrase->parent()).width;
+                for (const auto &child : tray->children())
+                    if (auto *dot = dynamic_cast<RectNode *>(child.get());
+                        dot && dot->visible() && dot->width() < shortPhrase->parent()->height() &&
+                        dot->height() < shortPhrase->parent()->height()) {
+                        const auto dotBounds = sceneBounds(*dot);
+                        paintedRight = std::max(paintedRight, dotBounds.x + dotBounds.width);
+                    }
+                const float narrowWidth = std::ceil(
+                    paintedRight - sceneBounds(*tray).x + view.width() - tray->width() +
+                    renderer.measureText("i…", shortPhrase->fontSize(), shortPhrase->font()).width);
+                view.arrange(renderer, {viewport.x, viewport.y, narrowWidth, viewport.height});
+                shortPhrase = plainText(view, "is typing");
+                assert(shortPhrase && plainText(view, "i") && !plainText(view, "+1"));
+                assert(shortPhrase->parent()->width() + .02f >= fullPhrase.width);
+                containedBounds(nativeTextInk(renderer, *shortPhrase),
+                                sceneBounds(*shortPhrase->parent()));
+                typingRow({"i"});
             }
             buffer.typing = savedTyping;
             model.settings.avatars = true;
             arrange();
             const float motionOffset = scroll->scrollOffset(),
                         motionMaximum = scroll->maxScrollOffset();
-            const auto motionBody = bounds(body(view, "FooterRow-30"));
+            const auto motionAnchor = visibleAnchor();
+            const auto motionBody = bounds(body(view, motionAnchor));
             for (const bool reduced : {false, true})
                 for (const auto fx : {blast::FxLevel::Full, blast::FxLevel::Off}) {
                     model.settings.reducedMotion = reduced;
@@ -7209,7 +7424,7 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                         typingRow(eligible);
                         near(scroll->scrollOffset(), motionOffset);
                         near(scroll->maxScrollOffset(), motionMaximum);
-                        near(bounds(body(view, "FooterRow-30")).top, motionBody.top);
+                        near(bounds(body(view, motionAnchor)).top, motionBody.top);
                         near(scroll->height(), viewport.height);
                     }
                 }
@@ -7219,7 +7434,8 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             // Opening the list must preserve the restored viewport, not undo reflow.
             const float popupOffset = scroll->scrollOffset(),
                         popupMaximum = scroll->maxScrollOffset();
-            const auto popupBody = bounds(body(view, "FooterRow-30"));
+            const auto popupAnchor = visibleAnchor();
+            const auto popupBody = bounds(body(view, popupAnchor));
             const auto countNodes = [&](auto &&self, const Node &node) -> size_t {
                 size_t count = 1;
                 for (const auto &child : node.children())
@@ -7245,7 +7461,7 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             assert(!plainText(view, "Expired") && !plainText(view, "Muted"));
             near(scroll->scrollOffset(), popupOffset);
             near(scroll->maxScrollOffset(), popupMaximum);
-            const auto openedBody = bounds(body(view, "FooterRow-30"));
+            const auto openedBody = bounds(body(view, popupAnchor));
             near(openedBody.top, popupBody.top);
             near(openedBody.height, popupBody.height);
             dispatcher.setFocus(overflow(overflow, view));
@@ -7325,18 +7541,39 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
             arrange();
             assert(visibleImage() &&
                    renderer.textures.rgbaHash(visibleImage()->textureId()) == rfcHash);
-            const float spriteOffset = scroll->scrollOffset(),
-                        spriteMaximum = scroll->maxScrollOffset();
+            model.settings.nickColors["{ALICE}"] = "#e07030";
+            arrange();
+            const auto overrideHash = renderer.textures.rgbaHash(visibleImage()->textureId());
+            assert(overrideHash != rfcHash);
+            const auto overrideTexture = visibleImage()->textureId();
+            const auto overrideUploads = renderer.textures.uploads;
+            arrange();
+            assert(visibleImage()->textureId() == overrideTexture &&
+                   renderer.textures.uploads == overrideUploads);
+            model.settings.nickColors["{ALICE}"] = "#3080e0";
+            arrange();
+            assert(renderer.textures.rgbaHash(visibleImage()->textureId()) != overrideHash);
+            model.settings.nickColors.erase("{ALICE}");
+            model.settings.nickPalette = "CLASSIC";
+            arrange();
+            const auto classicHash = renderer.textures.rgbaHash(visibleImage()->textureId());
+            model.settings.nickPalette = "VIVID";
+            arrange();
+            assert(renderer.textures.rgbaHash(visibleImage()->textureId()) != classicHash);
+            const auto vividTexture = visibleImage()->textureId();
+            const auto vividUploads = renderer.textures.uploads;
+            arrange();
+            assert(visibleImage()->textureId() == vividTexture &&
+                   renderer.textures.uploads == vividUploads);
             model.settings.avatarStyle = "none";
             arrange();
             assert(!visibleImage() && avatarCount() == 0 && plainText(view, "{alice}"));
             near(tray->height(), typingHeight);
-            near(scroll->scrollOffset(), spriteOffset);
-            near(scroll->maxScrollOffset(), spriteMaximum);
             buffer.typing.clear();
             buffer.server.clear();
-            // Empty typing space is not a second viewport: history ink and selection pass through.
-            scroll->setScrollOffset(scroll->maxScrollOffset() - typingHeight * .75f);
+            // Without typing, history ink and selection reach the end of the viewport.
+            arrange();
+            scroll->setScrollOffset(scroll->maxScrollOffset());
             arrange();
             const auto behind = body(view, "FooterRow-31");
             const auto glyphs = renderer.measureText(
@@ -7834,13 +8071,12 @@ void retainedMentionFooter(TranscriptTestRenderer &renderer) {
     assert(followLeft > view.x() + view.width() * .5f);
     assert(navBottom < followTop);
     assert(followRight <= view.x() + view.width() && followBottom <= view.y() + view.height());
-    // Reply occlusion moves controls, never the viewport; cramped controls disappear.
     for (const LayoutRect viewport : {LayoutRect{17, 23, 900, 260}, LayoutRect{17, 23, 900, 180},
                                       LayoutRect{17, 23, 160, 180}, LayoutRect{17, 23, 80, 100}}) {
-        view.setContextInset(0, 0, 64);
+        view.setContextInset(64);
         view.arrange(renderer, viewport);
-        near(scroll->height(), viewport.height);
-        near(scroll->contentViewportHeight(), viewport.height);
+        assert(std::abs(scroll->height() - (viewport.height - 64)) < .1f);
+        assert(std::abs(scroll->contentViewportHeight() - (viewport.height - 64)) < .1f);
         const float cardTop = viewport.y + viewport.height - 64;
         for (const Node *control : {static_cast<Node *>(follow), markRead->parent()})
             if (control->visible()) {
@@ -7850,7 +8086,7 @@ void retainedMentionFooter(TranscriptTestRenderer &renderer) {
                        rect.x + rect.width <= viewport.x + viewport.width + .5f);
             }
     }
-    view.setContextInset(0, 0, 0);
+    view.setContextInset();
     view.arrange(renderer, {17, 23, 900, 180});
     view.arrange(renderer, {17, 23, 900, 100});
     Node::transformedBounds(follow, followLeft, followTop, followRight, followBottom);
@@ -8722,9 +8958,12 @@ class TranscriptPaintRecorder final : public RenderBackend {
 };
 
 void selectedContentGeometry(TranscriptTestRenderer &renderer) {
-    for (const int variant : {0, 1, 2}) {
-        const bool dense = variant != 0;
+    for (int variant = 0; variant < 32; ++variant) {
+        const float width = variant < 16 ? 900.f : 360.f;
+        const bool dense = variant % 4 != 0;
         blast::Model model;
+        model.settings.scale = variant % 8 < 4 ? 1.f : 1.5f;
+        model.settings.messageScale = variant % 16 < 8 ? .85f : 1.2f;
         model.settings.timestamps = true;
         model.settings.avatars = false;
         model.settings.reducedMotion = true;
@@ -8732,9 +8971,10 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
         theme.update(model);
         auto &buffer = model.buffers["selection-material"];
         buffer.id = buffer.target = "selection-material";
-        buffer.kind = variant == 2 ? "query" : "channel";
+        buffer.kind = variant % 4 == 2 ? "query" : "channel";
         if (dense)
-            model.settings.messageLayouts[buffer.id] = blast::MessageLayout::Irc;
+            model.settings.messageLayouts[buffer.id] =
+                variant % 4 == 3 ? blast::MessageLayout::Stacked : blast::MessageLayout::Irc;
         for (int i = 0; i < 6; ++i) {
             blast::Message entry;
             entry.id = "material-" + std::to_string(i);
@@ -8754,12 +8994,28 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
         InputDispatcher dispatcher;
         dispatcher.setSceneRoot(&view);
         view.setInputDispatcher(dispatcher);
-        const LayoutRect viewport{17, 23, 900, 1200};
+        const LayoutRect viewport{17, 23, width, 1200};
         view.sync();
         view.arrange(renderer, viewport);
         for (int i = 0; i < 6; ++i) {
             const auto rendered = body(view, "MaterialBody-" + std::to_string(i));
             const auto before = sceneBounds(rendered.row);
+            auto *material = find<blast::MaterialNode>(rendered.content);
+            assert(material);
+            const auto surfaceBefore = sceneBounds(*material);
+            RectNode *highlight = nullptr;
+            for (const auto &child : rendered.content.children())
+                if (auto *rect = dynamic_cast<RectNode *>(child.get());
+                    rect && rect->visible() && rect->x() == material->x() &&
+                    rect->y() == material->y())
+                    highlight = rect;
+            assert(!dense || highlight);
+            if (dense)
+                assert(highlight->style().radius.tl < blast::themeCornerRadius());
+            const auto contentBounds = dense ? sceneBounds(*highlight) : surfaceBefore;
+            const auto bodyBefore = sceneBounds(rendered.body);
+            dispatcher.pointerMotion(before.x + 1, surfaceBefore.y + surfaceBefore.height * .5f, 1);
+            assert(dispatcher.hoveredArea() == &rendered.row);
             dispatcher.setFocus(&rendered.row);
             view.arrange(renderer, viewport);
             RectNode *ring = nullptr;
@@ -8772,15 +9028,44 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
                 }
             assert(ring && roundedCorners(ring->style().radius));
             const auto bounds = sceneBounds(*ring);
-            auto *material = find<blast::MaterialNode>(rendered.content);
-            assert(material);
             const auto surface = sceneBounds(*material);
-            near(bounds.x, surface.x);
-            near(bounds.y, surface.y);
-            near(bounds.height, surface.height);
-            near(sceneBounds(rendered.row).height, before.height);
-            near(sceneBounds(rendered.row).y, before.y);
-            assert(bounds.width < rendered.row.width() * .8f);
+            near(surface.x, surfaceBefore.x);
+            near(surface.y, surfaceBefore.y);
+            near(surface.width, surfaceBefore.width);
+            near(surface.height, surfaceBefore.height);
+            containedBounds(contentBounds, bounds);
+            assert(bounds.width > contentBounds.width);
+            assert(bounds.height > contentBounds.height);
+            const auto rowBounds = sceneBounds(rendered.row);
+            containedBounds(bounds, rowBounds);
+            near(rowBounds.x, before.x);
+            near(rowBounds.width, before.width);
+            near(rowBounds.height, before.height);
+            near(rowBounds.y, before.y);
+            const auto bodyAfter = sceneBounds(rendered.body);
+            near(bodyAfter.x, bodyBefore.x);
+            near(bodyAfter.y, bodyBefore.y);
+            near(bodyAfter.width, bodyBefore.width);
+            near(bodyAfter.height, bodyBefore.height);
+            assert(!ring->hitTestVisible());
+            highlight = nullptr;
+            for (const auto &child : rendered.content.children())
+                if (auto *rect = dynamic_cast<RectNode *>(child.get());
+                    rect && rect->visible() && rect->style().fill.a > 0) {
+                    const auto painted = sceneBounds(*rect);
+                    if (painted.width > contentBounds.width &&
+                        painted.height > contentBounds.height) {
+                        assert(!highlight);
+                        highlight = rect;
+                    }
+                }
+            assert(highlight && !highlight->hitTestVisible());
+            const auto highlightBounds = sceneBounds(*highlight);
+            near(bounds.x, highlightBounds.x);
+            near(bounds.y, highlightBounds.y);
+            near(bounds.width, highlightBounds.width);
+            near(bounds.height, highlightBounds.height);
+            nearRadii(ring->style().radius, highlight->style().radius);
             for (const auto &fragment : rendered.body.children())
                 if (fragment->visible() && dynamic_cast<InputArea *>(fragment.get()))
                     containedBounds(sceneBounds(*fragment), bounds);
@@ -8791,13 +9076,17 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
                                        .width = material->width(),
                                        .height = material->height()});
                 assert(paint.rectangles.size() == 1);
-                near(bounds.width, paint.rectangles.front().width);
-                near(bounds.height, paint.rectangles.front().height);
-                nearRadii(ring->style().radius, paint.rectangles.front().style.radius);
+                near(surface.width, paint.rectangles.front().width);
+                near(surface.height, paint.rectangles.front().height);
+                assert(paint.rectangles.front().style.radius.tl < blast::themeBubbleRadius());
+                const auto innerRadius = paint.rectangles.front().style.radius.tl;
+                const auto outerRadius = ring->style().radius.tl;
+                assert(outerRadius > innerRadius);
+                assert(outerRadius <= std::min(bounds.width, bounds.height) * .5f);
             } else {
-                nearRadii(ring->style().radius, Radii{blast::themeCornerRadius()});
                 // Actual text/metadata, not a full-width empty reading strip.
-                assert(bounds.width < surface.width * .8f);
+                if (width == 900.f)
+                    assert(bounds.width < surface.width * .8f);
                 const auto inspect = [&](auto &&self, Node &node) -> void {
                     if (!node.visible())
                         return;
@@ -8824,7 +9113,7 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
         dispatcher.setFocus(&rendered.row);
         view.arrange(renderer, viewport);
         auto *scroll = find<ScrollView>(view);
-        const LayoutRect clipped{17, 23, 900, 110};
+        const LayoutRect clipped{17, 23, width, 110};
         // Focus alone does not reveal an offscreen row in this standalone host.
         // Materialize the same selected source under the clipped native viewport.
         assert(view.jumpToSourceMessage(buffer.messages[2].id));
@@ -8848,7 +9137,7 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
         const auto bounds = sceneBounds(*ring);
         const auto visible = intersectBounds(bounds, nativeHistoryClip(view));
         assert(visible.height > 0 && visible.height < bounds.height);
-        near(bounds.height, find<blast::MaterialNode>(partial.content)->height());
+        assert(bounds.height > find<blast::MaterialNode>(partial.content)->height());
         dispatcher.setFocus(nullptr);
         dispatcher.setSceneRoot(nullptr);
     }
@@ -9086,6 +9375,34 @@ void foundryTranscriptAvatars(TranscriptTestRenderer &renderer) {
             assert(reclassified &&
                    renderer.textures.rgbaHash(reclassified->textureId()) == hashes[0]);
         }
+        const auto baselineHash = renderer.textures.rgbaHash(
+            find<Image>(body(view, "FoundryAvatarBody").content)->textureId());
+        model.settings.nickColors["{ALICE}"] = "#e07030";
+        arrange();
+        image = find<Image>(body(view, "FoundryAvatarBody").content);
+        const auto overrideHash = renderer.textures.rgbaHash(image->textureId());
+        assert(overrideHash != baselineHash);
+        const auto overrideTexture = image->textureId();
+        const auto overrideUploads = renderer.textures.uploads;
+        arrange();
+        assert(find<Image>(body(view, "FoundryAvatarBody").content)->textureId() ==
+                   overrideTexture &&
+               renderer.textures.uploads == overrideUploads);
+        model.settings.nickColors["{ALICE}"] = "#3080e0";
+        arrange();
+        assert(renderer.textures.rgbaHash(
+                   find<Image>(body(view, "FoundryAvatarBody").content)->textureId()) !=
+               overrideHash);
+        model.settings.nickColors.clear();
+        model.settings.nickPalette = "CLASSIC";
+        arrange();
+        const auto classicHash = renderer.textures.rgbaHash(
+            find<Image>(body(view, "FoundryAvatarBody").content)->textureId());
+        model.settings.nickPalette = "VIVID";
+        arrange();
+        assert(renderer.textures.rgbaHash(
+                   find<Image>(body(view, "FoundryAvatarBody").content)->textureId()) !=
+               classicHash);
         model.settings.avatarStyle = "monogram";
         arrange();
         assert(!find<Image>(body(view, "FoundryAvatarBody").content));
@@ -9843,6 +10160,7 @@ void runTranscriptCheck() {
     smoothWheel(renderer);
     smoothWheel(renderer, "wheel");
     smoothWheel(renderer, "uncommitted-wheel-rename");
+    transcriptAffordanceMotion(renderer);
     messageIdentityRevision(renderer);
     messageNavigation(renderer, false);
     messageNavigation(renderer, true);

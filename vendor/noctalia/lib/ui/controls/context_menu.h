@@ -11,6 +11,8 @@
 #include <vector>
 
 class Renderer;
+class Box;
+class Label;
 
 enum class ContextSubmenuDirection : std::uint8_t {
   Right,
@@ -83,7 +85,15 @@ public:
 
 private:
   struct RowVisual {
-    std::function<void(bool)> apply;
+    std::function<void(const ColorSpec&, const ColorSpec&)> apply;
+    Node* owner = nullptr;
+    ColorSpec normalForeground;
+    Box* background = nullptr;
+    Label* foreground = nullptr;
+    ColorSpec targetBackground;
+    ColorSpec targetForeground;
+    std::uint32_t animation = 0;
+    bool initialized = false;
     float y = 0.0F;
     float height = 0.0F;
     bool interactive = false;

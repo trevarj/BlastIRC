@@ -1,5 +1,6 @@
 #pragma once
 
+#include "render/animation/animation_manager.h"
 #include "render/scene/input_dispatcher.h"
 #include "ui/controls/context_menu.h"
 #include "ui/controls/scroll_view.h"
@@ -89,6 +90,9 @@ private:
 
   WaylandConnection& m_wayland;
   RenderContext& m_renderContext;
+  AnimationManager m_animations;
+  float m_openingOpacity = 1.0F;
+  bool m_openingStarted = false;
   std::unique_ptr<PopupSurface> m_surface;
   std::unique_ptr<Node> m_sceneRoot;
   InputDispatcher m_inputDispatcher;
@@ -110,6 +114,7 @@ private:
   void restoreParentKeyboardInteractivity();
   void ensureHighlightedVisible();
   void requestVisualUpdate();
+  void applyOpeningMotion();
   void deferActivation(ContextMenuControlEntry entry);
   void deferClose();
   ContextMenuPopup* rootMenu() noexcept;

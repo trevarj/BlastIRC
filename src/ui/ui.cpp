@@ -37,6 +37,8 @@
 #include <filesystem>
 #include <iterator>
 #include <optional>
+#include <render/animation/animation_manager.h>
+#include <render/animation/motion_service.h>
 #include <render/codecs/codecs.h>
 #include <render/core/image_decoder.h>
 #include <render/core/image_resize.h>
@@ -714,21 +716,45 @@ class IconButton final : public InputArea {
             setTooltip(tooltip_);
         }
     }
-    void sync(float scale) {
+    void sync(float scale, bool motionEnabled) {
         scale_ = scale;
         const bool primary = selected_ || pressed();
         const bool hover = hovered() && !primary;
-        background_->setFill(primary ? themeSurfaceColor("primary_container")
-                             : hover ? themeSurfaceColor("hover")
-                                     : Color{0, 0, 0, 0});
+        const auto background = primary ? themeSurfaceColor("primary_container")
+                                : hover ? themeSurfaceColor("hover")
+                                        : Color{0, 0, 0, 0};
+        const auto foreground = themeForegroundColor(primary ? "on_primary_container"
+                                                     : hover ? "on_hover"
+                                                             : "on_surface");
+        const int interaction = pressed() ? 2 : hovered() ? 1 : 0;
+        auto *manager = animationManager();
+        const bool targetChanged =
+            background != targetBackground_ || foreground != targetForeground_;
+        if (targetChanged || !motionEnabled || !manager) {
+            if (manager && animation_)
+                manager->cancel(animation_);
+            animation_ = 0;
+            const auto fromBackground = displayedBackground_, fromForeground = displayedForeground_;
+            targetBackground_ = background;
+            targetForeground_ = foreground;
+            if (manager && motionEnabled && interaction_ >= 0 && interaction != interaction_) {
+                animation_ = manager->animate(
+                    0.f, 1.f, 100.f, Easing::EaseOutCubic,
+                    [this, fromBackground, fromForeground](float progress) {
+                        applyColors(lerpColor(fromBackground, targetBackground_, progress),
+                                    lerpColor(fromForeground, targetForeground_, progress));
+                    },
+                    [this] { animation_ = 0; }, this);
+            } else
+                applyColors(background, foreground);
+        }
+        interaction_ = interaction;
         if (focused())
             background_->setBorder(themeForegroundColor("secondary"), std::max(1.f, scale));
         else
             background_->clearBorder();
         background_->setRadius(themeCornerRadius());
-        icon_->setColor(themeForegroundColor(primary ? "on_primary_container"
-                                             : hover ? "on_hover"
-                                                     : "on_surface"));
+        // Theme interpolation updates colors directly instead of chasing another tween.
     }
 
   protected:
@@ -740,6 +766,15 @@ class IconButton final : public InputArea {
     }
 
   private:
+    void applyColors(Color background, Color foreground) {
+        displayedBackground_ = background;
+        displayedForeground_ = foreground;
+        background_->setFill(background);
+        icon_->setColor(foreground);
+    }
+    AnimationManager::Id animation_ = 0;
+    Color displayedBackground_{}, displayedForeground_{}, targetBackground_{}, targetForeground_{};
+    int interaction_ = -1;
     Box *background_;
     LucideIcon *icon_;
     std::function<void()> click_;
@@ -874,6 +909,7 @@ class JumpOverlay final : public InputArea {
 class UiRoot final : public Node {
   public:
     std::function<bool()> afterChildrenLayout;
+    std::function<void()> beforeChildrenLayout;
     bool inLayout = false;
 
   protected:
@@ -885,6 +921,8 @@ class UiRoot final : public Node {
             bool &value;
             ~ResetLayout() { value = false; }
         } reset{inLayout};
+        if (beforeChildrenLayout)
+            beforeChildrenLayout();
         Node::doLayout(renderer);
         if (afterChildrenLayout && afterChildrenLayout())
             Node::doLayout(renderer);
@@ -928,6 +966,11 @@ struct Ui::Impl {
     std::optional<float> widthDragSceneX;
     bool widthDragChanged = false;
     SidebarMode widthDragMode = SidebarMode::Expanded;
+    AnimationManager::Id panelAnimation = 0;
+    std::array<float, 2> panelExtent{}, panelTarget{};
+    std::array<SidebarMode, 2> panelPresentation{SidebarMode::Hidden, SidebarMode::Hidden};
+    bool panelGeometryReady = false, animatePanelToggle = false, snapPanelMotion = false;
+    bool panelFramePending = false;
     JumpOverlay *jump = nullptr;
     emoji::Picker *reactionPicker = nullptr;
     TopicPopover *topicPopover = nullptr;
@@ -1098,6 +1141,12 @@ struct Ui::Impl {
             else
                 model.settings.bindings.try_emplace(name, binding);
         }
+        scene->beforeChildrenLayout = [this] {
+            if (panelFramePending) {
+                panelFramePending = false;
+                refresh();
+            }
+        };
         scene->afterChildrenLayout = [this] {
             inputGeometryPending = false;
             const bool restored = restoreJumpFocus(true);
@@ -1205,6 +1254,8 @@ struct Ui::Impl {
                                       : "Resize channel sidebar · Left/Right adjusts width");
             handle->setOnPress([this, i](const InputArea::PointerData &event) {
                 if (event.pressed) {
+                    snapPanelMotion = true;
+                    refresh();
                     widthDrag = i;
                     widthDragX = event.sceneX;
                     widthDragStart = (i == 0 ? rail->width() : sidebar->width()) / scale;
@@ -1237,6 +1288,8 @@ struct Ui::Impl {
                     (event.sym == XKB_KEY_Left || event.sym == XKB_KEY_Right)) {
                     if (widthDrag)
                         retirePointerCapture();
+                    snapPanelMotion = true;
+                    refresh();
                     const float current = (i == 0 ? rail->width() : sidebar->width()) / scale;
                     if (resizePanel(i, current + (event.sym == XKB_KEY_Right ? 8.f : -8.f)))
                         queue(model, "save");
@@ -1294,6 +1347,8 @@ struct Ui::Impl {
         };
     }
     ~Impl() {
+        if (auto *manager = scene->animationManager())
+            manager->cancelForOwner(scene.get());
         uploadAlive.reset();
         if (payloadClipboard && uploadPayloadRequest)
             payloadClipboard->cancelPayload(uploadPayloadRequest);
@@ -1327,6 +1382,26 @@ struct Ui::Impl {
     bool synchronizeKeyInput(std::uint32_t sym);
     bool synchronizePointerInput(float x, float y, bool targetInput, bool pendingReplay = true);
     void updateRegularPanelModes();
+    void updatePanelMotion(std::array<float, 2> target);
+    bool motionEnabled() const {
+        return model.settings.fx != FxLevel::Off && !model.settings.reducedMotion;
+    }
+    void openPanel(Node &panel) {
+        if (auto *manager = panel.animationManager()) {
+            manager->cancelForOwner(&panel);
+            panel.setOpacity(motionEnabled() ? .6f : 1.f);
+            if (motionEnabled())
+                manager->animate(
+                    .6f, 1.f, 150.f, Easing::EaseOutCubic,
+                    [&panel](float value) { panel.setOpacity(value); }, {}, &panel);
+        } else
+            panel.setOpacity(1.f);
+    }
+    void resetPanelOpacity(Node &panel) {
+        if (auto *manager = panel.animationManager())
+            manager->cancelForOwner(&panel);
+        panel.setOpacity(1.f);
+    }
     bool resizePanel(std::size_t panel, float logicalWidth);
     void applyWidthDrag(float sceneX);
     void finishWidthDrag();
@@ -1558,6 +1633,9 @@ struct Ui::Impl::PaneView final : Node {
                                     ui.workspace.focused == pane.id && selected &&
                                     !ui.paletteOpen && !ui.jumpOpen && !ui.reactionTarget &&
                                     !ui.dialogs->active());
+        if (ui.paletteOpen || ui.jumpOpen || ui.reactionTarget || ui.dialogs->active() ||
+            ui.topicSource || ui.uploadStage != UploadStage::Closed || ui.media->active())
+            transcript->cancelAutoscroll();
         transcript->sync();
         composer->setVisible(exists && !search);
         welcomeScroll->setVisible(!exists);
@@ -1597,45 +1675,42 @@ struct Ui::Impl::PaneView final : Node {
                                       ? messageTextSize(ui.model.settings, Buffer{})
                                       : messageTextSize(ui.model.settings, activeBuffer->second);
         const float historyRow = renderer.fontRowExtent(messageSize, themeMessageFont());
-        const float typingRow = composing ? typingIndicatorHeight(renderer, s, messageSize) : 0;
-        const float replyHeight =
-            composing ? ui.editors.replyContextHeight(pane.id, renderer, innerWidth) : 0;
-        const float replyOverlayHeight = composing ? replyHeight + typingRow + 4 * s : 0;
+        const float replyHeight = composing && !pane.reply.empty()
+                                      ? ui.editors.replyContextHeight(pane.id, renderer, innerWidth)
+                                      : 0;
+        const float replySpace = replyHeight > 0 ? replyHeight + 4 * s : 0;
         const float historyMinimum = 2 * historyRow + 12 * s;
-        // Only typing reserves history space; the reply card floats above it.
-        // Let paste previews/accessories compact before spending the native history floor.
         const float preferredMaximum =
-            std::max(0.f, available - 2 * paddingY - historyMinimum - typingRow - panelGap);
+            std::max(0.f, available - 2 * paddingY - historyMinimum - panelGap - replySpace);
         const float preferredBudget =
             std::max(std::max(32.f, 32 * s), std::min(available * .5f, preferredMaximum));
         const float minimumComposer =
             composing
                 ? ui.editors.minimumComposerHeight(pane.id, renderer, innerWidth, preferredMaximum)
                 : 0;
-        const float composerBudget =
-            std::min(std::max(preferredBudget, minimumComposer),
-                     std::max(0.f, available - 2 * paddingY - historyMinimum - panelGap));
+        const float composerBudget = std::min(
+            std::max(preferredBudget, minimumComposer),
+            std::max(0.f, available - 2 * paddingY - historyMinimum - panelGap - replySpace));
         ui.editors.setComposerHeightLimit(pane.id, composing ? composerBudget : 0);
         LayoutConstraints editorConstraints = LayoutConstraints::unconstrained();
         editorConstraints.setExactWidth(std::max(1.f, innerWidth));
         const float desiredComposer =
             composing ? composer->measure(renderer, editorConstraints).height : 0;
-        const float composerCardHeight =
-            composing ? std::min(desiredComposer + 2 * paddingY, available) : 0;
+        const float composerCardHeight = composing ? std::min(desiredComposer + 2 * paddingY,
+                                                              std::max(0.f, available - replySpace))
+                                                   : 0;
         const float composerPadding = std::min(paddingY, composerCardHeight / 2);
         const float composerHeight = std::max(0.f, composerCardHeight - 2 * composerPadding);
         const float composerGap =
-            composing ? std::min(panelGap, std::max(0.f, available - composerCardHeight)) : 0;
+            composing
+                ? std::min(panelGap, std::max(0.f, available - composerCardHeight - replySpace))
+                : 0;
         const float historyHeight = std::max(0.f, available - composerCardHeight - composerGap);
         const float composerY = top + historyHeight + composerGap;
         place(*transcript, left, top, innerWidth, historyHeight);
-        // In an impossible pane the typing inset yields before native history text.
-        // Reply visibility never changes the content extent or composer budget.
-        const float inset = std::min(typingRow, std::max(0.f, historyHeight - 2 * historyRow));
-        transcript->setContextInset(inset, typingRow,
-                                    composing && !pane.reply.empty() ? replyOverlayHeight : 0);
-        // Zero host bounds pass empty-zone hits through while traversing the real card.
-        place(*replyHost, left, top + historyHeight - replyOverlayHeight, 0, 0);
+        transcript->setContextInset(std::max(0.f, replySpace - composerGap - composerPadding));
+        place(*replyHost, left,
+              composerY + composerPadding - (replyHeight > 0 ? 4 * s : 0) - replyHeight, 0, 0);
         replyHost->setVisible(composing);
         replyHost->setExcludeSubtreeFromTabOrder(!composing);
         for (const auto &reply : replyHost->children())
@@ -1668,6 +1743,47 @@ void Ui::Impl::shutdownMedia() {
     media->invalidate();
     media.reset();
 }
+void Ui::Impl::updatePanelMotion(std::array<float, 2> target) {
+    auto *manager = scene->animationManager();
+    const bool changed = target != panelTarget;
+    const bool snap = !panelGeometryReady || snapPanelMotion || !motionEnabled() || !manager ||
+                      !MotionService::instance().enabled() || (changed && !animatePanelToggle);
+    const std::array modes{navigationMode, peopleMode};
+    if (snap || changed) {
+        if (manager && panelAnimation)
+            manager->cancel(panelAnimation);
+        panelAnimation = 0;
+        panelTarget = target;
+        if (snap) {
+            panelExtent = target;
+            panelPresentation = modes;
+        } else {
+            const auto from = panelExtent;
+            for (std::size_t i = 0; i < modes.size(); ++i)
+                if (modes[i] != SidebarMode::Hidden &&
+                    (panelPresentation[i] != SidebarMode::Expanded || from[i] == 0))
+                    panelPresentation[i] = modes[i];
+            panelAnimation = manager->animate(
+                0.f, 1.f, 180.f, Easing::EaseOutCubic,
+                [this, from, target](float progress) {
+                    for (std::size_t i = 0; i < target.size(); ++i)
+                        panelExtent[i] = from[i] + (target[i] - from[i]) * progress;
+                    panelFramePending = true;
+                    scene->markLayoutDirty();
+                },
+                [this] {
+                    panelAnimation = 0;
+                    panelFramePending = true;
+                    scene->markLayoutDirty();
+                },
+                scene.get());
+        }
+    }
+    if (!panelAnimation)
+        panelPresentation = modes;
+    panelGeometryReady = true;
+    snapPanelMotion = animatePanelToggle = false;
+}
 void Ui::Impl::updateRegularPanelModes() {
     const float currentScale = ui_logic::userScale(model.settings.scale);
     const float outer = shellOuterPadding(width, height, currentScale);
@@ -1691,6 +1807,7 @@ void Ui::Impl::updateRegularPanelModes() {
 bool Ui::Impl::resizePanel(std::size_t panel, float logicalWidth) {
     if (!std::isfinite(logicalWidth) || jumpOpen || paletteOpen || dialogs->active())
         return false;
+    snapPanelMotion = true;
     const float minimumChat =
         std::max(360 * scale, EditorStore::minimumComposerWidth(scale) + 2 * panePaddingX * scale);
     const float current = (panel == 0 ? rail->width() : sidebar->width()) / scale;
@@ -1734,6 +1851,8 @@ void Ui::Impl::finishWidthDrag() {
         queue(model, "save");
 }
 void Ui::Impl::cancelPointerCapture() {
+    for (const auto &[id, view] : views)
+        view->transcript->cancelAutoscroll();
     finishWidthDrag();
     if (pressedPointer[1].test(BTN_LEFT))
         suppressedPointer[1].set(BTN_LEFT);
@@ -1896,7 +2015,7 @@ void Ui::Impl::showReactionPicker(TranscriptMessageTarget target) {
     cancelPointerCapture();
     for (auto &[id, pane] : workspace.panes)
         pane.focusComposer = false;
-    reactionPicker->sync(width, height, scale);
+    reactionPicker->sync(width, height, scale, motionEnabled());
     reactionPicker->show(
         "React to " + reactionTarget->nick, {},
         [this](std::string glyph) { finishReactionPicker(std::move(glyph)); },
@@ -2487,6 +2606,10 @@ void Ui::Impl::pollUpload() {
 
 void Ui::Impl::syncUploadPanel() {
     const bool visible = uploadStage != UploadStage::Closed;
+    if (visible && !uploadPanel->visible())
+        openPanel(*uploadPanel);
+    if (!visible || !motionEnabled())
+        resetPanelOpacity(*uploadPanel);
     if (!visible && uploadPanel->visible())
         retireSubtreePointerCapture(*uploadPanel);
     uploadPanel->setVisible(visible);
@@ -2642,6 +2765,8 @@ void Ui::Impl::showPalette(bool commands) {
         return;
     }
     commandMode = commands;
+    if (!paletteOpen)
+        openPanel(*palettePanel);
     paletteOpen = true;
     selected = 0;
     query.clear();
@@ -2665,6 +2790,8 @@ void Ui::Impl::showPalette(bool commands) {
 }
 void Ui::Impl::dismissPalette() {
     paletteOpen = false;
+    resetPanelOpacity(*palettePanel);
+    retireSubtreePointerCapture(*palette);
     palette->setVisible(false);
     if (dialogs->active()) {
         if (dispatcher)
@@ -2685,6 +2812,7 @@ void Ui::Impl::dismissPalette() {
 void Ui::Impl::startJump() {
     if (jumpOpen || reactionTarget || dialogs->active() || editors.composing())
         return;
+    snapPanelMotion = true;
     if (dispatcher)
         if (auto *input = dispatcher->focusedArea(); input && input->textInputClient())
             if (const auto *native = dynamic_cast<Input *>(input->textInputClient());
@@ -2726,6 +2854,7 @@ void Ui::Impl::startJump() {
         jumpHadFocus = paletteHadFocus;
         jumpWasComposerInput = paletteWasComposerInput;
         paletteOpen = false;
+        resetPanelOpacity(*palettePanel);
         palette->setVisible(false);
     } else if (!inheritReturnFocus) {
         jumpHadFocus = dispatcher && dispatcher->focusedArea();
@@ -2747,6 +2876,7 @@ void Ui::Impl::startJump() {
     jumpCancelChord.clear();
     jump->begin(std::move(hints));
     jumpOpen = true;
+    openPanel(*jump);
     jump->setVisible(true);
     place(*jump, 0, 0, width, height);
     if (dispatcher)
@@ -2785,6 +2915,8 @@ void Ui::Impl::finishJump(bool committed, std::string buffer) {
         suppressedPointer[source] |= pressedPointer[source];
     cancelPointerCapture();
     jumpOpen = false;
+    snapPanelMotion = true;
+    resetPanelOpacity(*jump);
     jumpRestoreAfterLayout = false;
     jumpActivationKey = 0;
     jumpTouchActive = false;
@@ -3421,7 +3553,7 @@ void Ui::Impl::showTopic(std::uint64_t id, Node &anchor) {
     topicSource = std::pair{id, pane->second.buffer};
     float left = 0, top = 0, right = 0, bottom = 0;
     Node::transformedBounds(&anchor, left, top, right, bottom);
-    topicPopover->sync(width, height, scale);
+    topicPopover->sync(width, height, scale, motionEnabled());
     topicPopover->show(buffer->second.topic, {left, top, right - left, bottom - top},
                        [this] { dismissTopic(); });
 }
@@ -3445,6 +3577,8 @@ void Ui::Impl::dismissTopic(bool restoreFocus) {
 void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> pointer) {
     if (command.empty())
         return;
+    for (const auto &[id, view] : views)
+        view->transcript->cancelAutoscroll();
     chord.clear();
     if (command.starts_with("upload-")) {
         uploadAction(command);
@@ -3637,6 +3771,7 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         updateRegularPanelModes();
         workspace.navigationMode =
             nextSidebarChoice(workspace.navigationMode, navigationRegularMode);
+        animatePanelToggle = true;
         updateRegularPanelModes();
         queue(model, "save");
     } else if (command == "toggle-people") {
@@ -3646,6 +3781,7 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
             finishJump(false);
         updateRegularPanelModes();
         model.settings.peopleMode = nextSidebarChoice(model.settings.peopleMode, peopleRegularMode);
+        animatePanelToggle = true;
         updateRegularPanelModes();
         queue(model, "save");
     } else if (command == "cancel") {
@@ -3783,6 +3919,10 @@ void Ui::Impl::drainPending() {
 }
 void Ui::Impl::refresh(bool panelResize) {
     std::string externalActive;
+    if (!motionEnabled()) {
+        resetPanelOpacity(*palettePanel);
+        resetPanelOpacity(*jump);
+    }
     if (model.activeBuffer != publishedActive)
         externalActive = model.activeBuffer;
     drainPending();
@@ -3800,6 +3940,7 @@ void Ui::Impl::refresh(bool panelResize) {
         if (widthDrag)
             retirePointerCapture();
         inputGeometryPending = true;
+        snapPanelMotion = true;
     }
     scale = nextScale;
     place(*scene, 0, 0, width, height);
@@ -3848,7 +3989,7 @@ void Ui::Impl::refresh(bool panelResize) {
         place(*windowButtons[i], controlsLeft + i * (extent + gap), (titleHeight - extent) / 2,
               extent, extent);
         if (i != 0)
-            windowButtons[i]->sync(scale);
+            windowButtons[i]->sync(scale, motionEnabled());
     }
     const auto commandBinding = model.settings.bindings.find("execute-command");
     const std::string_view commandValue = commandBinding == model.settings.bindings.end()
@@ -3927,8 +4068,15 @@ void Ui::Impl::refresh(bool panelResize) {
         peopleMode = fitSidebarModes(navigationMode, peopleRegularMode, remaining, boundary, scale,
                                      chatMinimum, expandedWidth, compactNavigationWidth)
                          .second;
-    const float navigationWidth = panelWidth(navigationMode, expandedWidth, compactNavigationWidth);
-    const float peopleWidth = panelWidth(peopleMode, expandedPeopleWidth, compactWidth);
+    const float targetNavigation =
+        panelWidth(navigationMode, expandedWidth, compactNavigationWidth);
+    const float targetPeople = panelWidth(peopleMode, expandedPeopleWidth, compactWidth);
+    updatePanelMotion({targetNavigation + (navigationMode != SidebarMode::Hidden ? boundary : 0.f),
+                       targetPeople + (peopleMode != SidebarMode::Hidden ? boundary : 0.f)});
+    const float navigationGap = std::min(boundary, panelExtent[0]);
+    const float peopleGap = std::min(boundary, panelExtent[1]);
+    const float navigationWidth = panelExtent[0] - navigationGap;
+    const float peopleWidth = panelExtent[1] - peopleGap;
     if (panelResize && (rail->width() != railWidth || sidebar->width() != navigationWidth)) {
         // Only moving effective geometry retires content; the handle keeps its capture.
         for (auto *node :
@@ -3946,6 +4094,13 @@ void Ui::Impl::refresh(bool panelResize) {
             replacement = dispatcher->firstTabFocusUnder(view->second->titleLine);
         retirePanel(*people, replacement, peopleMode == SidebarMode::Hidden);
     }
+    const auto retireExpandedControl = [this](Node &control) {
+        InputArea *replacement = windowButtons[0];
+        if (const auto view = views.find(workspace.focused); dispatcher && view != views.end())
+            if (auto *input = dispatcher->firstTabFocusUnder(view->second->composer))
+                replacement = input;
+        retirePanel(control, replacement, true);
+    };
     const WorkspaceRect railRect{outer, contentTop, railWidth, contentHeight};
     place(*rail, railRect);
     rail->sync(selectedServer, railRect.width, railRect.height, scale);
@@ -3953,37 +4108,41 @@ void Ui::Impl::refresh(bool panelResize) {
     const WorkspaceRect navigationRect{left, contentTop, navigationWidth, contentHeight};
     place(*sidebar, navigationRect);
     sidebar->sync(selectedServer, lastBuffer, navigationRect.width, navigationRect.height, scale,
-                  navigationMode);
+                  panelPresentation[0]);
+    sidebar->setInteractionMode(navigationMode, retireExpandedControl);
+    sidebar->setHitTestVisible(navigationMode != SidebarMode::Hidden);
+    sidebar->setExcludeSubtreeFromTabOrder(navigationMode == SidebarMode::Hidden);
     const auto dividerColor = withAlpha(themeColor("outline_variant"), .18f * themeSurfaceAlpha());
     const float dividerX = outer + railWidth + (boundary - 1.f) / 2;
     place(*navigationDividers[0], dividerX, contentTop, 1.f, contentHeight);
-    place(*navigationDividers[1], left + navigationWidth + (boundary - 1.f) / 2, contentTop, 1.f,
-          contentHeight);
-    navigationDividers[1]->setVisible(navigationMode != SidebarMode::Hidden);
+    place(*navigationDividers[1], left + navigationWidth + (navigationGap - 1.f) / 2, contentTop,
+          1.f, contentHeight);
+    navigationDividers[1]->setVisible(panelExtent[0] > 0);
     for (std::size_t i = 0; i < navigationDividers.size(); ++i)
         navigationDividers[i]->setFill(
             widthHandles[i]->focused() ? themeForegroundColor("secondary") : dividerColor);
     const float handleWidth = 8 * scale;
     place(*widthHandles[0], dividerX - handleWidth / 2, contentTop, handleWidth, contentHeight);
-    place(*widthHandles[1], left + navigationWidth + boundary / 2 - handleWidth / 2, contentTop,
-          handleWidth, contentHeight);
+    place(*widthHandles[1], left + navigationWidth + navigationGap / 2 - handleWidth / 2,
+          contentTop, handleWidth, contentHeight);
     widthHandles[0]->setVisible(!jumpOpen && !paletteOpen && !dialogs->active());
     widthHandles[1]->setVisible(navigationMode != SidebarMode::Hidden && !jumpOpen &&
                                 !paletteOpen && !dialogs->active());
-    if (navigationMode != SidebarMode::Hidden)
-        left += navigationWidth + boundary;
-    const float right =
-        width - outer - (peopleMode != SidebarMode::Hidden ? peopleWidth + boundary : 0);
+    left += panelExtent[0];
+    const float right = width - outer - panelExtent[1];
     const float chatWidth = std::max(1.f, right - left);
     if (conversationRect.x != left || conversationRect.y != contentTop ||
         conversationRect.width != chatWidth || conversationRect.height != contentHeight)
         inputGeometryPending = true;
     conversationRect = {left, contentTop, chatWidth, contentHeight};
-    const WorkspaceRect peopleRect{right + boundary, contentTop, peopleWidth, contentHeight};
+    const WorkspaceRect peopleRect{right + peopleGap, contentTop, peopleWidth, contentHeight};
     place(*people, peopleRect);
-    people->sync(lastBuffer, peopleRect.width, peopleRect.height, scale, peopleMode);
-    peopleMaterial->setVisible(peopleMode != SidebarMode::Hidden);
-    if (peopleMode != SidebarMode::Hidden) {
+    people->sync(lastBuffer, peopleRect.width, peopleRect.height, scale, panelPresentation[1]);
+    people->setInteractionMode(peopleMode, retireExpandedControl);
+    people->setHitTestVisible(peopleMode != SidebarMode::Hidden);
+    people->setExcludeSubtreeFromTabOrder(peopleMode == SidebarMode::Hidden);
+    peopleMaterial->setVisible(panelExtent[1] > 0);
+    if (panelExtent[1] > 0) {
         place(*peopleMaterial, peopleRect);
         peopleMaterial->sync();
     }
@@ -4003,10 +4162,10 @@ void Ui::Impl::refresh(bool panelResize) {
             "toggle-navigation"));
     }
     windowButtons[0]->selected(navigationRegularMode != SidebarMode::Hidden);
-    windowButtons[0]->sync(scale);
+    windowButtons[0]->sync(scale, motionEnabled());
     dialogs->sync(width, height, scale);
     if (reactionPicker)
-        reactionPicker->sync(width, height, scale);
+        reactionPicker->sync(width, height, scale, motionEnabled());
     if (topicSource) {
         const auto pane = workspace.panes.find(topicSource->first);
         const auto buffer = model.buffers.find(topicSource->second);
@@ -4017,7 +4176,7 @@ void Ui::Impl::refresh(bool panelResize) {
             dismissTopic(false);
         } else {
             pane->second.focusComposer = false;
-            topicPopover->sync(width, height, scale);
+            topicPopover->sync(width, height, scale, motionEnabled());
             if (topicPopover->topicInput().value() != buffer->second.topic)
                 topicPopover->topicInput().setValue(buffer->second.topic);
         }
@@ -4189,6 +4348,13 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
         else
             consumed.erase(keyId);
         return handled || mediaHandled;
+    }
+    if (!event.preedit && event.sym == XKB_KEY_Escape) {
+        bool stopped = false;
+        for (const auto &[id, view] : views)
+            stopped |= view->transcript->cancelAutoscroll();
+        if (stopped)
+            return consume();
     }
     if (!event.preedit && event.sym == XKB_KEY_g && event.modifiers == KeyMod::Ctrl)
         model.status.clear();
@@ -4666,6 +4832,7 @@ void Ui::update(float width, float height, float nativeRenderScale) {
         if (impl_->widthDrag)
             impl_->retirePointerCapture();
         impl_->inputGeometryPending = true;
+        impl_->snapPanelMotion = true;
     }
     impl_->width = width;
     impl_->height = height;
@@ -4732,6 +4899,10 @@ void Ui::discardPointerRelease(std::uint32_t button, bool touch) {
     }
 }
 bool Ui::handlePointerButton(std::uint32_t button, bool pressed, float x, float y, bool touch) {
+    bool stoppedAutoscroll = false;
+    if (pressed)
+        for (const auto &[id, view] : impl_->views)
+            stoppedAutoscroll |= view->transcript->cancelAutoscroll();
     if (pressed && !touch)
         prepareMousePress();
     const std::size_t source = touch ? 1 : 0;
@@ -4764,6 +4935,21 @@ bool Ui::handlePointerButton(std::uint32_t button, bool pressed, float x, float 
                 return true;
             }
         }
+    }
+    if (pressed && stoppedAutoscroll) {
+        if (button < impl_->suppressedPointer[source].size())
+            impl_->suppressedPointer[source].set(button);
+        return true;
+    }
+    if (pressed && !touch && button == BTN_MIDDLE && impl_->dispatcher && !impl_->jumpOpen &&
+        !impl_->paletteOpen && !impl_->reactionTarget && !impl_->topicSource &&
+        impl_->uploadStage == Impl::UploadStage::Closed && !impl_->dialogs->active()) {
+        auto *hit = impl_->dispatcher->inputAreaAt(x, y);
+        for (const auto &[id, view] : impl_->views)
+            if (withinNode(hit, view->transcript) && view->transcript->beginAutoscroll(x, y)) {
+                impl_->suppressedPointer[source].set(button);
+                return true;
+            }
     }
     if (pressed && impl_->dispatcher && !impl_->jumpOpen && !impl_->paletteOpen &&
         !impl_->reactionTarget && !impl_->dialogs->active()) {
@@ -4805,6 +4991,9 @@ void Ui::handlePointerMotion(float x, float y, bool touch) {
         return;
     if (!impl_->synchronizePointerInput(x, y, false))
         throw std::logic_error("Pointer motion cannot be dispatched during native layout");
+    if (!touch)
+        for (const auto &[id, view] : impl_->views)
+            view->transcript->moveAutoscroll(y);
     if (!touch || !impl_->jumpOpen || !impl_->jumpTouchActive)
         return;
     if (!impl_->jumpTouchDragged) {
@@ -4819,6 +5008,9 @@ void Ui::handlePointerMotion(float x, float y, bool touch) {
     impl_->refresh();
 }
 void Ui::beginPointerInteraction(float x, float y, bool preparePressGeometry) {
+    if (!preparePressGeometry)
+        for (const auto &[id, view] : impl_->views)
+            view->transcript->cancelAutoscroll();
     const auto cancelTranscriptReveals = [&] {
         for (const auto &[id, view] : impl_->views)
             view->transcript->cancelFocusReveal();

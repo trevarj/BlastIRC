@@ -39,7 +39,135 @@ class ContextMenuPopupTestAccess {
         popup.m_surface = std::make_unique<PopupSurface>(wayland);
         popup.m_menu = &menu;
     }
+    static Node &replaceSceneRoot(ContextMenuPopup &popup) {
+        popup.m_sceneRoot = std::make_unique<Node>();
+        popup.m_sceneRoot->setAnimationManager(&popup.m_animations);
+        popup.applyOpeningMotion();
+        return *popup.m_sceneRoot;
+    }
+    static AnimationManager &animations(ContextMenuPopup &popup) { return popup.m_animations; }
+    static ContextMenuPopup &addChild(ContextMenuPopup &popup) {
+        popup.m_child = std::make_unique<ContextMenuPopup>(popup.m_wayland, popup.m_renderContext);
+        popup.m_child->m_parentMenu = &popup;
+        return *popup.m_child;
+    }
+    static bool reset(const ContextMenuPopup &popup) {
+        return !popup.m_sceneRoot && !popup.m_child && !popup.m_animations.hasActive() &&
+               !popup.m_openingStarted && popup.m_openingOpacity == 1.f;
+    }
 };
+
+static void checkContextMenuMotion() {
+    auto &motion = MotionService::instance();
+    const bool enabled = motion.enabled();
+    const float speed = motion.speed();
+    motion.setSpeed(1.f);
+    motion.setEnabled(true);
+    RenderContext context;
+    WaylandConnection wayland;
+    {
+        ContextMenuPopup popup(wayland, context);
+        auto &animations = ContextMenuPopupTestAccess::animations(popup);
+        assert(!animations.hasActive());
+        auto &first = ContextMenuPopupTestAccess::replaceSceneRoot(popup);
+        assert(first.opacity() == .6f && animations.hasActive());
+        g_usleep(25000);
+        animations.tick(0);
+        const float intermediate = first.opacity();
+        assert(intermediate > .6f && intermediate < 1.f);
+        auto &rebuilt = ContextMenuPopupTestAccess::replaceSceneRoot(popup);
+        assert(rebuilt.opacity() == intermediate && animations.hasActive());
+        g_usleep(160000);
+        animations.tick(0);
+        assert(rebuilt.opacity() == 1.f && !animations.hasActive());
+        popup.close();
+        assert(ContextMenuPopupTestAccess::reset(popup));
+        ContextMenuPopupTestAccess::replaceSceneRoot(popup);
+        assert(animations.hasActive());
+        auto &child = ContextMenuPopupTestAccess::addChild(popup);
+        auto &childRoot = ContextMenuPopupTestAccess::replaceSceneRoot(child);
+        assert(childRoot.opacity() == .6f &&
+               ContextMenuPopupTestAccess::animations(child).hasActive());
+        popup.close();
+        animations.tick(0);
+        assert(ContextMenuPopupTestAccess::reset(popup));
+        auto &reopened = ContextMenuPopupTestAccess::replaceSceneRoot(popup);
+        assert(reopened.opacity() == .6f);
+        motion.setEnabled(false);
+        assert(reopened.opacity() == 1.f);
+        popup.close();
+        auto &disabled = ContextMenuPopupTestAccess::replaceSceneRoot(popup);
+        assert(disabled.opacity() == 1.f && !animations.hasActive());
+    }
+    motion.setEnabled(true);
+    {
+        ContextMenuPopup retiring(wayland, context);
+        ContextMenuPopupTestAccess::replaceSceneRoot(retiring);
+        assert(ContextMenuPopupTestAccess::animations(retiring).hasActive());
+    }
+    motion.setEnabled(false);
+    motion.setEnabled(true);
+    const Palette savedPalette = palette;
+    Palette testPalette = palette;
+    testPalette.hover = rgba(.2f, .4f, .6f, 1.f);
+    testPalette.onHover = rgba(1.f, 1.f, 1.f, 1.f);
+    setPalette(testPalette);
+    AnimationManager animations;
+    ScaledRenderer renderer(context, 1.f);
+    {
+        ContextMenuControl menu;
+        menu.setAnimationManager(&animations);
+        ContextMenuControlEntry first;
+        first.label = "First";
+        ContextMenuControlEntry second;
+        second.label = "Second";
+        menu.setEntries({first, second});
+        menu.layout(renderer);
+        auto background = [&menu](std::size_t index) -> Box & {
+            auto *box = dynamic_cast<Box *>(menu.children()[index]->children()[0].get());
+            assert(box);
+            return *box;
+        };
+        assert(background(0).style().fill == testPalette.hover);
+        menu.setHighlightedIndex(1);
+        assert(menu.highlightedIndex() == 1 && animations.hasActive());
+        assert(background(0).style().fill == testPalette.hover);
+        g_usleep(25000);
+        animations.tick(0);
+        const Color intermediate = background(0).style().fill;
+        assert(intermediate.a > 0.f && intermediate.a < 1.f);
+        menu.setHighlightedIndex(0);
+        assert(background(0).style().fill == intermediate);
+        motion.setEnabled(false);
+        assert(background(0).style().fill == testPalette.hover);
+        assert(background(1).style().fill == clearColor());
+        animations.tick(0);
+        motion.setEnabled(true);
+        menu.setHighlightedIndex(1);
+        assert(animations.hasActive());
+        menu.setEntries({first});
+        menu.layout(renderer);
+        assert(!animations.hasActive());
+        menu.setEntries({first, second});
+        menu.layout(renderer);
+        menu.setHighlightedIndex(1);
+        assert(animations.hasActive());
+    }
+    assert(!animations.hasActive());
+    {
+        ContextMenuControl embedded;
+        ContextMenuControlEntry row;
+        row.label = "Embedded";
+        embedded.setEntries({row, row});
+        embedded.layout(renderer);
+        embedded.setHighlightedIndex(1);
+        auto *box = dynamic_cast<Box *>(embedded.children()[1]->children()[0].get());
+        assert(box && box->style().fill == testPalette.hover);
+    }
+    setPalette(savedPalette);
+    motion.setSpeed(speed);
+    motion.setEnabled(enabled);
+}
 
 static void checkWaylandSeatTouchMouseIsolation() {
     WaylandSeat seat;
@@ -1623,6 +1751,7 @@ int main() {
     checkCancelPendingScrollRequests();
     checkKeyedParentFocusFallback();
     checkContextMenuHierarchyAndOutsideRelease();
+    checkContextMenuMotion();
     checkWaylandSeatTouchMouseIsolation();
     checkInlineGhost();
     checkInputRangeAndCells();

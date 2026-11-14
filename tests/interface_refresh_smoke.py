@@ -2227,12 +2227,12 @@ def run_fools(ctx):
         while row > y + metrics['top'] and native.getpixel((column, row)) != canvas:
             row -= 1
         composer_top = row + 1
-        bottom = round(composer_top - metrics['padding_y'] - metrics['gap'])
-        region = (round(x + metrics['left']), round(bottom - 32 * scale),
+        bottom = round(composer_top - metrics['gap'])
+        region = (round(x + metrics['left']), round(bottom - 48 * scale),
                   round(x + width - metrics['left']), bottom)
         assert (x <= region[0] < region[2] <= x + width and
                 y + metrics['top'] < region[1] < region[3] < composer_top <= caret[1]), (
-                    'Invalid native reserved typing footer', region, composer_top, caret)
+                    'Invalid native history-tail typing region', region, composer_top, caret)
         path = Path(str(ctx['destination']).removesuffix('.bmp') + '-fools-no-typing-' + phase)
         native.save(str(path) + '.png')
         footer = native.crop(region)
@@ -2251,10 +2251,10 @@ def run_fools(ctx):
     typing_evidence.update({'recognized_footer_words': words, 'chip_recognition': chip})
     evidence_path.write_text(json.dumps(typing_evidence, indent=2) + '\n')
     assert not any(text.casefold() == ctx['query_target'].casefold() for text, _ in words), (
-        'Muted fool typing appeared in reserved footer', words, region)
+        'Muted fool typing appeared in the scrolling history footer', words, region)
     assert (footer_frames['before']['footer_ltrb'] == region and
             footer_images['before'].tobytes() == footer_images['after'].tobytes()), (
-                'Muted TAGMSG changed the actual reserved footer', typing_evidence)
+                'Muted TAGMSG changed the actual scrolling history footer', typing_evidence)
     gui.wait_messages(ctx['proc'], ctx['database_path'], ctx['expected_messages'])
     return {'modes': modes, 'unread_before': row_before, 'unread_muted': row_after,
             'unread_opt_in_expected': row_before[1] + 1, 'muted_typing_words': words,
@@ -2442,7 +2442,7 @@ def run_typing(ctx):
             'expiry_observed_seconds': expired_after, 'receive_disabled_visible': bool(pill())}
 
 def run_typing_bubble(ctx):
-    """Four genuine channel TAGMSG senders, shared tray and passive scene popup."""
+    """Real TAGMSG animates the history tail without moving native Input/reply."""
     from contextlib import ExitStack
 
     p, w, prefs, db = ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path']
@@ -2481,47 +2481,246 @@ def run_typing_bubble(ctx):
                     prefix.split('!', 1)[0] == nick and
                     ctx['observer'].last_tags.get('+typing') == state, timeout=15)
 
-        _policy_send(ctx, '\x042AB971,2AB971ANCHORANCHOR\x0f typing tray anchor',
-                     target=channel)
+        history_colors = [(73 + index * 3, 91 + index * 2, 177 - index * 2)
+                          for index in range(40)]
+        for index, rgb in enumerate(history_colors):
+            token = ''.join(f'{component:02X}' for component in rgb)
+            _policy_send(ctx, f'\x04{token},{token}HISTORY{index:02d}\x0f footer history',
+                         target=channel, durable=False)
+        gui.wait_messages(p, db, ctx['expected_messages'])
         wire_start = len(ctx['observer'].frames)
-        for style in ('bubbles', 'irc', 'stacked'):
+        for style_index, style in enumerate(('bubbles', 'irc', 'stacked')):
             typing(0)
             gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'],
                                   identity, style, label='typing-bubble-' + style)
+            color = (42 + style_index * 17, 185, 113)
+            token = ''.join(f'{component:02X}' for component in color)
+            _policy_send(ctx, 'Ordinary native reply source ' + style, target=channel)
+            preceding_color = (191, 84 + style_index * 17, 61)
+            preceding_token = ''.join(f'{component:02X}' for component in preceding_color)
+            _policy_send(ctx, f'\x04{preceding_token},{preceding_token}ANCHORANCHOR\x0f',
+                         target=channel)
+            _policy_send(ctx, f'\x04{token},{token}ANCHORANCHOR\x0f', target=channel)
             empty_initial = gui._composer_native(w, '', 0, 0)
             gui.type_text('private café draft')
             draft = 'private café draft'
             size = len(draft.encode('utf-8'))
+            gui.framed_keys(w, 'shift+Left')
+            selected = gui._composer_native(w, draft, size - 1, size)
+            typing(1)
+            assert gui._composer_native(w, draft, size - 1, size) == selected, \
+                'Typing changed selected draft'
+            typing(0)
+            gui.framed_keys(w, 'End', 'ctrl+p', 'ctrl+p', 'ctrl+p', 'ctrl+r')
             initial = gui._composer_native(w, draft, size, size)
+            reply = _policy_reply_region(ctx, 'typing-footer-reply-' + style)
+            pane = gui.read_layout(prefs)['conversation']['rect']
+            gui.move_pointer(w, pane[0] + pane[2] / 2, pane[1] + pane[3] / 2)
+            scroll_marker = gui.GUI_DEBUG[w][1].stat().st_size
+            gui.POINTER.scroll(120)
+            gui.await_native_frame(w, scroll_marker,
+                re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
+            previous_tail = []
+            def settled_live_tail():
+                box = _policy_box(ctx, color)
+                settled = bool(box and previous_tail and previous_tail[0] == box)
+                previous_tail[:] = [box]
+                return box if settled else None
+            gui.SESSION.until('reply selection returns to a settled native live tail',
+                              settled_live_tail)
             anchor = _policy_wait_box(ctx, color)
             caret = initial['caret']
             pane = gui.read_layout(prefs)['conversation']['rect']
-            footer = (pane[0], anchor[3] + 1, pane[2], caret[1] - anchor[3] - 1)
-            assert footer[3] > 0, (footer, anchor, caret)
+            footer = (pane[0], pane[1] + 80 * ctx['args'].zoom, pane[2],
+                      reply[1] - pane[1] - 80 * ctx['args'].zoom)
+            assert footer[3] > 0, (footer, anchor, caret, reply)
             phases = []
 
+            def body_box(capture, rgb=color):
+                items = gui.native_marker_components(capture, pane, rgb)
+                return items[0]['bbox'] if len(items) == 1 and items[0]['full'] else None
+
+            def footer_view(label, capture=None):
+                capture = capture if capture is not None else gui.native_rgb_capture(w)
+                assert input_boundary(capture) == idle_input_top, (
+                    'Typing animation moved the native input boundary', style, label)
+                assert _policy_crop(capture, reply_patch) == reply_pixels, (
+                    'Typing animation moved or changed the reply excerpt', style, label)
+                marker = body_box(capture)
+                assert marker is not None, ('Native tail marker missing', style, label)
+                path = Path(ctx['destination']).with_name(
+                    Path(ctx['destination']).stem + '-typing-footer-' + style + '-' + label + '.png')
+                Image.frombytes('RGB', (capture['width'], capture['height']),
+                                capture['pixels']).save(path)
+                return {'marker': marker, 'capture': str(path)}
+
+
+            def input_boundary(capture):
+                image = Image.frombytes('RGB', (capture['width'], capture['height']), capture['pixels'])
+                column = round(pane[0] + pane[2] - 200 * ctx['args'].zoom)
+                row = round(caret[1] + caret[3] / 2)
+                canvas = image.getpixel((round(pane[0] + 1), row))
+                assert image.getpixel((column, row)) != canvas, 'Input surface scan missed paint'
+                while row > pane[1] and image.getpixel((column, row - 1)) != canvas:
+                    row -= 1
+                return row
+
+            idle_input_top = input_boundary(gui.native_rgb_capture(w))
+            def reply_bounds(capture):
+                native = Image.frombytes('RGB', (capture['width'], capture['height']),
+                                         capture['pixels'])
+                canvas = native.getpixel((round(pane[0] + 1), round(reply[1])))
+                columns = range(round(pane[0] + pane[2] * .2),
+                                round(pane[0] + pane[2] * .8))
+                edges = [row for row in range(max(round(pane[1]), round(reply[1] - 64 * ctx['args'].zoom)),
+                                              idle_input_top)
+                         if sum(native.getpixel((column, row)) != canvas for column in columns)
+                         > .8 * len(columns)]
+                tops = [row for row in edges if row < reply[1]]
+                bottoms = [row for row in edges if row >= reply[1]]
+                assert tops and bottoms, ('Native reply outline edges were not observed', edges, reply)
+                top, bottom = max(tops), max(bottoms) + 1
+                return (pane[0], top, pane[0] + pane[2], bottom)
+
+            idle_capture = gui.native_rgb_capture(w)
+            reply_patch = reply_bounds(idle_capture)
+            reply_top = reply_patch[1]
+            assert abs(idle_input_top - reply_patch[3] - 4 * ctx['args'].zoom) <= 1, (
+                'Reply card does not have the ordinary four-pixel Input gap',
+                reply_patch, idle_input_top)
+            reply_pixels = _policy_crop(idle_capture, reply_patch)
+            idle_footer = footer_view('reply-idle', idle_capture)
+            preceding = body_box(idle_capture, preceding_color)
+            newest = body_box(idle_capture)
+            assert preceding and newest, 'Consecutive native row-spacing markers are missing'
+            normal_row_gap = newest[1] - preceding[3]
+            idle_clearance = reply_top - newest[3]
+            assert 0 <= idle_clearance <= normal_row_gap + 2 * ctx['args'].zoom, (
+                'Idle history contains a typing reserve beyond ordinary row spacing',
+                idle_clearance, normal_row_gap, newest, reply_top)
+            latest_rgb = color
+            active_footer_top = reply_top - 64 * ctx['args'].zoom
+
+            def contained(label, boxes):
+                view = footer_view(label)
+                assert view['marker'][1] < anchor[1], (
+                    'Typing did not move live-tail history upward', anchor, view)
+                assert all(view['marker'][3] < box[1] < box[3] <= reply_top
+                           for box in boxes), ('Typing ink is not at history end', boxes, view, reply_patch)
+                return view
+
             def stable(label):
-                assert _policy_wait_box(ctx, color) == anchor, (
-                    'Typing changed the actual message anchor', label)
+                assert input_boundary(gui.native_rgb_capture(w)) == idle_input_top, (
+                    'Typing changed the native input boundary', label)
                 assert gui._composer_native(w, draft, size, size) == initial, (
                     'Typing changed native draft/caret/selection', label)
+                assert reply_bounds(gui.native_rgb_capture(w)) == reply_patch, (
+                    'Typing moved the actual reply card outline', label)
+                assert _policy_reply_region(ctx, 'typing-footer-fixed-' + style + '-' + label) == reply, (
+                    'Typing moved the reply preview', label)
                 phases.append(label)
 
             def footer_words(label):
+                image = gui.native_rgb_capture(w)
+                latest = body_box(image, latest_rgb)
+                top = latest[3] + idle_clearance if latest else active_footer_top
+                if top >= reply_top - 1:
+                    return []
+                region = (pane[0], top, pane[2], reply_top - top)
                 words = upload.visible_words(
                     ctx['window'], Path(ctx['destination']),
                     label='typing-bubble-' + style + '-' + label,
-                    region=footer, min_confidence=0)
+                    region=region, min_confidence=0)
                 return [(row['text'], (int(row['left']), int(row['top']),
                                        int(row['left']) + int(row['width']),
                                        int(row['top']) + int(row['height'])))
                         for row in words]
 
             typing(1)
-            single = gui.SESSION.until('one real typing identity in native tray', lambda:
+            single = gui.SESSION.until('one real typing identity in native history footer', lambda:
                 next((box for text, box in footer_words('one')
                       if text.rstrip(',').casefold() == names[0].casefold()), None))
             stable('one')
+            single_footer = contained('single', [single])
+            active_footer_top = single_footer['marker'][3] + idle_clearance
+            motion_frames = {}
+            motion_observations = {}
+            def sample_transition(label, trigger):
+                geometry = gui.window_geometry(w)
+                pending, errors = [], []
+                ready = threading.Event()
+                trigger_done = threading.Event()
+                stop_capture = threading.Event()
+                observation_deadline = []
+
+                def collect():
+                    try:
+                        while not stop_capture.is_set():
+                            if (trigger_done.is_set() and
+                                    time.monotonic() >= observation_deadline[0]):
+                                break
+                            pending.append(gui.native_rgb_capture(w, geometry=geometry))
+                            ready.set()
+                    except BaseException as error:
+                        errors.append(error)
+                        ready.set()
+
+                worker = threading.Thread(target=collect, daemon=True)
+                worker.start()
+                try:
+                    assert ready.wait(10), 'Native footer sampler did not start'
+                    if errors:
+                        raise errors[0]
+                    trigger()
+                    observation_deadline.append(time.monotonic() + 1)
+                    trigger_done.set()
+                    worker.join(12)
+                finally:
+                    stop_capture.set()
+                    worker.join(12)
+                    assert not worker.is_alive(), 'Native footer sampler did not finish'
+                    if errors:
+                        raise errors[0]
+                assert gui.window_geometry(w) == geometry, 'Client moved during footer capture'
+                return [footer_view(label + '-' + str(index), capture)
+                        for index, capture in enumerate(pending)]
+
+            typing(0)
+            _policy_effects(ctx, fx='full')
+            stable('full-fx-idle')
+            assert footer_view('full-fx-idle')['marker'] == anchor
+            idle_top, active_top = anchor[1], single_footer['marker'][1]
+            for direction, count, target_top in (
+                    ('grow', 1, active_top), ('shrink', 0, idle_top)):
+                frames = sample_transition(direction, lambda count=count: typing(count))
+                stable(direction)
+                assert frames and frames[-1]['marker'][1] == target_top, (
+                    'Native history footer did not settle', direction, frames)
+                partial = any(active_top < frame['marker'][1] < idle_top for frame in frames)
+                motion_observations[direction] = {
+                    'partial_content_movement_observed': partial,
+                    'status': 'observed-partial-content-movement' if partial else 'inconclusive-only-endpoints',
+                    'limitation': None if partial else
+                        'Native capture scheduling missed intermediate content positions; '
+                        'exact smooth-motion timing is covered by native C++ geometry checks.'}
+                positions = [frame['marker'][1] for frame in frames]
+                assert all(active_top <= top <= idle_top for top in positions), (
+                    'Native tail content overshot footer endpoints', direction, frames)
+                assert all((a >= b if direction == 'grow' else a <= b)
+                           for a, b in zip(positions, positions[1:])), (
+                    'Native footer motion reversed unexpectedly', direction, positions)
+                motion_frames[direction] = frames
+            _policy_effects(ctx, fx='full', reduced=True)
+            typing(1)
+            gui.SESSION.until('reduced-motion footer reaches its active endpoint',
+                              lambda: body_box(gui.native_rgb_capture(w)) == single_footer['marker'])
+            stable('reduced-motion-active')
+            typing(0)
+            gui.SESSION.until('reduced-motion footer removes its entire reserve',
+                              lambda: body_box(gui.native_rgb_capture(w)) == anchor)
+            stable('reduced-motion-idle')
+            _policy_effects(ctx, fx='off')
+            stable('full-fx-complete')
             typing(4)
 
             def shared():
@@ -2538,6 +2737,9 @@ def run_typing_bubble(ctx):
 
             shown, overflow = gui.SESSION.until('shared inline identities and exact remaining +N', shared)
             stable('many')
+            shared_footer = contained('many', [overflow, *(box for _, box in shown)])
+            assert shared_footer['marker'] == single_footer['marker'], \
+                'Participant count expanded the fixed one-row footer'
             tray_top = min([overflow[1], *(box[1] for _, box in shown)])
             method = ctx['input_method']
             assert method is not None, 'Focused scope requires its existing real NativeInputMethod'
@@ -2553,36 +2755,102 @@ def run_typing_bubble(ctx):
             left, top, _, height = caret
             glyph_box = (left + 2, top, preedit['caret'][0] - 2, top + height)
             assert glyph_box[0] < glyph_box[2], (caret, preedit)
-            glyphs = _policy_crop(gui.native_rgb_capture(w), glyph_box)
+            preedit_frames = []
+            def settled_preedit_frame():
+                capture = gui.native_rgb_capture(w)
+                geometry = (body_box(capture), input_boundary(capture), reply_bounds(capture))
+                settled = bool(geometry[0] and preedit_frames and preedit_frames[0] == geometry)
+                preedit_frames[:] = [geometry]
+                return capture if settled else None
+            preedit_capture = gui.SESSION.until('settled native preedit passive geometry',
+                                               settled_preedit_frame)
+            preedit_input_top = input_boundary(preedit_capture)
+            preedit_reply_bounds = reply_bounds(preedit_capture)
+            glyphs = _policy_crop(preedit_capture, glyph_box)
+            preedit_anchor = body_box(preedit_capture)
+            preedit_history_anchors = [(rgb, body_box(preedit_capture, rgb)) for rgb in history_colors]
+            preedit_history_anchors = [(rgb, box) for rgb, box in preedit_history_anchors if box]
+            assert preedit_anchor and preedit_history_anchors, \
+                'Preedit position proof requires visible real history markers'
             passive_marker = trace.stat().st_size
 
-            def retained():
+            def retained(*, popup_open=False):
                 assert gui._composer_native(w, draft, size, size) == preedit
                 method.drain()
                 assert method.state['active'] and method.state['surrounding'] == (draft, size, size)
                 assert _policy_crop(gui.native_rgb_capture(w), glyph_box) == glyphs, \
                     'Passive typing popup lost actual IME preedit glyphs'
-                assert _policy_wait_box(ctx, color) == anchor
+                capture = gui.native_rgb_capture(w)
+                assert input_boundary(capture) == preedit_input_top, \
+                    'Popup moved the post-preedit Input boundary'
+                assert reply_bounds(capture) == preedit_reply_bounds, \
+                    'Popup moved the post-preedit reply card'
+                if popup_open:
+                    unoccluded = [(rgb, expected, body_box(capture, rgb))
+                                  for rgb, expected in preedit_history_anchors]
+                    unoccluded = [(rgb, expected, actual)
+                                  for rgb, expected, actual in unoccluded
+                                  if actual and actual[0] == expected[0] and actual[2] == expected[2]]
+                    assert unoccluded, 'Popup position proof lost every complete history marker'
+                    assert all(actual == expected for _, expected, actual in unoccluded), (
+                        'Popup moved unoccluded real history markers', unoccluded)
+                else:
+                    assert body_box(capture) == preedit_anchor, (
+                        'Popup dismissal moved the real tail marker',
+                        preedit_anchor, body_box(capture))
+
+            popup_participant_region = []
 
             def popup_words(label):
-                return _policy_words(ctx, 'typing-bubble-' + style + '-' + label,
-                                     (pane[0], pane[1], pane[2], tray_top - pane[1]))
+                words = upload.visible_words(
+                    w, Path(ctx['destination']),
+                    label='policy-typing-bubble-' + style + '-' + label,
+                    region=(pane[0], pane[1], pane[2], tray_top - pane[1]),
+                    psm=11, min_confidence=0)
+                titles = [row for row in words if row['text'].casefold() == 'typing']
+                if not titles:
+                    return []
+                title = max(titles, key=lambda row: int(row['top']))
+                left, top = int(title['left']), int(title['top'])
+                words = upload.visible_words(
+                    w, Path(ctx['destination']),
+                    label='policy-typing-bubble-' + style + '-' + label + '-list',
+                    region=(left, top, pane[0] + pane[2] - left, tray_top - top),
+                    psm=11, min_confidence=0)
+                return [(row['text'], (int(row['left']), int(row['top']),
+                                       int(row['left']) + int(row['width']),
+                                       int(row['top']) + int(row['height'])))
+                        for row in words]
 
             def opened():
                 typing(4)
                 words = popup_words('popup')
                 found = {text.casefold(): box for text, box in words}
-                return words if {'typing', 'now', *(nick.casefold() for nick in names)} <= found.keys() else None
+                if not {nick.casefold() for nick in names} <= found.keys():
+                    return None
+                boxes = [found[nick.casefold()] for nick in names]
+                padding = 2 * ctx['args'].zoom
+                left = min(box[0] for box in boxes) - padding
+                top = min(box[1] for box in boxes) - padding
+                right = max(box[2] for box in boxes) + padding
+                bottom = max(box[3] for box in boxes) + padding
+                popup_participant_region[:] = [(left, top, right - left, bottom - top)]
+                return words
 
             def closed(label):
                 typing(4)
-                return not {'typing', 'now'} <= {
-                    text.casefold() for text, _ in popup_words(label)}
+                assert popup_participant_region, 'Dismissal requires an observed complete popup list'
+                words = upload.visible_words(
+                    w, Path(ctx['destination']),
+                    label='policy-typing-bubble-' + style + '-' + label + '-participants',
+                    region=popup_participant_region[0], psm=11, min_confidence=0)
+                return not any(row['text'].rstrip(',').casefold() in {nick.casefold() for nick in names}
+                               for row in words)
 
             gui.click(w, (overflow[0] + overflow[2]) / 2,
                       (overflow[1] + overflow[3]) / 2)
             popup = gui.SESSION.until('scene popup contains all four, including inline names', opened)
-            retained()
+            retained(popup_open=True)
             # Stay inside the scaled transcript's left edge, outside the list
             # even when its panel occupies almost the entire narrow viewport.
             metrics = gui.pane_metrics(gui.read_layout(prefs), ctx['args'].zoom)
@@ -2606,7 +2874,7 @@ def run_typing_bubble(ctx):
                       (overflow[1] + overflow[3]) / 2)
             gui.SESSION.until('reopened complete typing list before switch', opened)
             _policy_focus(ctx, ctx['query_id'])
-            assert not any(text.casefold() == 'typing'
+            assert not any(text.rstrip(',').casefold() in {nick.casefold() for nick in names}
                            for text, _ in _policy_words(ctx, 'typing-bubble-switched-' + style)), \
                 'Typing popup survived its source buffer switch'
             _policy_focus(ctx, identity, expected=(draft + '猫', size + 3, size + 3))
@@ -2624,12 +2892,133 @@ def run_typing_bubble(ctx):
             empty_after_done = gui._composer_native(w, '', 0, 0)
             assert empty_after_done == empty_before_done, \
                 'Done changed the same empty-document native caret'
+            done_footer = footer_view('done')
+            assert done_footer['marker'] == idle_footer['marker'], (
+                'Done left a permanent typing reserve', idle_footer, done_footer)
+            expiry_footer = None
+            if style == 'bubbles':
+                typing(1)
+                gui.SESSION.until('real identity visible before unrefreshed expiry', lambda:
+                    any(text.rstrip(',').casefold() == names[0].casefold()
+                        for text, _ in footer_words('before-expiry')))
+                deadline = time.monotonic() + 15
+                while True:
+                    expiry_footer = footer_view('expired')
+                    if expiry_footer['marker'] == idle_footer['marker']:
+                        break
+                    assert time.monotonic() < deadline, 'Unrefreshed native typing footer did not expire'
+                    time.sleep(.2)
+                assert not any(text.rstrip(',').casefold() in {nick.casefold() for nick in names}
+                               for text, _ in footer_words('expired')), \
+                    'Expired identity remains painted in the history footer'
+                assert gui._composer_native(w, '', 0, 0) == empty_after_done
+                assert _policy_wait_box(ctx, color) == anchor
+            gui.move_pointer(w, pane[0] + pane[2] / 2, pane[1] + pane[3] / 2)
+            scroll_marker = trace.stat().st_size
+            gui.POINTER.scroll(-12)
+            gui.await_native_frame(w, scroll_marker,
+                re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
+            away_color = []
+            def older_anchor():
+                image = gui.native_rgb_capture(w)
+                if body_box(image) is not None:
+                    return None
+                for rgb in history_colors:
+                    box = body_box(image, rgb)
+                    if box:
+                        away_color[:] = rgb
+                        return box
+                return None
+            old_anchor = gui.SESSION.until('older real history marker with tail offscreen', older_anchor)
+            away_capture = str(_policy_capture(ctx, 'typing-footer-older-idle-' + style))
+            for count in (4, 0, 4, 0):
+                typing(count)
+                assert body_box(gui.native_rgb_capture(w), tuple(away_color)) == old_anchor, \
+                    'Typing moved the visible older-history pixel anchor'
+                assert not any(text.rstrip(',').casefold() in {nick.casefold() for nick in names}
+                               for text, _ in footer_words('older-' + str(count))), \
+                    'History footer was pinned onscreen while reading older messages'
+                assert gui._composer_native(w, '', 0, 0) == empty_after_done
+            away_active = str(_policy_capture(ctx, 'typing-footer-older-final-' + style))
+            gui.move_pointer(w, pane[0] + pane[2] / 2, pane[1] + pane[3] / 2)
+            scroll_marker = trace.stat().st_size
+            gui.POINTER.scroll(120)
+            gui.await_native_frame(w, scroll_marker,
+                re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
+            gui.SESSION.until('native wheel restores the same idle tail endpoint',
+                              lambda: body_box(gui.native_rgb_capture(w)) == anchor)
+            handoffs = []
+            _policy_effects(ctx, fx='full')
+            for done_first in (False, True):
+                idle_handoff = body_box(gui.native_rgb_capture(w))
+                typing(1)
+                def active_handoff_endpoint():
+                    box = body_box(gui.native_rgb_capture(w))
+                    if (box is not None and idle_handoff is not None and
+                            box[1] == idle_handoff[1] - (idle_top - active_top)):
+                        return box
+                    return None
+                gui.SESSION.until('last-typer footer reaches its active content endpoint',
+                                  active_handoff_endpoint)
+                gui.SESSION.until('last real typer visible before message handoff', lambda:
+                    any(text.rstrip(',').casefold() == names[0].casefold()
+                        for text, _ in footer_words('handoff-active')))
+                before_handoff = body_box(gui.native_rgb_capture(w))
+                handoff_rgb = (203, 111 + int(done_first) * 19, 71 + style_index * 17)
+                handoff_token = ''.join(f'{component:02X}' for component in handoff_rgb)
+                text = f'\x04{handoff_token},{handoff_token}HANDOFFROW\x0f'
+                def incoming_handoff():
+                    if done_first:
+                        peers[0].send(f'@+typing=done TAGMSG {channel}')
+                        time.sleep(.04)
+                    peers[0].send(f'PRIVMSG {channel} :{text}')
+                    gui.receive_until(ctx['observer'], 'PRIVMSG', [channel, text], names[0],
+                                      redact=ctx['lab']._redact)
+                frames = sample_transition('handoff-' + str(done_first), incoming_handoff)
+                ctx['expected_messages'].extend(ctx['channel_messages'](text, names[0]))
+                gui.wait_messages(p, db, ctx['expected_messages'])
+                latest_rgb = handoff_rgb
+                final_handoff = body_box(gui.native_rgb_capture(w))
+                assert frames and frames[-1]['marker'] == final_handoff, \
+                    'Incoming last-typer handoff did not settle'
+                positions = [frame['marker'][1] for frame in frames]
+                low, high = sorted((before_handoff[1], final_handoff[1]))
+                if done_first:
+                    high += idle_top - active_top
+                assert all(low <= top <= high for top in positions), (
+                    'Last-typer handoff escaped its history endpoints', done_first, positions)
+                peak = positions.index(max(positions))
+                assert all(a >= b for a, b in zip(positions[peak:], positions[peak + 1:])), (
+                    'Last-typer message caused a second footer-shrink bounce', done_first, positions)
+                assert not any(text.rstrip(',').casefold() in {nick.casefold() for nick in names}
+                               for text, _ in footer_words('handoff-done')), \
+                    'Message did not consume its last-typer footer'
+                assert gui._composer_native(w, '', 0, 0) == empty_after_done
+                handoffs.append({'done_first': done_first, 'frames': frames,
+                                 'before': before_handoff, 'after': final_handoff})
+            _policy_effects(ctx, fx='off')
+            gui.cancel_native_reply(w, Path(ctx['destination']),
+                                    label='typing-footer-finish-' + style, expected_text='')
             evidence.append({'style': style, 'anchor': anchor, 'caret': caret,
                 'empty_initial': empty_initial, 'empty_before_done': empty_before_done,
                 'empty_after_done': empty_after_done,
                 'stable_phases': ['zero', *phases, 'done'], 'single': single,
                 'inline_names': shown, 'overflow': overflow, 'popup_words': popup,
                 'preedit': preedit, 'preedit_glyph_box': glyph_box, 'committed': committed,
+                'passive_geometry': {'tail_marker': preedit_anchor,
+                                     'input_top': preedit_input_top,
+                                     'reply_bounds': preedit_reply_bounds,
+                                     'history_markers': preedit_history_anchors},
+                'footer': {'idle': idle_footer, 'single': single_footer,
+                           'many': shared_footer, 'done': done_footer},
+                'native_motion_frames': motion_frames,
+                'native_motion_observations': motion_observations,
+                'expired_footer': expiry_footer,
+                'older_history': {'marker': old_anchor, 'rgb': away_color,
+                                  'idle_capture': away_capture, 'final_capture': away_active},
+                'last_typer_handoffs': handoffs,
+                'idle_clearance': {'reply_top': reply_top, 'body_bottom': newest[3],
+                                   'pixels': idle_clearance, 'normal_row_gap': normal_row_gap},
                 'no_native_popup_or_input_disable': True,
                 'capture': str(_policy_capture(ctx, 'typing-bubble-final-' + style))})
         assert not [frame for frame in ctx['observer'].frames[wire_start:]
@@ -2639,8 +3028,8 @@ def run_typing_bubble(ctx):
     return _refresh_return(ctx, 'typing-bubble', {
         'eligible': names, 'phases': evidence,
         'limitations': ['Native Wayland exposes Input ownership/caret, not scene nodes. '
-            'Existing native raster text recognition locates +2 and the read-only list; '
-            'scene avatar count, exact tray height, colors and surfaces belong to native C++ proofs.']})
+            'Native RGB scans prove history content movement and raster text bounds; '
+            'exact avatar count and animation timing remain native C++ assertions.']})
 
 
 
@@ -6460,7 +6849,7 @@ def run_logo_alignment(ctx):
 
 
 def run_overlay_refinements(ctx):
-    """Real unreserved reply overlap, fixed native Input, transparent history and /me."""
+    """Reserved reply footer, fixed native Input, unchanged typing and /me."""
     p, w, prefs, db = ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path']
     identity = ctx['query_id']
     _policy_focus(ctx, identity)
@@ -6483,7 +6872,6 @@ def run_overlay_refinements(ctx):
     gui.framed_keys(w, 'Left', 'Right')
     size = len(draft.encode())
     before = gui._composer_native(w, draft, size, size)
-    # The newest wide swatch crosses the card's text-free area without any scroll.
     _policy_send(ctx, '\x04D37925,D37925' + 'H' * 60 + '\x0f newest overlay witness')
     newest = _policy_wait_box(ctx, (211, 121, 37))
     anchor = _policy_wait_box(ctx, (42, 185, 113))
@@ -6493,33 +6881,37 @@ def run_overlay_refinements(ctx):
                'source': ((25, 167, 211), source_marker)}
     captures = []
 
-    def overlap_observation(label, *, obscured=False):
+    def reply_observation(label, *, replying=False):
         native = gui._composer_native(w, draft, size, size)
         rectangle = gui.read_layout(prefs)['conversation']['rect']
         frame = gui.native_rgb_capture(w)
-        path = Path(ctx['destination']).with_name('overlay-overlap-' + label + '.png')
+        path = Path(ctx['destination']).with_name('overlay-footer-' + label + '.png')
         Image.frombytes('RGB', (frame['width'], frame['height']), frame['pixels']).save(path)
         captures.append(str(path))
         observed = {}
         for name, (rgb, box) in markers.items():
-            roi = (box[0] - 1, box[1] - 1, box[2] - box[0] + 2, box[3] - box[1] + 2)
-            parts = gui.native_marker_components(frame, roi, rgb)
-            assert parts, ('Actual marker vanished; absence is not overlap evidence', label, name, box, str(path))
-            bounds = (min(item['bbox'][0] for item in parts), min(item['bbox'][1] for item in parts),
-                      max(item['bbox'][2] for item in parts), max(item['bbox'][3] for item in parts))
-            assert (box[0] <= bounds[0] < bounds[2] <= box[2]
-                    and box[1] <= bounds[1] < bounds[3] <= box[3]), (
-                'Actual marker moved outside its saved native ROI', label, name, box, parts, str(path))
-            if name == 'newest' or not obscured:
-                assert bounds == tuple(box), ('Actual marker geometry changed', label, name, box, parts, str(path))
-            if not obscured:
-                assert len(parts) == 1 and parts[0]['full'], (label, name, parts, str(path))
-            observed[name] = {'original_bbox': box, 'surviving_components': parts, 'saved_roi': roi}
+            parts = gui.native_marker_components(frame, rectangle, rgb)
+            complete = [item for item in parts if item['full']]
+            assert complete, ('Actual history marker vanished', label, name, parts, str(path))
+            marker = min(complete, key=lambda item: item['bbox'][1])
+            bounds = tuple(marker['bbox'])
+            assert bounds[0] == box[0] and bounds[2] == box[2], (
+                'Reply changed history marker width', label, name, box, bounds)
+            assert bounds[3] - bounds[1] == box[3] - box[1], (
+                'Reply clipped history marker', label, name, box, bounds)
+            if replying:
+                assert bounds[1] < box[1], ('Reply did not reserve history space', label, name, box, bounds)
+            else:
+                assert bounds == tuple(box), ('Reply space was not reclaimed', label, name, box, bounds)
+            observed[name] = {'original_bbox': box, 'history_bbox': bounds}
+        shifts = [item['history_bbox'][1] - item['original_bbox'][1] for item in observed.values()]
+        assert max(shifts) == min(shifts), ('Reply changed relative history anchors', label, shifts)
         return {'native_composer': native, 'conversation': rectangle,
                 'markers': observed, 'capture': str(path)}
 
-    closed = overlap_observation('before')
+    closed = reply_observation('before')
     layout_before = closed['conversation']
+    closed_frame = gui.native_rgb_capture(w)
     reply = gui.begin_native_reply(w, gui.read_layout(prefs), ctx['args'].zoom,
                                     Path(ctx['destination']), label='overlay-two-line-reply')
     gui._composer_native(w, draft, size, size)
@@ -6530,41 +6922,37 @@ def run_overlay_refinements(ctx):
     gui.SESSION.until('native pointer leaves the measured source swatch', lambda:
         re.search(r'wl_pointer[@#]\d+\.(?:motion|enter)\(',
                   gui.GUI_DEBUG[w][1].read_bytes()[pointer_offset:].decode(errors='replace')))
-    opened = overlap_observation('open', obscured=True)
+    opened = reply_observation('open', replying=True)
     assert opened['native_composer'] == closed['native_composer'], 'Reply changed native composer geometry/draft'
-    assert opened['conversation'] == layout_before, 'Reply changed conversation geometry'
-    excerpt_region = _policy_reply_region(ctx, 'overlay-two-lines')
+    assert opened['conversation'] == layout_before, 'Reply changed conversation pane geometry'
+    reply_frame = gui.native_rgb_capture(w)
     preview_parts = [item['bbox'] for item in gui.native_marker_components(
-        gui.native_rgb_capture(w), layout_before, (25, 167, 211))
-        if item['full'] and item['bbox'][1] >= excerpt_region[1] and item['bbox'][3] < before['caret'][1]]
-    assert len(preview_parts) == 1, ('No unique actual rich preview row marker', preview_parts)
-    preview_marker = preview_parts[0]
-    raw_reply_words = _policy_words(ctx, 'overlay-two-lines-raw', excerpt_region)
-    body_words = [(text, box) for text, box in raw_reply_words
-                  if box[0] >= preview_marker[0]
-                  and preview_marker[1] < (box[1] + box[3]) / 2 < preview_marker[3]]
-    assert body_words, ('No actual preview text bounds beside rich marker', raw_reply_words, preview_marker)
-    body_right = max(box[2] for _, box in body_words)
-    excerpt_region = (preview_marker[0], excerpt_region[1],
-                      body_right - preview_marker[0], excerpt_region[3])
-    # Preserve the full vertical inspection band and all small/Unicode words;
-    # only actual inner text bounds exclude the rounded border and Cancel.
-    reply_words = _policy_words(ctx, 'overlay-two-lines', excerpt_region)
-    excerpts = [box for text, box in reply_words if 'overlayexcerpt' in text.casefold()]
-    assert excerpts, ('No actual source excerpt in native reply card', reply_words)
-    baselines = []
-    for _, box in sorted(reply_words, key=lambda item: item[1][1]):
-        center = (box[1] + box[3]) / 2
-        if not any(abs(center - previous) <= max(3, (box[3] - box[1]) / 2) for previous in baselines):
-            baselines.append(center)
-    assert len(baselines) == 1, ('Reply excerpt spans more than one native glyph row', reply_words, baselines)
-    heading_words = _policy_words(ctx, 'overlay-heading-reference')
-    heading = max((box for text, box in heading_words if text.casefold() == 'replying'
-                   and box[3] < excerpt_region[1]), key=lambda box: box[3])
-    typing_top = round(max(box[3] for _, box in reply_words)) + 1
+        reply_frame, layout_before, (25, 167, 211))
+        if item['full'] and item['bbox'][3] < before['caret'][1]]
+    assert preview_parts, ('No actual rich preview row marker', preview_parts)
+    preview_marker = max(preview_parts, key=lambda box: box[1])
+    assert preview_marker[1] > opened['markers']['source']['history_bbox'][3], (
+        'Reply excerpt was not below its actual history source', preview_marker, opened['markers'])
+    left = round(layout_before[0]) + 1
+    right = round(layout_before[0] + layout_before[2]) - 1
+    assert left < right and closed_frame['width'] == reply_frame['width'], (
+        'Reply capture changed native window width', layout_before)
+    card_edges = []
+    for y in range(round(layout_before[1]), preview_marker[1]):
+        start = (y * reply_frame['width'] + left) * 3
+        end = (y * reply_frame['width'] + right) * 3
+        changed = sum(reply_frame['pixels'][index:index + 3] !=
+                      closed_frame['pixels'][index:index + 3]
+                      for index in range(start, end, 3))
+        if changed > (right - left) * .9:
+            card_edges.append(y)
+    assert card_edges, ('No actual full-width reply border above rich excerpt', preview_marker)
+    card_top = min(card_edges)
+    assert card_top < preview_marker[1], ('Reply border did not enclose excerpt', card_top, preview_marker)
+    typing_top = preview_marker[3] + 1
     typing_box = (round(layout_before[0]), typing_top,
                   round(layout_before[0] + layout_before[2]), round(before['caret'][1]))
-    assert typing_box[1] < typing_box[3], ('No measured typing band between reply and native Input', typing_box)
+    assert typing_box[1] < typing_box[3], ('No measured typing band below reply and above Input', typing_box)
     gui.move_pointer(w, layout_before[0] + layout_before[2] / 2, layout_before[1] + 1)
 
     def typing_pixels():
@@ -6594,9 +6982,9 @@ def run_overlay_refinements(ctx):
             'Typing transition crosses the measured reply/Input boundaries', typing_box, bounds)
         return {'measured_band': typing_box, 'changed_bbox': bounds, 'changed_pixels': len(changed),
                 'before_capture': typing_before_capture, 'active_capture': save_typing_pixels('active', pixels)}
-    typing = gui.SESSION.until('real TAGMSG paints the measured band below reply and above Input', typing_visible)
+    typing = gui.SESSION.until('real TAGMSG paints the unchanged band below reply and above Input', typing_visible)
     assert gui.native_input_rectangle(w) == before['caret']
-    overlap_observation('typing', obscured=True)
+    reply_observation('typing', replying=True)
     assert gui._composer_native(w, draft, size, size)['caret'] == before['caret']
     _policy_typing(ctx, 'done')
     def typing_restored():
@@ -6607,21 +6995,16 @@ def run_overlay_refinements(ctx):
     typing['done_restores_exact_baseline'] = True
     captures.append(str(_policy_capture(ctx, 'overlay-fixed-two-lines')))
 
-    # No wheel or navigation occurs between the followed newest row and this
-    # opening observation. Actual surviving RGB, not an absent/clipped marker,
-    # must occupy the real heading/excerpt band immediately.
-    card_band = (heading[1], max(box[3] for _, box in reply_words))
-    surviving = opened['markers']['newest']['surviving_components']
-    behind = [item for item in surviving
-              if max(item['bbox'][1], card_band[0]) < min(item['bbox'][3], card_band[1])]
-    assert behind, ('Followed newest actual marker does not occupy the open card band',
-                    newest, card_band, surviving, opened['capture'])
-    painted_behind = {'card_band': card_band, 'newest_marker': newest,
-                      'surviving_components_in_band': behind, 'wheel_required': False,
-                      'capture': opened['capture']}
+    card_band = (card_top, preview_marker[3])
+    history_marker = opened['markers']['newest']['history_bbox']
+    assert history_marker[3] <= card_band[0], (
+        'Followed newest history overlaps the reply card', history_marker, card_band, opened['capture'])
+    reserved_footer = {'card_band': card_band, 'newest_history_marker': history_marker,
+                       'reserved_height': newest[1] - history_marker[1],
+                       'wheel_required': False, 'capture': opened['capture']}
     cancelled = gui.cancel_native_reply(w, ctx['destination'], label='overlay-cancel', expected_text=draft)
     captures.extend(cancelled['captures'])
-    closed_again = overlap_observation('cancel')
+    closed_again = reply_observation('cancel')
     assert closed_again['native_composer'] == closed['native_composer'], \
         'Real Cancel reply changed native composer geometry or draft'
     assert closed_again['conversation'] == layout_before, 'Real Cancel reply changed conversation geometry'
@@ -6714,10 +7097,10 @@ def run_overlay_refinements(ctx):
     logo = _probe_logo_alignment(ctx)
     return _refresh_return(ctx, 'overlay-refinements', {
         'reply': reply,
-        'two_line_excerpt': reply_words, 'typing_below_reply': typing,
-        'input_caret_unchanged': before['caret'], 'history_anchor_unchanged': anchor,
-        'transparent_history': painted_behind, 'actual_wheel_frames': [],
-        'overlap_before_open_cancel': [closed, opened, closed_again], 'real_cancel': cancelled,
+        'native_reply_excerpt_marker': preview_marker, 'typing_below_reply': typing,
+        'input_caret_unchanged': before['caret'], 'history_anchor_relative_positions_unchanged': anchor,
+        'reserved_reply_footer': reserved_footer, 'actual_wheel_frames': [],
+        'footer_before_open_cancel': [closed, opened, closed_again], 'real_cancel': cancelled,
         'actions': actions, 'rail_captures': logo['captures'], 'captures': captures,
         'logo_geometry': logo['geometry_contract']})
 
@@ -7732,20 +8115,19 @@ def run_buffer_boundaries(ctx):
     size = len(draft.encode('utf-8'))
     gui.framed_keys(w, 'ctrl+Home', 'ctrl+shift+End')
     before = gui._composer_native(w, draft, size, 0)
-    # Reply is an unreserved transparent overlay: the newest body can overlap
-    # its heading. Keep the quote's cyan identity separate from both endpoints,
-    # and measure its actual swatch instead of OCR-ing overlapping heading text.
     baseline = gui.native_rgb_capture(w)
     swatches = [item for item in gui.native_marker_components(
         baseline, layout['conversation']['rect'], source_rgb)
-        if item['full'] and item['bbox'][1] > source_marker[3]]
-    assert swatches, ('No actual native reply quote below its original source', source_marker, swatches)
+        if item['full']]
+    assert swatches, ('No actual native reply quote', source_marker, swatches)
     quote_swatch = max(swatches, key=lambda item: item['bbox'][1])
     qx, qy, qr, qb = quote_swatch['bbox']
+    tail_markers = [item['bbox'] for item in gui.native_marker_components(
+        baseline, layout['conversation']['rect'], tail_rgb) if item['full']]
+    assert tail_markers and max(box[3] for box in tail_markers) <= qy, (
+        'Actual newest history crosses the reserved reply excerpt', tail_markers, quote_swatch)
     excerpt = (qx - 1, qy - 1, qr - qx + 2, qb - qy + 2)
     ex, ey, ew, eh = excerpt
-    # Endpoint colors never occur in the quote, so sample the full real pane;
-    # newest rows are allowed to occupy the active reply card's band.
     transcript_sample = tuple(layout['conversation']['rect'])
     quote_relative_box = [quote_swatch['bbox'][0] - ex, quote_swatch['bbox'][1] - ey,
                           quote_swatch['bbox'][2] - ex, quote_swatch['bbox'][3] - ey]

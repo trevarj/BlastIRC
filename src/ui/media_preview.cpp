@@ -14,6 +14,8 @@
 #include <fstream>
 #include <map>
 #include <optional>
+#include <render/animation/animation_manager.h>
+#include <render/animation/motion_service.h>
 #include <render/codecs/codecs.h>
 #include <render/core/image_decoder.h>
 #include <render/core/image_resize.h>
@@ -29,6 +31,7 @@
 #include <ui/controls/label.h>
 #include <ui/controls/select_popup_context.h>
 #include <ui/controls/slider.h>
+#include <ui/style.h>
 #include <utility>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
@@ -541,8 +544,23 @@ struct MediaPreviewController::Impl {
         entry.pending = true;
         tickets[entry.ticket] = id;
     }
-    void close(bool restore) {
+    void beginOpening() {
+        if (model.settings.fx == FxLevel::Off || model.settings.reducedMotion ||
+            !MotionService::instance().enabled() || !overlay->animationManager())
+            return;
+        auto *panel = overlay->panel;
+        panel->setOpacity(.6f);
+        overlay->animationManager()->animate(
+            .6f, 1.f, 150, Easing::EaseOutCubic,
+            [panel](float opacity) { panel->setOpacity(opacity); }, {}, panel);
+    }
+    void close(bool restore, bool preserveOpening = false) {
         const bool wasActive = overlay->visible();
+        if (!preserveOpening) {
+            if (auto *manager = overlay->animationManager())
+                manager->cancelForOwner(overlay->panel);
+            overlay->panel->setOpacity(1);
+        }
         if (restore && wasActive) {
             if (auto it = entries.find(overlayId); it != entries.end())
                 cancel(it->second);
@@ -565,9 +583,10 @@ struct MediaPreviewController::Impl {
         overlay->info->setVisible(false);
         if (mode(entry.kind) == PreviewMode::Off)
             return;
+        const bool opening = !overlay->visible();
         auto focus =
             dispatcher && !overlay->visible() ? dispatcher->captureTabFocus() : returnFocus;
-        close(false);
+        close(false, !opening);
         returnFocus = std::move(focus);
         overlayId = id;
         overlayKind = entry.kind;
@@ -586,15 +605,18 @@ struct MediaPreviewController::Impl {
         overlay->markLayoutDirty();
         if (dispatcher)
             dispatcher->setFocus(overlay->dismiss->inputArea());
+        if (opening)
+            beginOpening();
     }
     void info(std::uint64_t id) {
         auto it = entries.find(id);
         if (it == entries.end())
             return;
         auto &entry = it->second;
+        const bool opening = !overlay->visible();
         auto focus =
             dispatcher && !overlay->visible() ? dispatcher->captureTabFocus() : returnFocus;
-        close(false);
+        close(false, !opening);
         returnFocus = std::move(focus);
         overlayId = id;
         showingInfo = true;
@@ -630,6 +652,8 @@ struct MediaPreviewController::Impl {
         overlay->markLayoutDirty();
         if (dispatcher)
             dispatcher->setFocus(overlay->info->inputArea());
+        if (opening)
+            beginOpening();
     }
     void activate(std::uint64_t id) {
         auto it = entries.find(id);
@@ -856,6 +880,12 @@ std::string_view MediaPreviewController::error(std::uint64_t id) const {
 }
 void MediaPreviewController::update(float width, float height, float scale) {
     auto &s = *impl_;
+    if (s.model.settings.fx == FxLevel::Off || s.model.settings.reducedMotion ||
+        !MotionService::instance().enabled()) {
+        if (auto *manager = s.overlay->animationManager())
+            manager->cancelForOwner(s.overlay->panel);
+        s.overlay->panel->setOpacity(1);
+    }
     if (std::exchange(s.decodeChanged, false))
         s.notify();
     if (s.policy != s.currentPolicy()) {
@@ -1160,7 +1190,7 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
     entry.lastUse = ++controller.clock;
     s.background->setSize(w, h + captionHeight);
     s.background->setFill(themeSurfaceColor("surface_container"));
-    s.background->setRadius(themeCornerRadius());
+    s.background->setRadius(Style::radiusLg * themeScale());
     if (entry.asset && entry.kind == PreviewKind::Image && s.shownRevision != entry.assetRevision) {
         s.image->clear(renderer);
         const bool loaded =

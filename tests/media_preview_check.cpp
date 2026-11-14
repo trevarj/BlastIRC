@@ -6,12 +6,15 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <core/input/key_modifiers.h>
 #include <core/text_clipboard.h>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <glib.h>
+#include <render/animation/animation_manager.h>
+#include <render/animation/motion_service.h>
 #include <render/codecs/codecs.h>
 #include <render/core/texture_manager.h>
 #include <render/render_context.h>
@@ -19,6 +22,7 @@
 #include <render/scene/input_dispatcher.h>
 #include <render/text/cairo_text_renderer.h>
 #include <string>
+#include <thread>
 #include <ui/controls/button.h>
 #include <ui/controls/image.h>
 #include <ui/controls/input.h>
@@ -901,7 +905,14 @@ void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     PreviewClipboard clipboard;
     auto *previousClipboard = Input::textClipboard();
     Input::setTextClipboard(&clipboard);
+    auto &motion = MotionService::instance();
+    const bool wasEnabled = motion.enabled();
+    const float previousSpeed = motion.speed();
+    motion.setEnabled(true);
+    motion.setSpeed(1);
+    AnimationManager animations;
     Node root;
+    root.setAnimationManager(&animations);
     root.setSize(800, 600);
     root.setPopupContext(&menu);
     InputDispatcher dispatcher;
@@ -939,6 +950,55 @@ void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     menu.choose("Info");
     auto *info = infoInput(root);
     assert(controller.active() && info && info->value() == url && server.requests == 0);
+    auto *overlay = root.children().front().get();
+    auto *panel = overlay->children().at(1).get();
+    root.layout(renderer);
+    const auto panelX = panel->x(), panelY = panel->y(), panelWidth = panel->width();
+    assert(panel->opacity() >= .5f && panel->opacity() < 1 &&
+           dispatcher.focusedArea() == info->inputArea());
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    animations.tick(0);
+    const float halfway = panel->opacity();
+    assert(halfway > .6f && halfway < 1);
+    rightClick();
+    menu.choose("Info");
+    assert(panel->opacity() == halfway);
+    root.layout(renderer);
+    assert(panel->x() == panelX && panel->y() == panelY && panel->width() == panelWidth);
+    std::this_thread::sleep_for(std::chrono::milliseconds(160));
+    animations.tick(0);
+    assert(panel->opacity() == 1);
+    for (bool reduced : {false, true}) {
+        controller.close();
+        rightClick();
+        menu.choose("Info");
+        assert(panel->opacity() < 1);
+        model.settings.reducedMotion = reduced;
+        model.settings.fx = reduced ? FxLevel::Full : FxLevel::Off;
+        controller.update(800, 600, 1);
+        assert(controller.active() && panel->opacity() == 1);
+        controller.close();
+        rightClick();
+        menu.choose("Info");
+        assert(panel->opacity() == 1);
+        model.settings.reducedMotion = false;
+        model.settings.fx = FxLevel::Full;
+    }
+    controller.close();
+    rightClick();
+    menu.choose("Info");
+    motion.setEnabled(false);
+    assert(panel->opacity() == 1);
+    motion.setEnabled(true);
+    controller.close();
+    rightClick();
+    menu.choose("Info");
+    controller.close();
+    animations.tick(0);
+    assert(!controller.active() && panel->opacity() == 1 &&
+           dispatcher.focusedArea() != info->inputArea() && !dispatcher.pointerCaptured());
+    rightClick();
+    menu.choose("Info");
     info->textInputApplyEdit({.commitText = "forbidden", .preeditText = {}, .hasCommitText = true});
     assert(info->value() == url);
     info->inputArea()->dispatchKey(XKB_KEY_space, ' ', 0, true);
@@ -1048,6 +1108,8 @@ void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     assert(!controller.openUrl(url) && server.requests == 2);
     root.removeChild(view);
     Input::setTextClipboard(previousClipboard);
+    motion.setSpeed(previousSpeed);
+    motion.setEnabled(wasEnabled);
 }
 } // namespace
 

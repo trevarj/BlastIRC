@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <render/core/color.h>
 #include <span>
 #include <string_view>
 
@@ -16,10 +17,10 @@ std::array<std::size_t, 4> foundryAvatarLayers(std::string_view nick,
                                                std::string_view mapping = "rfc1459");
 // Writes exactly one atlas-sized straight-alpha RGBA tile. No renderer/GPU cache.
 bool composeFoundryAvatar(std::span<std::uint8_t> rgba, std::string_view nick,
-                          std::string_view mapping = "rfc1459");
+                          const Color &bodyColor, std::string_view mapping = "rfc1459");
 // UI-thread only. Call when a virtual slot's identity changes, not on every frame.
 // Image owns its uploaded pixels, including across GPU-resource reloads.
 bool setFoundryAvatar(Image &image, Renderer &renderer, std::string_view nick,
-                      std::string_view mapping = "rfc1459");
+                      const Color &bodyColor, std::string_view mapping = "rfc1459");
 
 } // namespace blast

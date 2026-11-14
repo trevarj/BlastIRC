@@ -48,7 +48,7 @@ class TranscriptView final : public Node {
     void setInputDispatcher(InputDispatcher &);
     void setOnNickMenu(std::function<void(std::string, std::optional<InputArea::PointerData>)>);
     // The host queued native IntoView for a specific message action, not the canvas.
-    void noteFocusReveal();
+    void noteFocusReveal(bool userInitiated = false);
     // A newer explicit pointer/scroll/navigation intent supersedes only our queued reveal.
     void cancelFocusReveal();
     // Focused typing-list navigation precedes global cancel/history bindings.

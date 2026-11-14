@@ -151,6 +151,32 @@ std::array<std::size_t, 4> foundryAvatarLayers(std::string_view nick, std::strin
             atlas::markOffset + (accessory == 1 ? 4 : 0) + mark};
 }
 
+float foundryAvatarBodyCenterY(std::string_view nick, std::string_view mapping) {
+    static const auto centers = [] {
+        std::array<float, atlas::bodyCount> result;
+        result.fill(.5f);
+        const auto &image = foundryAtlasImage();
+        if (image.pixels.empty())
+            return result;
+        for (size_t body = 0; body < result.size(); ++body) {
+            const auto tile = atlas::bodyOffset + body;
+            const auto x = tile % atlas::columns * atlas::tileSize;
+            const auto y = tile / atlas::columns * atlas::tileSize;
+            size_t top = atlas::tileSize, bottom = 0;
+            for (size_t row = 0; row < atlas::tileSize; ++row)
+                for (size_t col = 0; col < atlas::tileSize; ++col)
+                    if (image.pixels[((y + row) * atlas::width + x + col) * 4 + 3] >= 128) {
+                        top = std::min(top, row);
+                        bottom = std::max(bottom, row + 1);
+                    }
+            if (top < bottom)
+                result[body] = float(top + bottom) / (2 * atlas::tileSize);
+        }
+        return result;
+    }();
+    return centers[foundryAvatarLayers(nick, mapping)[1] - atlas::bodyOffset];
+}
+
 bool composeFoundryAvatar(std::span<std::uint8_t> rgba, std::string_view nick,
                           const Color &bodyColor, std::string_view mapping) {
     if (rgba.size() != tileBytes)

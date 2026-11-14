@@ -4,6 +4,7 @@
 #include "render/core/renderer.h"
 #include "render/scene/node.h"
 
+#include <optional>
 #include <string>
 
 class TextNode : public Node {
@@ -19,6 +20,16 @@ public:
   FontWeight fontWeight() const noexcept { return m_font.weight; }
   const std::string& fontFamily() const noexcept { return m_font.family; }
   const std::string& fontFeatures() const noexcept { return m_font.features; }
+  std::optional<float> inkCenterY() const noexcept { return m_inkCenterY; }
+
+  // Optional paint target relative to the local baseline; layout metrics stay unchanged.
+  void setInkCenterY(std::optional<float> center) {
+    if (m_inkCenterY == center) {
+      return;
+    }
+    m_inkCenterY = center;
+    markPaintDirty();
+  }
 
   void setText(std::string text) {
     if (m_text == text) {
@@ -149,4 +160,5 @@ private:
   Color m_shadowColor;
   float m_shadowOffsetX = 0.0F;
   float m_shadowOffsetY = 0.0F;
+  std::optional<float> m_inkCenterY;
 };

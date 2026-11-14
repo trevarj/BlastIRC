@@ -37,6 +37,7 @@ static void presentation(const Settings &actual, const Settings &expected) {
     assert(actual.incomingMotion == expected.incomingMotion &&
            actual.incomingReveal == expected.incomingReveal &&
            actual.incomingDurationMs == expected.incomingDurationMs &&
+           actual.mentionEffect == expected.mentionEffect &&
            actual.foolDisplay == expected.foolDisplay && actual.foolUnread == expected.foolUnread &&
            actual.messageWrapColumns == expected.messageWrapColumns);
     assert(actual.linkPreviews == expected.linkPreviews &&
@@ -2913,6 +2914,7 @@ int main() {
             assert(legacy.settings.sendMotion == SendMotion::Flight &&
                    legacy.settings.sendReveal == SendReveal::Pixels);
             assert(legacy.settings.fx == FxLevel::Full && legacy.settings.sound);
+            assert(legacy.settings.mentionEffect == MentionEffect::Off);
             assert(legacy.settings.cursorShape == "line" && legacy.settings.cursorEffect == "off" &&
                    legacy.settings.cursorTrailDurationMs == 120.f &&
                    legacy.settings.cursorTrailStrength == .20f);
@@ -3030,6 +3032,34 @@ int main() {
                 presentation(reopened.settings, configured.settings);
                 assert(contents(config / "config.toml") == originalConfig);
             }
+        }
+        for (const auto &[token, effect] :
+             vector<std::pair<string, MentionEffect>>{{"off", MentionEffect::Off},
+                                                      {"text_shimmer", MentionEffect::TextShimmer},
+                                                      {"rail_pulse", MentionEffect::RailPulse},
+                                                      {"border_halo", MentionEffect::BorderHalo}}) {
+            {
+                std::ofstream output(config / "settings.toml");
+                output << "[appearance]\nmention_effect = '" << token
+                       << "'\n"
+                          "send_motion = 'slide'\nsend_reveal = 'none'\n"
+                          "incoming_motion = 'pop'\nincoming_reveal = 'pixels'\n"
+                          "incoming_duration_ms = 1250\n";
+            }
+            Storage storage;
+            Model configured;
+            storage.load(configured);
+            assert(configured.settings.mentionEffect == effect &&
+                   configured.settings.sendMotion == SendMotion::Slide &&
+                   configured.settings.sendReveal == SendReveal::None &&
+                   configured.settings.incomingMotion == SendMotion::Pop &&
+                   configured.settings.incomingReveal == SendReveal::Pixels &&
+                   configured.settings.incomingDurationMs == 1250.f);
+            storage.save(configured);
+            Model reopened;
+            storage.load(reopened);
+            presentation(reopened.settings, configured.settings);
+            assert(contents(config / "config.toml") == originalConfig);
         }
         // Either field may be absent without changing the explicitly configured other field.
         for (const string source :
@@ -3295,9 +3325,9 @@ int main() {
         for (const string diagnostic :
              {"appearance.send_motion", "appearance.send_reveal", "appearance.incoming_motion",
               "appearance.incoming_duration_ms", "appearance.fool_display",
-              "appearance.message_wrap_columns", "previews", "previews.max_height",
-              "previews.media_max_mib", "previews.media_max_seconds", "cursor.shape",
-              "cursor.effect"}) {
+              "appearance.mention_effect", "appearance.message_wrap_columns", "previews",
+              "previews.max_height", "previews.media_max_mib", "previews.media_max_seconds",
+              "cursor.shape", "cursor.effect"}) {
             Storage storage;
             Model invalid = legacy;
             if (diagnostic == "cursor.shape")
@@ -3310,6 +3340,8 @@ int main() {
                 invalid.settings.incomingMotion = SendMotion::Flight;
             else if (diagnostic == "appearance.incoming_duration_ms")
                 invalid.settings.incomingDurationMs = std::numeric_limits<float>::quiet_NaN();
+            else if (diagnostic == "appearance.mention_effect")
+                invalid.settings.mentionEffect = static_cast<MentionEffect>(-1);
             else if (diagnostic == "appearance.fool_display")
                 invalid.settings.foolDisplay = static_cast<FoolDisplay>(-1);
             else if (diagnostic == "appearance.message_wrap_columns")
@@ -3602,6 +3634,14 @@ int main() {
             {"[appearance]\nsend_reveal = 'Pixels'\n", "appearance.send_reveal"},
             {"[appearance]\nsend_reveal = ''\n", "appearance.send_reveal"},
             {"[appearance]\nsend_reveal = false\n", "send_reveal"},
+            {"[appearance]\nmention_effect = 'unknown'\n", "appearance.mention_effect"},
+            {"[appearance]\nmention_effect = 'Text_Shimmer'\n", "appearance.mention_effect"},
+            {"[appearance]\nmention_effect = ''\n", "appearance.mention_effect"},
+            {"[appearance]\nmention_effect = true\n", "mention_effect"},
+            {"[appearance]\nmention_effect = 1\n", "mention_effect"},
+            {"[appearance]\nmention_effect = 1.0\n", "mention_effect"},
+            {"[appearance]\nmention_effect = []\n", "mention_effect"},
+            {"[appearance]\nmention_effect = {}\n", "mention_effect"},
             {"[presentation]\nirc_channels = 'Libera/#a'\n", "presentation.irc_channels"},
             {"[presentation]\nirc_channels = ['Libera/#a', false]\n", "presentation.irc_channels"},
             {"[presentation]\nmessage_layouts = []\n", "message_layouts"},

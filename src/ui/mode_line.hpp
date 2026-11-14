@@ -10,7 +10,7 @@ struct Model;
 enum class SidebarMode;
 class ModeLine final : public Node {
   public:
-    ModeLine(Model &, std::function<void(std::string)> execute);
+    ModeLine(Model &, std::function<void(std::string)> execute, std::function<void(Node &)> retire);
     ~ModeLine() override;
     void sync(float userScale, SidebarMode effectiveNavigation, std::string_view keyHint = {});
 

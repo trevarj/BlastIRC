@@ -179,6 +179,7 @@ void Label::setBaselineMode(LabelBaselineMode mode) {
     return;
   }
   m_baselineMode = mode;
+  m_textNode->setInkCenterY(std::nullopt);
   m_measureCached = false;
 }
 
@@ -709,6 +710,11 @@ LayoutSize Label::measureWithConstraints(Renderer& renderer, const LayoutConstra
     m_textBaseX = layoutWidth - contentWidth;
   }
 
+  m_textNode->setInkCenterY(
+      singleLine && inkHeight > 0.0F && m_baselineMode == LabelBaselineMode::InkCentered
+          ? std::optional<float>(height() * 0.5F - m_baselineOffset)
+          : std::nullopt
+  );
   applyScrollPosition();
 
   m_cachedText = m_plainText;

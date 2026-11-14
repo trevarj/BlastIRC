@@ -44,6 +44,7 @@ struct ModeLine::Impl {
     };
     Model &model;
     std::function<void(std::string)> execute;
+    std::function<void(Node &)> retire;
     std::array<Group, 6> groups;
     std::vector<Unread> unread;
     size_t unreadCount = 0;
@@ -53,8 +54,9 @@ struct ModeLine::Impl {
     float scale = 1;
     bool error = false;
 
-    Impl(Node &owner, Model &model, std::function<void(std::string)> execute)
-        : model(model), execute(std::move(execute)) {
+    Impl(Node &owner, Model &model, std::function<void(std::string)> execute,
+         std::function<void(Node &)> retire)
+        : model(model), execute(std::move(execute)), retire(std::move(retire)) {
         constexpr std::array icons{"user",        "server",   "plug-connected-x",
                                    "info-circle", "keyboard", "history"};
         for (size_t i = 0; i < groups.size(); ++i) {
@@ -72,8 +74,9 @@ struct ModeLine::Impl {
     }
 };
 
-ModeLine::ModeLine(Model &model, std::function<void(std::string)> execute)
-    : impl_(std::make_unique<Impl>(*this, model, std::move(execute))) {
+ModeLine::ModeLine(Model &model, std::function<void(std::string)> execute,
+                   std::function<void(Node &)> retire)
+    : impl_(std::make_unique<Impl>(*this, model, std::move(execute), std::move(retire))) {
     setClipChildren(true);
     setPaintContained(true);
     sync(1, SidebarMode::Expanded);
@@ -169,7 +172,8 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
             p.fools = model.settings.fools;
         }
         for (const auto &[id, channel] : model.buffers) {
-            if (channel.kind != "channel" || channel.archived || channel.unread <= 0)
+            if (channel.kind != "channel" || channel.archived || channel.muted ||
+                channel.unread <= 0)
                 continue;
             if (p.unreadCount == p.unread.size()) {
                 const auto slot = p.unread.size();
@@ -200,6 +204,8 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                 entry.area = area;
             }
             auto &entry = p.unread[p.unreadCount++];
+            if (!entry.id.empty() && entry.id != id)
+                p.retire(*entry.area);
             const std::string_view name = serverDisplayName(model, channel.server);
             const auto network = model.networks.find(channel.server);
             const std::string_view mapping = network == model.networks.end()
@@ -245,6 +251,8 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
         }
     }
     for (size_t i = p.unreadCount; i < p.unread.size(); ++i) {
+        if (p.unread[i].area->visible())
+            p.retire(*p.unread[i].area);
         p.unread[i].area->setVisible(false);
         p.unread[i].width = 0;
     }

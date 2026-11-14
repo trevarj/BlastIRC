@@ -1939,9 +1939,20 @@ struct Dialogs::Impl {
                });
         slider(*incoming, "Incoming duration (100–2000 ms)", model.settings.incomingDurationMs, 100,
                2000, 10, [this](float value) { model.settings.incomingDurationMs = value; });
+        static constexpr const char *mentionNames[] = {"Off", "Text shimmer", "Rail pulse",
+                                                       "Border halo"};
+        select(*incoming, "Mention accent", {std::begin(mentionNames), std::end(mentionNames)},
+               mentionNames[std::clamp(int(model.settings.mentionEffect), 0, 3)],
+               [this](std::size_t index, std::string_view) {
+                   if (index < std::size(mentionNames))
+                       model.settings.mentionEffect = MentionEffect(index);
+               });
         label(*incoming, "Sending and receiving effects are independent; only new live messages "
                          "animate, never restored history or fools, and Effects Off or Reduced "
                          "motion pauses animation without resetting it.");
+        label(*incoming, "Mention accent adds a live own-nick message accent, independent of "
+                         "entrances and the global mention event cue. Effects Off or Reduced "
+                         "motion pauses it without changing your choice.");
         auto *physics = section("effects.physics", "Physics");
         auto *gravity = slider(*physics, "Gravity", model.settings.gravity, -200, 500, 1,
                                [this](float value) { model.settings.gravity = value; });

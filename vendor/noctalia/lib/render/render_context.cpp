@@ -524,14 +524,16 @@ void RenderContext::renderNode(
         const Mat3 shadowTransform = worldTransform * Mat3::translation(text->shadowOffsetX(), text->shadowOffsetY());
         m_textRenderer.draw(
             renderScale, sw, sh, 0.0F, 0.0F, text->text(), text->fontSize(), shadowColor, shadowTransform, font,
-            text->maxWidth(), text->maxLines(), text->textAlign(), text->ellipsize(), text->useMarkup(), true
+            text->maxWidth(), text->maxLines(), text->textAlign(), text->ellipsize(), text->useMarkup(), true,
+            text->inkCenterY()
         );
       }
       auto color = text->color();
       color.a *= effectiveOpacity;
       m_textRenderer.draw(
           renderScale, sw, sh, 0.0F, 0.0F, text->text(), text->fontSize(), color, worldTransform, font,
-          text->maxWidth(), text->maxLines(), text->textAlign(), text->ellipsize(), text->useMarkup()
+          text->maxWidth(), text->maxLines(), text->textAlign(), text->ellipsize(), text->useMarkup(), false,
+          text->inkCenterY()
       );
     }
     break;

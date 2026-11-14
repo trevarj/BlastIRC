@@ -90,11 +90,9 @@
           librsvg
           libwebp
           libjxl
-          libheif
           libxml2
           mpv-unwrapped
           hunspell
-          hunspellDicts.en_US
         ])
         ++ [ stbHeaders ];
       nativeTools = with pkgs; [

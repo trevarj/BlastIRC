@@ -939,7 +939,7 @@ struct ServerRail::Impl {
 
     bool hasUnread() const {
         return std::any_of(model.buffers.begin(), model.buffers.end(), [](const auto &entry) {
-            return entry.second.kind != "search" && entry.second.unread > 0;
+            return entry.second.kind != "search" && !entry.second.muted && entry.second.unread > 0;
         });
     }
 
@@ -987,7 +987,8 @@ struct ServerRail::Impl {
             entry(name);
         for (const auto &[id, buffer] : model.buffers) {
             const auto item = servers.find(buffer.server);
-            if (item != servers.end() && buffer.kind != "server" && buffer.unread > 0) {
+            if (item != servers.end() && buffer.kind != "server" && !buffer.muted &&
+                buffer.unread > 0) {
                 item->second.unread += buffer.unread;
                 item->second.mentioned |= ui_logic::hasUnreadMention(model, buffer);
             }
@@ -1707,7 +1708,7 @@ struct Sidebar::Impl {
         const bool shortHeader = height < 360 * scale;
         int unreadInArchive = 0;
         for (const auto &[id, buffer] : model.buffers)
-            if (buffer.archived && buffer.server == selected &&
+            if (buffer.archived && !buffer.muted && buffer.server == selected &&
                 (buffer.kind == "channel" || buffer.kind == "query"))
                 unreadInArchive += buffer.unread;
         if (archivedUnread != unreadInArchive) {

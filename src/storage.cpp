@@ -396,6 +396,26 @@ SendReveal revealValue(const string &token, const char *key) {
             return reveal;
     invalid(key, "none, fade, or pixels");
 }
+string mentionEffectName(MentionEffect value) {
+    switch (value) {
+    case MentionEffect::Off:
+        return "off";
+    case MentionEffect::TextShimmer:
+        return "text_shimmer";
+    case MentionEffect::RailPulse:
+        return "rail_pulse";
+    case MentionEffect::BorderHalo:
+        return "border_halo";
+    }
+    invalid("appearance.mention_effect", "off, text_shimmer, rail_pulse, or border_halo");
+}
+MentionEffect mentionEffectValue(const string &token) {
+    for (auto effect : {MentionEffect::Off, MentionEffect::TextShimmer, MentionEffect::RailPulse,
+                        MentionEffect::BorderHalo})
+        if (token == mentionEffectName(effect))
+            return effect;
+    invalid("appearance.mention_effect", "off, text_shimmer, rail_pulse, or border_halo");
+}
 string foolDisplayName(FoolDisplay value) {
     switch (value) {
     case FoolDisplay::Minimized:
@@ -520,6 +540,7 @@ void validate(const Settings &settings) {
     motionValue(sendMotionName(settings.incomingMotion), "appearance.incoming_motion", true);
     sendRevealName(settings.incomingReveal);
     range(settings.incomingDurationMs, 100, 2000, "appearance.incoming_duration_ms");
+    mentionEffectName(settings.mentionEffect);
     foolDisplayName(settings.foolDisplay);
     if (settings.messageWrapColumns < 0 || settings.messageWrapColumns > 1000)
         invalid("appearance.message_wrap_columns", "an integer from 0 through 1000");
@@ -810,6 +831,9 @@ void parseSettings(const toml::table &document, Settings &settings) {
         exactField(*row, "incoming_reveal", reveal);
         settings.incomingReveal = revealValue(reveal, "appearance.incoming_reveal");
         field(*row, "incoming_duration_ms", settings.incomingDurationMs);
+        string mention = mentionEffectName(settings.mentionEffect);
+        exactField(*row, "mention_effect", mention);
+        settings.mentionEffect = mentionEffectValue(mention);
         string fools = foolDisplayName(settings.foolDisplay);
         exactField(*row, "fool_display", fools);
         bool foundFoolDisplay = false;
@@ -1107,6 +1131,7 @@ toml::table settingsDocument(const Settings &settings) {
                                    {"incoming_motion", sendMotionName(settings.incomingMotion)},
                                    {"incoming_reveal", sendRevealName(settings.incomingReveal)},
                                    {"incoming_duration_ms", settings.incomingDurationMs},
+                                   {"mention_effect", mentionEffectName(settings.mentionEffect)},
                                    {"fool_display", foolDisplayName(settings.foolDisplay)},
                                    {"fool_unread", settings.foolUnread},
                                    {"message_wrap_columns", settings.messageWrapColumns},

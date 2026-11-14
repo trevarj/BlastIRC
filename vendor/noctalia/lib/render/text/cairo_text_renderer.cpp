@@ -77,28 +77,35 @@ namespace {
     }
   }
 
-  bool requiresRgba(PangoLayout* layout, bool useMarkup) {
+  bool requiresRgba(PangoLayout* layout, bool useMarkup, bool& hasBackground) {
+    bool required = false;
     for (GSList* line = pango_layout_get_lines_readonly(layout); line != nullptr; line = line->next) {
       for (GSList* run = static_cast<PangoLayoutLine*>(line->data)->runs; run != nullptr; run = run->next) {
         const auto* item = static_cast<PangoGlyphItem*>(run->data);
         if (useMarkup) {
           for (GSList* attr = item->item->analysis.extra_attrs; attr != nullptr; attr = attr->next) {
             const auto type = static_cast<PangoAttribute*>(attr->data)->klass->type;
-            if (type == PANGO_ATTR_FOREGROUND || type == PANGO_ATTR_BACKGROUND ||
-                type == PANGO_ATTR_UNDERLINE_COLOR) {
+            if (type == PANGO_ATTR_BACKGROUND) {
+              hasBackground = true;
               return true;
+            }
+            if (type == PANGO_ATTR_FOREGROUND || type == PANGO_ATTR_UNDERLINE_COLOR) {
+              required = true;
             }
           }
         }
         const auto* glyphs = item->glyphs;
         for (int i = 0; i < glyphs->num_glyphs; ++i) {
           if (glyphs->glyphs[i].attr.is_color) {
-            return true;
+            if (!useMarkup) {
+              return true;
+            }
+            required = true;
           }
         }
       }
     }
-    return false;
+    return required;
   }
 
   struct VerticalExtents {
@@ -770,7 +777,7 @@ void CairoTextRenderer::measureCharSpans(
 // ── Rasterization ───────────────────────────────────────────────────────────
 
 void CairoTextRenderer::rasterizeLayout(
-    float contentScale, PangoLayout* layout, const Color& color, bool tinted, CacheEntry& entry
+    float contentScale, PangoLayout* layout, const Color& color, bool tinted, bool hasBackground, CacheEntry& entry
 ) {
   entry.tinted = tinted;
   // Pixel-sized surface: ceil the logical rect up.
@@ -830,6 +837,9 @@ void CairoTextRenderer::rasterizeLayout(
 
   entry.pixelWidth = pxWidth;
   entry.pixelHeight = pxHeight;
+  int visibleInkTop = pxHeight, visibleInkBottom = 0;
+  entry.glyphInkCenterY.reset();
+  entry.glyphInkKnown = !hasBackground;
   entry.tiles.clear();
   entry.bytes = 0;
 
@@ -952,6 +962,19 @@ void CairoTextRenderer::rasterizeLayout(
     for (int y = 0; y < tileH; ++y) {
       std::memcpy(tight.data() + y * tightRowBytes, data + y * stride, static_cast<std::size_t>(tightRowBytes));
     }
+    // Near-transparent antialias fringes are not part of visible-ink centering.
+    if (entry.glyphInkKnown) {
+      for (int y = 0; y < tileH; ++y) {
+        const auto* row = tight.data() + y * tightRowBytes + (tinted ? 0 : 3);
+        for (int x = 0; x < pxWidth; ++x) {
+          if (row[x * bytesPerPixel] >= 32) {
+            visibleInkTop = std::min(visibleInkTop, tilePlan.yTopPx + y);
+            visibleInkBottom = std::max(visibleInkBottom, tilePlan.yTopPx + y + 1);
+            break;
+          }
+        }
+      }
+    }
     cairo_surface_destroy(surface);
 
     if (m_textureManager == nullptr) {
@@ -982,6 +1005,10 @@ void CairoTextRenderer::rasterizeLayout(
     entry.bytes += static_cast<std::size_t>(tightRowBytes) * static_cast<std::size_t>(tileH);
   }
 
+  if (entry.glyphInkKnown && visibleInkBottom > visibleInkTop) {
+    entry.glyphInkCenterY =
+        (static_cast<float>(visibleInkTop + visibleInkBottom) * 0.5F - entry.baselinePx) / contentScale;
+  }
   entry.metrics = metricsFromLayout(contentScale, layout);
 }
 
@@ -1076,7 +1103,8 @@ CairoTextRenderer::CacheEntry* CairoTextRenderer::lookupOrRasterize(
       pango_attr_list_unref(maskAttrs);
     }
   }
-  const bool tinted = coverageOnly || !requiresRgba(layout, useMarkup);
+  bool hasBackground = false;
+  const bool tinted = coverageOnly || !requiresRgba(layout, useMarkup, hasBackground);
   if (tinted) {
     key.colorRgba = 0U;
   }
@@ -1085,7 +1113,7 @@ CairoTextRenderer::CacheEntry* CairoTextRenderer::lookupOrRasterize(
     rasterColor.a = 1.0F;
   }
   CacheEntry entry{};
-  rasterizeLayout(contentScale, layout, rasterColor, tinted, entry);
+  rasterizeLayout(contentScale, layout, rasterColor, tinted, hasBackground, entry);
   g_object_unref(layout);
 
   MetricsKey mkey;
@@ -1117,7 +1145,7 @@ CairoTextRenderer::CacheEntry* CairoTextRenderer::lookupOrRasterize(
 void CairoTextRenderer::draw(
     float contentScale, float surfaceWidth, float surfaceHeight, float x, float baselineY, std::string_view text,
     float fontSize, const Color& color, const Mat3& transform, const TextFont& font, float maxWidth, int maxLines,
-    TextAlign align, TextEllipsize ellipsize, bool useMarkup, bool coverageOnly
+    TextAlign align, TextEllipsize ellipsize, bool useMarkup, bool coverageOnly, std::optional<float> inkCenterY
 ) {
   maybeSyncFontConfig();
   if (m_pangoContext == nullptr || m_backend == nullptr || text.empty()) {
@@ -1129,6 +1157,24 @@ void CairoTextRenderer::draw(
   );
   if (entry == nullptr || entry->tiles.empty()) {
     return;
+  }
+  if (inkCenterY && !entry->glyphInkKnown) {
+    const auto* coverage = lookupOrRasterize(
+        contentScale, text, fontSize, font, maxWidth, maxLines, align, color, ellipsize, useMarkup, true
+    );
+    std::optional<float> glyphInkCenter;
+    if (coverage && !coverage->tiles.empty()) {
+      glyphInkCenter = coverage->glyphInkCenterY;
+    }
+    // Acquiring coverage can evict the RGBA entry; keep only the copied glyph metric.
+    entry = lookupOrRasterize(
+        contentScale, text, fontSize, font, maxWidth, maxLines, align, color, ellipsize, useMarkup, coverageOnly
+    );
+    if (entry == nullptr || entry->tiles.empty()) {
+      return;
+    }
+    entry->glyphInkCenterY = glyphInkCenter;
+    entry->glyphInkKnown = true;
   }
   if (entry->tiles.size() > 1) {
     kLog.warn(
@@ -1146,7 +1192,11 @@ void CairoTextRenderer::draw(
   // is shifted up by `baselineLocal`, placing the baseline at local y=0.
   // Shift left by inkOffsetX so the logical text origin stays at `x`.
   const float inkOffX = entry->inkOffsetX * invScale;
-  const Mat3 localTranslation = Mat3::translation(x - inkOffX, baselineY - baselineLocal);
+  float quadY = baselineY - baselineLocal;
+  if (inkCenterY && entry->glyphInkCenterY) {
+    quadY += *inkCenterY - *entry->glyphInkCenterY;
+  }
+  const Mat3 localTranslation = Mat3::translation(x - inkOffX, quadY);
   Mat3 baseWorld = transform * localTranslation;
 
   // Snap the glyph quad's origin to the nearest buffer pixel. Without this,

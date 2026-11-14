@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -94,11 +95,12 @@ public:
   );
 
   // coverageOnly draws a uniformly tinted glyph mask, excluding markup backgrounds.
+  // inkCenterY optionally aligns visible raster ink to a local baseline-relative target.
   void draw(
       float contentScale, float surfaceWidth, float surfaceHeight, float x, float baselineY, std::string_view text,
       float fontSize, const Color& color, const Mat3& transform, const TextFont& font = {}, float maxWidth = 0.0F,
       int maxLines = 0, TextAlign align = TextAlign::Start, TextEllipsize ellipsize = TextEllipsize::End,
-      bool useMarkup = false, bool coverageOnly = false
+      bool useMarkup = false, bool coverageOnly = false, std::optional<float> inkCenterY = std::nullopt
   );
 
 private:
@@ -187,6 +189,8 @@ private:
     int pixelHeight = 0;  // total raster surface pixel height (sum of tiles)
     float baselinePx = 0; // baseline from top of full layout, in raster pixels
     float inkOffsetX = 0; // raster px from surface left to logical text origin
+    std::optional<float> glyphInkCenterY; // logical pixels relative to the raster baseline
+    bool glyphInkKnown = false;
     TextMetrics metrics;  // logical metrics in logical (unscaled) pixels
     std::size_t bytes = 0;
     bool tinted = false; // true: alpha coverage, tint in shader; false: premul RGBA
@@ -210,7 +214,9 @@ private:
   // coverage so the color is applied via u_tint at draw time. When false,
   // rasterizes as CAIRO_FORMAT_ARGB32 with `color` baked in for default-colored
   // runs alongside COLR emoji or explicit markup foreground/background colors.
-  void rasterizeLayout(float contentScale, PangoLayout* layout, const Color& color, bool tinted, CacheEntry& entry);
+  void rasterizeLayout(
+      float contentScale, PangoLayout* layout, const Color& color, bool tinted, bool hasBackground, CacheEntry& entry
+  );
   // Extract logical metrics from a laid-out PangoLayout, dividing by PANGO_SCALE and by scale.
   TextMetrics metricsFromLayout(float contentScale, PangoLayout* layout) const;
 

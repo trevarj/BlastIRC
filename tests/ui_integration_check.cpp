@@ -2797,12 +2797,13 @@ void railReadAllCheck() {
         const auto before = commands.size();
         dispatcher.pointerMotion(point[0], point[1], 100);
         assert(dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 101, 1010, touch));
-        serverLog.unread = 0;
+        serverLog.muted = true;
         frame();
         assert(!visible(*readAll) && !readAll->enabled());
         assert(!dispatcher.pointerCaptured() && dispatcher.focusedArea() != readAll);
+        assert(serverLog.unread == 1 && dispatcher.firstTabFocusUnder(readAll) == nullptr);
         assert(scroll->height() == emptyScrollHeight && add->y() == addTop);
-        serverLog.unread = 1;
+        serverLog.muted = false;
         frame();
         dispatcher.pointerButton(point[0], point[1], BTN_LEFT, false, 102, 1020, touch);
         assert(commands.size() == before); // Retired streams cannot click the restored row.
@@ -3006,7 +3007,7 @@ void statusIdentityCheck() {
     Theme theme;
     theme.update(model);
     PangoRenderer renderer;
-    ModeLine line(model, [](std::string) {});
+    ModeLine line(model, [](std::string) {}, [](Node &) {});
     line.setSize(1200, 30);
     const auto frame = [&] {
         line.sync(1, SidebarMode::Expanded);
@@ -3992,6 +3993,9 @@ void sidebarArchiveControlsCheck() {
            model.actions.back().buffer == "one/#room" && model.actions.back().text == "off");
     assert(model.buffers.at("one/#room").unread == 7 &&
            model.buffers.at("one/#room").draft == "retained draft");
+    assert(dynamic_cast<Button *>(archived->parent())->label()->text() == "Archived");
+    model.buffers.at("one/#room").muted = false;
+    frame();
     // Natural filter captions retain the unread count through resize, zoom and count changes.
     for (const float nextScale : {.7f, 1.f, 2.f}) {
         scale = nextScale;
@@ -6527,6 +6531,10 @@ void alphaForegroundCheck() {
                     const Color unmutedInk = label.color();
                     unread.muted = true;
                     frame();
+                    assert(!visible(*serverBadge) && visible(*accountBadge));
+                    assert(labelWithText(ui.root(), "BlastIRC · " +
+                                                        std::to_string(accountUnread.unread) +
+                                                        " unread"));
                     const Color mutedFill = themeForegroundColor("surface_container_highest");
                     assert(mutedFill != unmutedFill);
                     assert(relativeLuminance(mutedFill) < relativeLuminance(unmutedFill));
@@ -6541,6 +6549,10 @@ void alphaForegroundCheck() {
                     assert(unread.unread == count && unread.readMarker == marker);
                     unread.muted = false;
                     frame();
+                    assert(visible(*serverBadge) && visible(*accountBadge));
+                    assert(labelWithText(
+                        ui.root(),
+                        "BlastIRC · " + std::to_string(count + accountUnread.unread) + " unread"));
                     assert(label.color() == unmutedInk && label.text() == text);
                     checkBadge(*row, label, unmutedFill);
                 };
@@ -7576,7 +7588,6 @@ void hiddenUnreadStatusCheck(
     incoming(fools);
     incoming(fools, false, false, true, "fool");
     assert(model.buffers.at(fools).unread == 1);
-    model.buffers.at(normal).muted = true;
     Clipboard clipboard;
     Theme theme;
     theme.update(model);
@@ -7759,6 +7770,61 @@ void hiddenUnreadStatusCheck(
     assert(model.activeBuffer == edgeBuffers[0]);
     width = 2000;
     frame();
+    // Retire an in-flight interaction before compaction retargets the first slot.
+    ui.setWindowActive(true);
+    for (const bool touch : {false, true}) {
+        auto *first = areaWithKey(*line, "buffer:" + mention);
+        assert(first && visible(*first));
+        const auto point = pointerPoint(*first);
+        const auto marker = model.buffers.at(mention).readMarker;
+        dispatcher.setFocus(first);
+        ui.beginPointerInteraction(point[0], point[1]);
+        assert(!ui.handlePointerButton(BTN_LEFT, true, point[0], point[1], touch));
+        dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 1101, 11010, touch);
+        model.buffers.at(mention).unread = 2;
+        frame();
+        assert(dispatcher.focusedArea() == first);
+        assert(dispatcher.capturedArea() == first || dispatcher.pendingTouchPressArea() == first);
+        model.buffers.at(mention).unread = 1;
+        model.buffers.at(mention).muted = true;
+        frame();
+        assert(areaWithKey(*line, "buffer:" + normal) == first && visible(*first));
+        assert(dispatcher.focusedArea() != first && !dispatcher.pointerCaptured() &&
+               dispatcher.pendingTouchPressArea() != first);
+        assert(ui.handlePointerButton(BTN_LEFT, false, point[0], point[1], touch));
+        frame();
+        assert(model.activeBuffer == edgeBuffers[0]);
+        assert(model.buffers.at(mention).unread == 1 &&
+               model.buffers.at(mention).readMarker == marker &&
+               model.buffers.at(normal).unread == 1);
+        model.buffers.at(mention).muted = false;
+        frame();
+        assert(segment("Remote/#same") && segment("Local/#same"));
+    }
+    // Muting retires a real summary control without consuming either buffer's unread state.
+    assert(labelWithText(ui.root(), "BlastIRC · 2 unread"));
+    const auto marker = model.buffers.at(normal).readMarker;
+    ui.setWindowActive(true);
+    dispatcher.setFocus(overflow);
+    model.buffers.at(normal).muted = true;
+    frame();
+    assert(!segment("Local/#same") && segment("Remote/#same"));
+    assert(!visible(*overflow) && dispatcher.firstTabFocusUnder(overflow) == nullptr);
+    assert(dispatcher.focusedArea() != overflow);
+    assert(labelWithText(ui.root(), "BlastIRC · 1 unread"));
+    assert(model.buffers.at(normal).unread == 1 && model.buffers.at(normal).readMarker == marker &&
+           model.buffers.at(mention).unread == 1);
+    clickPoint(overflowPoint);
+    assert(model.activeBuffer == edgeBuffers[0]);
+    dispatcher.setFocus(overflow);
+    nativeKey(ui, dispatcher, XKB_KEY_Return);
+    frame();
+    assert(model.activeBuffer == edgeBuffers[0]);
+    model.buffers.at(normal).muted = false;
+    frame();
+    assert(segment("Local/#same") && segment("Remote/#same") && visible(*overflow));
+    assert(labelWithText(ui.root(), "BlastIRC · 2 unread"));
+    assert(model.buffers.at(normal).unread == 1 && model.buffers.at(normal).readMarker == marker);
     model.buffers.at(normal).unread = 0;
     model.buffers.at(mention).unread = 0;
     frame();

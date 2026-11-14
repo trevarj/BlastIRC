@@ -1,11 +1,13 @@
 #include "../src/render/graphics.hpp"
 #include "../src/theme/theme.hpp"
+#include "../src/ui/foundry_avatar.hpp"
 #include "../src/ui/irc_format.hpp"
 #include "../src/ui/media_preview.hpp"
 #include "../src/ui/message_selection.hpp"
 #include "../src/ui/presentation.hpp"
 #include "../src/ui/transcript.hpp"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -38,6 +40,7 @@
 #include <ui/controls/input.h>
 #include <ui/controls/label.h>
 #include <ui/controls/scroll_view.h>
+#include <ui/controls/scrollbar.h>
 #include <ui/controls/select_popup_context.h>
 #include <ui/controls/spinner.h>
 #include <ui/style.h>
@@ -62,9 +65,31 @@ class CpuTextureUploadSink final : public TextureManager {
                               PixmapFormat, bool) override {
         return upload(data, width, height);
     }
-    TextureHandle loadFromPixels(const std::uint8_t *data, int width, int height, TextureDataFormat,
-                                 TextureFilter, bool) override {
-        return upload(data, width, height);
+    TextureHandle loadFromPixels(const std::uint8_t *data, int width, int height,
+                                 TextureDataFormat format, TextureFilter, bool) override {
+        const auto handle = upload(data, width, height);
+        if (format == TextureDataFormat::Alpha || format == TextureDataFormat::Rgba) {
+            GlyphInk ink{};
+            ink.texture = handle.id;
+            for (size_t level = 0; level < ink.bounds.size(); ++level) {
+                const int threshold = std::array{1, 32, 128}[level];
+                int left = width, top = height, right = 0, bottom = 0;
+                for (int y = 0; y < height; ++y)
+                    for (int x = 0; x < width; ++x)
+                        // RGBA paint fixtures use white glyphs over a zero-red background.
+                        if (data[(y * width + x) * (format == TextureDataFormat::Alpha ? 1 : 4)] >=
+                            threshold) {
+                            left = std::min(left, x);
+                            top = std::min(top, y);
+                            right = std::max(right, x + 1);
+                            bottom = std::max(bottom, y + 1);
+                        }
+                ink.bounds[level] = {float(left), float(top), float(right - left),
+                                     float(bottom - top)};
+            }
+            glyphInk.push_back(ink);
+        }
+        return handle;
     }
     TextureHandle createEmpty(int, int, TextureDataFormat, TextureFilter) override { std::abort(); }
     bool replace(TextureHandle &, const std::uint8_t *, int, int, TextureDataFormat, TextureFilter,
@@ -81,6 +106,11 @@ class CpuTextureUploadSink final : public TextureManager {
     void probeExtensions() override { std::abort(); }
     std::uint32_t uploads = 0;
     std::vector<std::pair<TextureId, uint64_t>> rgbaHashes;
+    struct GlyphInk {
+        TextureId texture;
+        std::array<LayoutRect, 3> bounds;
+    };
+    std::vector<GlyphInk> glyphInk;
     uint64_t rgbaHash(TextureId id) const {
         const auto found = std::find_if(rgbaHashes.begin(), rgbaHashes.end(),
                                         [id](const auto &entry) { return entry.first == id; });
@@ -99,11 +129,57 @@ class CpuTextureUploadSink final : public TextureManager {
     }
 };
 
+class CpuGlyphDrawSink final : public RenderBackend {
+  public:
+    explicit CpuGlyphDrawSink(TextureManager &textures) : textures(textures) {}
+    void initialize(GlSharedContext &) override { std::abort(); }
+    void cleanup() override {}
+    bool makeCurrent(RenderTarget &) override { std::abort(); }
+    bool makeCurrentNoSurface() override { std::abort(); }
+    bool beginFrame(RenderTarget &) override { std::abort(); }
+    void endFrame(RenderTarget &) override { std::abort(); }
+    RenderGraphicsResetStatus graphicsResetStatus() override { std::abort(); }
+    void invalidateGpuResources() override { std::abort(); }
+    void abandonAfterGraphicsReset() noexcept override { std::abort(); }
+    std::unique_ptr<RenderSurfaceTarget> createSurfaceTarget(wl_surface *) override {
+        std::abort();
+    }
+    std::unique_ptr<RenderFramebuffer> createFramebuffer(uint32_t, uint32_t) override {
+        std::abort();
+    }
+    void bindFramebuffer(const RenderFramebuffer &) override { std::abort(); }
+    void bindDefaultFramebuffer() override { std::abort(); }
+    void setViewport(uint32_t, uint32_t) override { std::abort(); }
+    void clear(Color) override { std::abort(); }
+    void setBlendMode(RenderBlendMode) override { std::abort(); }
+    int maxTextureSize() override { return 2048; }
+    void setScissor(RenderScissor) override { std::abort(); }
+    void disableScissor() override { std::abort(); }
+    void drawRect(float, float, float, float, const RoundedRectStyle &, const Mat3 &) override {
+        std::abort();
+    }
+    void drawImage(const RenderImageDraw &) override { std::abort(); }
+    void drawGlyph(const RenderGlyphDraw &draw) override { lastGlyph = draw; }
+    void drawSpinner(float, float, float, float, const SpinnerStyle &, const Mat3 &) override {
+        std::abort();
+    }
+    void drawFullscreenTexture(TextureId, bool) override { std::abort(); }
+    void drawFullscreenTint(Color) override { std::abort(); }
+    void drawFramebufferBlur(TextureId, uint32_t, uint32_t, float, float, float) override {
+        std::abort();
+    }
+    TextureManager &textureManager() override { return textures; }
+    RenderGlyphDraw lastGlyph{};
+
+  private:
+    TextureManager &textures;
+};
+
 // SDK tests/input_bidi_test.cpp's adapter, retaining native Pango/Cairo/HarfBuzz
 // measurements (including glyph measurements), with the upload-only sink above.
 class TranscriptTestRenderer final : public Renderer {
   public:
-    TranscriptTestRenderer() { text.initialize(nullptr, nullptr); }
+    TranscriptTestRenderer() { text.initialize(&backend, &textures); }
     TextMetrics measureText(std::string_view value, float size, const TextFont &font = {},
                             float width = 0, int lines = 0, TextAlign align = TextAlign::Start,
                             TextEllipsize ellipsize = TextEllipsize::End,
@@ -146,9 +222,59 @@ class TranscriptTestRenderer final : public Renderer {
     }
     TextureManager &textureManager() override { return textures; }
     float renderScale() const noexcept override { return 1.f; }
+    void paintText(Node &node, float opacity = 1) {
+        if (!node.visible())
+            return;
+        opacity *= node.opacity();
+        if (opacity <= 0)
+            return;
+        if (const auto *glyph = dynamic_cast<TextNode *>(&node)) {
+            auto color = glyph->color();
+            color.a *= opacity;
+            text.draw(1, 1000, 1000, 0, 0, glyph->text(), glyph->fontSize(), color,
+                      Mat3::identity(), glyph->font(), glyph->maxWidth(), glyph->maxLines(),
+                      glyph->textAlign(), glyph->ellipsize(), glyph->useMarkup(), false,
+                      glyph->inkCenterY());
+        }
+        for (const auto &child : node.children())
+            paintText(*child, opacity);
+    }
+    std::array<LayoutRect, 3> paintedGlyphInk(const TextNode &glyph, float phase = 0, float dpr = 1,
+                                              bool shadow = false) {
+        float x, y;
+        Node::mapToScene(&glyph, 0, 0, x, y);
+        if (shadow) {
+            assert(glyph.hasShadow());
+            x += glyph.shadowOffsetX();
+            y += glyph.shadowOffsetY();
+        }
+        text.draw(dpr, 1000, 1000, 0, 0, glyph.text(), glyph.fontSize(),
+                  shadow ? glyph.shadowColor() : glyph.color(), Mat3::translation(x, y + phase),
+                  glyph.font(), glyph.maxWidth(), glyph.maxLines(), glyph.textAlign(),
+                  glyph.ellipsize(), glyph.useMarkup(), shadow, glyph.inkCenterY());
+        const auto &draw = backend.lastGlyph;
+        const auto found =
+            std::find_if(textures.glyphInk.begin(), textures.glyphInk.end(),
+                         [&](const auto &ink) { return ink.texture == draw.texture; });
+        assert(found != textures.glyphInk.end());
+        auto bounds = found->bounds;
+        for (auto &ink : bounds) {
+            ink.x = ink.x / dpr + draw.transform.m[6];
+            ink.y = ink.y / dpr + draw.transform.m[7];
+            ink.width /= dpr;
+            ink.height /= dpr;
+        }
+        return bounds;
+    }
+    float lastGlyphOriginY() const { return backend.lastGlyph.transform.m[7]; }
+    Color lastGlyphTint() const {
+        assert(backend.lastGlyph.tinted);
+        return backend.lastGlyph.tint;
+    }
     CpuTextureUploadSink textures;
 
   private:
+    CpuGlyphDrawSink backend{textures};
     CairoTextRenderer text;
     static TextMetrics metrics(const CairoTextRenderer::TextMetrics &m) {
         return {.width = m.width,
@@ -824,6 +950,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                        chip->style().fill == blast::themeColor("primary"));
                 assert(nick->color() == blast::themeForegroundColor("on_primary"));
                 const auto chipBounds = sceneBounds(*chip);
+                near(nativeInk.y + nativeInk.height * .5f, chipBounds.y + chipBounds.height * .5f);
                 const auto labelBounds = sceneBounds(*nick->parent());
                 const float padding = labelBounds.x - chipBounds.x;
                 assert(padding > 0);
@@ -2700,7 +2827,7 @@ void tailAppendKeepsActions(TranscriptTestRenderer &renderer) {
     const float tail = scroll->scrollOffset();
     dispatcher.setFocus(revealTarget);
     scroll->requestScrollIntoView(revealTarget);
-    view.noteFocusReveal();
+    view.noteFocusReveal(true);
     view.sync();
     view.arrange(renderer, viewport);
     const float revealed = scroll->scrollOffset();
@@ -2916,6 +3043,18 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
             arrange();
             auto *demandScroll = find<ScrollView>(view);
             assert(demandScroll && gap->y() < demandScroll->scrollOffset());
+            const auto newestVisibleEvent = [&]() -> std::optional<size_t> {
+                const auto clip = nativeHistoryClip(view);
+                std::optional<size_t> newest;
+                for (size_t i = 0; i < buffer.messages.size(); ++i)
+                    if (bodyText(view, buffer.messages[i].text, true)) {
+                        const auto bounds =
+                            sceneBounds(body(view, buffer.messages[i].text, true).row);
+                        if (bounds.y < clip.y + clip.height && bounds.y + bounds.height > clip.y)
+                            newest = i;
+                    }
+                return newest;
+            };
             buffer.historyState.gaps.front().newer.id = "offscreen-boundary";
             arrange();
             assert(model.actions.empty()); // Hidden seams never auto-drain.
@@ -2923,11 +3062,23 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
             arrange(); // Geometry exposure, not wheel/PageUp, demands the seam.
             assert(model.actions.size() == 1 && model.actions.back().type == "history-gap" &&
                    model.actions.back().text == "73");
+            const auto firstApproach = newestVisibleEvent();
+            const float firstApproachOffset = demandScroll->scrollOffset();
+            const auto firstClip = nativeHistoryClip(view);
+            assert(firstApproach && *firstApproach > 0);
+            const auto olderRow =
+                sceneBounds(body(view, buffer.messages[*firstApproach - 1].text, true).row);
+            const float olderEventCenter =
+                olderRow.y + olderRow.height * .5f - firstClip.y + firstApproachOffset;
             arrange();
             assert(model.actions.size() == 1);
             model.actions.clear();
             arrange();
             assert(model.actions.empty());
+            // An older measured event must fit at the edge after the clamped gesture.
+            viewport.height = std::min(viewport.height, olderEventCenter);
+            arrange();
+            assert(model.actions.empty()); // Resize alone cannot authorize another page.
             buffer.historyState.gaps.front().newer.time = "2026-11-07T12:34:59.999999999Z";
             for (int frame = 0; frame < 20; ++frame) {
                 arrange();
@@ -2936,6 +3087,10 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
             const float approached = demandScroll->scrollOffset();
             demandScroll->setScrollOffset(std::max(0.f, approached - 60 * scale));
             arrange();
+            const auto finalApproach = newestVisibleEvent();
+            const bool approachedOlder =
+                firstApproach && finalApproach && *finalApproach < *firstApproach;
+            assert(approachedOlder);
             assert(model.actions.size() == 1 && model.actions.back().text == "73");
             model.actions.clear();
             arrange();
@@ -3093,7 +3248,7 @@ void focusRevealIntents(TranscriptTestRenderer &renderer) {
         arrange();
         near(scroll->scrollOffset(), scroll->maxScrollOffset());
     };
-    auto queueReveal = [&] {
+    auto queueReveal = [&](bool userInitiated = true) {
         InputArea *target = nullptr;
         std::string targetText;
         for (size_t i = buffer.messages.size() - 2; i >= 10; --i)
@@ -3110,9 +3265,41 @@ void focusRevealIntents(TranscriptTestRenderer &renderer) {
         assert(target);
         dispatcher.setFocus(target);
         scroll->requestScrollIntoView(target);
-        view.noteFocusReveal();
+        view.noteFocusReveal(userInitiated);
         return targetText;
     };
+
+    tail();
+    queueReveal(false);
+    blast::Message restoredArrival;
+    restoredArrival.id = restoredArrival.text = "ArrivalDuringFocusRestore";
+    restoredArrival.nick = "Peer";
+    buffer.messages.push_back(restoredArrival);
+    view.sync();
+    view.sync();
+    view.arrange(renderer, viewport);
+    arrange();
+    near(scroll->scrollOffset(), scroll->maxScrollOffset());
+    assert(pane.following && pane.unseen == 0 && model.actions.empty());
+    buffer.messages.pop_back();
+    ++buffer.messagesRevision;
+    tail();
+    scroll->setScrollOffset(scroll->maxScrollOffset() * .5f);
+    arrange();
+    const float readingOffset = scroll->scrollOffset();
+    queueReveal(false);
+    view.setWindowActive(false);
+    view.setWindowActive(true);
+    arrange();
+    near(scroll->scrollOffset(), readingOffset);
+    assert(!pane.following && model.actions.empty());
+    buffer.messages.push_back(restoredArrival);
+    arrange();
+    near(scroll->scrollOffset(), readingOffset);
+    assert(!pane.following && pane.unseen == 1 && model.actions.empty());
+    buffer.messages.pop_back();
+    ++buffer.messagesRevision;
+    tail();
 
     // Boundaries operate on the loaded transcript, never the older-history action.
     // Keep the keyboard canvas focused so layout cannot legitimately transfer focus
@@ -3518,7 +3705,7 @@ void focusRevealIntents(TranscriptTestRenderer &renderer) {
     dispatcher.setFocus(retainedLink);
     pane.focusComposer = false;
     scroll->requestScrollIntoView(retainedLink);
-    view.noteFocusReveal();
+    view.noteFocusReveal(true);
     const float beforeOverlayReveal = scroll->scrollOffset();
     view.arrange(renderer, tallViewport);
     assert(scroll->scrollOffset() >= beforeOverlayReveal + revealTravel - .1f &&
@@ -5946,6 +6133,8 @@ void smoothWheel(TranscriptTestRenderer &renderer, std::string_view renameTarget
     view.sync();
     view.arrange(renderer, rect);
     auto *scroll = find<ScrollView>(view);
+    auto *bar = find<Scrollbar>(*scroll);
+    assert(bar && bar->opacity() == 0);
     assert(scroll && pane.following);
     const float start = scroll->scrollOffset();
     near(start, scroll->maxScrollOffset());
@@ -5977,6 +6166,8 @@ void smoothWheel(TranscriptTestRenderer &renderer, std::string_view renameTarget
         // must leave the SDK's wheel animation alive.
         view.sync();
         view.arrange(renderer, rect);
+        if (renameTarget.empty() && frame > 1)
+            near(bar->opacity(), 1); // Wheel setters only queue the next safe renewal.
         const float previous = scroll->scrollOffset();
         animations.tick(16);
         const float current = scroll->scrollOffset();
@@ -6075,6 +6266,8 @@ void transcriptAffordanceMotion(TranscriptTestRenderer &renderer) {
     auto *mention = control(":mention-read");
     auto *rail = mention->parent();
     assert(scroll && scroll->maxScrollOffset() > 0);
+    auto *bar = find<Scrollbar>(*scroll);
+    assert(bar && bar->visible() && bar->opacity() == 0);
     assert(rail->visible());
     assert(!jump->visible());
     assert(rail->opacity() > 0 && rail->opacity() < 1);
@@ -6128,6 +6321,91 @@ void transcriptAffordanceMotion(TranscriptTestRenderer &renderer) {
     arrange();
     near(jump->opacity(), 1);
     near(rail->opacity(), 1);
+    // Idle opacity preserves the native hit target and gutter, including a
+    // stationary thumb hold; tail and typing layout must not reveal the bar.
+    view.setVisible(false);
+    view.sync();
+    view.setVisible(true);
+    arrange();
+    near(bar->opacity(), 0);
+    model.settings.fx = blast::FxLevel::Full;
+    assert(view.scrollHalfPage(1));
+    arrange();
+    near(bar->opacity(), 1);
+    const auto barBounds = sceneBounds(*bar), viewportBounds = sceneBounds(*scroll);
+    const float heldOffset = scroll->scrollOffset();
+    InputArea *thumb = nullptr;
+    for (const auto &child : bar->children())
+        if (auto *area = dynamic_cast<InputArea *>(child.get()))
+            thumb = area;
+    assert(thumb);
+    Node::mapToScene(thumb, thumb->width() / 2, thumb->height() / 2, x, y);
+    assert(dispatcher.pointerButton(x, y, BTN_LEFT, true, 301, 3010, false));
+    view.sync();
+    auto *heldFocus = dispatcher.focusedArea();
+    const auto wait = [&](int ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        animations.tick(ms);
+        view.sync();
+    };
+    wait(650);
+    near(bar->opacity(), 1);
+    near(scroll->scrollOffset(), heldOffset);
+    assert(dispatcher.pointerCaptured() && dispatcher.focusedArea() == heldFocus);
+    dispatcher.pointerButton(x, y, BTN_LEFT, false, 302, 3020, false);
+    view.sync();
+    near(bar->opacity(), 1);
+    wait(650); // Idle expires; the fade starts from the visible value.
+    near(bar->opacity(), 1);
+    wait(170);
+    near(bar->opacity(), 0);
+    near(sceneBounds(*bar).x, barBounds.x);
+    near(sceneBounds(*bar).width, barBounds.width);
+    near(sceneBounds(*scroll).width, viewportBounds.width);
+    near(scroll->scrollOffset(), heldOffset);
+    assert(dispatcher.focusedArea() == heldFocus);
+    assert(view.scrollToBoundary(true));
+    arrange();
+    model.settings.reducedMotion = true;
+    MotionService::instance().setEnabled(false);
+    MotionService::instance().setSpeed(4);
+    wait(650); // Real idle time also hides with motion disabled or sped up.
+    near(bar->opacity(), 0);
+    auto incoming = buffer.messages.back();
+    incoming.id = incoming.text = "SilentTail";
+    buffer.messages.push_back(incoming);
+    buffer.typing["TypingPeer"] = model.now;
+    arrange();
+    near(scroll->scrollOffset(), scroll->maxScrollOffset());
+    near(bar->opacity(), 0);
+    // A clamped wheel gesture is not scrolling, over either history or its bar.
+    assert(dispatcher.pointerAxis(viewport.x + 80, viewport.y + 120,
+                                  WL_POINTER_AXIS_VERTICAL_SCROLL, WL_POINTER_AXIS_SOURCE_WHEEL, 15,
+                                  0, 120, 1.f));
+    arrange();
+    near(bar->opacity(), 0);
+    Node::mapToScene(thumb, thumb->width() / 2, thumb->height() / 2, x, y);
+    assert(dispatcher.pointerAxis(x, y, WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                  WL_POINTER_AXIS_SOURCE_WHEEL, 15, 0, 120, 1.f));
+    arrange();
+    near(bar->opacity(), 0);
+    InputArea *focusTarget = nullptr;
+    for (int i = 39; i >= 0; --i)
+        if (bodyText(view, "AffordanceRow-" + std::to_string(i), true)) {
+            auto &row = body(view, "AffordanceRow-" + std::to_string(i), true).row;
+            if (sceneBounds(row).y + row.height() <= viewport.y) {
+                focusTarget = &row;
+                break;
+            }
+        }
+    assert(focusTarget);
+    const float tailOffset = scroll->scrollOffset();
+    dispatcher.setFocus(focusTarget);
+    scroll->requestScrollIntoView(focusTarget);
+    view.noteFocusReveal(true);
+    arrange();
+    assert(scroll->scrollOffset() < tailOffset && dispatcher.focusedArea() == focusTarget);
+    near(bar->opacity(), 1);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -6208,10 +6486,73 @@ void check(TranscriptTestRenderer &renderer, float zoom, bool traditional) {
 
 } // namespace
 
+void inkCenteredMarkupShadows(TranscriptTestRenderer &renderer) {
+    blast::Model model;
+    blast::Theme theme;
+    theme.update(model);
+    Label label;
+    label.setText("<span background=\"#000040\">morganw</span>");
+    label.setUseMarkup(true);
+    label.setFontFamily(blast::themeUiFont().family);
+    label.setFontFeatures(blast::themeUiFont().features);
+    label.setFontWeight(FontWeight::Bold);
+    label.setFontSize(14 * .82f);
+    label.setColor(rgba(1, 1, 1, 1));
+    label.setBaselineMode(LabelBaselineMode::InkCentered);
+    label.setShadow(rgba(0, 0, 0, 1), 3, 4);
+    label.setPosition(17.25f, 23.25f);
+    label.measure(renderer);
+    auto *glyph = find<TextNode>(label);
+    assert(glyph);
+    for (const float dpr : {1.f, 2.f}) {
+        uint32_t warmedUploads = 0;
+        for (const float phase : {0.f, .25f, .5f, .75f}) {
+            const auto foreground = renderer.paintedGlyphInk(*glyph, phase, dpr)[1];
+            const float foregroundOrigin = renderer.lastGlyphOriginY();
+            const auto shadow = renderer.paintedGlyphInk(*glyph, phase, dpr, true)[1];
+            const bool offsetPreserved =
+                std::abs(shadow.x - foreground.x - glyph->shadowOffsetX()) < .02f &&
+                std::abs(shadow.y - foreground.y - glyph->shadowOffsetY()) < .02f;
+            if (!offsetPreserved)
+                std::fprintf(stderr,
+                             "painted markup shadow DPR=%g phase=%g fg=[%g,%g,%g,%g] "
+                             "shadow=[%g,%g,%g,%g] origins=[%g,%g] configured=[%g,%g]\n",
+                             dpr, phase, foreground.x, foreground.y, foreground.width,
+                             foreground.height, shadow.x, shadow.y, shadow.width, shadow.height,
+                             foregroundOrigin, renderer.lastGlyphOriginY(), glyph->shadowOffsetX(),
+                             glyph->shadowOffsetY());
+            assert(offsetPreserved);
+            near(shadow.width, foreground.width);
+            near(shadow.height, foreground.height);
+            const auto bounds = sceneBounds(label);
+            assert(std::abs(foreground.y + foreground.height * .5f -
+                            (bounds.y + bounds.height * .5f + phase)) <= .5f / dpr + .001f);
+            if (warmedUploads)
+                assert(renderer.textures.uploads == warmedUploads);
+            warmedUploads = renderer.textures.uploads;
+        }
+    }
+    label.setText("<span foreground=\"#FFFFFF\">morganw</span>");
+    label.measure(renderer);
+    const auto beforePlainPaint = renderer.textures.uploads;
+    const auto foreground = renderer.paintedGlyphInk(*glyph)[1];
+    assert(renderer.textures.uploads == beforePlainPaint + 1);
+    const auto shadow = renderer.paintedGlyphInk(*glyph, 0, 1, true)[1];
+    near(shadow.x - foreground.x, glyph->shadowOffsetX());
+    near(shadow.y - foreground.y, glyph->shadowOffsetY());
+    glyph->setText("<span background=\"#000040\">    </span>");
+    glyph->setInkCenterY(15);
+    renderer.paintedGlyphInk(*glyph);
+    const float emptyGlyphOrigin = renderer.lastGlyphOriginY();
+    glyph->setInkCenterY(std::nullopt);
+    renderer.paintedGlyphInk(*glyph);
+    near(renderer.lastGlyphOriginY(), emptyGlyphOrigin);
+}
+
 void bubbleNickBoundaries(TranscriptTestRenderer &renderer) {
     for (const auto &[zoom, messageZoom] :
          {std::pair{1.f, 1.f}, std::pair{1.25f, 1.25f}, std::pair{2.f, 2.f}, std::pair{1.f, 2.f},
-          std::pair{2.f, 1.f}}) {
+          std::pair{2.f, 1.f}, std::pair{1.f, 1.5f}}) {
         blast::Model model;
         model.settings.scale = zoom;
         model.settings.messageScale = messageZoom;
@@ -6236,8 +6577,9 @@ void bubbleNickBoundaries(TranscriptTestRenderer &renderer) {
         for (const char *family : {"sans-serif", "serif", "monospace"}) {
             model.settings.uiFont = family;
             theme.update(model);
-            for (const std::string nick : {"Wi", "trev", "WWWW", "Alice", "i_l", "WWWWW",
-                                           "長い名前оченьдлинноеимяLongNativeNickname"}) {
+            for (const std::string nick :
+                 {"Wi", "trev", "WWWW", "Alice", "i_l", "WWWWW", "morganw", "primary", "gpqy",
+                  "長い名前оченьдлинноеимяLongNativeNickname"}) {
                 buffer.messages.front().nick = nick;
                 for (const float width : {800.f * zoom, 240.f}) {
                     for (const bool avatars : {false, true}) {
@@ -6287,6 +6629,49 @@ void bubbleNickBoundaries(TranscriptTestRenderer &renderer) {
                                     }
                                 assert(chip);
                                 const auto chipBounds = sceneBounds(*chip);
+                                const auto inkBounds = nativeTextInk(renderer, *text);
+                                near(inkBounds.y + inkBounds.height * .5f,
+                                     chipBounds.y + chipBounds.height * .5f);
+                                if (((nick == "morganw" && !own) || (nick == "primary" && own)) &&
+                                    avatars && sentence == "Hi" && width == 800 * zoom)
+                                    for (const auto &[dpr, phase] :
+                                         {std::pair{1.f, 0.f}, std::pair{1.f, .25f},
+                                          std::pair{1.f, .5f}, std::pair{1.f, .75f},
+                                          std::pair{2.f, 0.f}, std::pair{2.f, .25f},
+                                          std::pair{2.f, .5f}, std::pair{2.f, .75f}}) {
+                                        const auto painted =
+                                            renderer.paintedGlyphInk(*text, phase, dpr);
+                                        const float center =
+                                            chipBounds.y + chipBounds.height * .5f + phase;
+                                        const bool centered =
+                                            std::abs(painted[1].y + painted[1].height * .5f -
+                                                     center) <= .5f / dpr + .001f;
+                                        if (!centered) {
+                                            const auto labelBounds = sceneBounds(*label);
+                                            std::fprintf(
+                                                stderr,
+                                                "nick raster nick=%s family=%s weight=%d ui=%g "
+                                                "message=%g "
+                                                "size=%g DPR=%g phase=%g pill=[%g,%g] "
+                                                "label=[%g,%g] "
+                                                "ink=[%g,%g] layoutBaseline=%g labelBaseline=%g "
+                                                "origin=%g "
+                                                "alpha1=[%g,%g] alpha32=[%g,%g] alpha128=[%g,%g]\n",
+                                                nick.c_str(), text->font().family.c_str(),
+                                                int(text->fontWeight()), zoom, messageZoom,
+                                                text->fontSize(), dpr, phase, chipBounds.y + phase,
+                                                chipBounds.y + chipBounds.height + phase,
+                                                labelBounds.y + phase,
+                                                labelBounds.y + labelBounds.height + phase,
+                                                bounded.inkTop, bounded.inkBottom,
+                                                bounded.layoutBaseline, label->baselineOffset(),
+                                                renderer.lastGlyphOriginY(), painted[0].y,
+                                                painted[0].y + painted[0].height, painted[1].y,
+                                                painted[1].y + painted[1].height, painted[2].y,
+                                                painted[2].y + painted[2].height);
+                                        }
+                                        assert(centered);
+                                    }
                                 const auto contentBounds = sceneBounds(rendered.body);
                                 Image *avatar = nullptr;
                                 for (const auto &child : rendered.content.children())
@@ -6306,6 +6691,9 @@ void bubbleNickBoundaries(TranscriptTestRenderer &renderer) {
                                     assert(bounds.width > 0);
                                     near(bounds.width, bounds.height);
                                     containedBounds(bounds, sceneBounds(rendered.row));
+                                    near(bounds.y +
+                                             bounds.height * blast::foundryAvatarBodyCenterY(nick),
+                                         chipBounds.y + chipBounds.height * .5f);
                                     // Compact avatars share the author header; neither the whole
                                     // chip nor its native focusable control may occupy the avatar's
                                     // painted square.
@@ -6548,6 +6936,266 @@ void visitSeparator(TranscriptTestRenderer &renderer) {
     emptyView.sync();
     emptyView.arrange(renderer, {17, 23, 700, 1000});
     assert(plainText(body(emptyView, "NewlyMutedUnread").row, "New since your last visit"));
+}
+
+void mentionAccentLifecycle(TranscriptTestRenderer &renderer) {
+    for (const auto layout :
+         {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc, blast::MessageLayout::Stacked})
+        for (const auto effect :
+             {blast::MentionEffect::TextShimmer, blast::MentionEffect::RailPulse,
+              blast::MentionEffect::BorderHalo}) {
+            blast::Model model;
+            model.now = 10;
+            model.settings.timestamps = model.settings.avatars = false;
+            model.settings.reducedMotion = false;
+            model.settings.fx = blast::FxLevel::Full;
+            model.settings.incomingMotion = blast::SendMotion::None;
+            model.settings.incomingReveal = blast::SendReveal::None;
+            model.settings.mentionEffect = effect;
+            model.settings.foolDisplay = blast::FoolDisplay::Shown;
+            model.settings.presence = blast::PresenceMode::All;
+            blast::Theme theme;
+            theme.update(model);
+            auto &buffer = model.buffers["mention-accent"];
+            buffer.id = buffer.target = "mention-accent";
+            buffer.kind = "channel";
+            buffer.muted = true;
+            model.settings.messageLayouts[buffer.id] = layout;
+            blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
+            Clipboard clipboard;
+            InputDispatcher dispatcher;
+            blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+            view.setWindowActive(true);
+            dispatcher.setSceneRoot(&view);
+            view.setInputDispatcher(dispatcher);
+            LayoutRect viewport{17, 23, 700, 300};
+            const auto arrange = [&] {
+                view.sync();
+                view.arrange(renderer, viewport);
+            };
+            const auto paintedColor = [](const TextNode &text) {
+                auto color = text.color();
+                for (const auto &child : text.children())
+                    if (const auto *glyph = dynamic_cast<TextNode *>(child.get());
+                        glyph && glyph->visible()) {
+                        const auto over = glyph->color();
+                        const float alpha = glyph->opacity() * over.a;
+                        color.r = std::lerp(color.r, over.r, alpha);
+                        color.g = std::lerp(color.g, over.g, alpha);
+                        color.b = std::lerp(color.b, over.b, alpha);
+                    }
+                return color;
+            };
+            const auto coloredText = [&]() -> TextNode & {
+                for (const auto &area : body(view, "LiveMentionAccent").body.children())
+                    for (const auto &child : area->children())
+                        if (auto *text = dynamic_cast<TextNode *>(child.get());
+                            text && text->text().find("ColoredBody") != std::string::npos)
+                            return *text;
+                std::abort();
+            };
+            const auto strength = [&](std::string_view token) {
+                const auto rendered = body(view, token);
+                if (effect == blast::MentionEffect::TextShimmer) {
+                    const auto normal = blast::themeForegroundColor("on_surface");
+                    const auto color = paintedColor(rendered.text);
+                    return std::abs(color.r - normal.r) + std::abs(color.g - normal.g) +
+                           std::abs(color.b - normal.b);
+                }
+                float alpha = 0;
+                for (const auto &child : rendered.content.children())
+                    if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+                        rect && rect->visible()) {
+                        const auto &style = rect->style();
+                        if (effect == blast::MentionEffect::BorderHalo && style.borderWidth > 0)
+                            alpha = std::max(alpha, style.border.a);
+                        if (effect == blast::MentionEffect::RailPulse &&
+                            std::abs(rect->width() - 2 * blast::themeScale()) < .02f &&
+                            roundedCorners(style.radius))
+                            alpha = std::max(alpha, style.fill.a);
+                    }
+                return alpha;
+            };
+            const auto append = [&](std::string token) -> blast::Message & {
+                blast::Message message;
+                message.id = message.text = std::move(token);
+                message.nick = "morganw";
+                message.mention = true;
+                message.arrival = model.now;
+                buffer.messages.push_back(std::move(message));
+                return buffer.messages.back();
+            };
+            arrange();
+            append("LiveMentionAccent").text += " \x03"
+                                                "04,02\x1f"
+                                                "ColoredBody😀\x1f\x0f";
+            arrange();
+            const float rowHeight = body(view, "LiveMentionAccent").row.height();
+            const auto originalColor = paintedColor(coloredText());
+            model.now += .3;
+            arrange();
+            assert(strength("LiveMentionAccent") > .01f);
+            if (effect == blast::MentionEffect::TextShimmer) {
+                assert(!(paintedColor(coloredText()) == originalColor));
+                auto &rich = coloredText();
+                const auto ink = nativeTextInk(renderer, rich);
+                for (const auto &child : rich.children())
+                    if (const auto *glyph = dynamic_cast<TextNode *>(child.get())) {
+                        const auto overlayInk = nativeTextInk(renderer, *glyph);
+                        near(overlayInk.x, ink.x);
+                        near(overlayInk.y, ink.y);
+                        near(overlayInk.width, ink.width);
+                        near(overlayInk.height, ink.height);
+                    }
+                const auto beforePaint = renderer.textures.uploads;
+                renderer.paintText(body(view, "LiveMentionAccent").body);
+                if (layout == blast::MessageLayout::Bubbles)
+                    assert(renderer.textures.uploads > beforePaint);
+                const auto warmedUploads = renderer.textures.uploads;
+                for (const double now : {10.31, 10.33, 10.35}) {
+                    model.now = now;
+                    arrange();
+                    renderer.paintText(body(view, "LiveMentionAccent").body);
+                    assert(renderer.textures.uploads == warmedUploads);
+                }
+                dispatcher.setFocus(&body(view, "LiveMentionAccent").row);
+                assert(view.textSelectionCommand("set-mark"));
+                assert(view.textSelectionCommand("end-of-line"));
+                arrange();
+                assert(strength("LiveMentionAccent") == 0);
+                assert(paintedColor(coloredText()) == originalColor);
+                assert(view.copySelection());
+                assert(clipboard.clipboardText() == "LiveMentionAccent ColoredBody😀");
+                view.clearTextSelection();
+                dispatcher.setFocus(nullptr);
+                arrange();
+                assert(strength("LiveMentionAccent") > .01f);
+                renderer.paintText(body(view, "LiveMentionAccent").body);
+                assert(renderer.textures.uploads == warmedUploads);
+            }
+            near(body(view, "LiveMentionAccent").content.x(), 0);
+            model.now += .15;
+            viewport.width -= 40;
+            buffer.messages.back().time = "12:34";
+            arrange();
+            assert(strength("LiveMentionAccent") > .01f);
+            near(body(view, "LiveMentionAccent").row.height(), rowHeight);
+            model.now = 10.6;
+            arrange();
+            assert(strength("LiveMentionAccent") < .001f);
+            model.now = 10.9;
+            arrange();
+            assert(strength("LiveMentionAccent") > .01f);
+            view.setWindowActive(false);
+            arrange();
+            assert(strength("LiveMentionAccent") > .01f);
+            model.now = 11.21;
+            arrange();
+            assert(strength("LiveMentionAccent") == 0);
+            assert(paintedColor(coloredText()) == originalColor);
+            model.settings.mentionEffect = blast::MentionEffect::Off;
+            arrange();
+            model.settings.mentionEffect = effect;
+            arrange();
+            assert(strength("LiveMentionAccent") == 0);
+            dispatcher.setSceneRoot(nullptr);
+            if (layout != blast::MessageLayout::Bubbles ||
+                effect != blast::MentionEffect::RailPulse)
+                continue;
+            for (int exclusion = 0; exclusion < 8; ++exclusion) {
+                model.now += 2;
+                const auto token = "ExcludedAccent" + std::to_string(exclusion);
+                auto &message = append(token);
+                if (exclusion == 0)
+                    message.history = true;
+                if (exclusion == 1)
+                    message.own = true;
+                if (exclusion == 2)
+                    message.pending = true;
+                if (exclusion == 3)
+                    message.deleted = true;
+                if (exclusion == 4)
+                    message.mention = false;
+                if (exclusion == 5)
+                    message.arrival = model.now - 2;
+                if (exclusion == 6)
+                    model.settings.fools.insert(message.nick);
+                if (exclusion == 7)
+                    message.presence = true;
+                arrange();
+                model.now += .3;
+                arrange();
+                assert(strength(exclusion == 3 ? "Message deleted" : token) == 0);
+                model.settings.fools.clear();
+            }
+            for (int policy = 0; policy < 6; ++policy) {
+                model.now += 2;
+                const auto token = "CancelledAccent" + std::to_string(policy);
+                append(token);
+                arrange();
+                model.now += .15;
+                arrange();
+                assert(strength(token) > .01f);
+                if (policy == 0)
+                    model.settings.reducedMotion = true;
+                if (policy == 1)
+                    model.settings.fx = blast::FxLevel::Off;
+                if (policy == 2)
+                    model.settings.mentionEffect = blast::MentionEffect::BorderHalo;
+                if (policy == 3)
+                    buffer.messages.back().mention = false;
+                if (policy == 4)
+                    view.setVisible(false);
+                if (policy == 5)
+                    pane.following = false;
+                arrange();
+                model.settings.reducedMotion = false;
+                model.settings.fx = blast::FxLevel::Full;
+                model.settings.mentionEffect = effect;
+                buffer.messages.back().mention = true;
+                view.setWindowActive(true);
+                view.setVisible(true);
+                view.scrollToBoundary(true);
+                arrange();
+                model.now += .15;
+                arrange();
+                assert(strength(token) == 0);
+            }
+            model.now += 2;
+            append("OffscreenAccent");
+            arrange();
+            model.now += .15;
+            arrange();
+            assert(strength("OffscreenAccent") > .01f);
+            view.scrollToBoundary(false);
+            arrange();
+            view.scrollToBoundary(true);
+            arrange();
+            assert(strength("OffscreenAccent") == 0);
+            model.now += 2;
+            model.settings.incomingDurationMs = 100;
+            model.settings.incomingMotion = blast::SendMotion::Slide;
+            append("DelayedMentionAccent").arrival = model.now - .3;
+            arrange();
+            model.now += .3;
+            arrange();
+            assert(strength("DelayedMentionAccent") > .01f);
+            near(body(view, "DelayedMentionAccent").content.x(), 0);
+            model.settings.incomingMotion = blast::SendMotion::None;
+            model.now += 2;
+            blast::Message middle;
+            middle.id = middle.text = "OffscreenLiveArrival";
+            middle.nick = "Peer";
+            middle.mention = true;
+            middle.arrival = model.now;
+            buffer.messages.insert(buffer.messages.begin(), std::move(middle));
+            ++buffer.messagesRevision;
+            arrange();
+            model.now += .3;
+            viewport.height = 10000;
+            arrange();
+            assert(pane.following && strength("OffscreenLiveArrival") == 0);
+        }
 }
 
 void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
@@ -8703,15 +9351,8 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
     for (auto *area : {alice, brackets})
         assert(area->focusable() && area->hitTestVisible());
     assert(aliceText->fontWeight() == FontWeight::Bold);
-    assert(aliceText->text().find("background=") == std::string::npos);
-    bool authorColorMatches = false;
-    for (const auto &child : rendered.content.children())
-        if (const auto *rect = dynamic_cast<RectNode *>(child.get()); rect && rect->visible()) {
-            authorColorMatches =
-                authorColorMatches ||
-                aliceText->text().find(formatRgbHex(rect->style().fill)) != std::string::npos;
-        }
-    assert(authorColorMatches);
+    renderer.paintedGlyphInk(*aliceText);
+    assert(renderer.lastGlyphTint() == blast::nickColor(model, "Alice", buffer.server));
     assert(url->focusable() && url->hitTestVisible());
     const auto tooltip = url->tooltipContent();
     assert(std::get_if<std::string>(&tooltip) &&
@@ -9371,9 +10012,17 @@ void foundryTranscriptAvatars(TranscriptTestRenderer &renderer) {
         if (variant == 2) {
             model.networks[buffer.server].caseMapping = "rfc1459";
             arrange();
-            auto *reclassified = find<Image>(body(view, "FoundryAvatarBody").content);
+            const auto reclassifiedRow = body(view, "FoundryAvatarBody");
+            auto *reclassified = find<Image>(reclassifiedRow.content);
             assert(reclassified &&
                    renderer.textures.rgbaHash(reclassified->textureId()) == hashes[0]);
+            const auto bounds = sceneBounds(*reclassified);
+            containedBounds(bounds, sceneBounds(reclassifiedRow.row));
+            auto *author = plainText(reclassifiedRow.content, entry.nick);
+            assert(author);
+            const auto ink = nativeTextInk(renderer, *author);
+            near(bounds.y + bounds.height * blast::foundryAvatarBodyCenterY(entry.nick, "rfc1459"),
+                 ink.y + ink.height * .5f);
         }
         const auto baselineHash = renderer.textures.rgbaHash(
             find<Image>(body(view, "FoundryAvatarBody").content)->textureId());
@@ -9633,9 +10282,15 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
                        std::string::npos);
                 assert(markup.find("style=\"italic\" underline=\"single\">ActionUnder") !=
                        std::string::npos);
-                assert(markup.find("style=\"italic\" foreground=\"" +
-                                   formatRgbHex(rgbHex(blast::ircPalette[4])) + "\">ActionRed") !=
-                       std::string::npos);
+                bool red = false;
+                for (const auto &area : rendered.body.children())
+                    for (const auto &child : area->children())
+                        if (const auto *text = dynamic_cast<TextNode *>(child.get());
+                            text && text->text().find("ActionRed") != std::string::npos) {
+                            assert(text->color() == rgbHex(blast::ircPalette[4]));
+                            red = true;
+                        }
+                assert(red);
                 assert(markup.find("style=\"italic\"> ActionReset") != std::string::npos);
                 assert(markup.find("font_family=\"monospace\"") != std::string::npos);
                 assert(markup.find("ActionMono") != std::string::npos);
@@ -10139,8 +10794,10 @@ void runTranscriptCheck() {
     friendAuthorIndicators(renderer);
     foundryTranscriptAvatars(renderer);
     bubbleNickBoundaries(renderer);
+    inkCenteredMarkupShadows(renderer);
     visitSeparator(renderer);
     messageEntranceLifecycle(renderer);
+    mentionAccentLifecycle(renderer);
     independentSendEffects(renderer);
     cappedTranscriptBodies(renderer);
     typingFooterGeometry(renderer);

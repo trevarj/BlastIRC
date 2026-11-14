@@ -169,8 +169,9 @@ def main():
                                  "cursor-affordances", "composer-affordances", "overlay-refinements",
                                  "activity-pins", "input-routing", "logo-alignment",
                                  "minimum-height", "message-links", "typing-focus", "mentions-unread",
-                                 "startup-history-sync", "jump-bottom", "buffer-boundaries",
-                                 "conversation-history", "soju-search-context"))
+                                 "startup-history-sync", "jump-bottom", "scrollbar", "buffer-boundaries",
+                                 "conversation-history", "soju-search-context", "mention-effects", "avatar-alignment",
+                                 "muted-unread"))
     options, remaining = parser.parse_known_args()
     if any(option in remaining for option in ("--probe", "--probes", "--layout-only", "--ime-only", "--raw-only")):
         parser.error("--scope selects the focused fixture; do not combine other GUI scopes")
@@ -1557,12 +1558,12 @@ def _policy_settings(ctx, category, edits):
 def _policy_appearance(ctx, *, fool=None, unread=None, wrap=None):
     edits = []
     if wrap is not None:
-        edits.append((21, 'slider', (0, 1, wrap), 'appearance', 'message_wrap_columns'))
+        edits.append((24, 'slider', (0, 1, wrap), 'appearance', 'message_wrap_columns'))
     if fool is not None:
-        edits.append((22, 'select', ('minimized', 'blurred', 'dimmed', 'hidden').index(fool),
+        edits.append((25, 'select', ('minimized', 'blurred', 'dimmed', 'hidden').index(fool),
                       'appearance', 'fool_display'))
     if unread is not None:
-        edits.append((23, 'toggle', unread, 'appearance', 'fool_unread'))
+        edits.append((26, 'toggle', unread, 'appearance', 'fool_unread'))
     saved = _policy_settings(ctx, 0, edits)
     if fool is not None:
         assert saved['appearance']['fool_display'] == fool, saved['appearance']
@@ -1582,18 +1583,24 @@ def _policy_chat(ctx, *, fools=None, receive=None):
     return _policy_settings(ctx, 2, edits)
 
 
-def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=False):
-    saved = _policy_settings(ctx, 3, [
+def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=False, mention=None):
+    edits = [
         (1, 'select', ('off', 'subtle', 'full').index(fx), 'appearance', 'fx'),
         (2, 'toggle', reduced, 'appearance', 'reduced_motion'),
         (5, 'select', ('none', 'rise', 'pop', 'slide', 'drift').index(motion),
          'appearance', 'incoming_motion'),
         (6, 'select', ('none', 'fade', 'pixels').index(reveal), 'appearance', 'incoming_reveal'),
-        (7, 'slider', (100, 10, 2000), 'appearance', 'incoming_duration_ms')])
+        (7, 'slider', (100, 10, 2000), 'appearance', 'incoming_duration_ms')]
+    if mention is not None:
+        edits.append((8, 'select', ('off', 'text_shimmer', 'rail_pulse', 'border_halo').index(mention),
+                      'appearance', 'mention_effect'))
+    saved = _policy_settings(ctx, 3, edits)
     appearance = saved['appearance']
     assert all(appearance[k] == v for k, v in {
         'fx': fx, 'reduced_motion': reduced, 'incoming_motion': motion,
         'incoming_reveal': reveal, 'incoming_duration_ms': 2000}.items()), appearance
+    if mention is not None:
+        assert appearance['mention_effect'] == mention, appearance
 
 
 def _policy_focus(ctx, identity, *, expected=('', 0, 0)):
@@ -1646,7 +1653,8 @@ def _policy_reply_region(ctx, label):
                                             Path(ctx['destination']), label)
 
 
-def _policy_chip_words(ctx, image, region, reference_height, label, allow_absent=False):
+def _policy_chip_words(ctx, image, region, reference_height, label, allow_absent=False, *,
+                       either_ink=False, minimum_fill=.65, allow_square=False):
     """Recognize observed chip ink, returning native boxes and capture evidence."""
     native = (image if isinstance(image, Image.Image) else
               Image.frombytes('RGB', (image['width'], image['height']), image['pixels']))
@@ -1681,8 +1689,8 @@ def _policy_chip_words(ctx, image, region, reference_height, label, allow_absent
             bottom = max(y for x, y in component) + 1
             w, h = right - left, bottom - top
             if not (0 < left < right < width and 0 < top < bottom < height
-                    and w > h and .7 * reference_height <= h <= reference_height + 8
-                    and len(component) >= .65 * w * h):
+                    and (w >= h if allow_square else w > h) and .7 * reference_height <= h <= reference_height + 8
+                    and len(component) >= minimum_fill * w * h):
                 continue
             # Common inner row span excludes dark rounded-corner pixels.
             rows = [[x for x in range(left, right) if (x, y) in component]
@@ -1701,12 +1709,13 @@ def _policy_chip_words(ctx, image, region, reference_height, label, allow_absent
     fill, fill_box, interior = candidates[0]
     glyphs = body.crop(interior).convert('L')
     fill_luma = Image.new('RGB', (1, 1), fill).convert('L').getpixel((0, 0))
-    darkest = glyphs.getextrema()[0]
-    assert fill_luma - darkest >= 48, ('Chip lacks contrasting dark glyph ink', fill, darkest)
+    darkest, lightest = glyphs.getextrema()
+    ink_luma = (lightest if either_ink and lightest - fill_luma > fill_luma - darkest else darkest)
+    assert abs(fill_luma - ink_luma) >= 48, ('Chip lacks contrasting glyph ink', fill, ink_luma)
     # Normalize observed fill->ink contrast without binarizing native glyphs:
     # binary OCR input can discard antialiased letter-closure detail.
     ink = glyphs.point(lambda value: max(0, min(255, round(
-        (fill_luma - value) * 255 / (fill_luma - darkest)))))
+        (fill_luma - value) * 255 / (fill_luma - ink_luma)))))
     ink_box = ink.point(lambda value: 255 if value >= 32 else 0).getbbox()
     assert ink_box is not None, ('Chip has no contrast glyphs', fill_box)
     scale, border = 4, 16
@@ -3118,6 +3127,275 @@ def run_incoming(ctx):
                                pixels for stamp, pixels in cropped if stamp >= first_complete))}}
 
 
+def run_mention_effects(ctx):
+    """Require changes above the global veil's maximum possible channel delta."""
+    _policy_focus(ctx, ctx['query_id'])
+    _policy_chat(ctx, fools=[], receive=False)
+    evidence = []
+    gui.set_navigation(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
+                       'hidden', 'mention-effects')
+    gui.set_people(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'], 'hidden')
+    for style_index, style in enumerate(('bubbles', 'irc', 'stacked')):
+        gui.set_message_style(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
+                              ctx['args'], ctx['destination'], ctx['query_id'], style,
+                              label='mention-effects-' + style)
+        choices = ('off', 'text_shimmer', 'rail_pulse', 'border_halo')
+        cases = [(choice, 'full', False, False) for choice in choices]
+        cases += [('border_halo', 'off', False, False), ('text_shimmer', 'full', True, False)]
+        cases += [(choice, 'full', False, True) for choice in choices]
+        off_variation = None
+        for index, (choice, fx, reduced, foolish) in enumerate(cases):
+            if index in (0, 6):
+                _policy_chat(ctx, fools=[ctx['query_target']] if foolish else [])
+                if foolish:
+                    gui.command('show-fools', window=ctx['window'])
+                    gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
+            _policy_effects(ctx, mention=choice, fx=fx, reduced=reduced)
+            gui.move_pointer(ctx['window'], 0, 0)
+            serial = style_index * 10 + index
+            rgb = (30 + 80 * (serial % 3), 90 + 70 * ((serial // 3) % 3),
+                   30 + 60 * (serial // 9))
+            token = ''.join(f'{v:02X}' for v in rgb)
+            text = (f'\x04{token},{token}MENTIONANCHOR\x0f '
+                    f'{ctx["own_nick"]}: Local accent glyph probe')
+            # The unformatted glyphs are the shimmer target; the solid IRC
+            # background remains a geometry anchor, not an animation witness.
+            _policy_send(ctx, text, durable=False)
+            samples, bounds = [], None
+            started = time.monotonic()
+            while time.monotonic() - started < 3.8:
+                image = gui.native_rgb_capture(ctx['window'])
+                raster = Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
+                difference = ImageChops.difference(raster, Image.new('RGB', raster.size, rgb))
+                channels = difference.split()
+                mask = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]),
+                                          channels[2]).point(lambda value: 255 if value <= 26 else 0)
+                anchors = Image.composite(Image.new('RGB', raster.size, rgb),
+                                          Image.new('RGB', raster.size), mask)
+                components = gui.native_marker_components(
+                    dict(image, pixels=anchors.tobytes()),
+                    gui.read_layout(ctx['preferences'])['conversation']['rect'], rgb)
+                boxes = [item['bbox'] for item in components
+                         if item['bbox'][2] - item['bbox'][0] >= 24
+                         and item['bbox'][3] - item['bbox'][1] >= 6
+                         and item['pixels'] >= .6 * (item['bbox'][2] - item['bbox'][0]) *
+                         (item['bbox'][3] - item['bbox'][1])]
+                marker = boxes[0] if len(boxes) == 1 else None
+                if marker is None:
+                    continue
+                if bounds is None:
+                    x, y, width, height = gui.read_layout(ctx['preferences'])['conversation']['rect']
+                    scale = gui.read_layout(ctx['preferences'])['scale']
+                    # Match jump-bottom's native overlay gutter: its independent
+                    # FAB may fade even with row FX off and is not row-local ink.
+                    # Body glyphs and the vertical rail/halo sides share the
+                    # actual anchor band; measured headers/prior rows do not.
+                    bounds = (round(x + 2 * scale), marker[1],
+                              round(x + width - 110 * scale), marker[3])
+                crop = _policy_crop(image, bounds)
+                samples.append((time.monotonic() - started, crop, marker))
+            gui.wait_messages(ctx['proc'], ctx['database_path'], ctx['expected_messages'])
+            assert samples and bounds, ('Mention row never became visible', style, choice)
+            settled = samples[-1][1]
+            early = [(stamp, pixels) for stamp, pixels, _ in samples if .1 <= stamp <= 1.15]
+            late = [pixels for stamp, pixels, _ in samples if stamp >= 3.5]
+            assert early and late, ('Native sampler missed accent or settled interval', style, choice)
+            # The global veil is at most .095 opaque: <=25 RGB/channel on
+            # any palette. A >32 delta cannot be explained by that cue.
+            delta_threshold = 8 if foolish else 32
+            changes = [sum(abs(a - b) > delta_threshold for a, b in zip(pixels, settled))
+                       for _, pixels in early]
+            variation = max(changes)
+            live_stamp, live_pixels = early[changes.index(variation)]
+            live_path = Path(ctx['destination']).with_name(
+                Path(ctx['destination']).stem + f'-mention-{style}-{index}-live.png')
+            Image.frombytes('RGB', (bounds[2] - bounds[0], bounds[3] - bounds[1]),
+                            live_pixels).save(live_path)
+            if choice == 'off':
+                off_variation = variation
+            enabled = choice != 'off' and fx != 'off' and not reduced and not foolish
+            # Off is measured with the same genuine own-nick global event.
+            # Only excess local contrast can satisfy the positive assertion.
+            if enabled:
+                assert variation > off_variation + 12, (
+                    'No row-local accent above global-veil Off control', style, choice,
+                    variation, off_variation)
+            else:
+                assert variation <= off_variation + (0 if foolish else 12), (
+                    'Suppressed accent changed local contrast', style, choice, variation, off_variation)
+            assert all(sum(abs(a - b) > 8 for a, b in zip(pixels, settled)) <= 12
+                       for pixels in late), ('Mention row failed to settle', style, choice)
+            assert len({tuple(box) for _, _, box in samples}) == 1, (
+                'Paint-only mention accent moved the body', style, choice)
+            evidence.append({'style': style, 'choice': choice, 'fx': fx, 'reduced_motion': reduced,
+                             'fully_shown_fool': foolish, 'channel_delta_threshold': delta_threshold,
+                             'frames': len(samples), 'region': bounds,
+                             'maximum_local_contrast_changes': variation,
+                             'off_control_changes': off_variation,
+                             'live_capture': str(live_path), 'live_seconds': live_stamp,
+                             'settled': True, 'marker': samples[-1][2],
+                             'capture': str(_policy_capture(ctx, f'mention-{style}-{index}'))})
+    _policy_chat(ctx, fools=[ctx['query_target']])
+    _policy_appearance(ctx, fool='hidden')
+    gui.command('hide-fools', window=ctx['window'])
+    gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
+    _policy_effects(ctx, mention='border_halo')
+    private_text = ctx['own_nick'] + ': HiddenMentionPrivacyProbe'
+    _policy_send(ctx, private_text)
+    words = _policy_words(ctx, 'mention-hidden-privacy')
+    assert not any('hiddenmentionprivacyprobe' in text.casefold() for text, _ in words), (
+        'Hidden Fool content leaked into native pixels', words)
+    _policy_chat(ctx, fools=[])
+    return _refresh_return(ctx, 'mention-effects', {
+        'cases': evidence, 'motion': 'none', 'reveal': 'none', 'hidden_fool_body_absent': True,
+        'limits': ['Channel deltas above 32 exceed the global veil maximum of 25; a real Off control '
+                   'also runs per layout. Low-contrast palettes may not produce enough observable accent '
+                   'contrast and fail rather than claiming proof. Exact easing, two-pulse count, rounded '
+                   'radius and selected glyph contrast remain C++ checks.',
+                   'Read-position, replay, synthetic-result and selection exclusion are C++ lifecycle checks.']})
+
+
+def run_avatar_alignment(ctx):
+    """Measure actual glyph ink and broad sprite body, independently of node boxes."""
+    from contextlib import ExitStack
+
+    _policy_focus(ctx, ctx['channel_id'])
+    _policy_effects(ctx, fx='off')  # Compatible with the pre-mention binary.
+    _policy_chat(ctx, fools=[], receive=False)
+    gui.set_navigation(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
+                       'hidden', 'avatar-alignment')
+    gui.set_people(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'], 'hidden')
+    gui.set_message_style(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
+                          ctx['args'], ctx['destination'], ctx['channel_id'], 'bubbles',
+                          label='avatar-alignment')
+    evidence, failures = [], []
+    report = _refresh_return(ctx, 'avatar-alignment', {
+        'measurements': evidence, 'failures': failures,
+        'limits': ['Native sprite measurement uses the broad visible shell, allowing its small cap offset; '
+                   'it does not inspect the atlas or claim a node rectangle proves body centering.',
+                   'Incoming uses a known descender nickname; own uses the fixture account nickname.']})
+    artifact = Path(ctx['destination']).with_name(Path(ctx['destination']).stem +
+                                                 '-avatar-alignment-measurements.json')
+    artifact.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+    with ExitStack() as stack:
+        nick = 'morganw'
+        guest = stack.enter_context(gui.fixtures.BootstrapClient(
+            dict(ctx['lab'].endpoints['direct'], nick=nick, username=nick),
+            ctx['lab'].ca_file, authenticate=False))
+        guest.send('JOIN ' + ctx['channel'])
+        gui.receive_until(ctx['observer'], 'JOIN', [ctx['channel']], nick, redact=ctx['lab']._redact)
+        for message_scale in (1., 1.5):
+            appearance = tomllib.loads(Path(ctx['preferences']).read_text())['appearance']
+            appearance.update(message_scale=message_scale, avatars=True, avatar_style='sprite',
+                              timestamps=False)
+            _refresh_restart(ctx, 'appearance',
+                             {key: json.dumps(value) for key, value in appearance.items()},
+                             focus=ctx['channel_id'])
+            for own in (False, True):
+                bump = 20 if message_scale > 1 else 0
+                rgb = (42 + bump, 185, 113) if not own else (179 + bump, 79, 213)
+                token = ''.join(f'{v:02X}' for v in rgb)
+                text = f'\x04{token},{token}ALIGNBODY\x0f native glyph alignment {message_scale}'
+                if own:
+                    upload.focus_composer(ctx['window'])
+                    _refresh_clipboard(ctx, text.encode(), 'text/plain;charset=utf-8')
+                    gui.framed_keys(ctx['window'], 'ctrl+v')
+                    length = len(text.encode('utf-8'))
+                    gui._composer_native(ctx['window'], text, length, length)
+                    gui.framed_keys(ctx['window'], 'Return')
+                    sender = ctx['own_nick']
+                else:
+                    guest.send(f'PRIVMSG {ctx["channel"]} :{text}')
+                    sender = nick
+                ctx['expected_messages'].extend(ctx['channel_messages'](text, sender))
+                gui.wait_messages(ctx['proc'], ctx['database_path'], ctx['expected_messages'])
+                # Older probes may still be visible after scale/rebind. Locate
+                # the newest complete anchor, not a unique text snapshot.
+                def newest():
+                    image = gui.native_rgb_capture(ctx['window'])
+                    items = gui.native_marker_components(image,
+                        gui.read_layout(ctx['preferences'])['conversation']['rect'], rgb)
+                    boxes = [item['bbox'] for item in items if item['full']]
+                    return (image, max(boxes, key=lambda box: box[1])) if boxes else None
+                image, marker = gui.SESSION.until('actual incoming/own alignment row', newest)
+                scale = gui.read_layout(ctx['preferences'])['scale']
+                raster = Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
+                x, y, width, height = gui.read_layout(ctx['preferences'])['conversation']['rect']
+                region = (round(x), max(round(y), marker[1] - round(44 * scale * message_scale)),
+                          round(x + width), marker[1])
+                label = f'avatar-alignment-{message_scale}-{"own" if own else "incoming"}'
+                # The pill is the isolated flat rounded fill above this body.
+                # Reuse native chip extraction; its ink bounds are measured
+                # before OCR and include the descender in the actual nickname.
+                result = {'message_scale': message_scale, 'own': own, 'nick': sender, 'marker': marker}
+                try:
+                    words, chip = _policy_chip_words(ctx, image, region,
+                        round(16 * scale * message_scale), label, either_ink=True, minimum_fill=.5)
+                    fill_box, ink_box = chip['fill_box'], chip['native_ink_box']
+                    top_gap = ink_box[1] - fill_box[1]
+                    bottom_gap = fill_box[3] - ink_box[3]
+                    glyph_ok = abs(top_gap - bottom_gap) <= max(1, round(scale))
+                    result = {'message_scale': message_scale, 'own': own, 'nick': sender,
+                              'marker': marker, 'chip': chip,
+                              'glyph_top_gap': top_gap, 'glyph_bottom_gap': bottom_gap,
+                              'glyph_centered': glyph_ok}
+                    if not glyph_ok:
+                        failures.append(label + ': nickname ink is not centered in pill')
+                    # Sprite fuses are thin and above the body. Broad painted
+                    # rows isolate the visible shell, rather than its square
+                    # scene node or fuse-inclusive whole-image rectangle.
+                    avatar_size = round(32 * scale)
+                    # Register the avatar lane to the actual badge edge;
+                    # the conversation allocation includes extra pane gutters.
+                    if own:
+                        lane_left, lane_right = round(fill_box[2] + 20 * scale), round(fill_box[2] + 56 * scale)
+                    else:
+                        lane_left, lane_right = round(fill_box[0] - 56 * scale), round(fill_box[0] - 20 * scale)
+                    lane = (lane_left, max(round(y), fill_box[1] - avatar_size),
+                            lane_right, min(image['height'], fill_box[3] + avatar_size))
+                    avatar = raster.crop(lane)
+                    canvas = max(avatar.getcolors(avatar.width * avatar.height), key=lambda item: item[0])[1]
+                    rows = []
+                    for row in range(avatar.height):
+                        points = [col for col in range(avatar.width)
+                                  if max(abs(a - b) for a, b in
+                                         zip(avatar.getpixel((col, row)), canvas)) > 8]
+                        rows.append(points)
+                    broadest = max(map(len, rows), default=0)
+                    broad = [row for row, points in enumerate(rows)
+                             if broadest and len(points) >= max(4, broadest * .5)]
+                    assert broad, ('No visible generated avatar body', lane)
+                    # Count every contrasting sprite color, including the dark
+                    # outline/LCD; choose the substantial body, never its cap.
+                    groups = []
+                    for row in broad:
+                        if not groups or row != groups[-1][-1] + 1:
+                            groups.append([])
+                        groups[-1].append(row)
+                    chip_center = (fill_box[1] + fill_box[3]) / 2
+                    group = max(groups, key=lambda values: sum(len(rows[row]) for row in values))
+                    body_center = lane[1] + (group[0] + group[-1] + 1) / 2
+                    body_height = group[-1] - group[0] + 1
+                    # The BODY layer includes a small cap above the broad shell;
+                    # allow that measured 4/96-tile difference, not a full fuse.
+                    tolerance = max(2, round(avatar_size * 4 / 96) + 1)
+                    avatar_ok = body_height >= 6 * scale and abs(body_center - chip_center) <= tolerance
+                    result.update(avatar_lane=lane, avatar_body_rows=[lane[1] + group[0],
+                                  lane[1] + group[-1] + 1], avatar_body_center=body_center,
+                                  chip_center=chip_center, avatar_tolerance=tolerance,
+                                  avatar_centered=avatar_ok)
+                    if not avatar_ok:
+                        failures.append(label + ': visible avatar body is not centered on badge')
+                except AssertionError as error:
+                    result['measurement_error'] = str(error)
+                    failures.append(label + ': ' + str(error))
+                result['capture'] = str(_policy_capture(ctx, label))
+                evidence.append(result)
+                artifact.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+    assert not failures, ('Native avatar/nickname alignment failures', failures, str(artifact))
+    return report
+
+
 # Append before the receiving interface_refresh_smoke.py __main__ guard.
 # Dependencies: existing gui/upload helpers and Pillow; stdlib ctypes, hashlib,
 # json, queue, threading, re, pathlib; installed native GIO/GLib/GObject and notify-send.
@@ -4128,7 +4406,7 @@ def run_chat_controls(ctx):
     after_unread = rows('SELECT unread,read_marker,draft FROM buffers WHERE id=?', (channel_id,))[0]
     assert flag() == (1,1) and after_unread[0] > before_unread[0]
     assert after_unread[1:] == before_unread[1:], (before_unread, after_unread)
-    archived_total = rows("SELECT COALESCE(SUM(unread),0) FROM buffers WHERE archived=1 "
+    archived_total = rows("SELECT COALESCE(SUM(unread),0) FROM buffers WHERE archived=1 AND muted=0 "
                           "AND server='Local' AND kind IN ('channel','query')")[0][0]
     controls = gui.sidebar_controls(layout(), ctx['args'].zoom)
     gui.click(window, *controls['query'])
@@ -4136,7 +4414,7 @@ def run_chat_controls(ctx):
     # sidebarArchiveControlsCheck owns exact native caption/fit regression.
     # This live consumer supplies the wire-derived count and fresh UI evidence,
     # without making tiny-font OCR an additional correctness requirement.
-    assert archived_total >= after_unread[0] > 0
+    assert archived_total == 0 < after_unread[0], 'Muted archive contributed to aggregate count'
     count_capture = (gui.capture_native_popup(window, count_popup, destination,
                                              'chat-controls-archived-count')
                      if count_popup is not None else
@@ -8285,6 +8563,223 @@ def run_buffer_boundaries(ctx):
                    'Swatches prove actual endpoint visibility, not arbitrary message glyph fidelity.']})
 
 
+def run_scrollbar(ctx):
+    """Native history scrollbar paint, idle/held drag, and passive layout isolation."""
+    p, w, prefs, db = ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path']
+    assert ctx['args'].zoom == 1 and ctx['args'].size == (1440, 940), ctx['args']
+    _policy_focus(ctx, ctx['query_id'])
+    _policy_chat(ctx, fools=[], receive=True)
+    _policy_effects(ctx, motion='none', fx='full')
+    _policy_typing_cap(ctx)
+    gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'],
+                          ctx['query_id'], 'bubbles', label='scrollbar')
+    for index in range(60):
+        _policy_send(ctx, f'Scrollbar history {index:02d}', durable=False)
+    _policy_send(ctx, 'Reply source \x0419A7D3,19A7D3SCROLLQUOTE\x0f')
+    tail_rgb = (42, 185, 113)
+    _policy_send(ctx, 'Native tail \x042AB971,2AB971SCROLLTAIL\x0f')
+    _policy_wait_box(ctx, tail_rgb)
+    layout = gui.read_layout(prefs)
+    reply = gui.begin_native_reply(w, layout, 1, Path(ctx['destination']), label='scrollbar-reply')
+    draft = 'private café scrollbar draft'
+    gui.type_text(draft)
+    size = len(draft.encode('utf-8'))
+    editor = gui._composer_native(w, draft, size, size)
+    frame = gui.native_rgb_capture(w)
+    quotes = [item for item in gui.native_marker_components(
+        frame, layout['conversation']['rect'], (25, 167, 211)) if item['full']]
+    assert len(quotes) == 2, ('Missing native history/reply swatches', quotes)
+    quote = max(quotes, key=lambda item: item['bbox'][1])
+    qx, qy, qr, qb = quote['bbox']
+    quote_region = (qx - 1, qy - 1, qr - qx + 2, qb - qy + 2)
+    metrics = gui.pane_metrics(layout, 1)
+    x, y, width, _ = layout['conversation']['rect']
+    right = round(x + width - metrics['left'])
+    # Native 6px bar expands inward to 12px. Short bodies leave this gutter
+    # and its adjacent conversation-material reference free of message ink.
+    strip = (right - 12, round(y + metrics['top'] + 8), right, qy - 30)
+    captures, phases = {}, []
+    wire_start = len(ctx['observer'].frames)
+    pointer = None
+    cursor_radius = 24
+
+    def move(px, py):
+        nonlocal pointer
+        gui.move_pointer(w, px, py)
+        pointer = (px, py)
+
+    def save(label, image):
+        path = Path(ctx['destination'])
+        path = path.with_name(path.stem + '-scrollbar-' + label + '.png')
+        Image.frombytes('RGB', (image['width'], image['height']), image['pixels']).save(path)
+        captures[label] = str(path)
+
+    def sample():
+        image = gui.native_rgb_capture(w)
+        assert gui.read_layout(prefs) == layout, 'Scrollbar changed native pane geometry'
+        native = Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
+        pixels = native.load()
+        rows = []
+        for row in range(strip[1], strip[3]):
+            # Headless Sway composites its software hand cursor into grim.
+            # Mask only its known pointer-local footprint, not native bar ink
+            # elsewhere along the hundreds-of-pixels-tall track/thumb.
+            if (pointer and strip[0] - cursor_radius <= pointer[0] <= right + 2 + cursor_radius and
+                    abs(row - pointer[1]) <= cursor_radius):
+                rows.append(0)
+                continue
+            background = pixels[right + 2, row]
+            rows.append(max(max(abs(a - b) for a, b in zip(pixels[column, row], background))
+                            for column in range(strip[0], strip[2])))
+        peak = max(rows)
+        ink = [strip[1] + index for index, value in enumerate(rows) if value > max(20, peak * .7)]
+        return image, {'peak': peak, 'thumb': (min(ink), max(ink)) if ink else None}
+
+    def unchanged(image):
+        assert gui._composer_native(w, draft, size, size) == editor, \
+            'History interaction changed input geometry/focus/draft'
+        assert gui.native_marker_components(image, quote_region, (25, 167, 211)) == [quote], \
+            'History interaction moved the native reply excerpt'
+
+    def hidden(label):
+        image, bar = sample()
+        assert bar['peak'] <= 12, ('Idle native scrollbar is painted', label, bar)
+        unchanged(image)
+        return image
+
+    def visible(label, *, wait=False):
+        def painted():
+            image, bar = sample()
+            thumb = bar['thumb']
+            return (image, bar) if thumb and thumb[1] - thumb[0] >= 12 else None
+
+        if wait:
+            image, bar = gui.SESSION.until('native scrollbar paints during ' + label, painted)
+        else:
+            image, bar = sample()
+        assert bar['thumb'] and bar['thumb'][1] - bar['thumb'][0] >= 12, (
+            'Scrolling native scrollbar is absent', label, bar)
+        if not phases or phases[-1]['label'] != label:
+            phases.append(dict(label=label, **bar))
+        return image, bar['thumb']
+
+    def idle(label):
+        time.sleep(1.05)
+        image = hidden(label)
+        save(label, image)
+
+    def wheel(steps):
+        move(x + width / 2, (strip[1] + strip[3]) / 2)
+        offset = gui.GUI_DEBUG[w][1].stat().st_size
+        gui.POINTER.scroll(steps)
+        gui.await_native_frame(w, offset, re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
+
+    def settled_thumb(label, absent=None):
+        previous, since = None, time.monotonic()
+
+        def settled():
+            nonlocal previous, since
+            image, bar = sample()
+            thumb = bar['thumb']
+            if not thumb or (absent is not None and _policy_box(ctx, absent, image=image)):
+                previous, since = None, time.monotonic()
+                return None
+            if thumb != previous:
+                previous, since = thumb, time.monotonic()
+            return thumb if time.monotonic() - since >= .12 else None
+
+        return gui.SESSION.until('settled native thumb after ' + label, settled)
+
+    move(x + width / 2, y / 2)
+    idle('before')
+    wheel(-8)
+    image, thumb = visible('wheel', wait=True)
+    save('during', image)
+    thumb = settled_thumb('wheel departure', absent=tail_rgb)
+    assert thumb[1] - thumb[0] > 2 * cursor_radius + 1, \
+        'Native thumb must extend beyond the cursor mask for meaningful hover proof'
+    time.sleep(.25)
+    visible('wheel-idle-grace')
+    idle('after')
+
+    # Hover the actual invisible target, not a guessed message-row edge.
+    move(right - 3, sum(thumb) / 2)
+    deadline = time.monotonic() + .9
+    while time.monotonic() < deadline:
+        hidden('hover')
+    save('hover', hidden('hover'))
+    wheel(-2)
+    _, thumb = visible('before-drag', wait=True)
+    thumb = settled_thumb('drag preparation')
+    assert thumb[1] - thumb[0] > 2 * cursor_radius + 1, \
+        'Native thumb must extend beyond the cursor mask for meaningful held-drag proof'
+    start_y = sum(thumb) / 2
+    move(right - 3, start_y)
+    gui.pointer_button(True)
+    try:
+        move(right - 3, start_y - 24)
+        held_start = time.monotonic()
+        while time.monotonic() - held_start < 1.1:
+            image, held = visible('held')
+        save('held-drag', image)
+        move(right - 3, start_y - 60)
+        moved = gui.SESSION.until('held native thumb resumes after idle grace',
+            lambda: state if (state := sample())[1]['thumb'] and
+            state[1]['thumb'][0] < held[0] - 10 else None)
+        save('resumed-drag', moved[0])
+    finally:
+        offset = gui.GUI_DEBUG[w][1].stat().st_size
+        gui.pointer_button(False)
+        gui.await_native_frame(w, offset,
+            re.compile(r'wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)'))
+    idle('released')
+    wheel(120)
+    _policy_wait_box(ctx, tail_rgb)
+    idle('tail')
+    for key in ('Page_Up', 'Page_Down'):
+        gui.framed_keys(w, key)
+        image, _ = visible(key, wait=True)
+        save(key.lower(), image)
+        if key == 'Page_Up':
+            assert not _policy_box(ctx, tail_rgb, image=image), 'PgUp did not move history'
+        else:
+            _policy_wait_box(ctx, tail_rgb)
+        idle(key.lower() + '-idle')
+
+    anchor = _policy_wait_box(ctx, tail_rgb)
+    _policy_typing(ctx, 'active')
+    observed_footer = False
+    deadline = time.monotonic() + .9
+    while time.monotonic() < deadline:
+        image = hidden('typing-layout')
+        box = _policy_box(ctx, tail_rgb, image=image)
+        observed_footer |= bool(box and box[1] < anchor[1])
+    assert observed_footer, 'Real TAGMSG never changed native history-footer layout'
+    save('typing-layout', image)
+    _policy_typing(ctx, 'done')
+    gui.SESSION.until('native typing footer restores same history anchor',
+                      lambda: _policy_box(ctx, tail_rgb) == anchor)
+    hidden('typing-done')
+    _policy_send(ctx, 'Incoming tail \x04D35A91,D35A91SCROLLFOLLOW\x0f')
+    deadline = time.monotonic() + .9
+    followed = False
+    while time.monotonic() < deadline:
+        image = hidden('incoming-layout')
+        followed |= bool(_policy_box(ctx, (211, 90, 145), image=image))
+    assert followed, 'Real incoming message did not paint in followed native history'
+    save('incoming-layout', image)
+    assert not [entry for entry in ctx['observer'].frames[wire_start:]
+                if entry['command'] == 'PRIVMSG' and
+                entry['prefix'].split('!', 1)[0] == ctx['own_nick']], \
+        'Scrollbar interactions unexpectedly sent the private draft'
+    return _refresh_return(ctx, 'scrollbar', {
+        'idle_ms': 600, 'fade_ms': 150, 'native_bar_strip': strip,
+        'software_cursor_mask_radius': cursor_radius,
+        'phases': phases, 'captures': captures, 'reply': reply,
+        'unchanged_native_editor': editor, 'passive_typing_and_incoming_hidden': True,
+        'stationary_drag_seconds': 1.1, 'no_unintended_send': True})
+
+
 def run_jump_bottom(ctx):
     """Real zero-arrival departure, native FAB boundary/click, and resumed following."""
     import os
@@ -8294,8 +8789,11 @@ def run_jump_bottom(ctx):
     assert ctx['args'].zoom == 1 and ctx['args'].size == (1440, 940), ctx['args']
     _policy_focus(ctx, identity)
     nonce = os.urandom(4).hex()
-    for index in range(50):
-        _policy_send(ctx, f'JB{nonce} history {index:02d}', durable=False)
+    first_rgb = (42, 185, 113)
+    history_bodies = [f'JB{nonce} history {index:02d}' for index in range(50)]
+    history_bodies[0] += f' \x042AB971,2AB971Astra{nonce}\x0f'
+    for body in history_bodies:
+        _policy_send(ctx, body, durable=False)
     tail_rgb, follow_rgb = (25, 167, 211), (211, 90, 145)
     # Reuse the rectangular reading-proof swatch; leading J glyphs overhang it.
     tail = f'Jump-bottom tail \x0419A7D3,19A7D3Astra{nonce}\x0f.'
@@ -8324,6 +8822,18 @@ def run_jump_bottom(ctx):
         assert gui.read_layout(prefs) == layout, 'Native proof geometry changed'
         return Image.frombytes('RGB', (image['width'], image['height']),
                                image['pixels']).crop(region)
+    def settled_box(rgb, label):
+        previous, unchanged_since = None, time.monotonic()
+        def observed():
+            nonlocal previous, unchanged_since
+            box = _policy_box(ctx, rgb)
+            now = time.monotonic()
+            if box is None or box != previous:
+                previous, unchanged_since = box, now
+                return None
+            return box if now-unchanged_since >= .2 else None
+        return gui.SESSION.until('native marker stable for 200ms: ' + label, observed)
+
 
     # Match the existing unread proof: exclude software cursor and hover ink.
     park_pointer()
@@ -8335,8 +8845,7 @@ def run_jump_bottom(ctx):
                 'SELECT seq,text FROM messages WHERE buffer=? ORDER BY seq', (identity,)).fetchall()
 
         history = retained()
-        assert [row[1] for row in history[-51:-1]] == [
-            f'JB{nonce} history {index:02d}' for index in range(50)], history
+        assert [row[1] for row in history[-51:-1]] == history_bodies, history
         gui.move_pointer(w, x + width / 2, y + height / 2)
         offset = gui.GUI_DEBUG[w][1].stat().st_size
         gui.POINTER.scroll(-32)
@@ -8380,15 +8889,326 @@ def run_jump_bottom(ctx):
     read = gui.wait_read_marker(p, db, identity)
     assert read[3] == follow, read
     gui._composer_native(w, draft, size, size)
+    following_capture = str(_policy_capture(ctx, 'jump-bottom-following'))
+    history_arrivals = []
+    for departure, away_rgb, resumed_rgb in (
+            ('wheel', (195, 123, 40), (42, 163, 113)),
+            ('keyboard', (153, 83, 195), (49, 137, 205))):
+        read_before = gui.wait_read_marker(p, db, identity)
+        if departure == 'wheel':
+            gui.move_pointer(w, x + width/2, y + height/2)
+            offset = gui.GUI_DEBUG[w][1].stat().st_size
+            gui.POINTER.scroll(-120)
+            gui.await_native_frame(w, offset, re.compile(r'wl_pointer[@#]\d+\.axis\(\d+,\s*0,'))
+        else:
+            gui.framed_keys(w, 'alt+less')
+        anchor = settled_box(first_rgb, departure + '-before-arrival')
+        gui._composer_native(w, draft, size, size)
+        away_token = ''.join(f'{part:02X}' for part in away_rgb)
+        away_body = f'Jump-bottom {departure} pending \x04{away_token},{away_token}Astra{nonce}\x0f.'
+        _policy_send(ctx, away_body)
+        # Message rows persist before the periodic per-buffer counter snapshot.
+        gui.save_state(p, prefs, db)
+        after_anchor = settled_box(first_rgb, departure + '-after-arrival')
+        assert after_anchor == anchor, (
+            'Incoming moved the user-selected history anchor', departure, anchor, after_anchor)
+        assert _policy_box(ctx, away_rgb) is None, 'Incoming jumped user history back to live'
+        gui.wait_rows(p, db, 'SELECT read_marker,unread FROM buffers WHERE id=?',
+                      (identity,), [(read_before[0], 1)])
+        away_capture = str(_policy_capture(ctx, 'jump-bottom-' + departure + '-arrival-anchor'))
+        gui.framed_keys(w, 'alt+greater')
+        restored_pending = _policy_wait_box(ctx, away_rgb)
+        assert gui.wait_read_marker(p, db, identity)[3] == away_body
+        token = ''.join(f'{part:02X}' for part in resumed_rgb)
+        resumed_body = f'Jump-bottom {departure} resumed \x04{token},{token}Astra{nonce}\x0f.'
+        _policy_send(ctx, resumed_body)
+        resumed = _policy_wait_box(ctx, resumed_rgb)
+        assert gui.wait_read_marker(p, db, identity)[3] == resumed_body
+        gui._composer_native(w, draft, size, size)
+        history_arrivals.append({
+            'departure': departure, 'history_anchor_before_and_after': anchor,
+            'read_marker_preserved_while_away': read_before,
+            'explicit_return': 'M->', 'returned_pending_marker': restored_pending,
+            'followed_subsequent_arrival': resumed,
+            'history_capture': away_capture,
+            'resumed_capture': str(_policy_capture(ctx, 'jump-bottom-' + departure + '-resumed'))})
     return _refresh_return(ctx, 'jump-bottom', {
         'retained_history_rows': len(history), 'no_arrivals_before_click': True,
         'acknowledged_before_departure': acknowledged, 'native_fab_boundary': boundary,
         'actual_pointer_click': point, 'restored_tail_marker': restored_tail,
         'followed_new_wire_marker': followed, 'followed_read_marker': read,
+        'user_history_arrivals': history_arrivals,
         'unchanged_native_editor': after_input,
         'captures': {'tail': at_tail, 'away_zero_arrivals': away, 'restored': restored,
-                     'following': str(_policy_capture(ctx, 'jump-bottom-following'))}})
+                     'following': following_capture}})
 
+
+
+def run_muted_unread(ctx):
+    """Real background arrivals survive native mute while aggregate UI excludes them."""
+    import sqlite3
+    import hashlib
+    p, w, prefs, db = ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path']
+    z, destination = ctx['args'].zoom, Path(ctx['destination'])
+    target, other = ctx['channel_id'], ctx['other_channel_id']
+    evidence = {}
+
+    def rows(sql, params=()):
+        with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as connection:
+            return connection.execute(sql, params).fetchall()
+
+    def saved():
+        state = gui.save_state(p, prefs, db)
+        assert state[1] == (ctx['query_id'],), ('Mute proof selected its unread target', state[1])
+        return state
+
+    def retained():
+        return {'buffers': rows('SELECT id,unread,read_marker,draft FROM buffers ORDER BY id'),
+                'messages': rows('SELECT * FROM messages WHERE presence=0 ORDER BY seq')}
+
+    def normalize(text):
+        return ''.join(character.casefold() for character in text if character.isalnum())
+
+    def words(label, region):
+        return upload.visible_words(w, destination, 'muted-unread-' + label, region=region, psm=6)
+
+    def title_count(expected, label):
+        region = gui.read_layout(prefs)['topbar']['rect']
+        def observed():
+            found = words(label + '-title', region)
+            text = ' '.join(item['text'] for item in found)
+            match = re.search(r'(\d+)\s+unread', text, re.IGNORECASE)
+            if expected == 0:
+                return found if 'blastirc' in normalize(text) and 'unread' not in text.casefold() else None
+            return found if match and int(match[1]) == expected else None
+        return gui.SESSION.until('rendered global unread count ' + str(expected), observed)
+
+    def sidebar_row():
+        region = gui.read_layout(prefs)['channels']['rect']
+        found = words('sidebar-target', region)
+        matches = [item for item in found
+                   if normalize(item['text']) == normalize(ctx['channel'])]
+        assert len(matches) <= 1, ('Ambiguous inactive channel row', found)
+        if matches:
+            item = matches[0]
+            cy = int(item['top']) + int(item['height']) / 2
+            return (region[0], cy - 20*z, region[2], 40*z), item
+
+    settings = tomllib.loads(Path(prefs).read_text())
+    palette = Path(prefs).with_name('noctalia.toml')
+    colors = (tomllib.loads(palette.read_text())['colors']
+              if palette.is_file() and settings['appearance']['theme_source']
+              not in ('builtin', 'built-in') else {})
+    value = colors.get('primary', '#A8C7FA')
+    primary = tuple(int(value[index:index + 2], 16) for index in (1, 3, 5))
+    primary_bytes = bytes(primary)
+
+    def plates(region, image=None):
+        image = image or gui.native_rgb_capture(w)
+        found = []
+        for item in gui.native_marker_components(image, region, primary):
+            left, top, right, bottom = item['bbox']
+            if (14*z <= bottom-top <= 24*z and bottom-top-2 <= right-left <= 60*z
+                    and item['pixels'] >= (right-left)*(bottom-top)*.6):
+                found.append(item['bbox'])
+        return found
+    def footer():
+        upload.focus_composer(w)
+        gui.move_pointer(w, 0, 0)
+        layout = gui.read_layout(prefs)
+        x, y, width, height = layout['rail']['rect']
+        extent, pad, gap = max(32, 36*z), 6*z, 6*z
+        top = y + max(pad, height-pad-3*extent-2*gap)
+        image = gui.native_rgb_capture(w)
+        read_box = (x+pad, top, x+width-pad, top+extent)
+        lower_box = (x+pad, top+extent+gap, x+width-pad, y+height-pad)
+        return (_policy_crop(image, read_box), _policy_crop(image, lower_box),
+                (x+width/2, top+extent/2))
+
+    def read_action(label, visible):
+        def observed():
+            read_pixels, lower_pixels, point = footer()
+            if ((read_pixels != empty_footer[0]) == visible and lower_pixels == empty_footer[1]):
+                return read_pixels, point
+        read_pixels, point = gui.SESSION.until('native read action visible=' + str(visible), observed)
+        fresh_click_buffer = None
+        if not visible:
+            before = retained()
+            marker = gui.GUI_DEBUG[w][1].stat().st_size
+            gui.click(w, *point)
+            gui.await_native_frame(w, marker,
+                re.compile(r'wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)'))
+            state = gui.save_state(p, prefs, db)
+            fresh_click_buffer = state[1][0]
+            assert fresh_click_buffer in (ctx['query_id'], '!global-mentions'), (
+                'Retired read slot activated an unexpected action', state[1])
+            assert retained() == before, 'Fresh reclaimed-footer click acknowledged unread or changed data'
+            if fresh_click_buffer == '!global-mentions':
+                # Reflow legitimately gives Mentions the old read-button slot.
+                # A new click may activate it; it must never clear stored unread.
+                _policy_focus(ctx, ctx['query_id'])
+            saved()
+            assert retained() == before, 'Restoring the unrelated query acknowledged the muted target'
+            assert observed(), 'Reclaimed footer did not return to its zero-unread layout'
+        return {'visible': visible, 'former_read_point': point,
+                'read_row_sha256': hashlib.sha256(read_pixels).hexdigest(),
+                'add_settings_same_pixels_and_position': True,
+                'fresh_reclaimed_slot_active_buffer': fresh_click_buffer,
+                'capture': str(gui.capture_window(w, destination, 'muted-unread-read-action-' + label))}
+
+
+    def expanded(label, count, muted):
+        gui.set_navigation(p, w, prefs, db, 'expanded', 'muted-unread-' + label)
+        saved()
+        layout = gui.read_layout(prefs)
+        region, item = gui.SESSION.until('inactive unread channel label', sidebar_row)
+        if muted:
+            local_box = badge_box
+        else:
+            local_plates = plates(region)
+            assert len(local_plates) == 1, ('Expected one actual local unread plate', local_plates)
+            local_box = local_plates[0]
+        left, top, right, bottom = local_box
+        local_words, local_badge = _policy_chip_words(
+            ctx, gui.native_rgb_capture(w), (left-4*z, top-4*z, right+4*z, bottom+4*z),
+            16*z, 'muted-unread-' + label + '-local-badge', either_ink=True, allow_square=True)
+        assert any(text == '1' for text, box in local_words), (
+            'Native local badge does not retain unread numeral 1', muted, local_words, local_badge)
+        rail = layout['rail']['rect']
+        # The selected avatar's primary outline touches its same-color badge.
+        # Locate dense native fill rows in the badge lane, not a reconstructed
+        # avatar Y: read_layout's shell top can differ from actual native ink.
+        avatar_extent = max(0, rail[2]-32*z)
+        badge_right = round(rail[0] + (rail[2]+avatar_extent)/2)
+        badge_left = round(badge_right-16*z)
+        rail_badge_regions = []
+        def rail_badges():
+            image = gui.native_rgb_capture(w)
+            dense_runs = []
+            for row_y in range(round(rail[1]), round(rail[1]+rail[3])):
+                row = image['pixels'][(row_y*image['width']+badge_left)*3:
+                                      (row_y*image['width']+badge_right)*3]
+                fill = sum(row[offset:offset+3] == primary_bytes for offset in range(0, len(row), 3))
+                if fill >= (badge_right-badge_left)*.5:
+                    if dense_runs and row_y == dense_runs[-1][1]:
+                        dense_runs[-1][1] = row_y+1
+                    else:
+                        dense_runs.append([row_y, row_y+1])
+            rail_badge_regions[:] = [(badge_left, top, badge_right-badge_left, bottom-top)
+                                     for top, bottom in dense_runs if 14*z <= bottom-top <= 24*z]
+            return [box for region in rail_badge_regions for box in plates(region, image)]
+        rail_plates, = gui.SESSION.until('server aggregate badge transition', lambda:
+            ((found,) if len(found := rail_badges()) == (0 if muted else 1) else None))
+        assert all(box[1] < rail[1] + 82*z for box in rail_plates), rail_plates
+        image = gui.native_rgb_capture(w)
+        result = {'title_words': title_count(count, label), 'local_words': local_words,
+                  'local_badge': local_badge, 'local_region': region, 'rail_badges_ltrb': rail_plates,
+                  'rail_badge_regions': rail_badge_regions,
+                  'capture': str(gui.capture_window(w, destination, 'muted-unread-' + label))}
+        return result, image, region
+
+    def hidden(label, local_present, count):
+        gui.set_navigation(p, w, prefs, db, 'hidden', 'muted-unread-hidden-' + label)
+        saved()
+        layout = gui.read_layout(prefs)
+        width, height = gui.GUI_SIZE
+        status_height = (22 if layout['tight'] else 26 if layout['compact'] else 30)*z
+        region = (0, height-status_height, width, status_height)
+        local_caption = normalize('Local/' + ctx['channel'] + ': 1')
+        other_caption = normalize('Other/' + ctx['channel'] + ': 1')
+        def observed():
+            found = words(label + '-hidden-summary', region)
+            text = normalize(''.join(item['text'] for item in found))
+            return found if ((local_caption in text) == local_present and other_caption not in text) else None
+        found = gui.SESSION.until('hidden-sidebar summary excludes only muted channel', observed)
+        # A second independent capture must not accept an old popup/layout frame.
+        assert observed(), ('Unstable hidden summary', found)
+        return {'summary_words': found, 'title_words': title_count(count, label + '-hidden'),
+                'capture': str(gui.capture_window(w, destination, 'muted-unread-hidden-' + label))}
+
+    def toggle(label, muted):
+        gui.set_navigation(p, w, prefs, db, 'expanded', 'muted-unread-action-' + label)
+        saved()
+        _, item = gui.SESSION.until('RMB inactive channel without acknowledgement', sidebar_row)
+        def right_click():
+            gui.move_pointer(w, int(item['left']) + int(item['width'])/2,
+                             int(item['top']) + int(item['height'])/2)
+            gui.POINTER.button(True, 0x111)
+            gui.POINTER.button(False, 0x111)
+        root = gui.open_native_popup(w, right_click)
+        popup = gui.open_native_submenu(w, root, 2)
+        rect = gui.SESSION.until('actual native ' + label + ' leaf',
+            lambda: upload.label_rect(w, destination, label, region=popup['rect']))
+        capture = gui.capture_native_popup(w, popup, destination, 'muted-unread-action-' + label.lower())
+        gui.popup_keys(w, root, 'Home', 'Down', 'Return')
+        gui.wait_rows(p, db, 'SELECT muted FROM buffers WHERE id=?', (target,), [(int(muted),)])
+        saved()
+        assert retained() == pending, 'Native mute/unmute changed unread, read marker, draft or history'
+        return {'action': label, 'leaf_box': rect, 'capture': str(capture)}
+
+    # Establish read baseline before the background arrivals, never select the
+    # target again after this point. No own-send/native composer injection needed.
+    for identity in (target, other, ctx['query_id']):
+        _policy_focus(ctx, identity)
+        gui.wait_read_marker(p, db, identity)
+    saved()
+    assert rows('SELECT SUM(unread) FROM buffers') == [(0,)], 'Fixture unread baseline is not isolated'
+    gui.set_navigation(p, w, prefs, db, 'expanded', 'muted-unread-empty-baseline')
+    empty_footer = footer()
+    evidence['empty_read_action'] = read_action('empty', False)
+    _policy_send(ctx, 'Native mute count retention ' + str(time.monotonic_ns()), target=ctx['channel'])
+    saved()
+    assert rows('SELECT id,unread FROM buffers WHERE unread>0 ORDER BY id') == sorted(
+        [(target, 1), (other, 1)]), 'Expected precisely two real-wire channel contributions'
+    # Acknowledge only the independent Other copy. Local remains inactive and
+    # becomes the last eligible unread conversation for the native read action.
+    _policy_focus(ctx, other)
+    gui.wait_read_marker(p, db, other)
+    _policy_focus(ctx, ctx['query_id'])
+    saved()
+    assert rows('SELECT id,unread FROM buffers WHERE unread>0 ORDER BY id') == [(target, 1)]
+    pending = retained()
+    evidence['before'], before_image, badge_region = expanded('before', 1, False)
+    evidence['before_read_action'] = read_action('before', True)
+    before_plates = plates(badge_region)
+    assert len(before_plates) == 1, ('Missing original local badge plate', before_plates)
+    badge_box = before_plates[0]
+    evidence['before_hidden'] = hidden('before', True, 1)
+    evidence['mute'] = toggle('Mute', True)
+    evidence['muted'], muted_image, _ = expanded('muted', 0, True)
+    evidence['muted_read_action'] = read_action('muted', False)
+    assert not plates(badge_region), 'Muted local badge retained undimmed primary fill'
+    assert _policy_crop(before_image, badge_box) != _policy_crop(muted_image, badge_box), (
+        'Local unread badge did not dim on mute', badge_box)
+    evidence['muted_hidden'] = hidden('muted', False, 0)
+    evidence['unmute'] = toggle('Unmute', False)
+    evidence['restored'], restored_image, _ = expanded('restored', 1, False)
+    evidence['restored_read_action'] = read_action('restored', True)
+    assert _policy_crop(before_image, badge_box) == _policy_crop(restored_image, badge_box), (
+        'Unmute did not restore the original local badge raster', badge_box)
+    evidence['restored_hidden'] = hidden('restored', True, 1)
+    saved()
+    assert retained() == pending, 'Summary/navigation acknowledged a background buffer'
+    evidence['retained_buffers'] = pending['buffers']
+    evidence['retained_history_rows'] = len(pending['messages'])
+    evidence['target_never_selected_after_arrival'] = True
+    evidence['local_badge_dimmed_and_restored_ltrb'] = badge_box
+    gui.set_navigation(p, w, prefs, db, 'expanded', 'muted-unread-click-read')
+    _, _, point = footer()
+    marker = gui.GUI_DEBUG[w][1].stat().st_size
+    gui.click(w, *point)
+    gui.await_native_frame(w, marker,
+        re.compile(r'wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)'))
+    saved()
+    gui.wait_rows(p, db, 'SELECT COUNT(*) FROM buffers WHERE unread<>0', (), [(0,)])
+    assert rows('SELECT * FROM messages WHERE presence=0 ORDER BY seq') == pending['messages']
+    assert rows('SELECT id,draft FROM buffers ORDER BY id') == [
+        (identity, draft) for identity, unread, read_marker, draft in pending['buffers']]
+    evidence['read_all_cleared_stored_unread'] = rows(
+        'SELECT unread,read_marker FROM buffers WHERE id=?', (target,))
+    evidence['cleared_read_action'] = read_action('cleared', False)
+    evidence['cleared_title'] = title_count(0, 'cleared')
+    return _refresh_return(ctx, 'muted-unread', evidence)
 
 
 def run_mentions_unread(ctx):

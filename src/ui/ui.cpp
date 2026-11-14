@@ -1197,8 +1197,12 @@ struct Ui::Impl {
         titleRow->setHitTestVisible(false);
         title->setHitTestVisible(false);
         title->setMaxLines(1);
-        modeLine =
-            static_cast<ModeLine *>(scene->addChild(std::make_unique<ModeLine>(model, callback)));
+        modeLine = static_cast<ModeLine *>(
+            scene->addChild(std::make_unique<ModeLine>(model, callback, [this](Node &row) {
+                retireSubtreePointerCapture(row);
+                if (dispatcher && withinNode(dispatcher->focusedArea(), &row))
+                    dispatcher->setFocus(nullptr);
+            })));
         const std::array<std::pair<const char *, const char *>, 3> tools = {
             {{"panel-left", "Toggle navigation"},
              {"terminal", "Execute command"},
@@ -3980,7 +3984,8 @@ void Ui::Impl::refresh(bool panelResize) {
     title->setColor(themeForegroundColor("primary"));
     int unread = 0;
     for (const auto &[id, b] : model.buffers)
-        unread += b.unread;
+        if (!b.muted)
+            unread += b.unread;
     if (savedUnread != unread) {
         title->setText("BlastIRC" + (unread ? " · " + std::to_string(unread) + " unread" : ""));
         savedUnread = unread;
@@ -4220,10 +4225,10 @@ void Ui::Impl::refresh(bool panelResize) {
         closeUploadMenu();
     restoreJumpFocus(false);
     syncUploadPanel();
-    if (windowActive)
-        repairFocus();
     modeLine->sync(scale, navigationMode, chord);
     place(*modeLine, outer, height - statusHeight, std::max(0.f, width - 2 * outer), statusHeight);
+    if (windowActive)
+        repairFocus();
     if (paletteOpen && !commandMode) {
         bool changed = paletteSources.size() != model.buffers.size();
         auto source = paletteSources.begin();
@@ -4801,7 +4806,8 @@ void Ui::setInputDispatcher(InputDispatcher &dispatcher) {
                 }
             for (const auto &[id, view] : impl_->views) {
                 if (node == view->transcript && queuedReveal)
-                    view->transcript->noteFocusReveal();
+                    view->transcript->noteFocusReveal(!impl_->restoringJumpFocus &&
+                                                      !impl_->inputSynchronizing);
                 if (node == view) {
                     impl_->conversationFocus = id;
                     return;

@@ -107,13 +107,12 @@ word_completion_dep = declare_dependency(
   dependencies: [threads_dep, gio_dep],
 )
 
-executable('blastirc',
-  'src/main.cpp',
+app_deps = [irc_dep, avatar_dep, preview_dep, picker_dep, spell_dep, word_completion_dep, noctalia_ui_dep, noctalia_ui_codecs_dep,
+  mpv_dep, sdl_dep, sdl_mixer_dep, fontconfig_dep] + storage_deps
+app_core_sources = files(
   'src/application.cpp',
   'src/storage.cpp',
-  'src/platform/window.cpp',
   'src/platform/clipboard.cpp',
-  'src/platform/capture.cpp',
   'src/ui/ui.cpp',
   'src/ui/mode_line.cpp',
   'src/ui/buffer_chrome.cpp',
@@ -133,9 +132,21 @@ executable('blastirc',
   'src/render/graphics.cpp',
   'src/theme/theme.cpp',
   'src/fx/effects.cpp',
+)
+app_core = static_library('blastirc-core', app_core_sources,
   include_directories: src_inc,
-  dependencies: [irc_dep, avatar_dep, preview_dep, picker_dep, spell_dep, word_completion_dep, noctalia_ui_dep, noctalia_ui_codecs_dep,
-    mpv_dep, sdl_dep, sdl_mixer_dep, fontconfig_dep] + storage_deps,
+  dependencies: app_deps,
+  cpp_args: app_cpp_args,
+  pic: false,
+)
+
+executable('blastirc',
+  'src/main.cpp',
+  'src/platform/window.cpp',
+  'src/platform/capture.cpp',
+  include_directories: src_inc,
+  dependencies: app_deps,
+  link_whole: app_core,
   cpp_args: app_cpp_args,
   install: true,
 )
@@ -214,24 +225,35 @@ if get_option('tests')
     cpp_args: check_args)
   test('native_theme_check', native_theme_check)
 
+  native_ui_deps = app_deps + [openssl_dep]
+  native_ui_core = app_core
+  if get_option('b_ndebug') != 'false' or not meson.get_compiler('cpp').compiles(
+      '''
+      #include <cassert>
+      #ifdef NDEBUG
+      #error Application assertions are disabled
+      #endif
+      int main() { return 0; }
+      ''',
+      args: get_option('cpp_args') + app_cpp_args,
+      include_directories: src_inc,
+      name: 'application core assertions enabled')
+    native_ui_core = static_library('blastirc-native-ui-core', app_core_sources,
+      include_directories: src_inc,
+      dependencies: native_ui_deps,
+      cpp_args: check_args + app_cpp_args,
+      pic: false,
+    )
+  endif
+
   native_ui_check = executable('blastirc-native-ui-check',
     'tests/native_rename_check.cpp', 'tests/composer_check.cpp', 'tests/emoji_check.cpp',
     'tests/settings_check.cpp', 'tests/transcript_check.cpp',
     'tests/ui_integration_check.cpp',
     'tests/media_preview_check.cpp',
-    'src/application.cpp', 'src/storage.cpp',
-    'src/platform/clipboard.cpp',
-    'src/ui/ui.cpp', 'src/ui/mode_line.cpp', 'src/ui/buffer_chrome.cpp',
-    'src/ui/sidebar.cpp', 'src/ui/dialogs.cpp', 'src/ui/workspace.cpp',
-    'src/ui/editor.cpp', 'src/ui/emoji.cpp', 'src/ui/emoji_picker.cpp',
-    'src/ui/command_completion.cpp',
-    'src/ui/message_selection.cpp', 'src/ui/transcript.cpp', 'src/ui/presentation.cpp',
-    'src/ui/foundry_avatar.cpp',
-    'src/ui/media_preview.cpp', 'src/ui/media_player.cpp',
-    'src/render/graphics.cpp', 'src/theme/theme.cpp', 'src/fx/effects.cpp',
     include_directories: src_inc,
-    dependencies: [irc_dep, avatar_dep, preview_dep, picker_dep, spell_dep, word_completion_dep, noctalia_ui_dep, noctalia_ui_codecs_dep,
-      mpv_dep, openssl_dep, sdl_dep, sdl_mixer_dep, fontconfig_dep] + storage_deps,
+    dependencies: native_ui_deps,
+    link_whole: native_ui_core,
     cpp_args: check_args + app_cpp_args)
   test('native_rename_check', native_ui_check, args: ['rename'])
   test('native_composer_check', native_ui_check, args: ['composer'])

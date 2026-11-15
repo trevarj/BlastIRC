@@ -4818,7 +4818,11 @@ void Ui::setInputDispatcher(InputDispatcher &dispatcher) {
         view->titleLine->setInputDispatcher(dispatcher);
         view->transcript->setInputDispatcher(dispatcher);
     }
-    dispatcher.setFocusChangeCallback([this](InputArea *, InputArea *area) {
+    dispatcher.setFocusChangeCallback([this](InputArea *previous, InputArea *area) {
+        if (auto *input = nativeInputFor(previous))
+            input->setWindowActive(true);
+        if (auto *input = nativeInputFor(area))
+            input->setWindowActive(impl_->windowActive);
         if (impl_->jumpRestorePending && !impl_->restoringJumpFocus && area != impl_->jump)
             impl_->completeJumpRestore();
         if (!area)
@@ -4863,6 +4867,8 @@ void Ui::setInputDispatcher(InputDispatcher &dispatcher) {
             }
         }
     });
+    if (auto *input = nativeInputFor(dispatcher.focusedArea()))
+        input->setWindowActive(impl_->windowActive);
     impl_->dialogs->setInputDispatcher(dispatcher);
 }
 void Ui::setWindowActive(bool active) {
@@ -4873,6 +4879,9 @@ void Ui::setWindowActive(bool active) {
         impl_->repeatCommands.clear();
     }
     impl_->windowActive = active;
+    if (impl_->dispatcher)
+        if (auto *input = nativeInputFor(impl_->dispatcher->focusedArea()))
+            input->setWindowActive(active);
     for (const auto &[id, view] : impl_->views) {
         view->transcript->setWindowActive(active);
         if (!active)

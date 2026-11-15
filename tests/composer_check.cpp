@@ -6062,6 +6062,11 @@ void runComposerNativeCheck() {
                    cyclingPreedit.history->undo == preeditUndo &&
                    cyclingPreedit.history->redo == preeditRedo &&
                    model.activeBuffer == "test/#channel" && model.actions.empty());
+            batchKey(XKB_KEY_Return, KEY_ENTER, '\r', 0);
+            assert(input->editingStateMatches(cyclingPreedit) &&
+                   cyclingPreedit.history->undo == preeditUndo &&
+                   cyclingPreedit.history->redo == preeditRedo && model.actions.empty() &&
+                   dispatcher.focusedArea() == input->inputArea());
             input->textInputResetPreedit();
             input->setValue("Al");
             frame();

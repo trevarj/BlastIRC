@@ -29,6 +29,8 @@ std::vector<NickAnnotation> annotateNicks(const Model &, const Buffer &, const I
                                           std::string_view author = {});
 class MediaPreviewController;
 Color nickColor(const Model &, const std::string &nick, const std::string &server);
+Color nickTextColor(const Model &, const std::string &nick, const std::string &server,
+                    Color background);
 
 struct TranscriptMessageTarget {
     std::string buffer;

@@ -266,7 +266,7 @@ def _refresh_restart(ctx, section, values, *, focus=None):
         gui.switch_buffer(ctx['channel'])
     else:
         _policy_focus(ctx, focus)
-    upload.focus_composer(window)
+        upload.focus_composer(window)
     gui._composer_native(window, '', 0, 0)
 
 
@@ -5962,11 +5962,24 @@ def run_transcript_refinements(ctx):
     end_color = (113, 91, 219)
     raw_rows, decoded_rows = [], []
     evidence = {'frames': [], 'limitations': []}
+    clients = []
+
+    def keepalive():
+        for client in [ctx['observer'], *(client for _, client in clients)]:
+            token = 'refinement-keepalive-' + os.urandom(6).hex()
+            client.send('PING :' + token)
+            client.wait(lambda command, params, prefix:
+                        command == 'PONG' and params and params[-1] == token, timeout=15)
+
+    def capture(label):
+        keepalive()
+        return _policy_capture(ctx, label)
 
     def native(image):
         return Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
 
     def observe(label, indices):
+        keepalive()
         upload.focus_composer(w)
         gui.move_pointer(w, 0, 0)
         def settled():
@@ -5987,7 +6000,7 @@ def run_transcript_refinements(ctx):
         difference = ImageChops.difference(pane, Image.new('RGB', pane.size, canvas))
         red, green, blue = difference.split()
         mask = ImageChops.lighter(ImageChops.lighter(red, green), blue).point(lambda v: 255 if v else 0)
-        path = _policy_capture(ctx, 'refinement-' + label)
+        path = capture('refinement-' + label)
         result = {'label': label, 'client': gui.window_geometry(w), 'pane_xywh': rect,
                   'body_marker_ltrb': boxes, 'canvas_rgb': canvas, 'capture': str(path)}
         evidence['frames'].append(result)
@@ -6018,7 +6031,6 @@ def run_transcript_refinements(ctx):
         stack.callback(gui.resize_panel_viewport, w,
                        (original_size['WIDTH'], original_size['HEIGHT']))
         gui.resize_panel_viewport(w, (1280, 960))
-        clients = []
         for prefix in ('qa', 'qb', 'qf'):
             nick = prefix + nonce
             client = stack.enter_context(gui.fixtures.BootstrapClient(
@@ -6030,12 +6042,13 @@ def run_transcript_refinements(ctx):
         gui.wait_read_marker(p, db, identity)
 
         def send(index, sender, middle):
+            keepalive()
             nick, client = clients[sender]
             color = ''.join(f'{v:02X}' for v in colors[index])
             end = ''.join(f'{v:02X}' for v in end_color)
-            raw = '\x04' + color + ',' + color + 'LEFTLEFT\x0f' + middle
-            raw += '\x04' + end + ',' + end + 'RGHTRGHT\x0f'
-            decoded = 'LEFTLEFT' + middle + 'RGHTRGHT'
+            raw = '\x04' + color + ',' + color + 'LEFT\x0f' + middle
+            raw += '\x04' + end + ',' + end + 'RGHT\x0f'
+            decoded = 'LEFT' + middle + 'RGHT'
             assert len(('PRIVMSG ' + channel + ' :' + raw).encode()) <= 510
             client.send(f'PRIVMSG {channel} :{raw}')
             gui.receive_until(ctx['observer'], 'PRIVMSG', [channel, raw], nick,
@@ -6047,8 +6060,12 @@ def run_transcript_refinements(ctx):
             return raw
 
         # A/A/B/A/A: returning A must not continue its interrupted group.
-        for i, (sender, middle) in enumerate(((0, ' café e\u0301 '), (0, ' x '),
-                (1, ' café e\u0301 '), (0, ' café e\u0301 '), (0, ' longer body ' * 3))):
+        for i, (sender, middle) in enumerate((
+                (0, ' The café e\u0301 plan is ready. Can we ship it today? '),
+                (0, ' One detail: keep the keyboard shortcut. '),
+                (1, ' Yes, I checked the narrow view. Both lines read well. '),
+                (0, ' Thanks! The café e\u0301 label needs its accent. '),
+                (0, ' I will send the update after lunch. The longer explanation should wrap naturally. '))):
             send(i, sender, middle)
             gui.wait_read_marker(p, db, identity)
         gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'], identity,
@@ -6100,6 +6117,12 @@ def run_transcript_refinements(ctx):
                               'irc', label='refinement-irc-restored')
         gui.resize_panel_viewport(w, (720, 960))
         _, _, compact, compact_rect, _ = observe('irc-compact-hidden-panes', range(5))
+        for style in ('bubbles', 'stacked'):
+            gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'], identity,
+                                  style, label='refinement-' + style + '-compact')
+            observe(style + '-compact-hidden-panes', range(5))
+        gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'], identity,
+                              'irc', label='refinement-irc-compact-restored')
         same_client = gui.window_geometry(w)
         gui.set_navigation(p, w, prefs, db, 'expanded', 'refinement-narrow-pane')
         gui.set_people(p, w, prefs, db, 'expanded')
@@ -6145,7 +6168,7 @@ def run_transcript_refinements(ctx):
             'The intervening ink box can include other row paint; blank-row counts alone do not '
             'prove complete summary/nonneighbor bounds. Inspect minimized/revealed native captures '
             'for nonoverlap; if edges cannot be separated, nonoverlap acceptance remains unproven.')
-        _policy_capture(ctx, 'refinement-minimized-revealed')
+        capture('refinement-minimized-revealed')
         evidence['irc_raw_rows'] = raw_rows
         gui.wait_messages(p, db, ctx['expected_messages'])
         # The chosen quote style and selection outline are native raster review;
@@ -6157,10 +6180,13 @@ def run_transcript_refinements(ctx):
             _, acknowledged, _ = observer.wait(lambda command, params, prefix:
                 command == 'CAP' and ('ACK' in params or 'NAK' in params))
             assert 'message-tags' in observer.capabilities, acknowledged
+        assert gui.client_tags_allowed(observer, 'reply', 'draft/react'), (
+            sorted(observer.capabilities), observer.isupport.get('CLIENTTAGDENY'))
         # Reply is a client tag, not an ISUPPORT capability. The actual sent
         # reply below must carry its source ID on the real observer wire.
         reply_evidence = []
         for style in ('bubbles', 'irc', 'stacked'):
+            keepalive()
             gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'], identity,
                                   style, label='refinement-reply-' + style)
             upload.focus_composer(w)
@@ -6170,6 +6196,7 @@ def run_transcript_refinements(ctx):
                            'A self message long enough to wrap within the configured body width. ' * 3 +
                            nonce + ' ' + style)
             for size, own_source in (('short', own_short), ('wrapped', own_wrapped)):
+                keepalive()
                 assert len(('PRIVMSG ' + channel + ' :' + own_source).encode()) <= 510
                 gui.type_text(own_source)
                 gui.framed_keys(w, 'Return')
@@ -6177,7 +6204,7 @@ def run_transcript_refinements(ctx):
                 ctx['expected_messages'].extend(ctx['channel_messages'](own_source, ctx['own_nick']))
                 gui.wait_messages(p, db, ctx['expected_messages'])
                 gui._composer_native(w, '', 0, 0)
-                captures.append(str(_policy_capture(ctx, 'reply-' + style + '-self-' + size)))
+                captures.append(str(capture('reply-' + style + '-self-' + size)))
                 if size == 'short':
                     # A real peer boundary gives both own bubbles their own
                     # author header; grouping must not hide the wrapped case.
@@ -6185,6 +6212,7 @@ def run_transcript_refinements(ctx):
             source = ('\x02Formatted quote\x02 café e\u0301 中 \x0304red\x0f ' +
                       'A long retained excerpt wraps across the native two-line quote card. ' * 3 +
                       nonce + ' ' + style)
+            keepalive()
             _policy_send(ctx, source, target=channel)
             with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as database:
                 source_id, = database.execute(
@@ -6206,10 +6234,10 @@ def run_transcript_refinements(ctx):
                 gui.framed_keys(w, chord)
                 gui.SESSION.until('actual keyboard transcript selection ' + label,
                                   lambda: gui.native_input_state(w) is None)
-                captures.append(str(_policy_capture(ctx, 'reply-' + style + '-' + label)))
+                captures.append(str(capture('reply-' + style + '-' + label)))
             gui.framed_keys(w, 'ctrl+r')
             quoted = gui._composer_native(w, draft, cursor, end)
-            captures.append(str(_policy_capture(ctx, 'reply-' + style + '-composer-card')))
+            captures.append(str(capture('reply-' + style + '-composer-card')))
             cancellation = gui.cancel_native_reply(w, Path(ctx['destination']),
                 label='refinement-reply-' + style + '-cancel', expected_text=draft)
             cancelled = gui._composer_native(w, draft, cursor, end)
@@ -6228,16 +6256,40 @@ def run_transcript_refinements(ctx):
                 'WHERE buffer=? AND nick=? AND text=? AND own=1',
                 (identity, ctx['own_nick'], draft), [(source_id, 0, 0)])
             gui._composer_native(w, '', 0, 0)
-            captures.append(str(_policy_capture(ctx, 'reply-' + style + '-in-message-card')))
+            captures.append(str(capture('reply-' + style + '-in-message-card')))
             gui.framed_keys(w, 'ctrl+p')
             gui.SESSION.until('actual selected sent reply', lambda: gui.native_input_state(w) is None)
-            captures.append(str(_policy_capture(ctx, 'reply-' + style + '-selected-own-quote')))
+            captures.append(str(capture('reply-' + style + '-selected-own-quote')))
+            with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as database:
+                reply_seq, reply_id = database.execute(
+                    'SELECT seq,id FROM messages WHERE buffer=? AND nick=? AND text=? AND own=1',
+                    (identity, ctx['own_nick'], draft)).fetchone()
+            gui.framed_keys(w, 'ctrl+e')
+            gui.observe_native_input(w, ctx['destination'], 'refinement-reaction-' + style, '', 0, 0)
+            gui.type_text('thumbsup')
+            gui.observe_native_input(w, ctx['destination'], 'refinement-reaction-filter-' + style,
+                                     'thumbsup', 8, 8)
+            gui.framed_keys(w, 'Return')
+            observer.wait(lambda command, params, prefix:
+                command == 'TAGMSG' and '+draft/react' in observer.last_tags)
+            reaction_frame = observer.frames[-1]
+            assert (reaction_frame['params'], reaction_frame['prefix'].split('!', 1)[0],
+                    reaction_frame['tags'].get('+reply'), reaction_frame['tags'].get('+draft/react')) == (
+                        [channel], ctx['own_nick'], reply_id, '👍'), reaction_frame
+            gui.wait_rows(p, db, 'SELECT emoji,nick FROM reactions WHERE message=? ORDER BY emoji,nick',
+                          (reply_seq,), [('👍', ctx['own_nick'])])
+            gui.SESSION.until('accepted refinement reaction restores transcript focus',
+                              lambda: gui.native_input_state(w) is None)
             upload.focus_composer(w)
             gui._composer_native(w, '', 0, 0)
+            captures.append(str(capture('reply-' + style + '-reaction-wide')))
+            gui.resize_panel_viewport(w, (720, 960))
+            captures.append(str(capture('reply-' + style + '-reaction-narrow')))
+            gui.resize_panel_viewport(w, (1280, 960))
             reply_evidence.append({'style': style, 'source_id': source_id, 'source_raw': source,
                 'draft_before': selected_draft, 'quoted_draft': quoted,
                 'cancelled_draft': cancelled, 'cancel_control': cancellation,
-                'reply_wire': reply_frame, 'captures': captures})
+                'reply_wire': reply_frame, 'reaction_wire': reaction_frame, 'captures': captures})
         evidence['reply_cards_and_selected_outlines'] = reply_evidence
         evidence['limitations'].append('Inspect quote-card rasters for rounded outline, nick rail, '
             'bold author and formatted two-line excerpt in composer and message; inspect selected '
@@ -8313,6 +8365,7 @@ def run_message_links(ctx):
         'deliberate_composer_enter_wire': lifecycle_frame})
 
     # A separate real GTK client receives the release that BlastIRC must not see.
+    focus_bounds = gui.window_geometry(w)
     portal, backend = (ctx['env'].get(name) for name in
                        ('BLASTIRC_PORTAL', 'BLASTIRC_PORTAL_BACKEND'))
     assert portal and backend, 'Native external-focus proof requires pinned private GTK portal binaries'
@@ -8342,10 +8395,90 @@ def run_message_links(ctx):
 
     external = gui.SESSION.until('owned independent GTK portal surface', external_window)
     external_id = external['id']
-    gui.SESSION.ipc('command', f'[con_id={external_id}] floating enable')
+    chooser_left = focus_bounds['X'] + focus_bounds['WIDTH'] // 2
+    placement = gui.SESSION.ipc('command',
+        f"[con_id={external_id}] floating enable, resize set width {focus_bounds['WIDTH'] // 2} px height 480 px, "
+        f"move position {chooser_left} px {focus_bounds['Y']} px")
+    print('Native activation chooser placement:', json.dumps({
+        'initial': external, 'commands': placement, 'after': gui.native_window(external_id),
+        'main': gui.native_window(w)}), flush=True)
+    gui.SESSION.until('independent chooser has a visible portion beside the retained composer', lambda:
+        gui.window_geometry(w) == focus_bounds and
+        chooser_left <= gui.native_window(external_id)['rect']['x'] <
+        focus_bounds['X'] + focus_bounds['WIDTH'] and
+        gui.native_window(external_id).get('floating') in ('auto_on', 'user_on') and
+        focus_bounds['Y'] <= gui.native_window(external_id)['rect']['y'] <
+        focus_bounds['Y'] + focus_bounds['HEIGHT'] and
+        gui.native_window(external_id)['visible'])
     gui.SESSION.ipc('command', f'[con_id={w}] focus')
     gui.SESSION.until('BlastIRC focus restored before lost-release setup',
                       lambda: gui.native_window(w).get('focused'))
+    gui._composer_native(w, '', 0, 0)
+    inactive_draft = 'Retained café cursor draft  '
+    gui.type_text(inactive_draft)
+    inactive_end = len(inactive_draft.encode('utf-8'))
+    active_input = gui._composer_native(w, inactive_draft, inactive_end, inactive_end)
+    bounds = gui.window_geometry(w)
+    caret_x, caret_y, caret_width, caret_height = active_input['caret']
+    caret_region = {'X': bounds['X'] + caret_x, 'Y': bounds['Y'] + caret_y,
+                    'WIDTH': max(caret_width + 16, 32), 'HEIGHT': caret_height}
+    assert caret_x + caret_region['WIDTH'] < bounds['WIDTH'], (caret_region, bounds)
+    external_rect = gui.native_window(external_id)['rect']
+    assert (external_rect['x'] + external_rect['width'] <= caret_region['X'] or
+            caret_region['X'] + caret_region['WIDTH'] <= external_rect['x'] or
+            external_rect['y'] + external_rect['height'] <= caret_region['Y'] or
+            caret_region['Y'] + caret_region['HEIGHT'] <= external_rect['y']), (
+                'Independent native chooser obscures the visible composer caret', external_rect, caret_region)
+    gui.move_pointer(w, 0, 0)
+
+    def sample_activation_caret(label, focused):
+        barrier('caret-' + label)
+        variants, painted, samples = set(), False, 0
+        started = time.monotonic()
+        while time.monotonic() - started < 2.5:
+            assert gui.native_window(w).get('focused') == focused
+            image = gui.native_rgb_capture(w, geometry=caret_region)
+            pixels, width = image['pixels'], image['width']
+            ink = any(pixels[row * width * 3:(row + 1) * width * 3 - 3] !=
+                      pixels[(row + 1) * width * 3 - 3:(row + 1) * width * 3] * (width - 1)
+                      for row in range(image['height']))
+            if not focused:
+                assert not ink, ('Inactive native window paints a caret or its effects', label, samples)
+            painted |= ink
+            variants.add(pixels)
+            samples += 1
+        assert samples >= 2 and (painted if focused else len(variants) == 1), (
+            'Native activation caret raster does not match focus', label, samples, len(variants), painted)
+        assert gui.window_geometry(w) == bounds, 'Activation probe moved the retained main window'
+        shot = gui.capture_window(w, destination, 'message-links-caret-' + label)
+        return {'focused': focused, 'samples': samples, 'variants': len(variants),
+                'painted': painted, 'capture': str(shot)}
+
+    active_caret = sample_activation_caret('active', True)
+    caret_leave = trace.stat().st_size
+    gui.SESSION.ipc('command', f'[con_id={external_id}] focus')
+    gui.SESSION.until('composer caret loses actual native window activation', lambda:
+        gui.native_window(external_id).get('focused') and not gui.native_window(w).get('focused') and
+        re.search(rf"wl_keyboard[@#]\d+\.leave\(\d+,\s*wl_surface[@#]{gui.GUI_DEBUG[w][2]}\)".encode(),
+                  trace.read_bytes()[caret_leave:]))
+    inactive_caret = sample_activation_caret('inactive', False)
+    caret_enter = trace.stat().st_size
+    gui.SESSION.ipc('command', f'[con_id={w}] focus')
+    gui.SESSION.until('retained composer regains actual native window activation', lambda:
+        gui.native_window(w).get('focused') and re.search(
+            rf"wl_keyboard[@#]\d+\.enter\(\d+,\s*wl_surface[@#]{gui.GUI_DEBUG[w][2]},".encode(),
+            trace.read_bytes()[caret_enter:]))
+    restored_input = gui._composer_native(w, inactive_draft, inactive_end, inactive_end)
+    assert restored_input == active_input, ('Native deactivation mutated composer state', active_input, restored_input)
+    restored_caret = sample_activation_caret('refocused', True)
+    report['native_window_caret_activation'] = {
+        'draft_before': active_input, 'draft_after': restored_input, 'region': caret_region,
+        'unobscured_external_rect': external_rect, 'leave_offset': caret_leave, 'enter_offset': caret_enter,
+        'external_window': gui.native_window(external_id), 'main_window': gui.native_window(w),
+        'placement_commands': placement,
+        'phases': [active_caret, inactive_caret, restored_caret]}
+    gui.clear_draft()
+    gui._composer_native(w, '', 0, 0)
     _policy_send(ctx, 'LostRelease ' + urls[1])
     selected('ctrl+p')
     gui.POINTER.publish_keymap()

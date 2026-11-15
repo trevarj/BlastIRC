@@ -423,8 +423,10 @@ int main(int argc, char **argv) {
                     app.model.status.clear();
                 auto menuKey = event;
                 if (!event.preedit && event.modifiers == KeyMod::Ctrl &&
-                    (event.sym == XKB_KEY_n || event.sym == XKB_KEY_p)) {
-                    menuKey.sym = event.sym == XKB_KEY_n ? XKB_KEY_Down : XKB_KEY_Up;
+                    (event.sym == XKB_KEY_n || event.sym == XKB_KEY_p || event.sym == XKB_KEY_g)) {
+                    menuKey.sym = event.sym == XKB_KEY_g   ? XKB_KEY_Escape
+                                  : event.sym == XKB_KEY_n ? XKB_KEY_Down
+                                                           : XKB_KEY_Up;
                     menuKey.utf32 = 0;
                     menuKey.modifiers = 0;
                 }

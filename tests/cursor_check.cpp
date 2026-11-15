@@ -155,9 +155,18 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
             const auto ime = editor.textInputState();
             assert(effects.hasActive());
             images[modeIndex] = capture(editor);
-            editor.resetCaretEffects();
+            editor.setWindowActive(false);
+            assert(focus.focusedArea() == editor.inputArea() && !effects.hasActive());
+            const auto inactive = capture(editor);
+            assert(editor.editingStateMatches(moved));
+            assert(editor.textInputState().cursorRectX == ime.cursorRectX);
+            editor.layout(renderer);
+            assert(capture(editor) == inactive && !effects.hasActive());
+            editor.setWindowActive(true);
             const auto plain = capture(editor);
-            assert(images[modeIndex] != plain && editor.editingStateMatches(moved));
+            assert(focus.focusedArea() == editor.inputArea());
+            assert(inactive != plain && images[modeIndex] != plain &&
+                   editor.editingStateMatches(moved));
             assert(editor.textInputState().cursorRectX == ime.cursorRectX);
             Node *viewport = nullptr;
             for (const auto &child : editor.children())
@@ -196,6 +205,13 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
                                        .hasPreedit = true});
             editor.layout(renderer);
             assert(!effects.hasActive());
+            const auto composingState = editor.editingState();
+            editor.setWindowActive(false);
+            editor.layout(renderer);
+            assert(editor.editingStateMatches(composingState) &&
+                   focus.focusedArea() == editor.inputArea());
+            editor.setWindowActive(true);
+            assert(editor.editingStateMatches(composingState));
             editor.textInputResetPreedit();
             editor.layout(renderer);
             editor.moveCaretLeft();
@@ -1571,6 +1587,17 @@ int main(int argc, char **argv) {
     assert(caret->visible());
     input.resetCaretEffects();
     assert(input.editingStateMatches(saved) && caret->visible());
+    input.setWindowActive(false);
+    assert(!caret->visible() && dispatcher.focusedArea() == input.inputArea());
+    assert(input.editingStateMatches(saved));
+    const auto inactiveIme = input.textInputState();
+    assert(inactiveIme.cursorRectX == ime.cursorRectX &&
+           inactiveIme.cursorRectY == ime.cursorRectY &&
+           inactiveIme.cursorRectWidth == ime.cursorRectWidth &&
+           inactiveIme.cursorRectHeight == ime.cursorRectHeight);
+    input.setWindowActive(true);
+    assert(caret->visible() && dispatcher.focusedArea() == input.inputArea());
+    assert(input.editingStateMatches(saved));
     input.selectAll();
     assert(!caret->visible());
     input.restoreEditingState(saved);

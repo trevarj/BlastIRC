@@ -43,6 +43,7 @@ public:
   void setCaretStyle(CaretShape shape, CaretEffect effect, float durationMs = 120.0F, float strength = 0.20F);
   // Paint state only. Call on buffer identity changes, pane hiding and external geometry changes.
   void resetCaretEffects();
+  void setWindowActive(bool active);
   void setAnimationManager(AnimationManager* manager) override;
   // Native wrapped logical height plus padding, floored by the same font strut for empty/nonempty text.
   float measuredMultilineHeight() const noexcept;
@@ -367,6 +368,7 @@ private:
   // Sticky caret column for Up/Down runs; negative = unset.
   float m_goalCaretX = -1.0F;
   bool m_cursorBlinkVisible = true;
+  bool m_windowActive = true;
   Timer m_cursorBlinkTimer;
 
   std::function<void(const std::string&)> m_onChange;

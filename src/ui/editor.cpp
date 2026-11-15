@@ -1441,7 +1441,8 @@ Input::DisplayProjection EditorStore::Impl::Composer::project(std::string_view r
                         if (!style.reverse &&
                             style.foregroundSource.kind == IrcColor::Kind::Foreground)
                             style.foreground =
-                                nickColor(owner.model, nick.nick, source->second.server);
+                                nickTextColor(owner.model, nick.nick, source->second.server,
+                                              style.background.value_or(projectionBackground));
                     }
                     break;
                 }
@@ -3454,6 +3455,7 @@ void EditorStore::Impl::Composer::sync() {
         input->resetCaretEffects();
     replyScratch.clear();
     Color replyColor = themeForegroundColor("on_surface_variant");
+    Color replyTextColor = replyColor;
     std::string author = "unknown sender";
     replyTooltip.clear();
     if (!pane.reply.empty()) {
@@ -3496,6 +3498,8 @@ void EditorStore::Impl::Composer::sync() {
                                             themeSurfaceColor("surface_container"))
                              .text;
                 replyColor = nickColor(owner.model, message->nick, source->server);
+                replyTextColor = nickTextColor(owner.model, message->nick, source->server,
+                                               themeSurfaceColor("surface_container_low"));
             }
             replyScratch = message->text;
             replyTooltip.assign("Replying to ");
@@ -3507,7 +3511,7 @@ void EditorStore::Impl::Composer::sync() {
     replyRail->setFill(withAlpha(replyColor, .45f));
     IrcStyle authorStyle;
     authorStyle.bold = true;
-    authorStyle.foreground = replyColor;
+    authorStyle.foreground = replyTextColor;
     replyHeading->setColor(themeForegroundColor("on_surface_variant"));
     replyAuthorMarkup = ircMarkup(author, authorStyle);
     replyHeadingMarkup.assign("Replying to ");
@@ -3845,6 +3849,10 @@ bool EditorStore::handleCompositionKey(std::uint32_t sym, std::uint32_t utf32,
             return true;
         if (handledRepeat)
             return true;
+        if (!preedit && KeySymbol::isEnter(sym)) {
+            view->compositionChord.clear();
+            return true;
+        }
         if (printable && !commandModifier && view->compositionChord.empty())
             return false;
         InputArea::KeyData key{};

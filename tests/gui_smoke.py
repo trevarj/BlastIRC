@@ -1938,8 +1938,8 @@ def set_message_style(proc, window, preferences, database_path, args, destinatio
         layout = read_layout(preferences)
         actions = title_actions(layout, args.zoom, channel=channel)
         popup = open_title_menu(window, actions)
-        # Message display precedes the stable Presence/History/Details/Close tail.
-        open_native_submenu(window, popup, 4, from_end=True)
+        # Channels also have Channel tools before Close; queries do not.
+        open_native_submenu(window, popup, 5 if channel else 4, from_end=True)
         popup_keys(window, popup, "Home", *(["Down"] * ("bubbles", "irc", "stacked").index(mode)), "Return")
         if mode == "bubbles":
             overrides.pop(buffer, None)

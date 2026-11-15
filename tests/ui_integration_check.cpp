@@ -838,6 +838,35 @@ void retainedBufferStateCheck(bool directMessage, blast::SidebarMode peoplePrefe
             panes[i] = paneFor(*inputs[i]);
             assert(inputs[i]->insertText("!"));
             ui.execute("undo");
+            dispatcher.setFocus(inputs[i]->inputArea());
+            ui.root().layout(renderer);
+            RectNode *caret = nullptr;
+            for (const auto &child : inputs[i]->children())
+                for (const auto &layer : child->children())
+                    if (auto *rect = dynamic_cast<RectNode *>(layer.get());
+                        rect && rect->zIndex() == 1)
+                        caret = rect;
+            assert(caret && caret->visible());
+            const auto activeState = inputs[i]->editingState();
+            const auto activeIme = inputs[i]->textInputState();
+            ui.setWindowActive(false);
+            ui.update(2000, 1200, 1);
+            ui.root().layout(renderer);
+            assert(!caret->visible() && dispatcher.focusedArea() == inputs[i]->inputArea());
+            dispatcher.setFocus(nullptr);
+            dispatcher.setFocus(inputs[i]->inputArea());
+            ui.root().layout(renderer);
+            assert(!caret->visible());
+            assert(documentMatches(*inputs[i], activeState));
+            const auto inactiveIme = inputs[i]->textInputState();
+            assert(activeIme.cursorRectX == inactiveIme.cursorRectX &&
+                   activeIme.cursorRectY == inactiveIme.cursorRectY &&
+                   activeIme.cursorRectWidth == inactiveIme.cursorRectWidth &&
+                   activeIme.cursorRectHeight == inactiveIme.cursorRectHeight);
+            ui.setWindowActive(true);
+            ui.root().layout(renderer);
+            assert(caret->visible() && dispatcher.focusedArea() == inputs[i]->inputArea());
+            assert(documentMatches(*inputs[i], activeState));
             auto state = inputs[i]->editingState();
             state.current.cursorPos = 3;
             state.current.selectionAnchor = 1;

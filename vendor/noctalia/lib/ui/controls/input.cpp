@@ -595,6 +595,18 @@ void Input::resetCaretEffects() {
   m_caretTrail.reset();
   for (auto* stamp : m_caretStamps) if (stamp != nullptr) stamp->setVisible(false);
 }
+void Input::setWindowActive(bool active) {
+  if (m_windowActive == active)
+    return;
+  m_windowActive = active;
+  if (active) {
+    revealCursor();
+  } else {
+    stopCursorBlink();
+    updateCursorVisibility();
+    markPaintDirty();
+  }
+}
 
 void Input::setAnimationManager(AnimationManager* manager) {
   if (manager != animationManager()) resetCaretEffects();
@@ -2178,7 +2190,12 @@ void Input::clearFromButton() {
 }
 
 bool Input::caretPaintEligible() const {
-  if (!m_enabled || m_inputArea == nullptr || !m_inputArea->focused() || hasSelection() || m_preeditCaretHidden)
+  if (!m_windowActive
+      || !m_enabled
+      || m_inputArea == nullptr
+      || !m_inputArea->focused()
+      || hasSelection()
+      || m_preeditCaretHidden)
     return false;
   for (const Node* node = this; node != nullptr; node = node->parent()) if (!node->visible()) return false;
   return true;
@@ -2644,8 +2661,7 @@ void Input::revealCursor() {
   m_cursorBlinkVisible = true;
   updateCursorVisibility();
   markPaintDirty();
-  if (m_inputArea != nullptr && m_inputArea->focused() && !hasSelection() &&
-      !m_preeditCaretHidden && MotionService::instance().enabled()) {
+  if (caretPaintEligible() && MotionService::instance().enabled()) {
     m_cursorBlinkTimer.start(kCursorBlinkResumeDelay, [this] { startCursorBlink(); });
   } else {
     m_cursorBlinkTimer.stop();
@@ -2653,14 +2669,14 @@ void Input::revealCursor() {
 }
 
 void Input::startCursorBlink() {
-  if (!MotionService::instance().enabled() || hasSelection() || m_preeditCaretHidden) {
+  if (!caretPaintEligible() || !MotionService::instance().enabled()) {
     m_cursorBlinkTimer.stop();
     m_cursorBlinkVisible = true;
     updateCursorVisibility();
     return;
   }
   m_cursorBlinkTimer.startRepeating(kCursorBlinkInterval, [this] {
-    if (m_inputArea == nullptr || !m_inputArea->focused()) {
+    if (!m_windowActive || m_inputArea == nullptr || !m_inputArea->focused()) {
       stopCursorBlink();
       return;
     }

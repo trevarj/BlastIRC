@@ -1615,7 +1615,6 @@ void bubbleGeometry(TranscriptTestRenderer &renderer, const Body &b, float zoom,
     assert(surface && surface->visible() && footer);
     assert(footer->text() == clock);
     assert(footer->fontSize() < b.text.fontSize());
-    assert(footer->opacity() > .7f && footer->opacity() < 1);
     assert(footer->color().a == 1);
     near(b.content.opacity(), 1);
     const auto measured =
@@ -2493,7 +2492,8 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
                 auto *actor = plainText(rendered.content, "↳ " + buffer.messages[i].nick);
                 assert(actor && actor->fontWeight() == FontWeight::Bold &&
                        actor->color() ==
-                           blast::nickColor(model, buffer.messages[i].nick, buffer.server));
+                           blast::nickTextColor(model, buffer.messages[i].nick, buffer.server,
+                                                blast::themeSurfaceColor("surface_container_low")));
                 auto *clock = bubbleFooter(rendered.content, zoom);
                 assert(clock && clock->text() == "12:" + std::to_string(34 + i) &&
                        clock->fontSize() < rendered.text.fontSize() &&
@@ -8708,7 +8708,9 @@ void sourceMentionConsumers(TranscriptTestRenderer &renderer) {
            feed.messages.front().sourceId == original.id);
     auto *actor = actorInk();
     assert(actor && actor->font().weight == FontWeight::Bold);
-    assert(actor->color() == blast::nickColor(model, original.nick, source.server));
+    assert(actor->color() ==
+           blast::nickTextColor(model, original.nick, source.server,
+                                blast::themeSurfaceColor("surface_container_low")));
     auto *origin = plainText(view, "Renamed network / " + source.target);
     assert(origin);
     const auto actorBounds = sceneBounds(*actor);
@@ -9634,7 +9636,12 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
         assert(area->focusable() && area->hitTestVisible());
     assert(aliceText->fontWeight() == FontWeight::Bold);
     renderer.paintedGlyphInk(*aliceText);
-    assert(renderer.lastGlyphTint() == blast::nickColor(model, "Alice", buffer.server));
+    const float nicknameLuminance = relativeLuminance(renderer.lastGlyphTint());
+    const float bubbleLuminance =
+        relativeLuminance(blast::themeSurfaceColor("surface_container_high"));
+    assert((std::max(nicknameLuminance, bubbleLuminance) + .05f) /
+               (std::min(nicknameLuminance, bubbleLuminance) + .05f) >=
+           4.5f);
     assert(url->focusable() && url->hitTestVisible());
     const auto tooltip = url->tooltipContent();
     assert(std::get_if<std::string>(&tooltip) &&
@@ -9699,6 +9706,98 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
     unchanged(buffer, before);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
+    blast::Message parent;
+    parent.id = "contrast-parent";
+    parent.nick = "{Nick}";
+    parent.text = "Contrast parent excerpt";
+    buffer.messages.push_back(parent);
+    buffer.messages.front().reply = parent.id;
+    ConfigDirectory config;
+    std::filesystem::create_directories(config.path / "blastirc");
+    auto *palette = std::fopen((config.path / "blastirc" / "noctalia.toml").c_str(), "w");
+    assert(palette);
+    assert(std::fputs("[colors]\nsurface='#ffffff'\non_surface='#111111'\n"
+                      "surface_container_low='#fafafa'\nsurface_container_high='#eeeeee'\n"
+                      "surface_container='#f5f5f5'\nprimary_container='#e5e0ff'\n"
+                      "on_primary_container='#191040'\non_surface_variant='#333333'\n",
+                      palette) >= 0);
+    assert(std::fclose(palette) == 0);
+    const auto contrast = [](Color foreground, Color background) {
+        const float a = relativeLuminance(foreground), b = relativeLuminance(background);
+        return (std::max(a, b) + .05f) / (std::min(a, b) + .05f);
+    };
+    const auto nicknameInk = [&](std::string_view nick, bool annotated) {
+        auto &current = body(view, original, true).body;
+        for (const auto &child : current.children())
+            for (const auto &fragment : child->children())
+                if (auto *text = dynamic_cast<TextNode *>(fragment.get());
+                    text && decodedMarkup(text->text()).find(nick) != std::string::npos) {
+                    assert(text->fontWeight() ==
+                           (annotated ? FontWeight::Bold : blast::themeMessageFont().weight));
+                    if (annotated)
+                        assert(decodedMarkup(text->text()) == nick);
+                    renderer.paintedGlyphInk(*text);
+                    return renderer.lastGlyphTint();
+                }
+        assert(false);
+        return Color{};
+    };
+    bool adjusted = false, preserved = false;
+    for (const char *source : {"builtin", "auto", "builtin"}) {
+        model.settings.themeSource = source;
+        theme.update(model);
+        for (const char *mode : {"THEME", "CLASSIC", "VIVID"}) {
+            model.settings.nickPalette = mode;
+            for (const auto layout : {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc,
+                                      blast::MessageLayout::Stacked}) {
+                model.settings.messageLayouts[buffer.id] = layout;
+                for (const bool own : {false, true}) {
+                    buffer.messages.front().own = own;
+                    model.settings.nickColors.clear();
+                    arrange();
+                    const auto surface = blast::themeSurfaceColor(
+                        layout == blast::MessageLayout::Bubbles
+                            ? (own ? "primary_container" : "surface_container_high")
+                            : "surface_container_low");
+                    const auto raw = blast::nickColor(model, "Alice", buffer.server);
+                    const auto ink = nicknameInk("Alice", true);
+                    assert(contrast(ink, surface) >= 4.5f);
+                    const auto current = body(view, original, true);
+                    if (!own && layout != blast::MessageLayout::Bubbles) {
+                        auto *sender = plainText(current.content, "Alice");
+                        assert(sender && contrast(sender->color(), surface) >= 4.5f);
+                    }
+                    auto *quote = plainText(current.content, "{Nick}");
+                    assert(quote && contrast(quote->color(), blast::themeSurfaceColor(
+                                                                 "surface_container")) >= 4.5f);
+                    if (contrast(raw, surface) >= 4.5f) {
+                        assert(ink == raw);
+                        preserved = true;
+                    } else {
+                        assert(ink != raw);
+                        adjusted = true;
+                    }
+                    model.settings.nickColors["{nICK}"] = "#ffffaa";
+                    arrange();
+                    assert(nicknameInk("[nICK]", true) == hex("#ffffaa"));
+                    auto *quoteOverride = plainText(body(view, original, true).content, "{Nick}");
+                    assert(quoteOverride && quoteOverride->color() == hex("#ffffaa"));
+                    model.networks[buffer.server].caseMapping = "ascii";
+                    arrange();
+                    assert(
+                        nicknameInk("[nICK]", false) ==
+                        blast::themeForegroundColor(own && layout == blast::MessageLayout::Bubbles
+                                                        ? "on_primary_container"
+                                                        : "on_surface"));
+                    model.networks[buffer.server].caseMapping = "rfc1459";
+                    model.settings.nickColors["{nICK}"] = "invalid";
+                    arrange();
+                    assert(contrast(nicknameInk("[nICK]", true), surface) >= 4.5f);
+                }
+            }
+        }
+    }
+    assert(adjusted && preserved);
 }
 
 void smartPresenceRedactionInvalidation(TranscriptTestRenderer &renderer) {
@@ -10546,7 +10645,9 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
                 const float actorNatural =
                     renderer.measureText(actor->text(), actor->fontSize(), actor->font()).width;
                 assert(actor->maxWidth() + .02f >= actorNatural);
-                assert(actor->color() == blast::nickColor(model, "A", buffer.server));
+                assert(actor->color() ==
+                       blast::nickTextColor(model, "A", buffer.server,
+                                            blast::themeSurfaceColor("surface_container_low")));
                 assert(!bubbleSurface(rendered));
                 // No filled row-sized substitute card may replace the material bubble.
                 for (const auto &child : rendered.content.children())

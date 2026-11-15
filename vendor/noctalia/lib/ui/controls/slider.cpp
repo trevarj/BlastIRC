@@ -209,6 +209,9 @@ void Slider::setEnabled(bool enabled) {
     return;
   }
   m_enabled = enabled;
+  if (m_inputArea != nullptr) {
+    m_inputArea->setEnabled(enabled);
+  }
   applyVisualState();
   markPaintDirty();
 }

@@ -42,6 +42,9 @@ class Application {
         double started = 0;
         string whoisTarget{};
         uint64_t sessionGeneration = 0;
+        string channelTarget{}, channelQuery{};
+        vector<ChannelBan> bans{};
+        set<string> removedBans{};
     };
     struct QueuedSend {
         string buffer, text;
@@ -105,8 +108,7 @@ class Application {
     AvatarLoader avatarLoader_;
     map<string, ChannelAvatar> channelAvatars_;
     uint64_t avatarSequence_ = 0;
-    map<string, string> caseMapping_, channelTypes_, prefixModes_, channelModes_,
-        historyReferences_;
+    map<string, string> caseMapping_, channelTypes_, historyReferences_;
     set<string> historyClassificationSettled_;
     map<string, std::deque<int64_t>> activity_;
     map<string, vector<Nick>> namesCache_;
@@ -173,7 +175,11 @@ class Application {
     void action(const Action &);
     void dispatchActions();
     void command(Buffer &, const string &);
-    void enqueueCommand(const Buffer &, const string &);
+    void enqueueCommand(const Buffer &, const string &, const string &channelQuery = "",
+                        const string &channelTarget = "");
+    void finishChannelQuery(const string &, const string &);
+    void updateChannelQuery(const Event &, CommandOrigin &);
+    void invalidateChannelTools(const string &);
     bool commandResponse(const Event &);
     void updateWhois(const Event &, const CommandOrigin &);
     void finishWhois(const string &error);

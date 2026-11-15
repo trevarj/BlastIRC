@@ -3444,6 +3444,9 @@ void Ui::Impl::paneMenu(std::uint64_t id, Node &anchor, bool includeHiddenTools,
         entries.push_back(std::move(presence));
         entries.push_back(std::move(history));
         entries.push_back(std::move(details));
+        if (buffer.kind == "channel")
+            entries.push_back(
+                menuLeaf(commands, "Channel tools…", "settings", prefix + "channel-tools"));
         if (buffer.kind != "server") {
             ContextMenuEntry separator{};
             separator.separator = true;
@@ -3497,6 +3500,43 @@ void Ui::Impl::nickMenu(std::string_view buffer, std::string_view nick,
     entries.push_back(std::move(message));
     entries.push_back(std::move(whois));
     entries.push_back(std::move(insert));
+    const auto runtime = model.networks.find(source->second.server);
+    if (runtime != model.networks.end() &&
+        Dialogs::moderationAllowed(model, source->first, identity)) {
+        const auto &network = runtime->second;
+        const auto target = std::find_if(
+            source->second.nicks.begin(), source->second.nicks.end(), [&](const auto &member) {
+                return irc::casefold(member.name, network.caseMapping) ==
+                       irc::casefold(identity, network.caseMapping);
+            });
+        ContextMenuEntry moderation{};
+        moderation.label = "Moderation";
+        moderation.icon = "users";
+        for (const auto &[status, caption] :
+             {std::pair{'o', "operator"}, {'h', "half-operator"}, {'v', "voice"}}) {
+            if (!channelStatusSupported(network, status))
+                continue;
+            const bool held = channelHasStatus(network, *target, status);
+            moderation.children.push_back(menuLeaf(
+                commands, std::string(held ? "Remove " : "Grant ") + caption,
+                held ? "user-x" : "users", prefix + "moderate:" + (held ? "-" : "+") + status));
+        }
+        moderation.children.push_back(
+            menuLeaf(commands, "Kick…", "user-x", prefix + "moderate:kick"));
+        if (channelModeGroup(network, 'b') == 0) {
+            moderation.children.push_back(
+                menuLeaf(commands, "Ban…", "user-x", prefix + "moderate:ban"));
+            moderation.children.push_back(
+                menuLeaf(commands, "Ban and kick…", "user-x", prefix + "moderate:kickban"));
+        }
+        if (channelModeGroup(network, 'q') == 0 && !channelStatusSupported(network, 'q')) {
+            moderation.children.push_back(
+                menuLeaf(commands, "Quiet…", "bell-off", prefix + "moderate:quiet"));
+            moderation.children.push_back(
+                menuLeaf(commands, "Unquiet…", "bell", prefix + "moderate:unquiet"));
+        }
+        entries.push_back(std::move(moderation));
+    }
     ContextMenuEntry separator{};
     separator.separator = true;
     entries.push_back(std::move(separator));
@@ -3678,6 +3718,10 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         const auto buffer = command.substr(prefix, split - prefix);
         if (!model.buffers.contains(buffer))
             return;
+        if (!insertNick && std::string_view(command).substr(split + 1) == "channel-tools") {
+            queue(model, "channel-tools-open", buffer);
+            return;
+        }
         if (!insertNick && chatControl(std::string_view(command).substr(split + 1), buffer))
             return;
         const auto current = workspace.panes.find(workspace.focused);
@@ -3727,6 +3771,10 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
                           nick = command.substr(a + 1, b - a - 1), action = command.substr(b + 1);
         if (!model.buffers.contains(buffer))
             return;
+        if (action.starts_with("moderate:")) {
+            dialogs->moderate(buffer, nick, std::string_view(action).substr(9));
+            return;
+        }
         if (action == "query" || action == "whois")
             queue(model, action, buffer, nick);
         else if (action == "friend" || action == "fool") {

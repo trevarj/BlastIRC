@@ -19,7 +19,14 @@ using std::vector;
 enum class FxLevel { Off, Subtle, Full };
 enum class SendMotion { None, Flight, Rise, Pop, Slide, Drift };
 enum class SendReveal { None, Fade, Pixels };
-enum class MentionEffect { Off, TextShimmer, RailPulse, BorderHalo };
+enum class MentionEffect {
+    Off,
+    NeonMention,
+    BreathingGlow,
+    LuminousOutline,
+    TextShimmer,
+    AccentUnderline
+};
 enum class FoolDisplay { Minimized, Blurred, Dimmed, Hidden, Shown };
 enum class PreviewMode { Off, Click, Automatic };
 enum class PresenceMode { All, Smart, Hidden, Global };
@@ -74,6 +81,8 @@ struct Settings {
     SendReveal incomingReveal = SendReveal::Fade;
     float incomingDurationMs = 550.f;
     MentionEffect mentionEffect = MentionEffect::Off;
+    float mentionStrength = .6f, mentionSpeed = 1.f;
+    bool mentionOutlineBreathing = false, mentionUnderlineGlint = false;
     FoolDisplay foolDisplay = FoolDisplay::Minimized;
     bool foolUnread = false;
     int messageWrapColumns = 80;
@@ -131,6 +140,7 @@ enum class ActivityKind { None, Join, Part, Quit, Nick };
 struct Message {
     string id, nick, text, time, reply, label, activityTarget;
     string sourceBuffer, sourceId, sourceServer, sourceTarget;
+    string mentionNick;
     // Unmodified payload of a search result; presentation text is not source identity.
     string sourceText, sourceReply;
     int64_t storageSequence = 0;
@@ -256,7 +266,60 @@ struct Network {
     bool sojuMutationSucceeded = false;
     string caseMapping = "rfc1459";
     string channelTypes = "#&+!";
+    string prefixModes = "(ov)@+";
+    string channelModeTypes = "b,k,l,imnpst";
 };
+inline std::string_view channelStatusModes(const Network &network) {
+    const std::string_view spec = network.prefixModes;
+    const auto close = spec.find(')');
+    if (spec.empty() || spec.front() != '(' || close == spec.npos || close <= 1 ||
+        spec.size() - close - 1 != close - 1)
+        return {};
+    const auto modes = spec.substr(1, close - 1);
+    const auto symbols = spec.substr(close + 1);
+    for (size_t i = 0; i < modes.size(); ++i)
+        if (!((modes[i] >= 'a' && modes[i] <= 'z') || (modes[i] >= 'A' && modes[i] <= 'Z')) ||
+            modes.find(modes[i]) != i || symbols[i] <= ' ' || symbols[i] >= '\x7f' ||
+            symbols.find(symbols[i]) != i)
+            return {};
+    return modes;
+}
+inline bool channelStatusSupported(const Network &network, char mode) {
+    return channelStatusModes(network).find(mode) != std::string_view::npos;
+}
+inline bool channelHasStatus(const Network &network, const Nick &nick, char mode) {
+    const auto modes = channelStatusModes(network);
+    const auto rank = modes.find(mode);
+    return rank != modes.npos &&
+           nick.prefix.find(network.prefixModes[modes.size() + 2 + rank]) != string::npos;
+}
+inline bool channelHasPrivilege(const Network &network, const Nick &nick, char mode) {
+    const auto modes = channelStatusModes(network);
+    const auto rank = modes.find(mode);
+    if (rank == modes.npos)
+        return false;
+    for (size_t i = 0; i <= rank; ++i)
+        if (nick.prefix.find(network.prefixModes[modes.size() + 2 + i]) != string::npos)
+            return true;
+    return false;
+}
+inline int channelModeGroup(const Network &network, char mode) {
+    const std::string_view spec = network.channelModeTypes;
+    int group = 0, result = -1;
+    for (size_t i = 0; i < spec.size(); ++i) {
+        if (spec[i] == ',') {
+            if (++group > 3)
+                return -1;
+        } else {
+            if (!((spec[i] >= 'a' && spec[i] <= 'z') || (spec[i] >= 'A' && spec[i] <= 'Z')) ||
+                spec.find(spec[i]) != i)
+                return -1;
+            if (spec[i] == mode)
+                result = group;
+        }
+    }
+    return group == 3 ? result : -1;
+}
 struct Event {
     string type, server, target, nick, text, id, time, reply, label;
     int64_t timestamp = 0;
@@ -286,6 +349,18 @@ struct WhoisProfile {
     bool open = false, loading = false;
     vector<WhoisRecord> records;
 };
+struct ChannelBan {
+    string mask, setter;
+    int64_t timestamp = 0;
+};
+struct ChannelToolsState {
+    string buffer, server, modesRequest, bansRequest, modesError, bansError;
+    uint64_t sessionGeneration = 0, revision = 0;
+    bool open = false, modesLoading = false, modesKnown = false, bansLoading = false,
+         bansKnown = false;
+    map<char, string> modes;
+    vector<ChannelBan> bans;
+};
 struct SourceJumpRequest {
     uint64_t revision = 0;
     string buffer, message;
@@ -304,6 +379,7 @@ struct Model {
     uint64_t settingsSaveRequest = 0;
     SettingsSaveResult settingsSaveResult;
     WhoisProfile whoisProfile;
+    ChannelToolsState channelTools;
     map<string, Buffer> mentionSources;
     SourceJumpRequest pendingSourceJump;
     // Synchronous native identity callbacks; absent in headless core clients.

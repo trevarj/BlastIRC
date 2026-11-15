@@ -38,6 +38,10 @@ static void presentation(const Settings &actual, const Settings &expected) {
            actual.incomingReveal == expected.incomingReveal &&
            actual.incomingDurationMs == expected.incomingDurationMs &&
            actual.mentionEffect == expected.mentionEffect &&
+           actual.mentionStrength == expected.mentionStrength &&
+           actual.mentionSpeed == expected.mentionSpeed &&
+           actual.mentionOutlineBreathing == expected.mentionOutlineBreathing &&
+           actual.mentionUnderlineGlint == expected.mentionUnderlineGlint &&
            actual.foolDisplay == expected.foolDisplay && actual.foolUnread == expected.foolUnread &&
            actual.messageWrapColumns == expected.messageWrapColumns);
     assert(actual.linkPreviews == expected.linkPreviews &&
@@ -90,6 +94,7 @@ static void dropHistoryOrderSchema(const fs::path &database) {
         "DROP INDEX messages_chat_activity;"
         "ALTER TABLE messages DROP COLUMN tie_order;"
         "ALTER TABLE messages DROP COLUMN tie_order_confirmed;"
+        "ALTER TABLE messages DROP COLUMN mention_nick;"
         "CREATE INDEX messages_buffer_order ON "
         "messages(buffer,sort_time,server_nanoseconds(time),seq);"
         "CREATE INDEX messages_order ON messages(sort_time,server_nanoseconds(time),seq);"
@@ -1568,7 +1573,7 @@ static void activitySchema6Migration(const fs::path &database, const fs::path &c
         scalar(database, "SELECT seq FROM messages WHERE id='migration-server-id'");
     {
         Storage storage;
-        assert(scalar(database, "PRAGMA user_version") == 11);
+        assert(scalar(database, "PRAGMA user_version") == 12);
         assert(scalar(database, "SELECT COUNT(*) FROM messages WHERE activity<>0") == 0);
         assert(scalar(database, "SELECT seq FROM messages WHERE id='migration-server-id'") ==
                sequence);
@@ -1607,7 +1612,7 @@ static void activitySchema6Migration(const fs::path &database, const fs::path &c
                   "ALTER TABLE buffers DROP COLUMN archived; PRAGMA user_version=7;");
     {
         Storage storage;
-        assert(scalar(database, "PRAGMA user_version") == 11);
+        assert(scalar(database, "PRAGMA user_version") == 12);
         const auto nick = storage.message(id, "schema7-nick");
         assert(nick && nick->activity == ActivityKind::Nick && nick->activityTarget.empty() &&
                nick->text == "opaque nick-change display text");
@@ -1644,7 +1649,7 @@ static void chatFlags(const fs::path &database, const fs::path &config, int64_t 
         Model model;
         storage.load(model);
         const auto &buffer = model.buffers.at(id);
-        assert(scalar(database, "PRAGMA user_version") == 11);
+        assert(scalar(database, "PRAGMA user_version") == 12);
         assert(!buffer.muted && !buffer.archived);
         assert(model.activeBuffer == id && buffer.draft == "retained flag migration draft" &&
                buffer.readMarker == "flag-read" && buffer.unread == 1 &&
@@ -1743,15 +1748,15 @@ static void chatFlags(const fs::path &database, const fs::path &config, int64_t 
                                renamed.archived == (sourceArchived && destinationArchived));
                     }
                 }
-    sql(database, "PRAGMA user_version=12;");
+    sql(database, "PRAGMA user_version=13;");
     bool rejected = false;
     try {
         Storage future;
     } catch (const std::runtime_error &) {
         rejected = true;
     }
-    assert(rejected && scalar(database, "PRAGMA user_version") == 12);
-    sql(database, "PRAGMA user_version=11;");
+    assert(rejected && scalar(database, "PRAGMA user_version") == 13);
+    sql(database, "PRAGMA user_version=12;");
 }
 static void retainedMentions(const fs::path &database, int64_t now) {
     Storage storage;
@@ -1793,6 +1798,7 @@ static void retainedMentions(const fs::path &database, int64_t now) {
     const auto &rows = sources.at(a).messages;
     for (size_t i = 0; i < rows.size(); ++i) {
         assert(rows[i].mention && rows[i].id == "row-" + std::to_string(i));
+        assert(rows[i].mentionNick == "current[");
         if (i)
             assert(rows[i - 1].storageSequence < rows[i].storageSequence);
     }
@@ -1813,6 +1819,16 @@ static void retainedMentions(const fs::path &database, int64_t now) {
     recorded.mention = false;
     storage.update(a, recorded);
     assert(storage.message(a, recorded.id)->mention); // Stale live state cannot undo evidence.
+    assert(storage.message(a, recorded.id)->mentionNick.empty());
+    auto known = message("known-nick", now, "historic nick!");
+    known.mention = true;
+    known.mentionNick = "historic";
+    storage.append(a, known);
+    known.mention = false;
+    known.mentionNick.clear();
+    storage.update(a, known);
+    assert(storage.message(a, known.id)->mentionNick == "historic");
+    storage.eraseMessage(a, known.id);
     auto duplicate = message("same-id", now, "other");
     duplicate.time = "2023-11-14T22:13:20.900Z";
     duplicate.mention = true;
@@ -1848,6 +1864,8 @@ static void retainedMentions(const fs::path &database, int64_t now) {
            !storage.sourceBuffer(synthetic.id));
     networks["MentionsA"].nick = "renamed";
     sources = storage.mentionSources(networks);
+    assert(storage.message(a, "row-0")->mentionNick == "current[");
+    assert(storage.history(a, -1).front().mentionNick == "current[");
     assert(sources.size() == 2 && sources.at(a).messages.size() == 227);
     string renamed = "MentionsA/#renamed";
     storage.renameBuffer(a, renamed);
@@ -1948,7 +1966,7 @@ static void protocolHistoryStorage(const fs::path &database, int64_t now) {
     sql(database, "PRAGMA user_version=9;");
     {
         Storage migrated;
-        assert(scalar(database, "PRAGMA user_version") == 11);
+        assert(scalar(database, "PRAGMA user_version") == 12);
         assert(migrated.message(legacy.id, "legacy-row"));
         assert(migrated.sourceBuffer(legacy.id)->target == legacy.target);
         assert(migrated.historyDiscarded(legacy.id) == std::optional<string>(""));
@@ -2240,7 +2258,7 @@ static void historyPlaybackOrdering(const fs::path &database, int64_t now) {
     const vector<string> expected{"pre1", "pre2", "A", "D", "X", "C", "B", "tailY", "tailZ"};
     {
         Storage storage;
-        assert(scalar(database, "PRAGMA user_version") == 11);
+        assert(scalar(database, "PRAGMA user_version") == 12);
         storage.loadHistoryState(source);
         assert(source.historyState.newest == (HistoryCursor{"B", time}));
         assert(storage.message(source.id, "B")->historyOrder == originalSequence);
@@ -3033,11 +3051,15 @@ int main() {
                 assert(contents(config / "config.toml") == originalConfig);
             }
         }
-        for (const auto &[token, effect] :
-             vector<std::pair<string, MentionEffect>>{{"off", MentionEffect::Off},
-                                                      {"text_shimmer", MentionEffect::TextShimmer},
-                                                      {"rail_pulse", MentionEffect::RailPulse},
-                                                      {"border_halo", MentionEffect::BorderHalo}}) {
+        for (const auto &[token, effect] : vector<std::pair<string, MentionEffect>>{
+                 {"off", MentionEffect::Off},
+                 {"neon_mention", MentionEffect::NeonMention},
+                 {"breathing_glow", MentionEffect::BreathingGlow},
+                 {"luminous_outline", MentionEffect::LuminousOutline},
+                 {"text_shimmer", MentionEffect::TextShimmer},
+                 {"accent_underline", MentionEffect::AccentUnderline},
+                 {"rail_pulse", MentionEffect::BreathingGlow},
+                 {"border_halo", MentionEffect::LuminousOutline}}) {
             {
                 std::ofstream output(config / "settings.toml");
                 output << "[appearance]\nmention_effect = '" << token
@@ -3045,6 +3067,8 @@ int main() {
                           "send_motion = 'slide'\nsend_reveal = 'none'\n"
                           "incoming_motion = 'pop'\nincoming_reveal = 'pixels'\n"
                           "incoming_duration_ms = 1250\n";
+                output << "mention_strength = 0.75\nmention_speed = 1.5\n"
+                          "mention_outline_breathing = true\nmention_underline_glint = true\n";
             }
             Storage storage;
             Model configured;
@@ -3055,7 +3079,14 @@ int main() {
                    configured.settings.incomingMotion == SendMotion::Pop &&
                    configured.settings.incomingReveal == SendReveal::Pixels &&
                    configured.settings.incomingDurationMs == 1250.f);
+            assert(configured.settings.mentionStrength == .75f &&
+                   configured.settings.mentionSpeed == 1.5f &&
+                   configured.settings.mentionOutlineBreathing &&
+                   configured.settings.mentionUnderlineGlint);
             storage.save(configured);
+            const string savedMention = contents(config / "settings.toml");
+            assert(savedMention.find("rail_pulse") == string::npos &&
+                   savedMention.find("border_halo") == string::npos);
             Model reopened;
             storage.load(reopened);
             presentation(reopened.settings, configured.settings);
@@ -3165,6 +3196,14 @@ int main() {
                                     "incoming_duration_ms = nan",
                                     "incoming_duration_ms = inf",
                                     "incoming_duration_ms = '550'",
+                                    "mention_strength = -0.01",
+                                    "mention_strength = 1.01",
+                                    "mention_strength = nan",
+                                    "mention_speed = 0.24",
+                                    "mention_speed = 2.01",
+                                    "mention_speed = inf",
+                                    "mention_outline_breathing = 1",
+                                    "mention_underline_glint = 'true'",
                                     "message_scale = 0.699",
                                     "message_scale = 2.001",
                                     "message_scale = nan",
@@ -3326,8 +3365,9 @@ int main() {
              {"appearance.send_motion", "appearance.send_reveal", "appearance.incoming_motion",
               "appearance.incoming_duration_ms", "appearance.fool_display",
               "appearance.mention_effect", "appearance.message_wrap_columns", "previews",
-              "previews.max_height", "previews.media_max_mib", "previews.media_max_seconds",
-              "cursor.shape", "cursor.effect"}) {
+              "appearance.mention_strength", "appearance.mention_speed", "previews.max_height",
+              "previews.media_max_mib", "previews.media_max_seconds", "cursor.shape",
+              "cursor.effect"}) {
             Storage storage;
             Model invalid = legacy;
             if (diagnostic == "cursor.shape")
@@ -3342,6 +3382,10 @@ int main() {
                 invalid.settings.incomingDurationMs = std::numeric_limits<float>::quiet_NaN();
             else if (diagnostic == "appearance.mention_effect")
                 invalid.settings.mentionEffect = static_cast<MentionEffect>(-1);
+            else if (diagnostic == "appearance.mention_strength")
+                invalid.settings.mentionStrength = std::numeric_limits<float>::quiet_NaN();
+            else if (diagnostic == "appearance.mention_speed")
+                invalid.settings.mentionSpeed = 0;
             else if (diagnostic == "appearance.fool_display")
                 invalid.settings.foolDisplay = static_cast<FoolDisplay>(-1);
             else if (diagnostic == "appearance.message_wrap_columns")

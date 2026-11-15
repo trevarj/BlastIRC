@@ -195,6 +195,7 @@ Message storedMessage(sqlite3 *db, const Statement &query) {
     message.pending = query.integer(9) != 0;
     message.deleted = query.integer(10) != 0;
     message.mention = query.integer(11) != 0;
+    message.mentionNick = query.text(19);
     message.action = query.integer(12) != 0;
     message.presence = query.integer(13) != 0;
     message.activity = static_cast<ActivityKind>(query.integer(15));
@@ -400,21 +401,34 @@ string mentionEffectName(MentionEffect value) {
     switch (value) {
     case MentionEffect::Off:
         return "off";
+    case MentionEffect::NeonMention:
+        return "neon_mention";
+    case MentionEffect::BreathingGlow:
+        return "breathing_glow";
+    case MentionEffect::LuminousOutline:
+        return "luminous_outline";
     case MentionEffect::TextShimmer:
         return "text_shimmer";
-    case MentionEffect::RailPulse:
-        return "rail_pulse";
-    case MentionEffect::BorderHalo:
-        return "border_halo";
+    case MentionEffect::AccentUnderline:
+        return "accent_underline";
     }
-    invalid("appearance.mention_effect", "off, text_shimmer, rail_pulse, or border_halo");
+    invalid(
+        "appearance.mention_effect",
+        "off, neon_mention, breathing_glow, luminous_outline, text_shimmer, or accent_underline");
 }
 MentionEffect mentionEffectValue(const string &token) {
-    for (auto effect : {MentionEffect::Off, MentionEffect::TextShimmer, MentionEffect::RailPulse,
-                        MentionEffect::BorderHalo})
+    if (token == "rail_pulse")
+        return MentionEffect::BreathingGlow;
+    if (token == "border_halo")
+        return MentionEffect::LuminousOutline;
+    for (auto effect : {MentionEffect::Off, MentionEffect::NeonMention,
+                        MentionEffect::BreathingGlow, MentionEffect::LuminousOutline,
+                        MentionEffect::TextShimmer, MentionEffect::AccentUnderline})
         if (token == mentionEffectName(effect))
             return effect;
-    invalid("appearance.mention_effect", "off, text_shimmer, rail_pulse, or border_halo");
+    invalid(
+        "appearance.mention_effect",
+        "off, neon_mention, breathing_glow, luminous_outline, text_shimmer, or accent_underline");
 }
 string foolDisplayName(FoolDisplay value) {
     switch (value) {
@@ -541,6 +555,8 @@ void validate(const Settings &settings) {
     sendRevealName(settings.incomingReveal);
     range(settings.incomingDurationMs, 100, 2000, "appearance.incoming_duration_ms");
     mentionEffectName(settings.mentionEffect);
+    range(settings.mentionStrength, 0, 1, "appearance.mention_strength");
+    range(settings.mentionSpeed, .25, 2, "appearance.mention_speed");
     foolDisplayName(settings.foolDisplay);
     if (settings.messageWrapColumns < 0 || settings.messageWrapColumns > 1000)
         invalid("appearance.message_wrap_columns", "an integer from 0 through 1000");
@@ -834,6 +850,10 @@ void parseSettings(const toml::table &document, Settings &settings) {
         string mention = mentionEffectName(settings.mentionEffect);
         exactField(*row, "mention_effect", mention);
         settings.mentionEffect = mentionEffectValue(mention);
+        field(*row, "mention_strength", settings.mentionStrength);
+        field(*row, "mention_speed", settings.mentionSpeed);
+        exactField(*row, "mention_outline_breathing", settings.mentionOutlineBreathing);
+        exactField(*row, "mention_underline_glint", settings.mentionUnderlineGlint);
         string fools = foolDisplayName(settings.foolDisplay);
         exactField(*row, "fool_display", fools);
         bool foundFoolDisplay = false;
@@ -1132,6 +1152,10 @@ toml::table settingsDocument(const Settings &settings) {
                                    {"incoming_reveal", sendRevealName(settings.incomingReveal)},
                                    {"incoming_duration_ms", settings.incomingDurationMs},
                                    {"mention_effect", mentionEffectName(settings.mentionEffect)},
+                                   {"mention_strength", settings.mentionStrength},
+                                   {"mention_speed", settings.mentionSpeed},
+                                   {"mention_outline_breathing", settings.mentionOutlineBreathing},
+                                   {"mention_underline_glint", settings.mentionUnderlineGlint},
                                    {"fool_display", foolDisplayName(settings.foolDisplay)},
                                    {"fool_unread", settings.foolUnread},
                                    {"message_wrap_columns", settings.messageWrapColumns},
@@ -1313,7 +1337,7 @@ struct Storage::Impl {
                 if (query.step())
                     version = query.integer(0);
             }
-            if (version > 11)
+            if (version > 12)
                 fail("database schema " + std::to_string(version) +
                      " is newer than this BlastIRC supports; schema was not modified");
             if (version < 1)
@@ -1405,6 +1429,9 @@ struct Storage::Impl {
                         "CREATE INDEX messages_chat_activity ON messages(buffer,sort_time,"
                         "server_nanoseconds(time),seq) WHERE presence=0 AND deleted=0;"
                         "PRAGMA user_version=11;");
+            if (version < 12)
+                execute(db, "ALTER TABLE messages ADD mention_nick TEXT NOT NULL DEFAULT '';"
+                            "PRAGMA user_version=12;");
             if (version < 10) {
                 // Keep legacy cache intact, but establish its pre-network tail before a
                 // new live event can become the fallback boundary of an offline gap.
@@ -1664,12 +1691,13 @@ struct Storage::Impl {
                       "buffer=?,id=?,nick=?,text=?,time=?,reply=?,label=?,timestamp=?,"
                       "received_at=?,sort_time=?,own=?,pending=?,deleted=?,mention=MAX(mention,?),"
                       "action=?,presence=?,local_echo=?,activity=?,activity_target=?,"
-                      "tie_order=?,tie_order_confirmed=? WHERE seq=?"
+                      "tie_order=?,tie_order_confirmed=?,"
+                      "mention_nick=CASE WHEN ?<>'' THEN ? ELSE mention_nick END WHERE seq=?"
                     : "INSERT INTO "
                       "messages(buffer,id,nick,text,time,reply,label,timestamp,"
                       "received_at,sort_time,own,pending,deleted,mention,action,"
-                      "presence,local_echo,activity,activity_target,tie_order,tie_order_confirmed) "
-                      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                      "presence,local_echo,activity,activity_target,tie_order,tie_order_confirmed,"
+                      "mention_nick) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         write.bind(1, buffer);
         if (message.id.empty())
             write.null(2);
@@ -1694,8 +1722,11 @@ struct Storage::Impl {
         write.bind(19, message.activityTarget);
         write.bind(20, order);
         write.bind(21, orderConfirmed);
-        if (sequence)
-            write.bind(22, sequence);
+        write.bind(22, message.mentionNick);
+        if (sequence) {
+            write.bind(23, message.mentionNick);
+            write.bind(24, sequence);
+        }
         write.step();
         if (!sequence)
             sequence = sqlite3_last_insert_rowid(db);
@@ -2055,7 +2086,7 @@ map<string, Buffer> Storage::mentionSources(const map<string, Network> &networks
     Statement buffers(impl->db, "SELECT id FROM buffers WHERE server<>'' AND target<>'' "
                                 "AND kind IN ('channel','query') AND target<>'*server*' "
                                 "ORDER BY id");
-    Statement mark(impl->db, "UPDATE messages SET mention=1 WHERE seq=? AND mention=0");
+    Statement mark(impl->db, "UPDATE messages SET mention=1,mention_nick=? WHERE seq=?");
     while (buffers.step()) {
         auto source = sourceBuffer(buffers.text(0));
         if (!source)
@@ -2072,27 +2103,33 @@ map<string, Buffer> Storage::mentionSources(const map<string, Network> &networks
             scan.nick = network->second.nick;
             scan.mapping = network->second.caseMapping;
         }
-        Statement rows(
-            impl->db,
-            "SELECT seq,COALESCE(id,'local:' || seq),nick,text,time,reply,label,"
-            "timestamp,own,pending,deleted,mention,action,presence,local_echo,"
-            "activity,activity_target,sort_time,tie_order FROM messages WHERE buffer=? AND own=0 "
-            "AND presence=0 AND deleted=0 AND (mention<>0 OR (?=1 AND seq>?)) "
-            "ORDER BY sort_time,server_nanoseconds(time),tie_order,seq");
+        Statement rows(impl->db,
+                       "SELECT seq,COALESCE(id,'local:' || seq),nick,text,time,reply,label,"
+                       "timestamp,own,pending,deleted,mention,action,presence,local_echo,"
+                       "activity,activity_target,sort_time,tie_order,mention_nick FROM messages "
+                       "WHERE buffer=? AND own=0 "
+                       "AND presence=0 AND deleted=0 AND (mention<>0 OR (?=1 AND seq>?)) "
+                       "ORDER BY sort_time,server_nanoseconds(time),tie_order,seq");
         rows.bind(1, source->id);
         rows.bind(2, static_cast<int64_t>(classify));
         rows.bind(3, scan.sequence);
         while (rows.step()) {
             scan.sequence = std::max(scan.sequence, rows.integer(0));
-            if (rows.integer(11) == 0) {
-                if (!actualNickMention(rows.text(3), network->second.nick,
-                                       network->second.caseMapping))
-                    continue;
-                mark.bind(1, rows.integer(0));
-                mark.step();
-                mark.reset();
-            }
             auto message = storedMessage(impl->db, rows);
+            if (!message.mention || message.mentionNick.empty()) {
+                const bool matched =
+                    classify && actualNickMention(message.text, network->second.nick,
+                                                  network->second.caseMapping);
+                if (!message.mention && !matched)
+                    continue;
+                if (matched) {
+                    message.mentionNick = network->second.nick;
+                    mark.bind(1, message.mentionNick);
+                    mark.bind(2, message.storageSequence);
+                    mark.step();
+                    mark.reset();
+                }
+            }
             message.mention = true;
             source->messages.push_back(std::move(message));
         }
@@ -2225,7 +2262,8 @@ void Storage::load(Model &model) {
             impl->db,
             "SELECT seq,COALESCE(id,'local:' || seq),nick,text,time,reply,label,"
             "timestamp,own,(pending OR (own=1 AND local_echo=1)),deleted,mention,"
-            "action,presence,local_echo,activity,activity_target,sort_time,tie_order FROM "
+            "action,presence,local_echo,activity,activity_target,sort_time,tie_order,mention_nick "
+            "FROM "
             "messages WHERE seq IN "
             "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 ORDER BY "
             "sort_time DESC,server_nanoseconds(time) DESC,tie_order DESC,seq DESC LIMIT 200) "
@@ -2377,20 +2415,20 @@ std::optional<Message> Storage::message(const string &buffer, const string &id) 
     Statement query(impl->db, "SELECT seq,COALESCE(id,'local:' || "
                               "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,"
                               "mention,action,presence,local_echo,activity,activity_target,sort_"
-                              "time,tie_order FROM messages WHERE "
+                              "time,tie_order,mention_nick FROM messages WHERE "
                               "buffer=? AND id=?");
     query.bind(1, buffer);
     query.bind(2, id);
     if (query.step())
         return storedMessage(impl->db, query);
     if (const auto local = localSequence(id)) {
-        Statement anonymous(
-            impl->db,
-            "SELECT seq,COALESCE(id,'local:' || "
-            "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,mention,"
-            "action,presence,local_echo,activity,activity_target,sort_time,tie_order FROM messages "
-            "WHERE seq=? AND buffer=? "
-            "AND id IS NULL");
+        Statement anonymous(impl->db,
+                            "SELECT seq,COALESCE(id,'local:' || "
+                            "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,mention,"
+                            "action,presence,local_echo,activity,activity_target,sort_time,tie_"
+                            "order,mention_nick FROM messages "
+                            "WHERE seq=? AND buffer=? "
+                            "AND id IS NULL");
         anonymous.bind(1, *local);
         anonymous.bind(2, buffer);
         if (anonymous.step())
@@ -2575,6 +2613,7 @@ void Storage::renameBuffer(const string &oldId, const string &newId) {
             "received_at=MIN(d.received_at,s.received_at),own=MAX(d.own,s.own),pending=MIN(d."
             "pending,s.pending),"
             "deleted=MAX(d.deleted,s.deleted),mention=MAX(d.mention,s.mention),"
+            "mention_nick=COALESCE(NULLIF(d.mention_nick,''),s.mention_nick),"
             "action=MAX(d.action,s.action),presence=MAX(d.presence,s.presence),"
             "local_echo=CASE WHEN d.local_echo=0 OR s.local_echo=0 THEN 0 "
             "WHEN d.local_echo=2 OR s.local_echo=2 THEN 2 ELSE 1 END,"
@@ -2782,7 +2821,7 @@ vector<Message> Storage::history(const string &buffer, int limit, const string &
                     "SELECT seq,COALESCE(id,'local:' || "
                     "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,"
                     "mention,action,presence,local_echo,activity,activity_target,sort_time,"
-                    "tie_order FROM messages WHERE seq IN "
+                    "tie_order,mention_nick FROM messages WHERE seq IN "
                     "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
                     "sort_time=?2 AND server_nanoseconds(time)=?3 AND tie_order=?4 "
                     "AND seq<?5 ORDER BY seq DESC LIMIT ?6) UNION ALL "

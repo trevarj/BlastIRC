@@ -164,7 +164,7 @@ def main():
                         choices=("badges", "typing", "typing-bubble", "fools", "transcript", "incoming", "uploads", "media",
                                  "notifications", "commands", "replies", "chat-controls", "irc-polish",
                                  "spelling", "unread-divider", "smart-presence", "activity-blur",
-                                 "settings-tree", "settings-refinements", "transcript-refinements", "topic-refinements",
+                                 "settings-tree", "settings-refinements", "transcript-refinements", "topic-refinements", "operator-tools",
                                  "nick-popup", "whois-profile", "messaging-refinements",
                                  "cursor-affordances", "composer-affordances", "overlay-refinements",
                                  "activity-pins", "input-routing", "logo-alignment",
@@ -1530,7 +1530,7 @@ def _policy_settings(ctx, category, edits):
             gui.settings_select(w, value)
         elif kind == 'slider':
             # Home is the native slider minimum; Right is one declared step.
-            minimum, step, target = value
+            minimum, step, target = value[:3]
             gui.framed_keys(w, 'Home', *(['Right'] * round((target - minimum) / step)))
         elif kind == 'text':
             gui.settings_field(w, value, ctx['destination'], 'policy-' + name)
@@ -1546,7 +1546,8 @@ def _policy_settings(ctx, category, edits):
         if not section and name == 'fools' and isinstance(actual, dict):
             actual = actual['names']
         if kind == 'slider':
-            assert abs(actual - value[2]) < .001, (name, actual, value)
+            expected = value[3] if len(value) == 4 else value[2]
+            assert abs(actual - expected) < .001, (name, actual, value)
         elif kind != 'select':
             expected = value.split() if not section and name == 'fools' else value
             assert actual == expected, (name, actual, expected)
@@ -1583,7 +1584,8 @@ def _policy_chat(ctx, *, fools=None, receive=None):
     return _policy_settings(ctx, 2, edits)
 
 
-def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=False, mention=None):
+def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=False, mention=None,
+                    strength=None, speed=None, outline=None, glint=None):
     edits = [
         (1, 'select', ('off', 'subtle', 'full').index(fx), 'appearance', 'fx'),
         (2, 'toggle', reduced, 'appearance', 'reduced_motion'),
@@ -1592,8 +1594,22 @@ def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=Fal
         (6, 'select', ('none', 'fade', 'pixels').index(reveal), 'appearance', 'incoming_reveal'),
         (7, 'slider', (100, 10, 2000), 'appearance', 'incoming_duration_ms')]
     if mention is not None:
-        edits.append((8, 'select', ('off', 'text_shimmer', 'rail_pulse', 'border_halo').index(mention),
+        edits.append((8, 'select', ('off', 'neon_mention', 'breathing_glow', 'luminous_outline',
+                                   'text_shimmer', 'accent_underline').index(mention),
                       'appearance', 'mention_effect'))
+    if strength is not None:
+        edits.append((9, 'slider', (0, 1, strength, strength / 100),
+                      'appearance', 'mention_strength'))
+    if outline is not None:
+        assert mention == 'luminous_outline'
+        edits.append((10, 'toggle', outline, 'appearance', 'mention_outline_breathing'))
+    if glint is not None:
+        assert mention == 'accent_underline'
+        edits.append((10, 'toggle', glint, 'appearance', 'mention_underline_glint'))
+    if speed is not None:
+        stop = 11 if mention in ('luminous_outline', 'accent_underline') else 10
+        edits.append((stop, 'slider', (25, 5, speed, speed / 100),
+                      'appearance', 'mention_speed'))
     saved = _policy_settings(ctx, 3, edits)
     appearance = saved['appearance']
     assert all(appearance[k] == v for k, v in {
@@ -1601,6 +1617,7 @@ def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=Fal
         'incoming_reveal': reveal, 'incoming_duration_ms': 2000}.items()), appearance
     if mention is not None:
         assert appearance['mention_effect'] == mention, appearance
+    return appearance
 
 
 def _policy_focus(ctx, identity, *, expected=('', 0, 0)):
@@ -3128,131 +3145,235 @@ def run_incoming(ctx):
 
 
 def run_mention_effects(ctx):
-    """Require changes above the global veil's maximum possible channel delta."""
+    """Compare retained real-wire rows against their own native Off raster."""
     _policy_focus(ctx, ctx['query_id'])
     _policy_chat(ctx, fools=[], receive=False)
-    evidence = []
     gui.set_navigation(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
                        'hidden', 'mention-effects')
     gui.set_people(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'], 'hidden')
+    choices = ('neon_mention', 'breathing_glow', 'luminous_outline',
+               'text_shimmer', 'accent_underline')
+    evidence = []
+    destination = Path(ctx['destination'])
+
+    def delta(a, b):
+        return sum(abs(x - y) for x, y in zip(a, b))
+
+    def capture(label, seconds=.55):
+        token = f'mention-keepalive-{time.monotonic_ns()}'
+        ctx['observer'].send('PING :' + token)
+        ctx['observer'].wait(lambda command, params, prefix:
+            command == 'PONG' and params and params[-1] == token, timeout=15)
+        gui.move_pointer(ctx['window'], 0, 0)
+        time.sleep(1.5)
+        frames, stamps = [], []
+        started = time.monotonic()
+        while time.monotonic() - started < seconds:
+            image = gui.native_rgb_capture(ctx['window'])
+            for rgb, expected in ((left_rgb, left), (right_rgb, right)):
+                actual = _policy_box(ctx, rgb, image=image)
+                diagnostic = (style, label, rgb, expected, actual)
+                assert actual == expected, ('Paint-only effect moved source marker', diagnostic)
+            frames.append(_policy_crop(image, region))
+            stamps.append(time.monotonic() - started)
+            time.sleep(.10)
+        path = destination.with_name(destination.stem + f'-mention-{style}-{label}.png')
+        Image.frombytes('RGB', (image['width'], image['height']), image['pixels']).save(path)
+        assert len(frames) >= 3, ('Insufficient native samples', style, label, stamps)
+        return frames, {'label': label, 'capture': str(path), 'frames': len(frames),
+                        'sample_seconds': stamps, 'region': region,
+                        'distinct_frames': len(set(frames)),
+                        'temporal_delta': sum(delta(a, b) for a, b in zip(frames, frames[1:])) /
+                                          (stamps[-1] - stamps[0])}
+
+    def observe(label, *, animated=False, suppressed=False, sample_seconds=None, **settings):
+        appearance = _policy_effects(ctx, **settings)
+        frames, item = capture(label, sample_seconds or (4.4 if animated else .55))
+        changes = [delta(frame, baseline) for frame in frames]
+        item.update(settings={key: appearance[key] for key in (
+            'mention_effect', 'mention_strength', 'mention_speed', 'mention_outline_breathing',
+            'mention_underline_glint', 'fx', 'reduced_motion')},
+                    maximum_off_delta=max(changes), minimum_off_delta=min(changes))
+        evidence.append(dict(style=style, **item))
+        diagnostic = (style, label, item)
+        if suppressed:
+            assert max(changes) == 0, ('Suppressed decoration differs from Off', diagnostic)
+        else:
+            assert max(changes) > 24, ('Persistent decoration missing after former expiry', diagnostic)
+        if animated:
+            assert len(set(frames)) > 2 and item['temporal_delta'] > 24, (
+                'Persistent motion did not change actual retained pixels', diagnostic)
+        else:
+            assert len(set(frames)) == 1, ('Steady decoration animated', diagnostic)
+        if not suppressed:
+            reference = Image.frombytes('RGB', (region[2] - region[0], region[3] - region[1]), baseline)
+            if settings['mention'] != 'luminous_outline':
+                nickname = (left[2] + 1 - region[0], left[1] - 7 - region[1],
+                            right[0] - 1 - region[0], left[3] + 7 - region[1])
+                original_nick = reference.crop(nickname).tobytes()
+                assert max(delta(Image.frombytes('RGB', reference.size, frame).crop(nickname).tobytes(),
+                                 original_nick) for frame in frames) > 24, (
+                    'Decoration missed the actual own-nickname span', diagnostic, nickname)
+            for frame in frames:
+                rendered = Image.frombytes('RGB', reference.size, frame)
+                interior = (right[2] + 3 - region[0], left[1] + 3 - region[1],
+                            right[2] + 45 - region[0], left[3] - 3 - region[1])
+                assert rendered.crop(interior).tobytes() == reference.crop(interior).tobytes(), (
+                    'Effect tinted unrelated body/interior', diagnostic, interior)
+                if settings['mention'] != 'luminous_outline':
+                    rail = (0, left[1] - region[1], max(1, left[0] - region[0] - 12),
+                            left[3] - region[1])
+                    assert rendered.crop(rail).tobytes() == reference.crop(rail).tobytes(), (
+                        'Nickname effect painted an obsolete message rail', diagnostic, rail)
+        return frames, item
+
+    def assert_source_absent(label):
+        image = gui.native_rgb_capture(ctx['window'])
+        pane = gui.read_layout(ctx['preferences'])['conversation']['rect']
+        components = [gui.native_marker_components(image, pane, rgb)
+                      for rgb in (left_rgb, right_rgb)]
+        assert not any(components), (label, style, components)
+
     for style_index, style in enumerate(('bubbles', 'irc', 'stacked')):
+        _policy_effects(ctx, mention='off', fx='off')
         gui.set_message_style(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
                               ctx['args'], ctx['destination'], ctx['query_id'], style,
                               label='mention-effects-' + style)
-        choices = ('off', 'text_shimmer', 'rail_pulse', 'border_halo')
-        cases = [(choice, 'full', False, False) for choice in choices]
-        cases += [('border_halo', 'off', False, False), ('text_shimmer', 'full', True, False)]
-        cases += [(choice, 'full', False, True) for choice in choices]
-        off_variation = None
-        for index, (choice, fx, reduced, foolish) in enumerate(cases):
-            if index in (0, 6):
-                _policy_chat(ctx, fools=[ctx['query_target']] if foolish else [])
-                if foolish:
-                    gui.command('show-fools', window=ctx['window'])
-                    gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
-            _policy_effects(ctx, mention=choice, fx=fx, reduced=reduced)
-            gui.move_pointer(ctx['window'], 0, 0)
-            serial = style_index * 10 + index
-            rgb = (30 + 80 * (serial % 3), 90 + 70 * ((serial // 3) % 3),
-                   30 + 60 * (serial // 9))
-            token = ''.join(f'{v:02X}' for v in rgb)
-            text = (f'\x04{token},{token}MENTIONANCHOR\x0f '
-                    f'{ctx["own_nick"]}: Local accent glyph probe')
-            # The unformatted glyphs are the shimmer target; the solid IRC
-            # background remains a geometry anchor, not an animation witness.
-            _policy_send(ctx, text, durable=False)
-            samples, bounds = [], None
-            started = time.monotonic()
-            while time.monotonic() - started < 3.8:
-                image = gui.native_rgb_capture(ctx['window'])
-                raster = Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
-                difference = ImageChops.difference(raster, Image.new('RGB', raster.size, rgb))
-                channels = difference.split()
-                mask = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]),
-                                          channels[2]).point(lambda value: 255 if value <= 26 else 0)
-                anchors = Image.composite(Image.new('RGB', raster.size, rgb),
-                                          Image.new('RGB', raster.size), mask)
-                components = gui.native_marker_components(
-                    dict(image, pixels=anchors.tobytes()),
-                    gui.read_layout(ctx['preferences'])['conversation']['rect'], rgb)
-                boxes = [item['bbox'] for item in components
-                         if item['bbox'][2] - item['bbox'][0] >= 24
-                         and item['bbox'][3] - item['bbox'][1] >= 6
-                         and item['pixels'] >= .6 * (item['bbox'][2] - item['bbox'][0]) *
-                         (item['bbox'][3] - item['bbox'][1])]
-                marker = boxes[0] if len(boxes) == 1 else None
-                if marker is None:
-                    continue
-                if bounds is None:
-                    x, y, width, height = gui.read_layout(ctx['preferences'])['conversation']['rect']
-                    scale = gui.read_layout(ctx['preferences'])['scale']
-                    # Match jump-bottom's native overlay gutter: its independent
-                    # FAB may fade even with row FX off and is not row-local ink.
-                    # Body glyphs and the vertical rail/halo sides share the
-                    # actual anchor band; measured headers/prior rows do not.
-                    bounds = (round(x + 2 * scale), marker[1],
-                              round(x + width - 110 * scale), marker[3])
-                crop = _policy_crop(image, bounds)
-                samples.append((time.monotonic() - started, crop, marker))
-            gui.wait_messages(ctx['proc'], ctx['database_path'], ctx['expected_messages'])
-            assert samples and bounds, ('Mention row never became visible', style, choice)
-            settled = samples[-1][1]
-            early = [(stamp, pixels) for stamp, pixels, _ in samples if .1 <= stamp <= 1.15]
-            late = [pixels for stamp, pixels, _ in samples if stamp >= 3.5]
-            assert early and late, ('Native sampler missed accent or settled interval', style, choice)
-            # The global veil is at most .095 opaque: <=25 RGB/channel on
-            # any palette. A >32 delta cannot be explained by that cue.
-            delta_threshold = 8 if foolish else 32
-            changes = [sum(abs(a - b) > delta_threshold for a, b in zip(pixels, settled))
-                       for _, pixels in early]
-            variation = max(changes)
-            live_stamp, live_pixels = early[changes.index(variation)]
-            live_path = Path(ctx['destination']).with_name(
-                Path(ctx['destination']).stem + f'-mention-{style}-{index}-live.png')
-            Image.frombytes('RGB', (bounds[2] - bounds[0], bounds[3] - bounds[1]),
-                            live_pixels).save(live_path)
-            if choice == 'off':
-                off_variation = variation
-            enabled = choice != 'off' and fx != 'off' and not reduced and not foolish
-            # Off is measured with the same genuine own-nick global event.
-            # Only excess local contrast can satisfy the positive assertion.
-            if enabled:
-                assert variation > off_variation + 12, (
-                    'No row-local accent above global-veil Off control', style, choice,
-                    variation, off_variation)
-            else:
-                assert variation <= off_variation + (0 if foolish else 12), (
-                    'Suppressed accent changed local contrast', style, choice, variation, off_variation)
-            assert all(sum(abs(a - b) > 8 for a, b in zip(pixels, settled)) <= 12
-                       for pixels in late), ('Mention row failed to settle', style, choice)
-            assert len({tuple(box) for _, _, box in samples}) == 1, (
-                'Paint-only mention accent moved the body', style, choice)
-            evidence.append({'style': style, 'choice': choice, 'fx': fx, 'reduced_motion': reduced,
-                             'fully_shown_fool': foolish, 'channel_delta_threshold': delta_threshold,
-                             'frames': len(samples), 'region': bounds,
-                             'maximum_local_contrast_changes': variation,
-                             'off_control_changes': off_variation,
-                             'live_capture': str(live_path), 'live_seconds': live_stamp,
-                             'settled': True, 'marker': samples[-1][2],
-                             'capture': str(_policy_capture(ctx, f'mention-{style}-{index}'))})
-    _policy_chat(ctx, fools=[ctx['query_target']])
-    _policy_appearance(ctx, fool='hidden')
-    gui.command('hide-fools', window=ctx['window'])
+        left_rgb, right_rgb = (31, 111 + style_index * 35, 47), (173, 53, 113 + style_index * 35)
+        def swatch(rgb, text):
+            token = ''.join(f'{value:02X}' for value in rgb)
+            return f'\x04{token},{token}{text}\x0f'
+        text = (swatch(left_rgb, 'ANCHOR') + ' ' + ctx['own_nick'] + ' ' +
+                swatch(right_rgb, 'BOUND') + ' unrelated body')
+        _policy_send(ctx, text)
+        left, right = _policy_wait_box(ctx, left_rgb), _policy_wait_box(ctx, right_rgb)
+        _policy_effects(ctx, mention='off', fx='full')
+        assert left[0] < right[0] and abs(left[1] - right[1]) <= 1, (
+            'Fixture own nickname wrapped; cannot compare native geometry', style, left, right)
+        layout = gui.read_layout(ctx['preferences'])
+        x, y, width, height = layout['conversation']['rect']
+        scale = layout['scale']
+        region = (round(x + 2 * scale), max(round(y), left[1] - round(42 * scale)),
+                  round(x + width - 110 * scale), min(round(y + height), left[3] + round(14 * scale)))
+        assert right[2] + 45 < region[2], ('Fixture body exceeds native sample region', region, right)
+        baseline_frames, off_item = capture('off')
+        assert len(set(baseline_frames)) == 1, ('Off source is not stable', style, off_item)
+        baseline = baseline_frames[-1]
+        evidence.append(dict(style=style, **off_item))
+        for choice in choices:
+            variant = {'outline': False} if choice == 'luminous_outline' else (
+                      {'glint': False} if choice == 'accent_underline' else {})
+            animated = choice in ('breathing_glow', 'text_shimmer')
+            observe(choice, mention=choice, strength=100, animated=animated, **variant)
+            observe(choice + '-reduced', mention=choice, strength=100, reduced=True, **variant)
+            observe(choice + '-fx-off', mention=choice, fx='off', suppressed=True)
+            observe(choice + '-zero', mention=choice, strength=0, suppressed=True)
+            _, low = observe(choice + '-low', mention=choice, strength=20, reduced=True, **variant)
+            _, high = observe(choice + '-high', mention=choice, strength=100, reduced=True, **variant)
+            assert high['maximum_off_delta'] > low['maximum_off_delta'] * 1.2, (
+                'Strength does not change actual decoration intensity', style, choice, low, high)
+            if choice in ('luminous_outline', 'accent_underline'):
+                variant = {'outline': True} if choice == 'luminous_outline' else {'glint': True}
+                observe(choice + '-variant', mention=choice, strength=100, animated=True, **variant)
+                observe(choice + '-variant-reduced', mention=choice, strength=100,
+                        reduced=True, **variant)
+            if animated or choice in ('luminous_outline', 'accent_underline'):
+                _, slow = observe(choice + '-slow', mention=choice, strength=100, speed=25,
+                                  animated=True, sample_seconds=17, **variant)
+                _, fast = observe(choice + '-fast', mention=choice, strength=100, speed=200,
+                                  animated=True, **variant)
+                assert fast['temporal_delta'] > slow['temporal_delta'] * 1.2, (
+                    'Speed does not change native animation rate', style, choice, slow, fast)
+        _policy_effects(ctx, mention='neon_mention', strength=100)
+        _policy_focus(ctx, ctx['channel_id'])
+        _policy_focus(ctx, ctx['query_id'])
+        frames, revisit = capture('revisit')
+        assert all(delta(frame, baseline) > 24 for frame in frames), (
+            'Retained mention disappeared after revisit', style, revisit)
+        evidence.append(dict(style=style, **revisit))
+        _policy_chat(ctx, fools=[ctx['query_target']])
+        gui.command('show-fools', window=ctx['window'])
+        gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
+        _policy_effects(ctx, mention='off')
+        fool_frames, _ = capture('shown-fool-off')
+        baseline = fool_frames[-1]
+        for choice in choices:
+            observe(choice + '-shown-fool', mention=choice, strength=100, suppressed=True)
+        _policy_appearance(ctx, fool='hidden')
+        gui.command('hide-fools', window=ctx['window'])
+        gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
+        assert_source_absent('Hidden fool source pixels leaked')
+        _policy_chat(ctx, fools=[])
+
+    saved = _policy_effects(ctx, mention='accent_underline', strength=73, glint=True, speed=135)
     gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
-    _policy_effects(ctx, mention='border_halo')
-    private_text = ctx['own_nick'] + ': HiddenMentionPrivacyProbe'
-    _policy_send(ctx, private_text)
-    words = _policy_words(ctx, 'mention-hidden-privacy')
-    assert not any('hiddenmentionprivacyprobe' in text.casefold() for text, _ in words), (
-        'Hidden Fool content leaked into native pixels', words)
-    _policy_chat(ctx, fools=[])
+    target = destination.with_name(destination.stem + '-mention-before-restart.bmp')
+    out, err = gui.finish_gui(ctx['proc'], ctx['window'], ctx['screenshot'], target, ctx['args'].size)
+    ctx['logs'].append(('mention-before-restart', out, err))
+    departed = {ctx['own_nick'], ctx['other_nick']}
+    while departed:
+        _, _, prefix = ctx['observer'].wait(lambda command, params, prefix:
+            command == 'QUIT' and prefix.split('!', 1)[0] in departed, timeout=15)
+        departed.remove(prefix.split('!', 1)[0])
+    screenshot = Path(ctx['screenshot']).with_name('mention-effects-restart.bmp')
+    proc, window = gui.launch_gui(ctx['binary'], screenshot, ctx['env'], ctx['args'].size, ctx['logs'])
+    ctx.update(proc=proc, window=window, screenshot=screenshot)
+    gui.wait_joins(ctx['observer'], ctx['channel'], (ctx['own_nick'], ctx['other_nick']))
+    _policy_focus(ctx, ctx['query_id'])
+    persisted = gui.save_preferences(proc, ctx['preferences'], window)['appearance']
+    keys = ('mention_effect', 'mention_strength', 'mention_speed',
+            'mention_outline_breathing', 'mention_underline_glint')
+    assert {key: persisted[key] for key in keys} == {key: saved[key] for key in keys}, (
+        'Native save/reload lost mention settings', saved, persisted)
+    left, right = _policy_wait_box(ctx, left_rgb), _policy_wait_box(ctx, right_rgb)
+    layout = gui.read_layout(ctx['preferences'])
+    x, y, width, height = layout['conversation']['rect']
+    scale = layout['scale']
+    region = (round(x + 2 * scale), max(round(y), left[1] - round(42 * scale)),
+              round(x + width - 110 * scale), min(round(y + height), left[3] + round(14 * scale)))
+    _policy_effects(ctx, mention='off')
+    baseline_frames, _ = capture('history-off')
+    baseline = baseline_frames[-1]
+    observe('history-reloaded', mention='accent_underline', strength=73, glint=True,
+            speed=135, animated=True)
+    for index in range(48):
+        _policy_send(ctx, f'Quiet retained visibility control row {index}', durable=False)
+    gui.wait_messages(ctx['proc'], ctx['database_path'], ctx['expected_messages'])
+    time.sleep(2)
+    assert_source_absent('Visibility control failed to move every mention offscreen')
+    pane = gui.read_layout(ctx['preferences'])['conversation']['rect']
+    quiet_region = (round(pane[0] + 2), round(pane[1] + 60 * scale),
+                    round(pane[0] + pane[2] - 110 * scale),
+                    round(gui.native_input_rectangle(ctx['window'])[1] - 12 * scale))
+    def quiet_sample():
+        trace = gui.GUI_DEBUG[ctx['window']][1]
+        offset = trace.stat().st_size
+        pixels = []
+        started = time.monotonic()
+        while time.monotonic() - started < 2.2:
+            pixels.append(_policy_crop(gui.native_rgb_capture(ctx['window']), quiet_region))
+            time.sleep(.15)
+        with trace.open('rb') as stream:
+            stream.seek(offset)
+            commits = len(re.findall(rb'wl_surface[@#]\d+\.commit\(', stream.read()))
+        assert len(set(pixels)) == 1, 'Offscreen mention animation changed visible ordinary rows'
+        return commits
+    enabled_commits = quiet_sample()
+    _policy_effects(ctx, mention='off')
+    time.sleep(2)
+    off_commits = quiet_sample()
+    assert enabled_commits <= off_commits + 2, (
+        'Offscreen mentions kept the native surface animating', enabled_commits, off_commits)
+    _policy_capture(ctx, 'mention-offscreen')
     return _refresh_return(ctx, 'mention-effects', {
-        'cases': evidence, 'motion': 'none', 'reveal': 'none', 'hidden_fool_body_absent': True,
-        'limits': ['Channel deltas above 32 exceed the global veil maximum of 25; a real Off control '
-                   'also runs per layout. Low-contrast palettes may not produce enough observable accent '
-                   'contrast and fail rather than claiming proof. Exact easing, two-pulse count, rounded '
-                   'radius and selected glyph contrast remain C++ checks.',
-                   'Read-position, replay, synthetic-result and selection exclusion are C++ lifecycle checks.']})
+        'cases': evidence, 'saved_reloaded_settings': {key: persisted[key] for key in keys},
+        'history_restart': True, 'hidden_fool_source_pixels_absent': True,
+        'visible_only': {'enabled_commits': enabled_commits, 'off_commits': off_commits,
+                         'region': quiet_region, 'all_source_markers_offscreen': True},
+        'motion': 'none', 'reveal': 'none',
+        'limits': ['Native raster checks observe retained row appearance and scheduling motion; '
+                   'cache allocations, glyph fragment coverage, selection/copy and precise outline '
+                   'geometry remain focused C++ regression checks.']})
 
 
 def run_avatar_alignment(ctx):
@@ -10054,6 +10175,329 @@ def run_conversation_history(ctx):
         'custom_and_disabled_bindings': saved,
         'selection_evidence': 'native UTF-8 text/caret plus private saved active_buffer and layout',
     })
+
+
+def run_operator_tools(ctx):
+    import secrets
+
+    p, w, prefs, db = ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path']
+    observer, channel, own = ctx['observer'], ctx['channel'], ctx['own_nick']
+    destination, zoom = Path(ctx['destination']), ctx['args'].zoom
+    evidence, captures = [], []
+    _policy_focus(ctx, ctx['channel_id'])
+    initial = gui.save_state(p, prefs, db)[0]
+    original_size = gui.window_geometry(w)
+    size = original_size['WIDTH'], original_size['HEIGHT']
+    guest_nick = 'OperatorGuest'
+    mask, reason = '*!*@operator-native.invalid', 'Private native operator confirmation'
+
+    def capture(label):
+        path = str(gui.capture_window(w, destination, 'operator-tools-' + label))
+        captures.append(path)
+        return path
+
+    def label_rect(label, region=None):
+        if region is None:
+            region = gui.read_layout(prefs)['conversation']['rect']
+        for spelling in dict.fromkeys((label, label.replace('…', '...'),
+                                       label.replace('…', '..'), label.replace('…', ''))):
+            rect = upload.label_rect(w, destination, spelling, region=region)
+            if rect:
+                return rect
+        return None
+
+    def names():
+        observer.send('NAMES ' + channel)
+        result = []
+        while True:
+            command, params, _ = observer.wait(lambda command, params, prefix:
+                command in ('353', '366') and channel in params, timeout=15)
+            if command == '366':
+                return result
+            result.extend(params[-1].split())
+
+    def status(nick):
+        prefix = observer.isupport['PREFIX'].split(')', 1)[1]
+        members = names()
+        matches = [name for name in members if name.lstrip(prefix) == nick]
+        assert len(matches) == 1, (nick, members)
+        return matches[0][:-len(nick)]
+
+    def notice(text):
+        def retained():
+            with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as database:
+                return database.execute(
+                    'SELECT buffer,nick,text FROM messages WHERE nick=? AND text LIKE ?',
+                    ('ChanServ', '%' + text + '%')).fetchall()
+        return gui.SESSION.until('real retained ChanServ response ' + text, retained)
+
+    def seek_input(value):
+        def advance():
+            gui.framed_keys(w, 'Tab')
+            state = gui.native_input_state(w)
+            return state if state and state.get('caret') and state.get('text') == value else False
+        return gui.SESSION.until('actual operator input ' + repr(value), advance)
+
+    def scroll(steps):
+        bounds = gui.window_geometry(w)
+        gui.move_pointer(w, bounds['WIDTH'] / 2, bounds['HEIGHT'] / 2)
+        marker = gui.GUI_DEBUG[w][1].stat().st_size
+        gui.POINTER.scroll(steps)
+        gui.await_native_frame(w, marker, re.compile(r'wl_pointer[@#]\d+\.axis'))
+
+    def control(label, *, direction=1):
+        def locate():
+            rect = label_rect(label)
+            if not rect:
+                scroll(3 * direction)
+            return rect
+        rect = gui.SESSION.until('actual operator control ' + label, locate)
+        marker = gui.GUI_DEBUG[w][1].stat().st_size
+        gui.click(w, rect[0] + rect[2] / 2, rect[1] + rect[3] / 2)
+        gui.await_native_frame(w, marker, re.compile(r'wl_pointer[@#]\d+\.button\('))
+
+    def caption(text):
+        return gui.SESSION.until('server-backed operator caption ' + text,
+            lambda: label_rect(text))
+
+    def painted_action(title, *, destructive=True):
+        heading = caption(title)
+        image = gui.native_rgb_capture(w)
+        left, right = round(heading[0]), image['width'] - round(heading[0])
+        runs = []
+        for y in range(round(heading[1] + heading[3]), image['height']):
+            start = None
+            for x in range(left, right + 1):
+                offset = (y * image['width'] + min(x, image['width'] - 1)) * 3
+                red, green, blue = image['pixels'][offset:offset + 3]
+                colored = (red > 140 and red > green + 25 and red > blue + 25
+                           if destructive else
+                           blue > 140 and blue > red + 15 and blue > green + 25)
+                if x == right:
+                    colored = False
+                if colored and start is None:
+                    start = x
+                elif not colored and start is not None:
+                    if x - start >= 32 * zoom:
+                        runs.append((x - start, (start + x) / 2, y))
+                    start = None
+        assert runs, ('No actual painted modal action', title, destructive)
+        _, x, y = max(runs)
+        print('Native painted action:', json.dumps({
+            'title': title, 'destructive': destructive, 'point': [x, y]}), flush=True)
+        marker = gui.GUI_DEBUG[w][1].stat().st_size
+        gui.click(w, x, y)
+        gui.await_native_frame(w, marker, re.compile(r'wl_pointer[@#]\d+\.button\('))
+
+    def toggle(label):
+        rect = caption(label)
+        image = gui.native_rgb_capture(w)
+        y = round(rect[1] + rect[3] / 2)
+        candidates = []
+        start = None
+        for x in range(round(rect[0] + rect[2] + 24 * zoom), image['width']):
+            offset = (y * image['width'] + x) * 3
+            rgb = image['pixels'][offset:offset + 3]
+            accent = max(rgb) > 70 and max(rgb) - min(rgb) > 35
+            if accent and start is None:
+                start = x
+            elif not accent and start is not None:
+                if 12 * zoom <= x - start <= 70 * zoom:
+                    candidates.append((start + x) / 2)
+                start = None
+        assert len(candidates) == 1, ('Expected one rendered native switch on row', label, candidates)
+        marker = gui.GUI_DEBUG[w][1].stat().st_size
+        gui.click(w, candidates[0], y)
+        gui.await_native_frame(w, marker, re.compile(r'wl_pointer[@#]\d+\.button\('))
+
+    def wire_mode(flags, *arguments, actor=None):
+        start = len(observer.frames)
+        try:
+            return observer.wait(lambda command, params, prefix:
+                command == 'MODE' and params == [channel, flags, *arguments] and
+                (actor is None or prefix.split('!', 1)[0] == actor), timeout=15)
+        except TimeoutError as error:
+            observed = [frame for frame in observer.frames[start:]
+                        if frame['command'] == 'MODE' or frame['command'].isdigit()]
+            capture('wire-mode-failure-current')
+            scroll(-50)
+            capture('wire-mode-failure-top')
+            with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as database:
+                retained = database.execute(
+                    'SELECT buffer,nick,text FROM messages ORDER BY seq DESC LIMIT 12').fetchall()
+            raise AssertionError({'expected_mode': [channel, flags, *arguments],
+                                  'actor': actor, 'actual_frames': observed,
+                                  'recent_retained': retained}) from error
+
+    def query_bans():
+        observer.send('MODE ' + channel + ' +b')
+        result = []
+        while True:
+            command, params, _ = observer.wait(lambda command, params, prefix:
+                command in ('367', '368') and channel in params, timeout=15)
+            if command == '368':
+                return result
+            result.append(params[2])
+
+    def member_kick():
+        gui.set_people(p, w, prefs, db, 'expanded')
+        gui.save_state(p, prefs, db)
+        layout = gui.read_layout(prefs)
+        people = layout['people']['rect']
+        rect = gui.SESSION.until('real joined operator test member in People',
+            lambda: upload.label_rect(w, destination, guest_nick, region=people))
+        popup = gui.open_native_popup(w, lambda: (
+            gui.move_pointer(w, rect[0] + rect[2] / 2, rect[1] + rect[3] / 2),
+            gui.POINTER.button(True, code=273), gui.POINTER.button(False, code=273)))
+        captures.append(str(gui.capture_native_popup(w, popup, destination,
+                                                    'operator-tools-member-menu')))
+        submenu = gui.open_native_submenu(w, popup, 3)
+        captures.append(str(gui.capture_native_popup(w, submenu, destination,
+                                                    'operator-tools-moderation-menu')))
+        assert 'q' in observer.isupport['PREFIX'].split(')', 1)[0], (
+            'Private Ergo must advertise PREFIX owner q, not a quiet list',
+            observer.isupport['PREFIX'])
+        gui.popup_keys(w, submenu, 'End', 'Up', 'Up', 'Return')
+        caption('Kick member')
+        seek_input('')
+        gui.type_text(reason)
+        gui._composer_native(w, reason, len(reason.encode()), len(reason.encode()))
+        painted_action('Kick member')
+        caption('Confirm kick?')
+        caption(guest_nick)
+        capture('kick-confirmation')
+
+    try:
+        gui.resize_panel_viewport(w, (max(size[0], int(1440 * zoom)),
+                                      max(size[1], int(940 * zoom))))
+        gui.set_navigation(p, w, prefs, db, 'expanded', 'operator-tools-source')
+        assert not status(own), 'GUI must start without channel privileges'
+        root = gui.open_title_menu(w, gui.title_actions(gui.read_layout(prefs), zoom))
+        captures.append(str(gui.capture_native_popup(w, root, destination,
+                                                    'operator-tools-more-menu')))
+        rect = gui.SESSION.until('native Channel tools action',
+            lambda: label_rect('Channel tools…', region=root['rect']))
+        gui.click(w, rect[0] + rect[2] / 2, rect[1] + rect[3] / 2)
+        caption('Channel tools')
+        caption('Not an operator')
+        seek_input('ChanServ')
+        gui.framed_keys(w, 'ctrl+End')
+        service = gui._composer_native(w, 'ChanServ', len('ChanServ'), len('ChanServ'))
+        control('Request operator', direction=-1)
+        denied = notice("You don't have any stored privileges on that channel")
+        assert not status(own), 'Denied ChanServ request granted a real privilege'
+        caption('Not an operator')
+        evidence.append({'phase': 'denied-request', 'retained_notice': denied,
+                         'server_prefix': '', 'service_input': service,
+                         'capture': capture('denied-unchanged-privilege')})
+        control('Close')
+
+        password = secrets.token_hex(20)
+        observer.send('PRIVMSG NickServ :REGISTER ' + password + ' *')
+        observer.wait(lambda command, params, prefix: command == 'NOTICE' and
+            prefix.split('!', 1)[0] == 'NickServ' and params[-1] == 'Account created', timeout=15)
+        observer.send('PRIVMSG ChanServ :REGISTER ' + channel)
+        observer.wait(lambda command, params, prefix: command == 'NOTICE' and
+            prefix.split('!', 1)[0] == 'ChanServ' and
+            params[-1] == 'Channel ' + channel + ' successfully registered', timeout=15)
+        account = ctx['lab'].endpoints['direct']['username']
+        observer.send('PRIVMSG ChanServ :AMODE ' + channel + ' +o ' + account)
+        wire_mode('+o', own)
+        observer.send('MODE ' + channel + ' -o ' + own)
+        revoked = wire_mode('-o', own, actor=ctx['query_target'])
+        assert not status(own), 'Stored ACL must not retain live operator status'
+        upload.focus_composer(w)
+        gui.type_text('/channeltools ' + channel)
+        gui.framed_keys(w, 'Return')
+        caption('Not an operator')
+        control('Request operator', direction=-1)
+        granted = wire_mode('+o', own, actor='irc.localhost')
+        assert '@' in status(own), 'Authorized ChanServ request did not grant actual +o'
+        gui.SESSION.until('native operator badge changes only after real server grant',
+            lambda: not label_rect('Not an operator') and label_rect('Operator'))
+        evidence.append({'phase': 'authorized-self-op', 'acl_account': account,
+                         'revocation_wire': revoked, 'grant_wire': granted,
+                         'server_prefix': status(own), 'capture': capture('authorized-real-op')})
+
+        toggle('Invite only (+i)')
+        enabled = wire_mode('+i', actor=own)
+        capture('safe-mode-enabled')
+        toggle('Invite only (+i)')
+        disabled = wire_mode('-i', actor=own)
+        observer.send('MODE ' + channel)
+        snapshot = observer.wait(lambda command, params, prefix:
+            command == '324' and channel in params, timeout=15)
+        assert 'i' not in snapshot[1][2], snapshot
+        control('Refresh bans')
+        caption('No server bans')
+        assert query_bans() == []
+        seek_input('')
+        gui.type_text(mask)
+        gui._composer_native(w, mask, len(mask), len(mask))
+        capture('explicit-ban-input')
+        control('Add ban…')
+        caption('Add ban?')
+        capture('explicit-ban-confirmation')
+        painted_action('Add ban?')
+        added = wire_mode('+b', mask, actor=own)
+        assert query_bans() == [mask]
+        control('Refresh bans')
+        caption('1 server bans')
+        seek_input(mask)
+        gui.framed_keys(w, 'shift+Tab')
+        selection = gui.open_native_popup(w, lambda: gui.key('Return'))
+        captures.append(str(gui.capture_native_popup(w, selection, destination,
+                                                    'operator-tools-real-ban-list')))
+        gui.popup_keys(w, selection, 'Home', 'Return')
+        control('Remove selected ban…')
+        caption('Remove ban?')
+        capture('explicit-unban-confirmation')
+        painted_action('Remove ban?')
+        removed = wire_mode('-b', mask, actor=own)
+        control('Refresh bans')
+        caption('No server bans')
+        assert query_bans() == []
+        evidence.append({'phase': 'safe-mode-and-server-ban-list', 'enabled_wire': enabled,
+                         'disabled_wire': disabled, 'mode_snapshot': snapshot,
+                         'added_wire': added, 'removed_wire': removed,
+                         'final_server_bans': [], 'capture': capture('server-empty-ban-snapshot')})
+        control('Close')
+
+        with gui.fixtures.BootstrapClient(
+                dict(ctx['lab'].endpoints['direct'], nick=guest_nick, username=guest_nick),
+                ctx['lab'].ca_file, authenticate=False) as guest:
+            guest.send('JOIN ' + channel)
+            gui.receive_until(observer, 'JOIN', [channel], guest_nick)
+            member_kick()
+            painted_action('Confirm kick?', destructive=False)
+            assert status(guest_nick) == '', 'Cancel unexpectedly removed the member'
+            gui.framed_keys(w, 'Escape')
+            member_kick()
+            painted_action('Confirm kick?')
+            kicked = gui.receive_until(observer, 'KICK', [channel, guest_nick, reason], own)
+            guest.wait(lambda command, params, prefix:
+                command == 'KICK' and params == [channel, guest_nick, reason], timeout=15)
+            assert not any(name.lstrip('~&@%+') == guest_nick for name in names())
+            gui.framed_keys(w, 'Escape')
+            gui.save_state(p, prefs, db)
+            text = guest_nick + ' was kicked by ' + own + ' — ' + reason
+            gui.wait_rows(p, db, 'SELECT text FROM messages WHERE buffer=? AND text=?',
+                          (ctx['channel_id'], text), [(text,)])
+            assert gui.save_state(p, prefs, db)[1] == (ctx['channel_id'],)
+            evidence.append({'phase': 'source-bound-member-kick', 'cancel_kept_member': True,
+                             'source_buffer': ctx['channel_id'], 'wire': kicked,
+                             'durable_activity': text, 'other_network_nick': ctx['other_nick'],
+                             'capture': capture('source-kick-durable')})
+    finally:
+        if sys.exc_info()[0] is None:
+            gui.framed_keys(w, 'Escape', 'Escape')
+            gui.resize_panel_viewport(w, size)
+            gui.set_people(p, w, prefs, db, initial['people_mode'])
+            gui.set_navigation(p, w, prefs, db, initial['native_navigation_mode'],
+                               'operator-tools-restore-navigation')
+    return _refresh_return(ctx, 'operator-tools', {'phases': evidence, 'captures': captures,
+        'fixture_prerequisite': 'Ergo channels.registration.enabled=true; private SASL account',
+        'authorization': 'real ChanServ persistent +o ACL, revoked live +o, then explicit OP request'})
 
 
 if __name__ == "__main__":

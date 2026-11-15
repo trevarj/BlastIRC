@@ -253,6 +253,10 @@ void sliderInput(Node &node, InputDispatcher &dispatcher) {
     if (!node.visible())
         return;
     if (auto *slider = dynamic_cast<Slider *>(&node)) {
+        if (!slider->enabled()) {
+            assert(!dispatcher.firstTabFocusUnder(slider));
+            return;
+        }
         auto *area = dispatcher.firstTabFocusUnder(slider);
         assert(area && slider->enabled());
         const auto value = slider->value();
@@ -1657,6 +1661,29 @@ void runSettingsCheck() {
     }
     named<Slider>(dialogs, "Incoming duration (100–2000 ms)")->setValue(900);
     assert(model.settings.incomingDurationMs == 900);
+    auto *mention = named<Select>(dialogs, "Mention effect");
+    auto *strength = named<Slider>(dialogs, "Mention strength (0–100%)");
+    auto *speed = named<Slider>(dialogs, "Mention speed (25–200%)");
+    auto *outline = named<Toggle>(dialogs, "Breathing outline");
+    auto *glint = named<Toggle>(dialogs, "Traveling underline glint");
+    for (std::size_t effect = 0; effect < 6; ++effect) {
+        mention->setSelectedIndex(effect);
+        assert(model.settings.mentionEffect == MentionEffect(effect));
+        assert(strength->enabled() == (effect != 0));
+        assert(outline->enabled() == (effect == 3));
+        assert(glint->enabled() == (effect == 5));
+        assert(speed->enabled() == (effect == 2 || effect == 4));
+    }
+    activate(dispatcher, *glint);
+    assert(model.settings.mentionUnderlineGlint && speed->enabled());
+    mention->setSelectedIndex(3);
+    activate(dispatcher, *outline);
+    assert(model.settings.mentionOutlineBreathing && speed->enabled());
+    strength->setValue(73);
+    speed->setValue(155);
+    assert(std::abs(model.settings.mentionStrength - .73f) < .001f &&
+           std::abs(model.settings.mentionSpeed - 1.55f) < .001f);
+    sliderInput(dialogs, dispatcher);
     named<Select>(dialogs, "Effects")->setSelectedIndex(0);
     assert(model.settings.fx == FxLevel::Off);
     activate(dispatcher, *named<Toggle>(dialogs, "Reduced motion"));
@@ -1798,6 +1825,11 @@ void runSettingsCheck() {
     assert(loaded.settings.incomingMotion == model.settings.incomingMotion &&
            loaded.settings.incomingReveal == model.settings.incomingReveal &&
            loaded.settings.incomingDurationMs == model.settings.incomingDurationMs &&
+           loaded.settings.mentionEffect == model.settings.mentionEffect &&
+           loaded.settings.mentionStrength == model.settings.mentionStrength &&
+           loaded.settings.mentionSpeed == model.settings.mentionSpeed &&
+           loaded.settings.mentionOutlineBreathing == model.settings.mentionOutlineBreathing &&
+           loaded.settings.mentionUnderlineGlint == model.settings.mentionUnderlineGlint &&
            loaded.settings.foolDisplay == model.settings.foolDisplay &&
            loaded.settings.foolUnread == model.settings.foolUnread &&
            loaded.settings.messageWrapColumns == model.settings.messageWrapColumns);

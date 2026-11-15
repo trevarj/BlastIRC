@@ -728,7 +728,10 @@ Body body(Node &view, std::string_view token, bool complete = false,
     assert(fragment && fragment->parent());
     auto *body = fragment->parent();
     auto *content = body->parent();
-    auto *row = content ? dynamic_cast<InputArea *>(content->parent()) : nullptr;
+    InputArea *row = nullptr;
+    for (auto *ancestor = content ? content->parent() : nullptr; ancestor && !row;
+         ancestor = ancestor->parent())
+        row = dynamic_cast<InputArea *>(ancestor);
     assert(row && row->visible());
     return {*text, *fragment, *content, *row, *body};
 }
@@ -739,8 +742,9 @@ void unchanged(const blast::Buffer &actual, const blast::Buffer &before) {
     for (std::size_t i = 0; i < before.messages.size(); ++i) {
         const auto fields = [](const blast::Message &m) {
             return std::tie(m.id, m.nick, m.text, m.time, m.reply, m.label, m.timestamp, m.arrival,
-                            m.own, m.history, m.pending, m.deleted, m.mention, m.action, m.presence,
-                            m.reactions, m.sendStatus, m.activity, m.activityTarget);
+                            m.own, m.history, m.pending, m.deleted, m.mention, m.mentionNick,
+                            m.action, m.presence, m.reactions, m.sendStatus, m.activity,
+                            m.activityTarget);
         };
         assert(fields(actual.messages[i]) == fields(before.messages[i]));
     }
@@ -963,7 +967,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
             else
                 near(baseline(*nick), baseline(rendered.text));
         }
-        rail(body(view, "DecorationBody2", true), "tertiary");
+        rail(body(view, "DecorationBody2", true), {});
     };
     for (const char *style : {"monogram", "sprite"}) {
         model.settings.avatarStyle = style;
@@ -6938,264 +6942,541 @@ void visitSeparator(TranscriptTestRenderer &renderer) {
     assert(plainText(body(emptyView, "NewlyMutedUnread").row, "New since your last visit"));
 }
 
-void mentionAccentLifecycle(TranscriptTestRenderer &renderer) {
+void persistentMentionStyles(TranscriptTestRenderer &renderer) {
     for (const auto layout :
          {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc, blast::MessageLayout::Stacked})
         for (const auto effect :
-             {blast::MentionEffect::TextShimmer, blast::MentionEffect::RailPulse,
-              blast::MentionEffect::BorderHalo}) {
+             {blast::MentionEffect::NeonMention, blast::MentionEffect::BreathingGlow,
+              blast::MentionEffect::LuminousOutline, blast::MentionEffect::TextShimmer,
+              blast::MentionEffect::AccentUnderline}) {
             blast::Model model;
-            model.now = 10;
+            model.now = 100;
             model.settings.timestamps = model.settings.avatars = false;
             model.settings.reducedMotion = false;
             model.settings.fx = blast::FxLevel::Full;
             model.settings.incomingMotion = blast::SendMotion::None;
             model.settings.incomingReveal = blast::SendReveal::None;
             model.settings.mentionEffect = effect;
+            model.settings.mentionStrength = .6f;
             model.settings.foolDisplay = blast::FoolDisplay::Shown;
             model.settings.presence = blast::PresenceMode::All;
             blast::Theme theme;
             theme.update(model);
-            auto &buffer = model.buffers["mention-accent"];
-            buffer.id = buffer.target = "mention-accent";
+            auto &buffer = model.buffers["persistent-mention"];
+            buffer.id = buffer.target = "persistent-mention";
             buffer.kind = "channel";
+            buffer.server = "network";
             buffer.muted = true;
+            model.networks[buffer.server].nick = "CurrentMe";
             model.settings.messageLayouts[buffer.id] = layout;
+            buffer.nicks = {{.name = "Other", .account = {}, .prefix = {}}};
+            blast::Message message;
+            message.id = "persistent-history";
+            message.nick = "Peer";
+            message.text = "PersistentBody Old\x02Me\x02 Other https://example.org/OldMe "
+                           "\x03"
+                           "04,02\x1f"
+                           "ColoredBody😀\x1f\x0f";
+            message.mention = message.history = true;
+            message.mentionNick = "OldMe";
+            message.arrival = 1;
+            buffer.messages.push_back(message);
+            const auto before = buffer;
             blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
             Clipboard clipboard;
             InputDispatcher dispatcher;
             blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+            view.setReadEligible(false);
             view.setWindowActive(true);
             dispatcher.setSceneRoot(&view);
             view.setInputDispatcher(dispatcher);
-            LayoutRect viewport{17, 23, 700, 300};
+            LayoutRect viewport{17, 23, 900, 600};
             const auto arrange = [&] {
                 view.sync();
                 view.arrange(renderer, viewport);
             };
-            const auto paintedColor = [](const TextNode &text) {
-                auto color = text.color();
-                for (const auto &child : text.children())
-                    if (const auto *glyph = dynamic_cast<TextNode *>(child.get());
-                        glyph && glyph->visible()) {
-                        const auto over = glyph->color();
-                        const float alpha = glyph->opacity() * over.a;
-                        color.r = std::lerp(color.r, over.r, alpha);
-                        color.g = std::lerp(color.g, over.g, alpha);
-                        color.b = std::lerp(color.b, over.b, alpha);
+            const auto roots = [&](const Body &rendered) {
+                std::vector<Node *> result;
+                for (const auto &area : rendered.body.children())
+                    if (dynamic_cast<InputArea *>(area.get()))
+                        for (const auto &child : area->children())
+                            if (!dynamic_cast<TextNode *>(child.get()) &&
+                                !dynamic_cast<RectNode *>(child.get()))
+                                result.push_back(child.get());
+                for (Node *container : {&rendered.content, static_cast<Node *>(&rendered.row)})
+                    for (const auto &child : container->children()) {
+                        if (child.get() == rendered.content.parent())
+                            continue;
+                        if (auto *rect = dynamic_cast<RectNode *>(child.get());
+                            rect && rect->style().borderWidth > 0)
+                            result.push_back(rect);
+                        else if (child.get() != &rendered.body &&
+                                 !dynamic_cast<InputArea *>(child.get()) &&
+                                 !dynamic_cast<blast::MaterialNode *>(child.get())) {
+                            const auto halo = [&](auto &&self, Node &node) -> bool {
+                                if (const auto *rect = dynamic_cast<RectNode *>(&node);
+                                    rect && rect->style().outerShadow)
+                                    return true;
+                                for (const auto &nested : node.children())
+                                    if (self(self, *nested))
+                                        return true;
+                                return false;
+                            };
+                            if (halo(halo, *child))
+                                result.push_back(child.get());
+                        }
                     }
-                return color;
+                return result;
             };
-            const auto coloredText = [&]() -> TextNode & {
-                for (const auto &area : body(view, "LiveMentionAccent").body.children())
-                    for (const auto &child : area->children())
-                        if (auto *text = dynamic_cast<TextNode *>(child.get());
-                            text && text->text().find("ColoredBody") != std::string::npos)
-                            return *text;
-                std::abort();
+            const auto signature = [&](const Body &rendered) {
+                std::vector<float> result;
+                const auto visit = [&](auto &&self, Node &node, float opacity) -> void {
+                    if (!node.visible() || (opacity *= node.opacity()) <= 0)
+                        return;
+                    result.insert(result.end(), {opacity, node.x(), node.y(), node.width(),
+                                                 node.height(), node.foregroundBlurRadius()});
+                    if (const auto *clip = node.pixelPartitionClip())
+                        result.insert(result.end(),
+                                      {clip->left, clip->top, clip->right, clip->bottom});
+                    if (auto *rect = dynamic_cast<RectNode *>(&node))
+                        result.insert(result.end(), {rect->style().fill.a, rect->style().border.a});
+                    for (const auto &child : node.children())
+                        self(self, *child, opacity);
+                };
+                for (auto *root : roots(rendered))
+                    visit(visit, *root, 1);
+                return result;
             };
-            const auto strength = [&](std::string_view token) {
-                const auto rendered = body(view, token);
-                if (effect == blast::MentionEffect::TextShimmer) {
-                    const auto normal = blast::themeForegroundColor("on_surface");
-                    const auto color = paintedColor(rendered.text);
-                    return std::abs(color.r - normal.r) + std::abs(color.g - normal.g) +
-                           std::abs(color.b - normal.b);
+            const auto decorated = [&] { return !signature(body(view, "PersistentBody")).empty(); };
+            const auto originals = [&] {
+                std::vector<std::tuple<std::string, Color, float>> result;
+                for (const auto &area : body(view, "PersistentBody").body.children())
+                    if (dynamic_cast<InputArea *>(area.get()))
+                        for (const auto &child : area->children())
+                            if (auto *text = dynamic_cast<TextNode *>(child.get()))
+                                result.emplace_back(text->text(), text->color(), text->opacity());
+                return result;
+            };
+            arrange();
+            assert(decorated());
+            const auto sortedChildren = [&](auto &&self, const Node &node) -> void {
+                int previous = std::numeric_limits<int>::min();
+                for (const auto &child : node.children()) {
+                    assert(child->zIndex() >= previous);
+                    previous = child->zIndex();
+                    self(self, *child);
                 }
-                float alpha = 0;
-                for (const auto &child : rendered.content.children())
-                    if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                        rect && rect->visible()) {
-                        const auto &style = rect->style();
-                        if (effect == blast::MentionEffect::BorderHalo && style.borderWidth > 0)
-                            alpha = std::max(alpha, style.border.a);
-                        if (effect == blast::MentionEffect::RailPulse &&
-                            std::abs(rect->width() - 2 * blast::themeScale()) < .02f &&
-                            roundedCorners(style.radius))
-                            alpha = std::max(alpha, style.fill.a);
-                    }
-                return alpha;
             };
-            const auto append = [&](std::string token) -> blast::Message & {
-                blast::Message message;
-                message.id = message.text = std::move(token);
-                message.nick = "morganw";
-                message.mention = true;
-                message.arrival = model.now;
-                buffer.messages.push_back(std::move(message));
-                return buffer.messages.back();
-            };
-            arrange();
-            append("LiveMentionAccent").text += " \x03"
-                                                "04,02\x1f"
-                                                "ColoredBody😀\x1f\x0f";
-            arrange();
-            const float rowHeight = body(view, "LiveMentionAccent").row.height();
-            const auto originalColor = paintedColor(coloredText());
-            model.now += .3;
-            arrange();
-            assert(strength("LiveMentionAccent") > .01f);
-            if (effect == blast::MentionEffect::TextShimmer) {
-                assert(!(paintedColor(coloredText()) == originalColor));
-                auto &rich = coloredText();
-                const auto ink = nativeTextInk(renderer, rich);
-                for (const auto &child : rich.children())
-                    if (const auto *glyph = dynamic_cast<TextNode *>(child.get())) {
-                        const auto overlayInk = nativeTextInk(renderer, *glyph);
-                        near(overlayInk.x, ink.x);
-                        near(overlayInk.y, ink.y);
-                        near(overlayInk.width, ink.width);
-                        near(overlayInk.height, ink.height);
+            sortedChildren(sortedChildren, body(view, "PersistentBody").row);
+            const auto originalInk = originals();
+            const auto height = body(view, "PersistentBody").row.height();
+            rail(body(view, "PersistentBody"), {});
+            for (const auto &child : body(view, "PersistentBody").content.children())
+                if (auto *rect = dynamic_cast<RectNode *>(child.get());
+                    rect && rect->visible() && rect->width() > viewport.width * .5f &&
+                    rect->height() >= height * .5f)
+                    assert(rect->style().fill.a == 0);
+            if (effect != blast::MentionEffect::LuminousOutline) {
+                int splitFragments = 0;
+                for (const auto &area : body(view, "PersistentBody").body.children())
+                    if (dynamic_cast<InputArea *>(area.get())) {
+                        TextNode *base = nullptr;
+                        for (const auto &child : area->children())
+                            if (auto *text = dynamic_cast<TextNode *>(child.get()))
+                                base = text;
+                        if (!base)
+                            continue;
+                        const auto text = decodedMarkup(base->text());
+                        bool active = false;
+                        for (const auto &child : area->children())
+                            if (!dynamic_cast<TextNode *>(child.get()) &&
+                                !dynamic_cast<RectNode *>(child.get()) && child->visible() &&
+                                child->opacity() > 0)
+                                active = true;
+                        if (text == "Old" || text == "Me") {
+                            assert(active);
+                            ++splitFragments;
+                            if (effect == blast::MentionEffect::NeonMention ||
+                                effect == blast::MentionEffect::BreathingGlow)
+                                for (const auto &child : area->children())
+                                    if (child->visible() && !dynamic_cast<TextNode *>(child.get()))
+                                        for (const auto &blur : child->children())
+                                            if (blur->foregroundBlurRadius() > 0) {
+                                                assert(blur->width() > base->width());
+                                                assert(blur->height() > base->height());
+                                                const auto *ink = find<TextNode>(*blur);
+                                                assert(ink);
+                                                const auto a = nativeTextInk(renderer, *base);
+                                                const auto b = nativeTextInk(renderer, *ink);
+                                                near(a.x, b.x);
+                                                near(a.y, b.y);
+                                                near(a.width, b.width);
+                                                near(a.height, b.height);
+                                            }
+                        } else
+                            assert(!active);
                     }
-                const auto beforePaint = renderer.textures.uploads;
-                renderer.paintText(body(view, "LiveMentionAccent").body);
-                if (layout == blast::MessageLayout::Bubbles)
-                    assert(renderer.textures.uploads > beforePaint);
-                const auto warmedUploads = renderer.textures.uploads;
-                for (const double now : {10.31, 10.33, 10.35}) {
-                    model.now = now;
-                    arrange();
-                    renderer.paintText(body(view, "LiveMentionAccent").body);
-                    assert(renderer.textures.uploads == warmedUploads);
+                assert(splitFragments == 2);
+            } else {
+                auto rendered = body(view, "PersistentBody");
+                const auto *surface = find<blast::MaterialNode>(rendered.content);
+                const RectNode *dense = nullptr;
+                if (layout != blast::MessageLayout::Bubbles)
+                    for (const auto &child : rendered.content.children())
+                        if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+                            rect && rect->visible() && rect->style().borderWidth == 0 &&
+                            rect->width() > 0 && rect->height() >= surface->height())
+                            dense = rect;
+                assert(layout == blast::MessageLayout::Bubbles || dense);
+                bool outline = false, halo = false;
+                for (auto *root : roots(rendered)) {
+                    if (auto *rect = dynamic_cast<RectNode *>(root); rect && rect->visible()) {
+                        assert(rect->style().fill.a == 0);
+                        near(rect->style().borderWidth, blast::themeScale());
+                        near(rect->x(), surface->x());
+                        near(rect->y(), surface->y());
+                        near(rect->width(), dense ? dense->width() : surface->width());
+                        near(rect->height(), surface->height());
+                        outline = true;
+                    } else if (root->visible()) {
+                        const auto *shadow = find<RectNode>(*root);
+                        assert(shadow && shadow->style().outerShadow);
+                        const auto shadowBounds = sceneBounds(*shadow);
+                        float surfaceX, surfaceY;
+                        Node::mapToScene(surface, 0, 0, surfaceX, surfaceY);
+                        near(shadowBounds.x, surfaceX);
+                        near(shadowBounds.y, surfaceY);
+                        near(shadowBounds.width, dense ? dense->width() : surface->width());
+                        near(shadowBounds.height, surface->height());
+                        assert(root->zIndex() < rendered.content.parent()->zIndex());
+                        bool beforeClip = false;
+                        for (const auto &sibling : rendered.row.children()) {
+                            if (sibling.get() == rendered.content.parent()) {
+                                assert(beforeClip);
+                                break;
+                            }
+                            beforeClip |= sibling.get() == root;
+                        }
+                        halo = true;
+                    }
                 }
-                dispatcher.setFocus(&body(view, "LiveMentionAccent").row);
-                assert(view.textSelectionCommand("set-mark"));
-                assert(view.textSelectionCommand("end-of-line"));
-                arrange();
-                assert(strength("LiveMentionAccent") == 0);
-                assert(paintedColor(coloredText()) == originalColor);
-                assert(view.copySelection());
-                assert(clipboard.clipboardText() == "LiveMentionAccent ColoredBody😀");
-                view.clearTextSelection();
-                dispatcher.setFocus(nullptr);
-                arrange();
-                assert(strength("LiveMentionAccent") > .01f);
-                renderer.paintText(body(view, "LiveMentionAccent").body);
-                assert(renderer.textures.uploads == warmedUploads);
+                assert(outline && halo);
             }
-            near(body(view, "LiveMentionAccent").content.x(), 0);
-            model.now += .15;
-            viewport.width -= 40;
-            buffer.messages.back().time = "12:34";
-            arrange();
-            assert(strength("LiveMentionAccent") > .01f);
-            near(body(view, "LiveMentionAccent").row.height(), rowHeight);
-            model.now = 10.6;
-            arrange();
-            assert(strength("LiveMentionAccent") < .001f);
-            model.now = 10.9;
-            arrange();
-            assert(strength("LiveMentionAccent") > .01f);
+            model.now = 10000;
+            pane.following = false;
             view.setWindowActive(false);
             arrange();
-            assert(strength("LiveMentionAccent") > .01f);
-            model.now = 11.21;
+            assert(decorated() && originals() == originalInk);
+            near(body(view, "PersistentBody").row.height(), height);
+            auto &other = model.buffers["other-buffer"];
+            other.id = other.target = "other-buffer";
+            other.kind = "channel";
+            pane.buffer = other.id;
             arrange();
-            assert(strength("LiveMentionAccent") == 0);
-            assert(paintedColor(coloredText()) == originalColor);
+            pane.buffer = buffer.id;
+            arrange();
+            assert(decorated());
+            model.settings.reducedMotion = true;
+            arrange();
+            const auto steady = signature(body(view, "PersistentBody"));
+            model.now += .71;
+            arrange();
+            assert(!steady.empty() && signature(body(view, "PersistentBody")) == steady);
+            model.settings.mentionStrength = .2f;
+            arrange();
+            const auto weak = signature(body(view, "PersistentBody"));
+            model.settings.mentionStrength = .9f;
+            arrange();
+            assert(!weak.empty() && signature(body(view, "PersistentBody")) != weak);
+            assert(signature(body(view, "PersistentBody")).front() > weak.front());
+            model.settings.mentionStrength = 0;
+            arrange();
+            assert(!decorated());
+            model.settings.mentionStrength = .6f;
+            model.settings.fx = blast::FxLevel::Off;
+            arrange();
+            assert(!decorated() && originals() == originalInk);
+            model.settings.fx = blast::FxLevel::Full;
             model.settings.mentionEffect = blast::MentionEffect::Off;
             arrange();
+            assert(!decorated());
             model.settings.mentionEffect = effect;
+            model.settings.reducedMotion = false;
+            view.setWindowActive(true);
             arrange();
-            assert(strength("LiveMentionAccent") == 0);
-            dispatcher.setSceneRoot(nullptr);
-            if (layout != blast::MessageLayout::Bubbles ||
-                effect != blast::MentionEffect::RailPulse)
-                continue;
+            const auto normal = signature(body(view, "PersistentBody"));
+            model.now += .41;
+            arrange();
+            const bool animated = effect == blast::MentionEffect::BreathingGlow ||
+                                  effect == blast::MentionEffect::TextShimmer;
+            assert((signature(body(view, "PersistentBody")) != normal) == animated);
+            if (animated) {
+                model.settings.mentionSpeed = .25f;
+                arrange();
+                const auto slow = signature(body(view, "PersistentBody"));
+                model.settings.mentionSpeed = 2;
+                arrange();
+                assert(signature(body(view, "PersistentBody")) != slow);
+            }
+            if (effect == blast::MentionEffect::LuminousOutline ||
+                effect == blast::MentionEffect::AccentUnderline) {
+                model.settings.mentionOutlineBreathing = true;
+                model.settings.mentionUnderlineGlint = true;
+                arrange();
+                const auto variant = signature(body(view, "PersistentBody"));
+                model.now += .43;
+                arrange();
+                assert(signature(body(view, "PersistentBody")) != variant);
+                model.settings.reducedMotion = true;
+                arrange();
+                const auto reducedVariant = signature(body(view, "PersistentBody"));
+                model.now += .43;
+                arrange();
+                assert(signature(body(view, "PersistentBody")) == reducedVariant);
+            }
+            model.settings.reducedMotion = false;
+            arrange();
+            renderer.paintText(body(view, "PersistentBody").content);
+            const auto warmedUploads = renderer.textures.uploads;
+            for (const double delta : {.02, .04, .06}) {
+                model.now += delta;
+                arrange();
+                renderer.paintText(body(view, "PersistentBody").content);
+                assert(renderer.textures.uploads == warmedUploads);
+                assert(originals() == originalInk);
+            }
+            dispatcher.setFocus(&body(view, "PersistentBody").row);
+            assert(view.textSelectionCommand("set-mark"));
+            assert(view.textSelectionCommand("end-of-line"));
+            arrange();
+            assert(view.copySelection());
+            assert(clipboard.clipboardText() ==
+                   "PersistentBody OldMe Other https://example.org/OldMe ColoredBody😀");
+            assert(originals() == originalInk);
+            view.clearTextSelection();
+            dispatcher.setFocus(nullptr);
+            arrange();
+            assert(decorated());
+            unchanged(buffer, before);
             for (int exclusion = 0; exclusion < 8; ++exclusion) {
-                model.now += 2;
-                const auto token = "ExcludedAccent" + std::to_string(exclusion);
-                auto &message = append(token);
-                if (exclusion == 0)
-                    message.history = true;
-                if (exclusion == 1)
-                    message.own = true;
-                if (exclusion == 2)
-                    message.pending = true;
-                if (exclusion == 3)
-                    message.deleted = true;
-                if (exclusion == 4)
-                    message.mention = false;
-                if (exclusion == 5)
-                    message.arrival = model.now - 2;
-                if (exclusion == 6)
-                    model.settings.fools.insert(message.nick);
-                if (exclusion == 7)
-                    message.presence = true;
-                arrange();
-                model.now += .3;
-                arrange();
-                assert(strength(exclusion == 3 ? "Message deleted" : token) == 0);
+                buffer.messages.front() = message;
                 model.settings.fools.clear();
+                if (exclusion == 0)
+                    buffer.messages.front().own = true;
+                if (exclusion == 1)
+                    buffer.messages.front().pending = true;
+                if (exclusion == 2)
+                    buffer.messages.front().deleted = true;
+                if (exclusion == 3)
+                    buffer.messages.front().mention = false;
+                if (exclusion == 4)
+                    buffer.messages.front().presence = true;
+                if (exclusion == 5)
+                    model.settings.fools.insert(message.nick);
+                if (exclusion == 6)
+                    buffer.messages.front().mentionNick.clear();
+                if (exclusion == 7) {
+                    buffer.messages.front().mentionNick.clear();
+                    buffer.messages.front().text = "PersistentBody Other notCurrentMe "
+                                                   "https://example.org/CurrentMe";
+                }
+                ++buffer.messagesRevision;
+                arrange();
+                const auto token = exclusion == 2 ? "Message deleted" : "PersistentBody";
+                const bool legacyOutline =
+                    effect == blast::MentionEffect::LuminousOutline && exclusion >= 6;
+                assert(signature(body(view, token)).empty() != legacyOutline);
             }
-            for (int policy = 0; policy < 6; ++policy) {
-                model.now += 2;
-                const auto token = "CancelledAccent" + std::to_string(policy);
-                append(token);
+            model.settings.fools.clear();
+            buffer.messages.front() = message;
+            buffer.messages.front().mentionNick.clear();
+            buffer.messages.front().text = "PersistentBody CurrentMe Other";
+            ++buffer.messagesRevision;
+            arrange();
+            assert(decorated());
+            model.networks[buffer.server].nick = "NextMe";
+            arrange();
+            assert(decorated() == (effect == blast::MentionEffect::LuminousOutline));
+            buffer.messages.front() = message;
+            ++buffer.messagesRevision;
+            arrange();
+            assert(decorated());
+            for (const auto policy : {blast::FoolDisplay::Blurred, blast::FoolDisplay::Dimmed,
+                                      blast::FoolDisplay::Shown}) {
+                model.settings.fools.insert(message.nick);
+                model.settings.foolDisplay = policy;
                 arrange();
-                model.now += .15;
-                arrange();
-                assert(strength(token) > .01f);
-                if (policy == 0)
-                    model.settings.reducedMotion = true;
-                if (policy == 1)
-                    model.settings.fx = blast::FxLevel::Off;
-                if (policy == 2)
-                    model.settings.mentionEffect = blast::MentionEffect::BorderHalo;
-                if (policy == 3)
-                    buffer.messages.back().mention = false;
-                if (policy == 4)
-                    view.setVisible(false);
-                if (policy == 5)
-                    pane.following = false;
-                arrange();
-                model.settings.reducedMotion = false;
-                model.settings.fx = blast::FxLevel::Full;
-                model.settings.mentionEffect = effect;
-                buffer.messages.back().mention = true;
-                view.setWindowActive(true);
-                view.setVisible(true);
-                view.scrollToBoundary(true);
-                arrange();
-                model.now += .15;
-                arrange();
-                assert(strength(token) == 0);
+                assert(!decorated());
             }
-            model.now += 2;
-            append("OffscreenAccent");
+            model.settings.fools.clear();
             arrange();
-            model.now += .15;
-            arrange();
-            assert(strength("OffscreenAccent") > .01f);
-            view.scrollToBoundary(false);
+            assert(decorated());
+            for (int i = 0; i < 80; ++i) {
+                blast::Message filler;
+                filler.id = filler.text = "UnrelatedRow" + std::to_string(i);
+                filler.nick = "Unrelated";
+                buffer.messages.push_back(std::move(filler));
+            }
+            ++buffer.messagesRevision;
             arrange();
             view.scrollToBoundary(true);
             arrange();
-            assert(strength("OffscreenAccent") == 0);
-            model.now += 2;
-            model.settings.incomingDurationMs = 100;
-            model.settings.incomingMotion = blast::SendMotion::Slide;
-            append("DelayedMentionAccent").arrival = model.now - .3;
+            assert(!bodyText(view, "PersistentBody"));
+            renderer.paintText(view);
+            const auto offscreenUploads = renderer.textures.uploads;
+            model.now += .23;
             arrange();
-            model.now += .3;
+            renderer.paintText(view);
+            assert(renderer.textures.uploads == offscreenUploads);
+            view.scrollToBoundary(false);
             arrange();
-            assert(strength("DelayedMentionAccent") > .01f);
-            near(body(view, "DelayedMentionAccent").content.x(), 0);
-            model.settings.incomingMotion = blast::SendMotion::None;
-            model.now += 2;
-            blast::Message middle;
-            middle.id = middle.text = "OffscreenLiveArrival";
-            middle.nick = "Peer";
-            middle.mention = true;
-            middle.arrival = model.now;
-            buffer.messages.insert(buffer.messages.begin(), std::move(middle));
-            ++buffer.messagesRevision;
-            arrange();
-            model.now += .3;
-            viewport.height = 10000;
-            arrange();
-            assert(pane.following && strength("OffscreenLiveArrival") == 0);
+            assert(decorated());
+            const auto retained = buffer;
+            for (const std::string kind : {"search", "mentions"}) {
+                auto &synthetic = model.buffers["synthetic-" + kind];
+                synthetic.id = "synthetic-" + kind;
+                synthetic.target = buffer.target;
+                synthetic.kind = kind;
+                auto aggregate = message;
+                aggregate.id = "aggregate-" + kind;
+                aggregate.sourceBuffer = buffer.id;
+                aggregate.sourceId = message.id;
+                aggregate.sourceServer = buffer.server;
+                aggregate.sourceTarget = buffer.target;
+                synthetic.messages.push_back(std::move(aggregate));
+                model.mentionSources[buffer.id] = retained;
+                pane.buffer = synthetic.id;
+                arrange();
+                assert(!decorated());
+            }
+            dispatcher.setSceneRoot(nullptr);
         }
+}
+
+void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
+    for (const auto layout : {blast::MessageLayout::Irc, blast::MessageLayout::Stacked}) {
+        blast::Model model;
+        model.now = 100;
+        model.settings.timestamps = model.settings.avatars = false;
+        model.settings.reducedMotion = false;
+        model.settings.fx = blast::FxLevel::Full;
+        model.settings.incomingMotion = blast::SendMotion::None;
+        model.settings.incomingReveal = blast::SendReveal::None;
+        model.settings.mentionEffect = blast::MentionEffect::LuminousOutline;
+        blast::Theme theme;
+        theme.update(model);
+        auto &buffer = model.buffers["grouped-mention-clipping"];
+        buffer.id = buffer.target = "grouped-mention-clipping";
+        buffer.kind = "channel";
+        model.settings.messageLayouts[buffer.id] = layout;
+        for (const char *token : {"AdjacentBefore", "GroupedOutline", "AdjacentAfter"}) {
+            blast::Message entry;
+            entry.id = token;
+            entry.text = std::string(token) + " Me";
+            entry.nick = "Peer";
+            entry.timestamp = 1700000000;
+            entry.history = true;
+            entry.mention = std::string_view(token) == "GroupedOutline";
+            entry.mentionNick = entry.mention ? "Me" : "";
+            buffer.messages.push_back(std::move(entry));
+        }
+        blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
+        Clipboard clipboard;
+        blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+        view.setReadEligible(false);
+        const LayoutRect viewport{17, 23, 900, 600};
+        const auto arrange = [&] {
+            view.sync();
+            view.arrange(renderer, viewport);
+        };
+        arrange();
+        const auto previous = body(view, "AdjacentBefore");
+        const auto grouped = body(view, "GroupedOutline");
+        const auto next = body(view, "AdjacentAfter");
+        const auto previousBounds = sceneBounds(previous.row);
+        const auto groupedBounds = sceneBounds(grouped.row);
+        const auto nextBounds = sceneBounds(next.row);
+        near(previousBounds.y + previousBounds.height, groupedBounds.y);
+        near(groupedBounds.y + groupedBounds.height, nextBounds.y);
+        const auto *surface = find<blast::MaterialNode>(grouped.content);
+        assert(surface);
+        near(surface->y(), 0);
+        assert(!grouped.row.clipChildren());
+        auto *rowClip = grouped.content.parent();
+        assert(rowClip && rowClip->parent() == &grouped.row && rowClip->clipChildren());
+        near(rowClip->width(), grouped.row.width());
+        near(rowClip->height(), grouped.row.height());
+        assert(find<blast::PixelRevealNode>(*rowClip));
+        Node *halo = nullptr;
+        for (const auto &child : grouped.row.children())
+            if (child.get() != rowClip && child->visible())
+                if (const auto *rect = find<RectNode>(*child); rect && rect->style().outerShadow)
+                    halo = child.get();
+        assert(halo && halo->zIndex() < rowClip->zIndex());
+        const RectNode *outline = nullptr;
+        for (const auto &child : grouped.content.children())
+            if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+                rect && rect->visible() && rect->style().borderWidth > 0)
+                outline = rect;
+        const auto *shadow = find<RectNode>(*halo);
+        assert(outline && shadow);
+        const auto outlineBounds = sceneBounds(*outline);
+        const auto shadowBounds = sceneBounds(*shadow);
+        near(shadowBounds.x, outlineBounds.x);
+        near(shadowBounds.y, outlineBounds.y);
+        near(shadowBounds.width, outlineBounds.width);
+        near(shadowBounds.height, outlineBounds.height);
+        bool haloBeforeBody = false;
+        for (const auto &child : grouped.row.children()) {
+            if (child.get() == rowClip) {
+                assert(haloBeforeBody);
+                break;
+            }
+            haloBeforeBody |= child.get() == halo;
+        }
+        const auto haloBounds = sceneBounds(*halo);
+        assert(haloBounds.y < groupedBounds.y);
+        assert(haloBounds.y + haloBounds.height > groupedBounds.y + groupedBounds.height);
+        const auto haloClip = ancestorPaintClip(*halo);
+        const auto viewportClip = nativeHistoryClip(view);
+        near(haloClip.x, viewportClip.x);
+        near(haloClip.y, viewportClip.y);
+        near(haloClip.width, viewportClip.width);
+        near(haloClip.height, viewportClip.height);
+        const auto visibleHalo = intersectBounds(haloBounds, haloClip);
+        assert(visibleHalo.y < groupedBounds.y);
+        assert(visibleHalo.y + visibleHalo.height > groupedBounds.y + groupedBounds.height);
+        containedBounds(visibleHalo, viewportClip);
+        model.settings.incomingMotion = blast::SendMotion::Slide;
+        model.settings.incomingDurationMs = 900;
+        auto arrival = buffer.messages.back();
+        arrival.id = "moving-mention";
+        arrival.text = "MovingMention Me";
+        arrival.mention = true;
+        arrival.mentionNick = "Me";
+        arrival.history = false;
+        arrival.arrival = model.now;
+        buffer.messages.push_back(std::move(arrival));
+        ++buffer.messagesRevision;
+        arrange();
+        model.now += .1;
+        arrange();
+        const auto moving = body(view, "MovingMention");
+        auto *movingClip = moving.content.parent();
+        assert(moving.content.x() > 0);
+        assert(movingClip && movingClip->parent() == &moving.row && movingClip->clipChildren());
+        assert(find<blast::PixelRevealNode>(*movingClip));
+        near(movingClip->x(), 0);
+        near(movingClip->y(), 0);
+        near(movingClip->width(), moving.row.width());
+        near(movingClip->height(), moving.row.height());
+        containedBounds(ancestorPaintClip(moving.text), sceneBounds(moving.row));
+        containedBounds(ancestorPaintClip(moving.text), nativeHistoryClip(view));
+        for (const auto &child : moving.row.children())
+            if (child.get() != movingClip)
+                if (const auto *rect = find<RectNode>(*child); rect && rect->style().outerShadow)
+                    assert(!child->visible());
+    }
 }
 
 void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
@@ -7247,7 +7528,8 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         const float rowHeight = rendered.row.height();
         const float textX = rendered.text.x(), textY = rendered.text.y();
         if (traditional) {
-            assert(rendered.row.clipChildren() && !rendered.row.hitTestVisible());
+            assert(!rendered.row.clipChildren() && !rendered.row.hitTestVisible());
+            assert(rendered.content.parent()->clipChildren());
             assert(!find<blast::MaterialNode>(rendered.content)->visible());
         }
         auto *date = plainText(view, "Undated history");
@@ -10797,7 +11079,8 @@ void runTranscriptCheck() {
     inkCenteredMarkupShadows(renderer);
     visitSeparator(renderer);
     messageEntranceLifecycle(renderer);
-    mentionAccentLifecycle(renderer);
+    persistentMentionStyles(renderer);
+    persistentMentionRowClipping(renderer);
     independentSendEffects(renderer);
     cappedTranscriptBodies(renderer);
     typingFooterGeometry(renderer);

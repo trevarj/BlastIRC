@@ -21,6 +21,23 @@ inline constexpr std::array commandCatalog{
     CommandInfo{"join", "Join channels", "#channel[,#channel] [keys]", true},
     CommandInfo{"part", "Leave a channel", "[#channel] [reason]", true},
     CommandInfo{"kick", "Remove someone from a channel", "[#channel] nick [reason]", true},
+    CommandInfo{"op", "Grant operator or request your own operator status", "[#channel] [nick]",
+                true},
+    CommandInfo{"deop", "Remove operator status", "[#channel] [nick]", true},
+    CommandInfo{"halfop", "Grant half-operator status", "[#channel] [nick]", true},
+    CommandInfo{"dehalfop", "Remove half-operator status", "[#channel] [nick]", true},
+    CommandInfo{"voice", "Grant voice", "[#channel] [nick]", true},
+    CommandInfo{"devoice", "Remove voice", "[#channel] [nick]", true},
+    CommandInfo{"requestop", "Request operator from channel services", "[#channel] [service]",
+                true},
+    CommandInfo{"channeltools", "Open channel tools", "[#channel]", true},
+    CommandInfo{"ban", "List bans or add an explicit mask", "[#channel] [mask]", true},
+    CommandInfo{"unban", "Remove an explicit ban mask", "[#channel] mask", true},
+    CommandInfo{"quiet", "Quiet an explicit mask when supported", "[#channel] mask", true},
+    CommandInfo{"unquiet", "Remove an explicit quiet mask", "[#channel] mask", true},
+    CommandInfo{"kickban", "Request a ban then kick (not atomic)", "[#channel] nick mask [reason]",
+                true},
+    CommandInfo{"invite", "Invite a nickname", "nick [#channel]", true},
     CommandInfo{"nick", "Change your nickname", "newnick", true},
     CommandInfo{"away", "Set or clear away status", "[reason]", true},
     CommandInfo{"whois", "Look up a nickname", "[nick]", true},
@@ -87,6 +104,30 @@ inline std::string_view missingCommandArguments(std::string_view input, std::str
         if (kind != "channel")
             return first.empty() ? "#channel nick" : "#channel";
         return first.empty() ? "nick" : "";
+    }
+    if (commandEqual(name, "op") || commandEqual(name, "deop") || commandEqual(name, "halfop") ||
+        commandEqual(name, "dehalfop") || commandEqual(name, "voice") ||
+        commandEqual(name, "devoice") || commandEqual(name, "requestop") ||
+        commandEqual(name, "channeltools") || commandEqual(name, "ban"))
+        return kind != "channel" && !isChannel(first) ? "#channel" : "";
+    if (commandEqual(name, "invite")) {
+        if (isChannel(first))
+            return commandWord(input).empty() ? "nick" : "";
+        if (first.empty())
+            return kind == "channel" ? "nick" : "nick #channel";
+        return kind != "channel" && !isChannel(commandWord(input)) ? "#channel" : "";
+    }
+    if (commandEqual(name, "unban") || commandEqual(name, "quiet") ||
+        commandEqual(name, "unquiet") || commandEqual(name, "kickban")) {
+        const bool kickban = commandEqual(name, "kickban");
+        auto target = first;
+        if (isChannel(first))
+            target = commandWord(input);
+        else if (kind != "channel")
+            return "#channel";
+        if (target.empty())
+            return kickban ? "nick mask" : "mask";
+        return kickban && commandWord(input).empty() ? "mask" : "";
     }
     if (commandEqual(name, "bouncer"))
         return first.empty() || (commandEqual(first, "bind") && commandWord(input).empty())

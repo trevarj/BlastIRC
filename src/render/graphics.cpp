@@ -213,7 +213,7 @@ void rect(RenderBackend &backend, const CustomDrawContext &context, Color fill, 
 
 struct MaterialNode::Impl {
     MaterialKind kind;
-    bool own = false, presence = false, hovered = false, highlight = false;
+    bool own = false, presence = false, hovered = false;
     float opacity = 1, radius = -1;
     std::uint64_t theme = 0;
     explicit Impl(MaterialKind value) : kind(value) {}
@@ -223,12 +223,11 @@ MaterialNode::~MaterialNode() = default;
 void MaterialNode::setMessage(const MessageSurface &surface) {
     auto &p = *impl;
     if (p.own == surface.own && p.presence == surface.presence && p.hovered == surface.hovered &&
-        p.highlight == surface.highlight && p.opacity == surface.opacity)
+        p.opacity == surface.opacity)
         return;
     p.own = surface.own;
     p.presence = surface.presence;
     p.hovered = surface.hovered;
-    p.highlight = surface.highlight;
     p.opacity = surface.opacity;
     markPaintDirty();
 }
@@ -277,7 +276,7 @@ void MaterialNode::draw(RenderBackend &backend, const CustomDrawContext &incomin
             ? std::min({themeBubbleRadius() * .75f, context.width * .5f, context.height * .5f})
             : themeCornerRadius();
     // Routine events share the reading surface, not a conversational bubble/accent.
-    if (p.kind == MaterialKind::Message && p.presence && !p.hovered && !p.highlight)
+    if (p.kind == MaterialKind::Message && p.presence && !p.hovered)
         return;
     const bool own = p.own && !p.presence;
     const auto panelBorder = [&p] {
@@ -294,15 +293,11 @@ void MaterialNode::draw(RenderBackend &backend, const CustomDrawContext &incomin
         auto fill = themeColor(p.presence ? "surface_container_low"
                                : own      ? "primary_container"
                                           : "surface_container_high");
-        if (p.highlight)
-            fill = lerpColor(fill, themeColor("tertiary_container"), .35f);
         if (p.hovered)
             fill = lerpColor(fill, themeColor("tertiary_container"), .15f);
         rect(backend, context, themeSurfaceFill(fill),
-             withAlpha(themeColor(p.highlight || p.hovered ? "tertiary" : "outline_variant"),
-                       p.highlight ? .55f
-                       : p.hovered ? .35f
-                                   : .3f),
+             withAlpha(themeColor(p.hovered ? "tertiary" : "outline_variant"),
+                       p.hovered ? .35f : .3f),
              radius, scale);
     }
 }

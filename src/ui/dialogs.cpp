@@ -338,6 +338,28 @@ struct Dialogs::Impl {
     std::function<void()> confirmAction;
     std::string mode, confirmation, nick, searchQuery, searchBuffer;
     std::string topicBuffer, editedTopic;
+    std::string toolsBuffer, toolsServer, toolsTarget, serviceNick = "ChanServ", banMask,
+                                                       selectedBan;
+    std::string moderationBuffer, moderationNick, moderationOperation, moderationMask, kickReason;
+    std::string moderationServer;
+    std::uint64_t moderationGeneration = 0;
+    std::string moderationAccount;
+    double moderationArrived = 0;
+    std::uint64_t toolsGeneration = 0, toolsRevision = 0;
+    Label *toolsIdentity = nullptr, *toolsStatus = nullptr, *modesStatus = nullptr,
+          *bansStatus = nullptr;
+    Button *requestOperator = nullptr, *refreshBans = nullptr, *addBan = nullptr,
+           *removeBan = nullptr;
+    Button *moderationReview = nullptr;
+    Select *banSelection = nullptr;
+    std::uint64_t toolsRenderedRevision = ~std::uint64_t{};
+    bool toolsRenderedLive = false, toolsRenderedSelf = false;
+    std::string toolsRenderedNick, toolsRenderedPrefix, toolsRenderedSupport, toolsRenderedGroups;
+    std::array<Toggle *, 4> modeToggles{};
+    std::vector<std::string> banOptions, banMasks;
+    std::vector<std::string> toolsMemberNames;
+    std::string toolsLookupNick, toolsLookupMapping;
+    std::size_t toolsSelfIndex = std::size_t(-1);
     std::string configMessage, recoveryMessage, fontFamily, fontFeatures;
     FontWeight fontWeight = FontWeight::Normal;
     std::string lastThemeSource, lastGeometry, lastDialog;
@@ -1062,6 +1084,12 @@ struct Dialogs::Impl {
             model.whoisProfile.loading = false;
             ++model.whoisProfile.revision;
         }
+        if (mode == "channel-tools" && name != "channel-tools")
+            model.channelTools.open = false;
+        toolsIdentity = toolsStatus = modesStatus = bansStatus = nullptr;
+        requestOperator = refreshBans = addBan = removeBan = nullptr;
+        banSelection = nullptr;
+        modeToggles.fill(nullptr);
         profileCards.clear();
         profileLoading = profileError = nullptr;
         if (mode.empty() && confirmation.empty() && dispatcher)
@@ -1090,6 +1118,7 @@ struct Dialogs::Impl {
         feedback = themeStatus = applicationStatus = motionStatus = soundStatus = cursorStatus =
             identityScope = connectionStatus = nullptr;
         connectButton = saveButton = nullptr;
+        moderationReview = nullptr;
         saveFeedbackActive = false;
         networkPicker = identityPicker = nullptr;
         invalidFields.clear();
@@ -1238,7 +1267,7 @@ struct Dialogs::Impl {
         feedback->setVisible(false);
         feedback->setParticipatesInLayout(false);
         auto *footer = row(*chrome, !tabs);
-        if (mode == "whois") {
+        if (mode == "whois" || mode == "channel-tools") {
             footer->setVisible(false);
             footer->setParticipatesInLayout(false);
             footer->setExcludeSubtreeFromTabOrder(true);
@@ -1274,6 +1303,11 @@ struct Dialogs::Impl {
             update->setEnabled(buffer != model.buffers.end() && buffer->second.kind == "channel" &&
                                buffer->second.joined);
             button(*footer, "Cancel", [this] { dismiss(); });
+        } else if (mode == "moderation") {
+            moderationReview = button(
+                *footer, "Review action", [this] { reviewModeration(); },
+                ButtonVariant::Destructive);
+            button(*footer, "Cancel", [this] { dismiss(); });
         } else if (mode == "nick-color") {
             button(
                 *footer, "Save color",
@@ -1291,7 +1325,7 @@ struct Dialogs::Impl {
                 model.settings.nickColors.erase(nick);
                 save({}, true);
             });
-        } else if (mode != "whois") {
+        } else if (mode != "whois" && mode != "channel-tools") {
             button(*footer, "OK", [this] { dismiss(); }, ButtonVariant::Primary);
         }
         panel->addChild(std::move(layout));
@@ -1464,6 +1498,23 @@ struct Dialogs::Impl {
             label(*page, "The core restored unconfirmed text to its conversation draft. Delivery "
                          "is uncertain: inspect the conversation before sending it again. BlastIRC "
                          "does not automatically retry uncertain submissions.");
+        } else if (mode == "channel-tools") {
+            buildChannelTools();
+        } else if (mode == "moderation") {
+            const auto source = model.buffers.find(moderationBuffer);
+            label(
+                *page,
+                moderationNick + " · " +
+                    (source == model.buffers.end() ? "Source unavailable" : source->second.target),
+                true);
+            if (moderationOperation != "kick")
+                text(*page, "Explicit mask", moderationMask,
+                     [this](const std::string &value) { moderationMask = value; });
+            if (moderationOperation == "kick" || moderationOperation == "kickban")
+                text(*page, "Kick reason (optional)", kickReason,
+                     [this](const std::string &value) { kickReason = value; });
+            label(*page, "Review the exact target and mask before confirming. The server decides "
+                         "whether each request is authorized.");
         } else if (mode == "topic") {
             const auto found = model.buffers.find(topicBuffer);
             if (found == model.buffers.end()) {
@@ -1939,20 +1990,53 @@ struct Dialogs::Impl {
                });
         slider(*incoming, "Incoming duration (100–2000 ms)", model.settings.incomingDurationMs, 100,
                2000, 10, [this](float value) { model.settings.incomingDurationMs = value; });
-        static constexpr const char *mentionNames[] = {"Off", "Text shimmer", "Rail pulse",
-                                                       "Border halo"};
-        select(*incoming, "Mention accent", {std::begin(mentionNames), std::end(mentionNames)},
-               mentionNames[std::clamp(int(model.settings.mentionEffect), 0, 3)],
-               [this](std::size_t index, std::string_view) {
-                   if (index < std::size(mentionNames))
-                       model.settings.mentionEffect = MentionEffect(index);
-               });
-        label(*incoming, "Sending and receiving effects are independent; only new live messages "
-                         "animate, never restored history or fools, and Effects Off or Reduced "
-                         "motion pauses animation without resetting it.");
-        label(*incoming, "Mention accent adds a live own-nick message accent, independent of "
-                         "entrances and the global mention event cue. Effects Off or Reduced "
-                         "motion pauses it without changing your choice.");
+        static constexpr const char *mentionNames[] = {
+            "Off",          "Neon mention",    "Breathing glow", "Luminous outline",
+            "Text shimmer", "Accent underline"};
+        auto *mention =
+            select(*incoming, "Mention effect", {std::begin(mentionNames), std::end(mentionNames)},
+                   mentionNames[std::clamp(int(model.settings.mentionEffect), 0, 5)], {});
+        auto *strength =
+            slider(*incoming, "Mention strength (0–100%)", model.settings.mentionStrength * 100, 0,
+                   100, 1, [this](float value) { model.settings.mentionStrength = value / 100; });
+        auto *outline =
+            toggle(*incoming, "Breathing outline", model.settings.mentionOutlineBreathing, {});
+        auto *glint = toggle(*incoming, "Traveling underline glint",
+                             model.settings.mentionUnderlineGlint, {});
+        auto *speed =
+            slider(*incoming, "Mention speed (25–200%)", model.settings.mentionSpeed * 100, 25, 200,
+                   5, [this](float value) { model.settings.mentionSpeed = value / 100; });
+        const auto applicable = [this, strength, outline, glint, speed] {
+            const auto effect = model.settings.mentionEffect;
+            strength->setEnabled(effect != MentionEffect::Off);
+            outline->setEnabled(effect == MentionEffect::LuminousOutline);
+            glint->setEnabled(effect == MentionEffect::AccentUnderline);
+            speed->setEnabled(
+                effect == MentionEffect::BreathingGlow || effect == MentionEffect::TextShimmer ||
+                (effect == MentionEffect::LuminousOutline &&
+                 model.settings.mentionOutlineBreathing) ||
+                (effect == MentionEffect::AccentUnderline && model.settings.mentionUnderlineGlint));
+        };
+        mention->setOnSelectionChanged([this, applicable](std::size_t index, std::string_view) {
+            if (index < std::size(mentionNames))
+                model.settings.mentionEffect = MentionEffect(index);
+            applicable();
+        });
+        outline->setOnChange([this, applicable](bool value) {
+            model.settings.mentionOutlineBreathing = value;
+            applicable();
+        });
+        glint->setOnChange([this, applicable](bool value) {
+            model.settings.mentionUnderlineGlint = value;
+            applicable();
+        });
+        applicable();
+        label(*incoming, "Incoming movement and reveal apply only to new live messages, never "
+                         "restored history or fools.");
+        label(*incoming,
+              "Mention effects persist on retained messages. Effects Off or zero "
+              "strength removes decoration; Reduced motion keeps a steady style. "
+              "Legacy mentions retain nick styling only when the matched nick is known.");
         auto *physics = section("effects.physics", "Physics");
         auto *gravity = slider(*physics, "Gravity", model.settings.gravity, -200, 500, 1,
                                [this](float value) { model.settings.gravity = value; });
@@ -2984,6 +3068,348 @@ struct Dialogs::Impl {
         save();
     }
 
+    static bool safeToken(std::string_view value) {
+        return !value.empty() && value.front() != ':' &&
+               value.find_first_of(" \t\r\n,") == value.npos && value.find('\0') == value.npos;
+    }
+
+    static const Nick *currentMember(const Model &model, std::string_view buffer,
+                                     std::string_view nick) {
+        const auto source = model.buffers.find(std::string(buffer));
+        if (source == model.buffers.end())
+            return nullptr;
+        const auto runtime = model.networks.find(source->second.server);
+        if (runtime == model.networks.end())
+            return nullptr;
+        const auto folded = irc::casefold(nick, runtime->second.caseMapping);
+        for (const auto &member : source->second.nicks)
+            if (irc::casefold(member.name, runtime->second.caseMapping) == folded)
+                return &member;
+        return nullptr;
+    }
+
+    bool moderationTargetCurrent() const {
+        const auto *member = currentMember(model, moderationBuffer, moderationNick);
+        return member && member->account == moderationAccount &&
+               member->arrived == moderationArrived;
+    }
+
+    const Buffer *liveToolsSource() const {
+        const auto &state = model.channelTools;
+        if (!state.open || state.buffer != toolsBuffer || state.server != toolsServer ||
+            state.sessionGeneration != toolsGeneration)
+            return nullptr;
+        const auto source = model.buffers.find(toolsBuffer);
+        const auto network = model.networks.find(toolsServer);
+        if (source == model.buffers.end() || source->second.server != toolsServer ||
+            source->second.kind != "channel" || !source->second.joined ||
+            network == model.networks.end() || network->second.state != "Ready" ||
+            network->second.sessionGeneration != toolsGeneration)
+            return nullptr;
+        return &source->second;
+    }
+
+    bool toolsCommand(std::string command, bool moderator = true) {
+        if (!liveToolsSource() ||
+            (moderator && !Dialogs::moderationAllowed(model, toolsBuffer,
+                                                      model.networks.at(toolsServer).nick))) {
+            setFeedback("This source is unavailable or your operator privilege has changed.");
+            return false;
+        }
+        model.actions.push_back({"command", toolsBuffer, std::move(command), {}});
+        return true;
+    }
+
+    void confirmBan(std::string mask, bool remove) {
+        const auto *source = liveToolsSource();
+        if (!source || !safeToken(mask) ||
+            channelModeGroup(model.networks.at(toolsServer), 'b') != 0 ||
+            !Dialogs::moderationAllowed(model, toolsBuffer, model.networks.at(toolsServer).nick)) {
+            setFeedback("Enter one explicit mask and use a live channel with operator privilege.");
+            return;
+        }
+        const auto buffer = toolsBuffer, server = toolsServer, channel = source->target;
+        const auto generation = toolsGeneration;
+        const auto message =
+            channel + "\nExact mask: " + mask + "\nThe server decides whether this is allowed.";
+        confirm(
+            "channel-ban", remove ? "Remove ban?" : "Add ban?", message,
+            remove ? "Remove ban" : "Add ban",
+            [this, buffer, server, channel, generation, mask = std::move(mask), remove] {
+                if (toolsBuffer != buffer || toolsServer != server ||
+                    toolsGeneration != generation || !liveToolsSource() ||
+                    channelModeGroup(model.networks.at(server), 'b') != 0 ||
+                    (remove &&
+                     (!model.channelTools.bansKnown || model.channelTools.bansLoading ||
+                      std::none_of(model.channelTools.bans.begin(), model.channelTools.bans.end(),
+                                   [&](const auto &ban) { return ban.mask == mask; })))) {
+                    setFeedback("The source or selected ban is no longer current.");
+                    return;
+                }
+                toolsCommand(std::string(remove ? "/unban " : "/ban ") + channel + " " + mask);
+            });
+    }
+
+    void buildChannelTools() {
+        toolsIdentity = label(*page, "", true);
+        toolsStatus = label(*page, "");
+        text(*page, "Operator service", serviceNick,
+             [this](const std::string &value) { serviceNick = value; });
+        label(*page, "Uses the ChanServ-compatible OP convention; this requests permission, "
+                     "it does not grant operator status.");
+        requestOperator = button(*page, "Request operator", [this] {
+            const auto *source = liveToolsSource();
+            if (!source || !safeToken(serviceNick) ||
+                !channelStatusSupported(model.networks.at(toolsServer), 'o')) {
+                setFeedback("Use a live joined channel and one compatible service nickname.");
+                return;
+            }
+            if (toolsCommand("/requestop " + source->target + " " + serviceNick, false))
+                setFeedback("Operator request queued; wait for server-reported privilege.", false);
+        });
+        modesStatus = label(*page, "");
+        static constexpr const char *captions[] = {"Invite only (+i)", "Moderated (+m)",
+                                                   "No external messages (+n)", "Topic lock (+t)"};
+        for (std::size_t i = 0; i < modeToggles.size(); ++i) {
+            const char mode = "imnt"[i];
+            modeToggles[i] = toggle(*page, captions[i], false, [this, mode, i](bool) {
+                const auto &state = model.channelTools;
+                const bool enabled = state.modesKnown && state.modes.contains(mode);
+                modeToggles[i]->setCheckedImmediate(enabled);
+                const auto *source = liveToolsSource();
+                if (!source || !state.modesKnown || state.modesLoading ||
+                    channelModeGroup(model.networks.at(toolsServer), mode) != 3)
+                    return;
+                toolsCommand("/mode " + source->target + (enabled ? " -" : " +") + mode);
+            });
+        }
+        button(*page, "Edit topic", [this] {
+            const auto *source = liveToolsSource();
+            if (!source) {
+                setFeedback("Join this channel before editing its topic.");
+                return;
+            }
+            topicBuffer = toolsBuffer;
+            editedTopic = source->topic;
+            beginPanel("topic", "Channel topic", false);
+            rebuildPage();
+        });
+        label(*page, "Bans", true);
+        bansStatus = label(*page, "");
+        refreshBans = button(*page, "Refresh bans", [this] {
+            if (const auto *source = liveToolsSource())
+                toolsCommand("/ban " + source->target, false);
+        });
+        banSelection =
+            select(*page, "Server ban list", {}, "", [this](std::size_t index, std::string_view) {
+                selectedBan = index < banMasks.size() ? banMasks[index] : "";
+                toolsRenderedRevision = ~std::uint64_t{};
+            });
+        text(*page, "Ban mask", banMask, [this](const std::string &value) { banMask = value; });
+        addBan = button(*page, "Add ban…", [this] { confirmBan(banMask, false); });
+        removeBan =
+            button(*page, "Remove selected ban…", [this] { confirmBan(selectedBan, true); });
+        toolsRevision = ~std::uint64_t{};
+        toolsRenderedRevision = ~std::uint64_t{};
+        updateChannelTools();
+    }
+
+    void updateChannelTools() {
+        if (!toolsIdentity)
+            return;
+        const auto *source = liveToolsSource();
+        const auto runtime = model.networks.find(toolsServer);
+        const Network *network = runtime == model.networks.end() ? nullptr : &runtime->second;
+        const auto &state = model.channelTools;
+        const Nick *self = nullptr;
+        if (source && network) {
+            if (toolsLookupNick != network->nick || toolsLookupMapping != network->caseMapping ||
+                source->nicks.size() != toolsMemberNames.size() ||
+                !std::equal(source->nicks.begin(), source->nicks.end(), toolsMemberNames.begin(),
+                            [](const Nick &member, const std::string &name) {
+                                return member.name == name;
+                            })) {
+                toolsLookupNick = network->nick;
+                toolsLookupMapping = network->caseMapping;
+                toolsMemberNames.clear();
+                toolsMemberNames.reserve(source->nicks.size());
+                toolsSelfIndex = std::size_t(-1);
+                const auto own = irc::casefold(network->nick, network->caseMapping);
+                for (const auto &member : source->nicks) {
+                    if (irc::casefold(member.name, network->caseMapping) == own)
+                        toolsSelfIndex = toolsMemberNames.size();
+                    toolsMemberNames.push_back(member.name);
+                }
+            }
+            if (toolsSelfIndex < source->nicks.size())
+                self = &source->nicks[toolsSelfIndex];
+        }
+        const bool moderator =
+            source && network && self && channelHasPrivilege(*network, *self, 'o');
+        const std::string_view ownNick =
+            network ? std::string_view(network->nick) : std::string_view{};
+        const std::string_view ownPrefix =
+            self ? std::string_view(self->prefix) : std::string_view{};
+        const std::string_view support =
+            network ? std::string_view(network->prefixModes) : std::string_view{};
+        const std::string_view groups =
+            network ? std::string_view(network->channelModeTypes) : std::string_view{};
+        if (toolsRenderedRevision == state.revision && toolsRenderedLive == bool(source) &&
+            toolsRenderedSelf == bool(self) && toolsRenderedNick == ownNick &&
+            toolsRenderedPrefix == ownPrefix && toolsRenderedSupport == support &&
+            toolsRenderedGroups == groups)
+            return;
+        toolsRenderedRevision = state.revision;
+        toolsRenderedLive = bool(source);
+        toolsRenderedSelf = bool(self);
+        toolsRenderedNick = ownNick;
+        toolsRenderedPrefix = ownPrefix;
+        toolsRenderedSupport = support;
+        toolsRenderedGroups = groups;
+        toolsIdentity->setText(toolsTarget + " · " +
+                               std::string(serverDisplayName(model, toolsServer)));
+        toolsStatus->setText(!source ? "Not joined or disconnected"
+                             : !self ? network->nick + " · membership/privilege unknown"
+                                     : self->prefix + self->name +
+                                           (moderator ? " · Operator" : " · Not an operator"));
+        requestOperator->setEnabled(source && network && !network->nick.empty() &&
+                                    channelStatusSupported(*network, 'o'));
+        modesStatus->setText(!state.modesError.empty() ? state.modesError
+                             : state.modesLoading      ? "Loading channel modes…"
+                             : state.modesKnown        ? "Server-reported channel modes"
+                                                       : "Channel modes unknown");
+        for (std::size_t i = 0; i < modeToggles.size(); ++i) {
+            const char mode = "imnt"[i];
+            const bool supported = network && channelModeGroup(*network, mode) == 3;
+            modeToggles[i]->parent()->setVisible(supported);
+            modeToggles[i]->parent()->setParticipatesInLayout(supported);
+            modeToggles[i]->setEnabled(moderator && supported && state.modesKnown &&
+                                       !state.modesLoading);
+            modeToggles[i]->setCheckedImmediate(state.modesKnown && state.modes.contains(mode));
+        }
+        bansStatus->setText(!state.bansError.empty() ? state.bansError
+                            : state.bansLoading      ? "Loading server ban list…"
+                            : !state.bansKnown ? "Ban list unknown; refresh to query the server."
+                            : state.bans.empty()
+                                ? "No server bans"
+                                : std::to_string(state.bans.size()) + " server bans");
+        const bool bansSupported = network && channelModeGroup(*network, 'b') == 0;
+        refreshBans->setEnabled(source && bansSupported && !state.bansLoading);
+        addBan->setEnabled(moderator && bansSupported);
+        removeBan->setEnabled(moderator && bansSupported && state.bansKnown && !state.bansLoading &&
+                              !selectedBan.empty());
+        banSelection->setEnabled(source && state.bansKnown && !state.bansLoading);
+        if (toolsRevision != state.revision) {
+            toolsRevision = state.revision;
+            banOptions.clear();
+            banMasks.clear();
+            for (const auto &ban : state.bans) {
+                std::string caption = ban.mask;
+                if (!ban.setter.empty())
+                    caption += " · " + ban.setter;
+                if (ban.timestamp)
+                    caption += " · " + std::to_string(ban.timestamp);
+                banOptions.push_back(std::move(caption));
+                banMasks.push_back(ban.mask);
+            }
+            banSelection->setOptions(banOptions);
+            const auto selected =
+                std::find_if(state.bans.begin(), state.bans.end(),
+                             [this](const auto &ban) { return ban.mask == selectedBan; });
+            if (selected != state.bans.end())
+                banSelection->setSelectedIndexSilently(std::size_t(selected - state.bans.begin()));
+            else {
+                selectedBan.clear();
+                banSelection->clearSelection();
+            }
+        }
+    }
+
+    void reviewModeration() {
+        const auto origin = model.buffers.find(moderationBuffer);
+        if (origin == model.buffers.end() || origin->second.server != moderationServer ||
+            !model.networks.contains(moderationServer) ||
+            model.networks.at(moderationServer).sessionGeneration != moderationGeneration) {
+            setFeedback("The original channel session is no longer current.");
+            return;
+        }
+        if (!moderationTargetCurrent() ||
+            !Dialogs::moderationAllowed(model, moderationBuffer, moderationNick)) {
+            setFeedback("This member/source is unavailable or your operator privilege changed.");
+            return;
+        }
+        const bool kick = moderationOperation == "kick" || moderationOperation == "kickban";
+        if ((moderationOperation != "kick" && !safeToken(moderationMask)) ||
+            kickReason.find_first_of("\r\n") != kickReason.npos ||
+            kickReason.find('\0') != kickReason.npos) {
+            setFeedback("Enter one explicit mask; masks and reasons cannot contain line breaks.");
+            return;
+        }
+        const auto &source = model.buffers.at(moderationBuffer);
+        const auto &network = model.networks.at(source.server);
+        if ((moderationOperation == "ban" || moderationOperation == "kickban") &&
+            channelModeGroup(network, 'b') != 0) {
+            setFeedback("This server does not advertise a ban list.");
+            return;
+        }
+        if ((moderationOperation == "quiet" || moderationOperation == "unquiet") &&
+            (channelModeGroup(network, 'q') != 0 || channelStatusSupported(network, 'q'))) {
+            setFeedback("This server does not advertise a quiet list.");
+            return;
+        }
+        const auto buffer = moderationBuffer, target = moderationNick,
+                   operation = moderationOperation, mask = moderationMask, reason = kickReason,
+                   server = source.server;
+        const auto generation = network.sessionGeneration;
+        const auto account = moderationAccount;
+        const auto arrived = moderationArrived;
+        std::string message = source.target + "\nExact target: " + target;
+        if (operation != "kick")
+            message += "\nExact mask: " + mask;
+        if (kick)
+            message += "\nReason: " + (reason.empty() ? "(none)" : reason);
+        if (operation == "kickban")
+            message += "\nBan and kick sends two ordered requests, not an atomic operation. "
+                       "The server may reject either request.";
+        confirm(
+            "moderation", "Confirm " + operation + "?", message, "Confirm",
+            [this, buffer, target, operation, mask, reason, server, generation, kick, account,
+             arrived] {
+                const auto *member = currentMember(model, buffer, target);
+                if (!member || member->account != account || member->arrived != arrived) {
+                    setFeedback("The selected member left, rejoined, or changed identity.");
+                    return;
+                }
+                if (!Dialogs::moderationAllowed(model, buffer, target) ||
+                    model.buffers.at(buffer).server != server ||
+                    model.networks.at(server).sessionGeneration != generation) {
+                    setFeedback("The source/member or your operator privilege changed.");
+                    return;
+                }
+                const auto &source = model.buffers.at(buffer);
+                const auto &network = model.networks.at(server);
+                if ((operation == "ban" || operation == "kickban") &&
+                    channelModeGroup(network, 'b') != 0) {
+                    setFeedback("This server no longer advertises a ban list.");
+                    return;
+                }
+                if ((operation == "quiet" || operation == "unquiet") &&
+                    (channelModeGroup(network, 'q') != 0 || channelStatusSupported(network, 'q'))) {
+                    setFeedback("This server no longer advertises a quiet list.");
+                    return;
+                }
+                model.actions.push_back({"command",
+                                         buffer,
+                                         "/" + operation + " " + source.target + " " +
+                                             (operation == "kick"      ? target
+                                              : operation == "kickban" ? target + " " + mask
+                                                                       : mask) +
+                                             (kick && !reason.empty() ? " " + reason : ""),
+                                         {}});
+                dismiss();
+            });
+    }
+
     void updateTopic() {
         const auto found = model.buffers.find(topicBuffer);
         if (found == model.buffers.end() || found->second.kind != "channel" ||
@@ -3358,6 +3784,9 @@ struct Dialogs::Impl {
             model.whoisProfile.loading = false;
             ++model.whoisProfile.revision;
         }
+        if (mode == "channel-tools") {
+            model.channelTools.open = false;
+        }
         if (dispatcher)
             dispatcher->setFocus(nullptr);
         mode.clear();
@@ -3379,6 +3808,34 @@ struct Dialogs::Impl {
         const auto *native =
             focused ? dynamic_cast<const Input *>(focused->textInputClient()) : nullptr;
         const bool composing = native && native->composing();
+        const auto &tools = model.channelTools;
+        if (mode == "moderation" && moderationReview)
+            moderationReview->setEnabled(
+                moderationTargetCurrent() &&
+                Dialogs::moderationAllowed(model, moderationBuffer, moderationNick) &&
+                model.buffers.at(moderationBuffer).server == moderationServer &&
+                model.networks.at(moderationServer).sessionGeneration == moderationGeneration);
+        if (mode == "channel-tools" && !tools.open)
+            dismiss();
+        if (tools.open && (mode.empty() || mode == "channel-tools") && confirmation.empty() &&
+            !composing) {
+            if (mode != "channel-tools" || toolsBuffer != tools.buffer ||
+                toolsGeneration != tools.sessionGeneration) {
+                toolsBuffer = tools.buffer;
+                toolsServer = tools.server;
+                const auto source = model.buffers.find(toolsBuffer);
+                toolsTarget = source == model.buffers.end() ? "Channel source unavailable"
+                                                            : source->second.target;
+                toolsGeneration = tools.sessionGeneration;
+                serviceNick = "ChanServ";
+                banMask.clear();
+                selectedBan.clear();
+                banOptions.clear();
+                beginPanel("channel-tools", "Channel tools", false);
+                rebuildPage();
+            }
+            updateChannelTools();
+        }
         if (profile.open && !profile.requestId.empty() && (mode.empty() || mode == "whois") &&
             confirmation.empty() && !composing) {
             if (mode != "whois" || profileRequest != profile.requestId) {
@@ -3577,12 +4034,13 @@ struct Dialogs::Impl {
         const std::string &dialog = confirming ? confirmation : mode;
         if (showing && visible) {
             const float preferredWidth = confirming ? 540.f : mode == "settings" ? 1000.f : 630.f;
-            const float preferredHeight = confirming            ? 250.f
-                                          : mode == "settings"  ? 720.f
-                                          : mode == "first-run" ? 720.f
-                                          : mode == "whois"     ? 720.f
-                                          : mode == "search"    ? 270.f
-                                                                : 400.f;
+            const float preferredHeight = confirming                ? 250.f
+                                          : mode == "settings"      ? 720.f
+                                          : mode == "first-run"     ? 720.f
+                                          : mode == "whois"         ? 720.f
+                                          : mode == "channel-tools" ? 720.f
+                                          : mode == "search"        ? 270.f
+                                                                    : 400.f;
             const float w = std::min(preferredWidth * zoom, std::max(0.f, width - 24.f));
             const float verticalMargin = !confirming && mode == "whois" ? 48.f * zoom : 24.f;
             const float h =
@@ -3647,6 +4105,97 @@ Dialogs::~Dialogs() {
         removeChild(children().back().get());
 }
 void Dialogs::open(std::string_view name) { impl_->open(name); }
+bool Dialogs::moderationAllowed(const Model &model, std::string_view buffer,
+                                std::string_view nick) {
+    const auto source = model.buffers.find(std::string(buffer));
+    if (source == model.buffers.end() || source->second.kind != "channel" ||
+        !source->second.joined || nick.empty())
+        return false;
+    const auto runtime = model.networks.find(source->second.server);
+    if (runtime == model.networks.end() || runtime->second.state != "Ready" ||
+        runtime->second.nick.empty())
+        return false;
+    const auto &network = runtime->second;
+    bool member = false, authorized = false;
+    const auto target = irc::casefold(nick, network.caseMapping);
+    const auto ownNick = irc::casefold(network.nick, network.caseMapping);
+    for (const auto &entry : source->second.nicks) {
+        const auto folded = irc::casefold(entry.name, network.caseMapping);
+        member |= folded == target;
+        if (folded == ownNick)
+            authorized = channelHasPrivilege(network, entry, 'o');
+    }
+    return member && authorized;
+}
+
+void Dialogs::moderate(std::string_view buffer, std::string_view nick, std::string_view operation) {
+    auto &s = *impl_;
+    if (!moderationAllowed(s.model, buffer, nick))
+        return;
+    const auto &source = s.model.buffers.at(std::string(buffer));
+    const auto &network = s.model.networks.at(source.server);
+    if (operation.size() == 2 && (operation.front() == '+' || operation.front() == '-')) {
+        const char status = operation.back();
+        if ((status != 'o' && status != 'h' && status != 'v') ||
+            !channelStatusSupported(network, status))
+            return;
+        const std::string origin(buffer), target(nick), change(operation), server(source.server);
+        const auto generation = network.sessionGeneration;
+        const auto *member = Impl::currentMember(s.model, buffer, nick);
+        const auto account = member->account;
+        const auto arrived = member->arrived;
+        auto submit = [this, origin, target, change, server, generation, account, arrived] {
+            auto &s = *impl_;
+            const auto *member = Impl::currentMember(s.model, origin, target);
+            if (!member || member->account != account || member->arrived != arrived) {
+                s.model.status = "Channel privilege request canceled: selected membership changed.";
+                return;
+            }
+            if (!moderationAllowed(s.model, origin, target) ||
+                s.model.buffers.at(origin).server != server ||
+                s.model.networks.at(server).sessionGeneration != generation ||
+                !channelStatusSupported(s.model.networks.at(server), change.back()))
+                return;
+            s.model.actions.push_back(
+                {"command",
+                 origin,
+                 "/mode " + s.model.buffers.at(origin).target + " " + change + " " + target,
+                 {}});
+        };
+        if (status == 'v')
+            submit();
+        else
+            s.confirm("channel-status", "Change channel privilege?",
+                      source.target + "\nExact target: " + target + "\nMode: " + change +
+                          "\nThe server decides whether this request is allowed.",
+                      "Confirm", std::move(submit));
+        return;
+    }
+    if (operation != "kick" && operation != "ban" && operation != "kickban" &&
+        operation != "quiet" && operation != "unquiet")
+        return;
+    if ((operation == "quiet" || operation == "unquiet") &&
+        (channelModeGroup(network, 'q') != 0 || channelStatusSupported(network, 'q')))
+        return;
+    s.moderationBuffer = buffer;
+    s.moderationServer = source.server;
+    s.moderationGeneration = network.sessionGeneration;
+    const auto *member = Impl::currentMember(s.model, buffer, nick);
+    s.moderationAccount = member->account;
+    s.moderationArrived = member->arrived;
+    s.moderationNick = nick;
+    s.moderationOperation = operation;
+    s.moderationMask.clear();
+    s.kickReason.clear();
+    s.beginPanel("moderation",
+                 operation == "kickban" ? "Ban and kick"
+                 : operation == "kick"  ? "Kick member"
+                 : operation == "ban"   ? "Ban member"
+                 : operation == "quiet" ? "Quiet member"
+                                        : "Unquiet member",
+                 false);
+    s.rebuildPage();
+}
 void Dialogs::remapBuffer(std::string_view oldId, std::string_view newId) {
     auto &s = *impl_;
     for (auto *key : {&s.returnFocus.key, &s.returnFocus.fallbackKey})

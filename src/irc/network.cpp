@@ -1000,9 +1000,7 @@ struct NetworkClient::Impl {
                     }
             for (auto &other : commands)
                 if (other.fallback && pending.fallback && other.label.empty() &&
-                    pending.label.empty() && other.name == pending.name &&
-                    (fold(other.target) == fold(target) || other.uncertainTarget ||
-                     pending.uncertainTarget))
+                    pending.label.empty() && sameCommandTarget(other, pending))
                     other.blocked = pending.blocked = true;
             commands.push_back(std::move(pending));
         }
@@ -1037,7 +1035,7 @@ struct NetworkClient::Impl {
         commands.push_back(std::move(command));
     }
     bool sameCommandTarget(const Command &a, const Command &b) const {
-        return a.name == b.name &&
+        return a.name == b.name && (a.name != "MODE" || a.modeList == b.modeList) &&
                (a.uncertainTarget || b.uncertainTarget || fold(a.target) == fold(b.target));
     }
     void retainSupplemental(Command command, Event *primary = nullptr) {

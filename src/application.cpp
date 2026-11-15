@@ -180,6 +180,13 @@ bool reorderHistoryTies(Buffer &buffer, const vector<size_t> &positions) {
     return changed;
 }
 string eventBody(const Event &e) {
+    if (tag(e, "command") == "324" &&
+        (e.params.size() < 3 || e.params[2].find('k') != string::npos)) {
+        if (e.params.size() < 3)
+            return "324 (parameters redacted)";
+        return "324 " + e.params[1] + " " + e.params[2] +
+               (e.params.size() > 3 ? " (parameters redacted)" : "");
+    }
     if (!e.text.empty())
         return e.text;
     string out = tag(e, "command");
@@ -852,6 +859,10 @@ void Application::renameBuffer(string oldId, string target) {
     for (auto &[command, origin] : commandOrigins_)
         if (origin.buffer == oldId)
             origin.buffer = id;
+    if (model.channelTools.buffer == oldId) {
+        invalidateChannelTools("Channel identity changed; reopen channel tools");
+        model.channelTools.open = false;
+    }
     for (auto &[key, value] : model.settings.workspace) {
         if (value == oldId &&
             (key == "visible_buffers" || key.starts_with("last_buffer:") ||
@@ -962,8 +973,14 @@ void Application::disconnect(string server) {
                 n.sojuMutationError = "Disconnected before management acknowledgement";
             n.sojuMutationPending = false;
             ++n.sessionGeneration;
+            n.prefixModes = "(ov)@+";
+            n.channelModeTypes = "b,k,l,imnpst";
             if (model.whoisProfile.server == name)
                 finishWhois("Connection closed before WHOIS completed");
+            if (model.channelTools.server == name) {
+                invalidateChannelTools("Connection closed");
+                model.channelTools.open = false;
+            }
         }
         sojuMutations_.erase(name);
         sojuCatalogSeen_.erase(name);
@@ -1447,6 +1464,8 @@ bool Application::insert(Buffer &b, Message m, bool persist, const string &compl
             if (auto old = storage_.message(b.id, m.id)) {
                 durableReplay = true;
                 m.mention = m.mention || old->mention;
+                if (m.mentionNick.empty())
+                    m.mentionNick = old->mentionNick;
                 m.storageSequence = old->storageSequence;
                 m.orderingTimestamp = old->orderingTimestamp;
                 m.historyOrder = old->historyOrder;
@@ -1852,8 +1871,11 @@ void Application::receive(Event e) {
     m.sendStatus = !m.own ? SendStatus::None : pending ? SendStatus::Queued : SendStatus::Confirmed;
     m.action = e.type == "action";
     const bool foolish = !m.own && isFool(model, e.server, m.nick);
-    if (!m.own && b.kind != "server")
+    if (!m.own && b.kind != "server") {
         m.mention = actualNickMention(m.text, network.nick, network.caseMapping);
+        if (m.mention)
+            m.mentionNick = network.nick;
+    }
     const string id = m.id;
     const bool mention = m.mention;
     const auto previousUnread = b.unread;
@@ -2597,8 +2619,12 @@ void Application::reduce(const Event &input) {
                 cancelSearchJump();
             searchRequests_.erase(e.server);
             ++n.sessionGeneration;
+            n.prefixModes = "(ov)@+";
+            n.channelModeTypes = "b,k,l,imnpst";
             if (model.whoisProfile.server == e.server)
                 finishWhois("Connection changed before WHOIS completed");
+            if (model.channelTools.server == e.server)
+                invalidateChannelTools("Connection changed");
             std::erase_if(commandOrigins_,
                           [&](const auto &item) { return item.second.server == e.server; });
             n.fileHost.clear();
@@ -2622,8 +2648,8 @@ void Application::reduce(const Event &input) {
             n.caseMapping = "rfc1459";
             channelTypes_.erase(e.server);
             n.channelTypes = "#&+!";
-            prefixModes_.erase(e.server);
-            channelModes_.erase(e.server);
+            n.prefixModes = "(ov)@+";
+            n.channelModeTypes = "b,k,l,imnpst";
             historyReferences_.erase(e.server);
             for (auto &[id, b] : model.buffers)
                 if (b.server == e.server)
@@ -2790,6 +2816,8 @@ void Application::reduce(const Event &input) {
                         origin.sessionGeneration = n.sessionGeneration;
                 if (model.whoisProfile.server == e.server)
                     model.whoisProfile.sessionGeneration = n.sessionGeneration;
+                if (model.channelTools.server == e.server)
+                    model.channelTools.sessionGeneration = n.sessionGeneration;
             }
             auto snapshot = [&](auto &values, const string &key, bool emptyIsValue = false) {
                 auto found = e.tags.find(key);
@@ -2802,8 +2830,20 @@ void Application::reduce(const Event &input) {
             n.caseMapping = caseMapping_.contains(e.server) ? caseMapping_.at(e.server) : "rfc1459";
             snapshot(channelTypes_, "CHANTYPES", true);
             n.channelTypes = channelTypes_.contains(e.server) ? channelTypes_.at(e.server) : "#&+!";
-            snapshot(prefixModes_, "PREFIX");
-            snapshot(channelModes_, "CHANMODES");
+            const auto prefix = e.tags.contains("PREFIX") ? tag(e, "PREFIX") : "(ov)@+";
+            if (n.prefixModes != prefix) {
+                for (auto &[id, room] : model.buffers)
+                    if (room.server == e.server) {
+                        for (auto &nick : room.nicks)
+                            nick.prefix.clear();
+                        if (auto cached = namesCache_.find(id); cached != namesCache_.end())
+                            for (auto &nick : cached->second)
+                                nick.prefix.clear();
+                    }
+            }
+            n.prefixModes = prefix;
+            n.channelModeTypes =
+                e.tags.contains("CHANMODES") ? tag(e, "CHANMODES") : "b,k,l,imnpst";
             n.clientTagDeny = tag(e, "CLIENTTAGDENY");
             if (const auto refs = e.tags.find("MSGREFTYPES"); refs != e.tags.end())
                 historyReferences_[e.server] = refs->second;
@@ -2823,16 +2863,13 @@ void Application::reduce(const Event &input) {
         if (!e.history && upper(tag(e, "command")) == "MODE" && e.params.size() >= 2 &&
             channel(e.server, e.params[0])) {
             auto &room = buffer(e.server, e.params[0]);
-            const string spec = prefixModes_.contains(e.server) ? prefixModes_[e.server] : "(ov)@+";
-            const auto close = spec.find(')');
-            const string modes = close == string::npos ? "ov" : spec.substr(1, close - 1);
-            const string prefixes = close == string::npos ? "@+" : spec.substr(close + 1);
-            vector<string> groups;
-            std::istringstream stream(channelModes_.contains(e.server) ? channelModes_[e.server]
-                                                                       : "b,k,l,imnpst");
-            for (string part; std::getline(stream, part, ',');)
-                groups.push_back(part);
-            groups.resize(4);
+            const auto modes = channelStatusModes(n);
+            const std::string_view prefixes =
+                std::string_view(n.prefixModes)
+                    .substr(modes.empty() ? n.prefixModes.size() : modes.size() + 2);
+            auto &tools = model.channelTools;
+            const bool panel = tools.server == e.server && tools.buffer == room.id &&
+                               tools.sessionGeneration == n.sessionGeneration;
             bool adding = true;
             size_t argument = 2;
             for (const char mode : e.params[1]) {
@@ -2845,13 +2882,49 @@ void Application::reduce(const Event &input) {
                     continue;
                 }
                 const auto status = modes.find(mode);
-                const bool parameter = status != string::npos ||
-                                       groups[0].find(mode) != string::npos ||
-                                       groups[1].find(mode) != string::npos ||
-                                       (adding && groups[2].find(mode) != string::npos);
-                if (!parameter || argument >= e.params.size())
-                    continue;
-                const auto &value = e.params[argument++];
+                const auto group = channelModeGroup(n, mode);
+                if (status == string::npos && group < 0)
+                    break;
+                const bool parameter =
+                    status != string::npos || group == 0 || group == 1 || (adding && group == 2);
+                string value;
+                if (parameter) {
+                    if (argument >= e.params.size())
+                        continue;
+                    value = e.params[argument++];
+                }
+                if (panel && status == string::npos && group >= 0) {
+                    if (group == 0 && mode == 'b') {
+                        if (tools.open && tools.bansKnown) {
+                            std::erase_if(tools.bans,
+                                          [&](const auto &ban) { return ban.mask == value; });
+                            if (adding)
+                                tools.bans.push_back({value, e.nick, e.timestamp});
+                            ++tools.revision;
+                        }
+                        for (auto &[id, origin] : commandOrigins_)
+                            if (id == tools.bansRequest && tools.bansLoading &&
+                                origin.channelQuery == "bans" && origin.server == e.server &&
+                                fold(e.server, origin.channelTarget) ==
+                                    fold(e.server, room.target)) {
+                                std::erase_if(origin.bans,
+                                              [&](const auto &ban) { return ban.mask == value; });
+                                if (adding) {
+                                    origin.removedBans.erase(value);
+                                    origin.bans.push_back({value, e.nick, e.timestamp});
+                                } else
+                                    origin.removedBans.insert(value);
+                                if (origin.bans.size() + origin.removedBans.size() > 4096)
+                                    finishChannelQuery(id, "Ban list exceeds display limit");
+                            }
+                    } else if (tools.open && group != 0 && tools.modesKnown) {
+                        if (adding)
+                            tools.modes[mode] = mode == 'k' ? "" : value;
+                        else
+                            tools.modes.erase(mode);
+                        ++tools.revision;
+                    }
+                }
                 if (status != string::npos && status < prefixes.size()) {
                     for (auto &nick : room.nicks)
                         if (fold(e.server, nick.name) == fold(e.server, value)) {
@@ -3162,11 +3235,10 @@ void Application::reduce(const Event &input) {
             namesCache_[b.id] = b.nicks;
             b.nicks.clear();
         }
-        string prefixes = "~&@%+";
-        auto prefix = tag(e, "PREFIX");
-        auto close = prefix.find(')');
-        if (close != string::npos)
-            prefixes = prefix.substr(close + 1);
+        const auto modes = channelStatusModes(n);
+        const std::string_view prefixes =
+            std::string_view(n.prefixModes)
+                .substr(modes.empty() ? n.prefixModes.size() : modes.size() + 2);
         for (auto value : e.params) {
             Nick nick;
             while (!value.empty() && prefixes.find(value.front()) != string::npos) {
@@ -3240,6 +3312,10 @@ void Application::reduce(const Event &input) {
         }
         if (!e.history && fold(e.server, victim) == fold(e.server, n.nick)) {
             b.joined = false;
+            if (model.channelTools.buffer == b.id) {
+                invalidateChannelTools("Channel is no longer joined");
+                model.channelTools.open = false;
+            }
             cancelHistory(b);
             clearAvatar(b);
             for (auto &s : model.servers)
@@ -4222,24 +4298,46 @@ void Application::send(Buffer &b, const string &text, const string &reply, bool 
             report(error.what(), b.server, origin);
         }
 }
-void Application::enqueueCommand(const Buffer &b, const string &line) {
+void Application::enqueueCommand(const Buffer &b, const string &line, const string &channelQuery,
+                                 const string &channelTarget) {
     auto c = client(b.server);
     if (!c)
         return;
-    std::erase_if(commandOrigins_,
-                  [&](const auto &item) { return model.now - item.second.started >= 120; });
+    std::erase_if(commandOrigins_, [&](const auto &item) {
+        if (model.now - item.second.started < 120)
+            return false;
+        finishChannelQuery(item.first, "Channel query timed out");
+        return true;
+    });
     if (commandOrigins_.size() >= 256) {
         auto oldest = std::min_element(
             commandOrigins_.begin(), commandOrigins_.end(),
             [](const auto &a, const auto &b) { return a.second.started < b.second.started; });
+        finishChannelQuery(oldest->first, "Channel query retired");
         commandOrigins_.erase(oldest);
     }
-    const auto id = "command-" + localId();
+    const auto id = (channelQuery == "modes" ? "channel-modes-" : "command-") + localId();
     const auto wire = irc::parse(line, irc::incomingCoreLimit);
     const string target =
         wire && wire->command == "WHOIS" && !wire->params.empty() ? wire->params.back() : string{};
     const auto generation = model.networks[b.server].sessionGeneration;
     commandOrigins_.emplace(id, CommandOrigin{b.server, b.id, model.now, target, generation});
+    if (!channelQuery.empty()) {
+        auto &origin = commandOrigins_.at(id);
+        origin.channelQuery = channelQuery;
+        origin.channelTarget = channelTarget;
+        auto &tools = model.channelTools;
+        if (tools.open && tools.server == b.server && tools.sessionGeneration == generation) {
+            const auto source = findBuffer(tools.buffer);
+            if (source && fold(b.server, source->target) == fold(b.server, channelTarget)) {
+                auto &request = channelQuery == "modes" ? tools.modesRequest : tools.bansRequest;
+                request = id;
+                (channelQuery == "modes" ? tools.modesLoading : tools.bansLoading) = true;
+                (channelQuery == "modes" ? tools.modesError : tools.bansError).clear();
+                ++tools.revision;
+            }
+        }
+    }
     if (!target.empty()) {
         const auto revision = model.whoisProfile.revision + 1;
         model.whoisProfile = {};
@@ -4254,11 +4352,114 @@ void Application::enqueueCommand(const Buffer &b, const string &line) {
     try {
         c->command(line, {}, id);
     } catch (...) {
+        finishChannelQuery(id, "Unable to send channel query");
         commandOrigins_.erase(id);
         if (model.whoisProfile.requestId == id)
             finishWhois("Unable to send WHOIS request");
         throw;
     }
+}
+void Application::finishChannelQuery(const string &id, const string &error) {
+    auto &tools = model.channelTools;
+    if (id == tools.modesRequest && tools.modesLoading) {
+        tools.modesLoading = false;
+        tools.modesError = error;
+        ++tools.revision;
+    }
+    if (id == tools.bansRequest && tools.bansLoading) {
+        tools.bansLoading = false;
+        tools.bansError = error;
+        ++tools.revision;
+    }
+}
+void Application::invalidateChannelTools(const string &error) {
+    auto &tools = model.channelTools;
+    finishChannelQuery(tools.modesRequest, error);
+    finishChannelQuery(tools.bansRequest, error);
+    tools.modesKnown = tools.bansKnown = false;
+    tools.modes.clear();
+    tools.bans.clear();
+    ++tools.revision;
+}
+void Application::updateChannelQuery(const Event &e, CommandOrigin &origin) {
+    auto &tools = model.channelTools;
+    const auto id = tag(e, "command-id");
+    const bool modes = origin.channelQuery == "modes";
+    if (tools.server != e.server || tools.sessionGeneration != origin.sessionGeneration ||
+        id != (modes ? tools.modesRequest : tools.bansRequest))
+        return;
+    const auto source = findBuffer(tools.buffer);
+    if (!source || !source->joined || source->server != e.server ||
+        fold(e.server, source->target) != fold(e.server, origin.channelTarget)) {
+        finishChannelQuery(id, "Channel query source is no longer joined");
+        return;
+    }
+    const auto code = tag(e, "command");
+    if (e.type == "error" || code == "FAIL" || !tag(e, "error").empty() ||
+        (code.size() == 3 && (code.front() == '4' || code.front() == '5'))) {
+        auto error = tag(e, "error");
+        if (error.empty())
+            error = e.params.empty() ? e.text : e.params.back();
+        finishChannelQuery(id, error.empty() ? "Channel query failed" : error.substr(0, 4096));
+        return;
+    }
+    const bool matching =
+        e.params.size() >= 2 && fold(e.server, e.params[1]) == fold(e.server, origin.channelTarget);
+    if (!tools.open && ((matching && ((modes && code == "324") || (!modes && code == "368"))) ||
+                        flag(e, "command-complete"))) {
+        finishChannelQuery(id, "Channel tools closed before snapshot completed");
+        return;
+    }
+    if (modes && code == "324" && matching && e.params.size() >= 3 && tools.modesLoading) {
+        map<char, string> snapshot;
+        bool adding = true;
+        size_t parameter = 3;
+        const auto &network = model.networks.at(e.server);
+        for (const char mode : e.params[2]) {
+            if (mode == '+' || mode == '-') {
+                adding = mode == '+';
+                continue;
+            }
+            const auto group = channelModeGroup(network, mode);
+            const bool argument = channelStatusSupported(network, mode) || group == 0 ||
+                                  group == 1 || (adding && group == 2);
+            string value;
+            if (argument) {
+                if (parameter >= e.params.size()) {
+                    finishChannelQuery(id, "Incomplete channel mode snapshot");
+                    return;
+                }
+                if (mode != 'k')
+                    value = e.params[parameter];
+                ++parameter;
+            }
+            if (adding && group > 0)
+                snapshot[mode] = std::move(value);
+        }
+        tools.modes = std::move(snapshot);
+        tools.modesKnown = true;
+        finishChannelQuery(id, {});
+    } else if (!modes && code == "367" && matching && e.params.size() >= 3 && tools.bansLoading) {
+        if (origin.removedBans.contains(e.params[2]))
+            return;
+        if (origin.bans.size() >= 4096) {
+            finishChannelQuery(id, "Ban list exceeds display limit");
+            return;
+        }
+        ChannelBan ban{e.params[2], e.params.size() > 3 ? e.params[3] : ""};
+        if (e.params.size() > 4)
+            std::from_chars(e.params[4].data(), e.params[4].data() + e.params[4].size(),
+                            ban.timestamp);
+        if (std::none_of(origin.bans.begin(), origin.bans.end(),
+                         [&](const auto &item) { return item.mask == ban.mask; }))
+            origin.bans.push_back(std::move(ban));
+    } else if (!modes && code == "368" && matching && tools.bansLoading) {
+        tools.bans = std::move(origin.bans);
+        tools.bansKnown = true;
+        finishChannelQuery(id, {});
+    }
+    if (flag(e, "command-complete") && (modes ? tools.modesLoading : tools.bansLoading))
+        finishChannelQuery(id, "Server did not return a complete channel snapshot");
 }
 bool Application::commandResponse(const Event &e) {
     const bool whois = tag(e, "command-name") == "WHOIS" || whoisNumeric(tag(e, "command"));
@@ -4267,14 +4468,25 @@ bool Application::commandResponse(const Event &e) {
         return whois;
     auto found = commandOrigins_.find(id);
     if (found == commandOrigins_.end())
-        return whois;
-    const auto origin = found->second;
+        return whois || id.starts_with("channel-modes-");
+    const auto &origin = found->second;
     // A wrong-server event cannot consume the genuine route.
     if (origin.server != e.server)
-        return whois || !origin.whoisTarget.empty();
+        return whois || !origin.whoisTarget.empty() || origin.channelQuery == "modes";
     const bool valid = model.now - origin.started < 120 &&
                        origin.sessionGeneration == model.networks[e.server].sessionGeneration;
     auto b = valid ? findBuffer(origin.buffer) : nullptr;
+    if (!origin.channelQuery.empty()) {
+        if (valid && b && b->server == e.server)
+            updateChannelQuery(e, found->second);
+        else
+            finishChannelQuery(id, "Channel query source changed");
+        if (origin.channelQuery == "modes") {
+            if (flag(e, "command-complete") || !valid)
+                commandOrigins_.erase(found);
+            return true;
+        }
+    }
     if (!origin.whoisTarget.empty()) {
         if (valid && b && b->server == e.server)
             updateWhois(e, origin);
@@ -4286,7 +4498,9 @@ bool Application::commandResponse(const Event &e) {
         commandOrigins_.erase(found);
     if (!valid || !b || b->server != e.server)
         return false;
-    string text = tag(e, "command-response");
+    const bool secretSnapshot = tag(e, "command") == "324" &&
+                                (e.params.size() < 3 || e.params[2].find('k') != string::npos);
+    string text = secretSnapshot ? eventBody(e) : tag(e, "command-response");
     if (text.empty() && e.type == "error")
         text = e.text;
     const bool hasOutput = !text.empty();
@@ -4558,6 +4772,132 @@ void Application::command(Buffer &b, const string &input) {
         enqueueCommand(b, "PART " + target + (reason.empty() ? "" : " :" + reason));
         return;
     }
+    const bool statusCommand = name == "OP" || name == "DEOP" || name == "HALFOP" ||
+                               name == "DEHALFOP" || name == "VOICE" || name == "DEVOICE";
+    if (statusCommand || name == "REQUESTOP" || name == "CHANNELTOOLS" || name == "BAN" ||
+        name == "UNBAN" || name == "QUIET" || name == "UNQUIET" || name == "KICKBAN" ||
+        name == "INVITE") {
+        auto [first, rest] = word(args);
+        string target = b.kind == "channel" ? b.target : "";
+        if (channel(b.server, first)) {
+            target = first;
+            args = rest;
+        } else if (name == "INVITE") {
+            const auto [explicitChannel, remaining] = word(rest);
+            if (channel(b.server, explicitChannel) && remaining.empty()) {
+                target = explicitChannel;
+                args = first;
+            }
+        }
+        const auto fail = [&](const string &reason) { report(reason, b.server, b.id); };
+        if (!channel(b.server, target) || target.find_first_of(", \t:") != string::npos) {
+            fail("Select one channel or specify an explicit #channel");
+            return;
+        }
+        auto &network = model.networks[b.server];
+        auto source =
+            std::find_if(model.buffers.begin(), model.buffers.end(), [&](const auto &item) {
+                return item.second.server == b.server && item.second.kind == "channel" &&
+                       fold(b.server, item.second.target) == fold(b.server, target);
+            });
+        if (network.state != "Ready" || source == model.buffers.end() || !source->second.joined) {
+            fail("Channel commands require a live joined channel");
+            return;
+        }
+        auto [value, extra] = word(args);
+        const auto member = [&](const string &nick) {
+            return std::find_if(source->second.nicks.begin(), source->second.nicks.end(),
+                                [&](const auto &item) {
+                                    return fold(b.server, item.name) == fold(b.server, nick);
+                                });
+        };
+        const auto maskValid = [](const string &mask) {
+            return !mask.empty() && mask.front() != ':' &&
+                   mask.find_first_of(" ,\t") == string::npos;
+        };
+        if (name == "CHANNELTOOLS") {
+            if (!value.empty()) {
+                fail("Usage: /channeltools [#channel]");
+                return;
+            }
+            action({"channel-tools-open", source->second.id, {}, {}});
+            return;
+        }
+        if (statusCommand || name == "REQUESTOP") {
+            const char mode = name == "HALFOP" || name == "DEHALFOP" ? 'h'
+                              : name == "VOICE" || name == "DEVOICE" ? 'v'
+                                                                     : 'o';
+            if (!extra.empty() || !channelStatusSupported(network, mode)) {
+                fail("Unsupported status or extra arguments");
+                return;
+            }
+            const auto nick = name == "REQUESTOP" || value.empty() ? network.nick : value;
+            const bool own = fold(b.server, nick) == fold(b.server, network.nick);
+            if (!irc::validNickname(nick) || (!own && member(nick) == source->second.nicks.end())) {
+                fail("Nickname must be a current channel member");
+                return;
+            }
+            const auto self = member(network.nick);
+            const bool request =
+                name == "REQUESTOP" ||
+                (name == "OP" && fold(b.server, nick) == fold(b.server, network.nick) &&
+                 (self == source->second.nicks.end() || !channelHasPrivilege(network, *self, 'o')));
+            if (request) {
+                const auto service = name == "REQUESTOP" && !value.empty() ? value : "ChanServ";
+                if (!irc::validNickname(service)) {
+                    fail("Service must be one valid nickname");
+                    return;
+                }
+                enqueueCommand(b, "PRIVMSG " + string(service) + " :OP " + target + " " +
+                                      network.nick);
+                fail("Operator request sent to " + string(service) +
+                     "; awaiting server authorization");
+            } else {
+                const bool adding = name == "OP" || name == "HALFOP" || name == "VOICE";
+                enqueueCommand(b, "MODE " + target + (adding ? " +" : " -") + mode + " " + nick);
+            }
+            return;
+        }
+        if (name == "INVITE" || name == "KICKBAN") {
+            if (!irc::validNickname(value) || (name == "INVITE" && !extra.empty()) ||
+                (name == "KICKBAN" && member(value) == source->second.nicks.end())) {
+                fail("Specify one valid nickname (kick target must still be a member)");
+                return;
+            }
+            if (name == "INVITE") {
+                enqueueCommand(b, "INVITE " + value + " " + target);
+                return;
+            }
+            const auto [mask, reason] = word(extra);
+            if (!maskValid(mask) || channelModeGroup(network, 'b') != 0) {
+                fail("Usage: /kickban [#channel] nick explicit-mask [reason]");
+                return;
+            }
+            enqueueCommand(b, "MODE " + target + " +b " + mask);
+            enqueueCommand(b,
+                           "KICK " + target + " " + value + (reason.empty() ? "" : " :" + reason));
+            fail("Ban and kick requests sent separately; the server may reject either");
+            return;
+        }
+        const bool quiet = name == "QUIET" || name == "UNQUIET";
+        const char mode = quiet ? 'q' : 'b';
+        if (channelModeGroup(network, mode) != 0 ||
+            (quiet && channelStatusSupported(network, 'q'))) {
+            fail("This server does not advertise that list mode");
+            return;
+        }
+        if (name == "BAN" && value.empty()) {
+            enqueueCommand(b, "MODE " + target + " +b", "bans", target);
+            return;
+        }
+        if (!maskValid(value) || !extra.empty()) {
+            fail("Specify one explicit mask; no hostmask is inferred");
+            return;
+        }
+        const bool adding = name == "BAN" || name == "QUIET";
+        enqueueCommand(b, "MODE " + target + (adding ? " +" : " -") + mode + " " + value);
+        return;
+    }
     if (name == "KICK") {
         auto [first, rest] = word(args);
         string target = b.target, victim = first, reason = rest;
@@ -4567,7 +4907,8 @@ void Application::command(Buffer &b, const string &input) {
             victim = parts.first;
             reason = parts.second;
         }
-        if (!channel(b.server, target) || victim.empty()) {
+        if (!channel(b.server, target) || target.find_first_of(", \t:") != string::npos ||
+            !irc::validNickname(victim)) {
             report("Usage: /kick [#channel] nick [reason]", b.server, b.id);
             return;
         }
@@ -4882,6 +5223,47 @@ void Application::action(const Action &a) {
     if (b->kind == "mentions")
         return;
     auto c = client(b->server);
+    if (a.type == "channel-tools-open") {
+        const auto network = model.networks.find(b->server);
+        if (b->kind != "channel" || !b->joined || !c || network == model.networks.end() ||
+            network->second.state != "Ready") {
+            report("Channel tools require a live joined channel", b->server, b->id);
+            return;
+        }
+        auto &tools = model.channelTools;
+        const auto revision = tools.revision + 1;
+        if (tools.buffer == b->id && tools.server == b->server &&
+            tools.sessionGeneration == network->second.sessionGeneration) {
+            tools.open = true;
+            if (tools.modesLoading) {
+                const auto pending = commandOrigins_.find(tools.modesRequest);
+                if (pending != commandOrigins_.end() && pending->second.server == b->server &&
+                    pending->second.sessionGeneration == network->second.sessionGeneration &&
+                    pending->second.channelQuery == "modes" &&
+                    fold(b->server, pending->second.channelTarget) == fold(b->server, b->target) &&
+                    model.now - pending->second.started < 120)
+                    return;
+                finishChannelQuery(tools.modesRequest, "Channel query is no longer pending");
+            }
+            tools.modesKnown = false;
+            tools.modes.clear();
+            tools.modesError.clear();
+            if (!tools.bansLoading) {
+                tools.bansKnown = false;
+                tools.bans.clear();
+                tools.bansError.clear();
+            }
+        } else {
+            tools = {};
+            tools.buffer = b->id;
+            tools.server = b->server;
+            tools.sessionGeneration = network->second.sessionGeneration;
+        }
+        tools.revision = revision;
+        tools.open = true;
+        enqueueCommand(*b, "MODE " + b->target, "modes", b->target);
+        return;
+    }
     if (a.type == "command") {
         command(*b, a.text);
         return;
@@ -5160,6 +5542,10 @@ void Application::action(const Action &a) {
             model.whoisProfile.open = model.whoisProfile.loading = false;
             ++model.whoisProfile.revision;
         }
+        if (model.channelTools.buffer == id) {
+            invalidateChannelTools("Channel buffer closed");
+            model.channelTools.open = false;
+        }
         std::erase_if(commandOrigins_, [&](const auto &item) { return item.second.buffer == id; });
         if (b->kind != "search")
             messageCount_ -= b->messages.size();
@@ -5235,16 +5621,21 @@ void Application::refreshMentions() {
             message.deleted |= tombstones.contains({live.id, message.id});
             if (old != rows.end()) {
                 message.mention |= old->second.mention;
+                if (message.mentionNick.empty())
+                    message.mentionNick = old->second.mentionNick;
                 message.storageSequence = old->second.storageSequence;
                 message.orderingTimestamp = old->second.orderingTimestamp;
                 message.historyOrder = old->second.historyOrder;
                 rows.erase(old);
             }
             const auto network = model.networks.find(live.server);
-            if (!message.mention && !message.own && !message.presence && !message.deleted &&
-                network != model.networks.end())
-                message.mention |= actualNickMention(message.text, network->second.nick,
-                                                     network->second.caseMapping);
+            if ((!message.mention || message.mentionNick.empty()) && !message.own &&
+                !message.presence && !message.deleted && network != model.networks.end() &&
+                actualNickMention(message.text, network->second.nick,
+                                  network->second.caseMapping)) {
+                message.mention = true;
+                message.mentionNick = network->second.nick;
+            }
             if (!message.id.empty() && message.mention && !message.own && !message.presence &&
                 !message.deleted)
                 rows.emplace(message.id, std::move(message));
@@ -5309,8 +5700,14 @@ void Application::refreshMentions() {
         const auto retained = model.mentionSources.find(source.id);
         if (retained == model.mentionSources.end())
             return;
-        for (auto &row : source.messages)
-            row.mention |= retained->second.sourceMessageIndex.contains(row.id);
+        for (auto &row : source.messages) {
+            const auto found = retained->second.sourceMessageIndex.find(row.id);
+            if (found != retained->second.sourceMessageIndex.end()) {
+                row.mention = true;
+                if (row.mentionNick.empty())
+                    row.mentionNick = retained->second.messages[found->second].mentionNick;
+            }
+        }
     };
     for (auto &[id, source] : unsavedSources_)
         preserveClassified(source);
@@ -5774,6 +6171,21 @@ void Application::drainClients() {
 void Application::tick(double now) {
     model.effects.clear();
     model.now = now;
+    auto &tools = model.channelTools;
+    if (tools.open) {
+        const auto source = findBuffer(tools.buffer);
+        if (!source || !source->joined || source->server != tools.server ||
+            model.networks[tools.server].state != "Ready" ||
+            model.networks[tools.server].sessionGeneration != tools.sessionGeneration) {
+            invalidateChannelTools("Channel is no longer joined on this connection");
+            tools.open = false;
+        }
+    }
+    for (const auto *id : {&tools.modesRequest, &tools.bansRequest}) {
+        const auto request = commandOrigins_.find(*id);
+        if (request == commandOrigins_.end() || model.now - request->second.started >= 120)
+            finishChannelQuery(*id, "Channel query timed out");
+    }
     if (model.whoisProfile.loading) {
         const auto request = commandOrigins_.find(model.whoisProfile.requestId);
         if (request == commandOrigins_.end() || model.now - request->second.started >= 120)

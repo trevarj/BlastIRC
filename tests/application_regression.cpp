@@ -13,6 +13,7 @@
 #include <iostream>
 #include <iterator>
 #include <poll.h>
+#include <source_location>
 #include <sqlite3.h>
 #include <stdexcept>
 #include <string_view>
@@ -35,6 +36,7 @@ struct RenameDrainPeer {
         }
     } listener, connection;
     string buffered;
+    string context;
     int port = 0;
     static void require(bool condition, const char *reason) {
         if (!condition)
@@ -105,7 +107,12 @@ struct RenameDrainPeer {
                 buffered.erase(0, end + 2);
                 return std::move(*message);
             }
-            waitFd(connection.value, POLLIN, deadline);
+            try {
+                waitFd(connection.value, POLLIN, deadline);
+            } catch (const std::exception &error) {
+                throw std::runtime_error(string(error.what()) +
+                                         (context.empty() ? "" : " [" + context + "]"));
+            }
             char bytes[4096];
             const auto result = ::recv(connection.value, bytes, sizeof(bytes), 0);
             if (result > 0) {
@@ -117,7 +124,12 @@ struct RenameDrainPeer {
         }
     }
     void expect(std::string_view command, std::initializer_list<std::string_view> params) {
-        const auto message = read();
+        irc::WireMessage message;
+        try {
+            message = read();
+        } catch (const std::exception &error) {
+            throw std::runtime_error(string(error.what()) + "; expected " + string(command));
+        }
         if (message.command == command &&
             std::equal(message.params.begin(), message.params.end(), params.begin(), params.end()))
             return;
@@ -659,6 +671,501 @@ struct ApplicationRegression {
                 }) == 1);
         }
     }
+    static void operatorCommandsAndQueries(Application &app, RenameDrainPeer &peer,
+                                           NetworkClient &client, const string &server,
+                                           const string &origin, const string &elsewhere,
+                                           const string &target) {
+        auto &room = app.model.buffers.at(origin);
+        auto &other = app.model.buffers.at(target);
+        auto &network = app.model.networks.at(server);
+        const auto oldMembers = room.nicks;
+        const bool oldJoined = room.joined, otherJoined = other.joined;
+        room.joined = other.joined = true;
+        room.nicks = {{"Me", "", ""}, {"Alice", "", ""}};
+        const auto drain = [&] {
+            peer.fence();
+            for (const auto &event : client.poll())
+                app.reduce(event);
+        };
+        const auto issue = [&](const string &source, const string &input, std::string_view command,
+                               std::initializer_list<std::string_view> params,
+                               const std::source_location location =
+                                   std::source_location::current()) {
+            const auto previous = app.commandOrigins_;
+            peer.context = "operatorCommandsAndQueries line " + std::to_string(location.line()) +
+                           ": " + input + "; source=" + source + "; expected=" + string(command);
+            app.action({"command", source, input, {}});
+            peer.context +=
+                "; status=" + app.model.status +
+                "; open=" + std::to_string(app.model.channelTools.open) +
+                "; modesLoading=" + std::to_string(app.model.channelTools.modesLoading) +
+                "; modesRequest=" + app.model.channelTools.modesRequest +
+                "; bansLoading=" + std::to_string(app.model.channelTools.bansLoading) +
+                "; bansRequest=" + app.model.channelTools.bansRequest;
+            const auto wire = peer.read();
+            assert(wire.command == command && std::equal(wire.params.begin(), wire.params.end(),
+                                                         params.begin(), params.end()));
+            const auto route = std::find_if(
+                app.commandOrigins_.begin(), app.commandOrigins_.end(), [&](const auto &item) {
+                    return !previous.contains(item.first) && item.second.buffer == source;
+                });
+            assert(route != app.commandOrigins_.end() && wire.tags.contains("label"));
+            app.model.activeBuffer = elsewhere;
+            return std::pair{wire.tags.at("label"), route->first};
+        };
+        const auto reply = [&](const auto &request, const string &line) {
+            peer.send("@label=" + request.first + " " + line);
+            drain();
+        };
+        const auto reject = [&](const string &source, const string &input) {
+            const auto pending = app.commandOrigins_.size();
+            app.model.status.clear();
+            app.action({"command", source, input, {}});
+            assert(!app.model.status.empty() && app.commandOrigins_.size() == pending);
+            drain();
+        };
+        const auto response = [&](const auto &request, const string &numeric, vector<string> params,
+                                  bool complete = false) {
+            Event event;
+            event.type = "network";
+            event.server = server;
+            event.params = std::move(params);
+            event.tags = {{"command-id", request.second}, {"command", numeric}};
+            if (complete)
+                event.tags["command-complete"] = "1";
+            return event;
+        };
+
+        auto request = issue(origin, "/op", "PRIVMSG", {"ChanServ", "OP #origin Me"});
+        assert(room.nicks[0].prefix.empty() && !channelHasPrivilege(network, room.nicks[0], 'o'));
+        reply(request, ":ChanServ!service@host NOTICE Me :Access denied");
+        assert(room.nicks[0].prefix.empty());
+        request = issue(origin, "/requestop #origin OtherServ", "PRIVMSG",
+                        {"OtherServ", "OP #origin Me"});
+        reply(request, ":OtherServ!service@host NOTICE Me :You are now an operator");
+        assert(room.nicks[0].prefix.empty());
+        peer.send(":Operator!user@host MODE #origin +o Me");
+        drain();
+        assert(channelHasStatus(network, room.nicks[0], 'o') &&
+               channelHasPrivilege(network, room.nicks[0], 'o'));
+        request = issue(origin, "/op", "MODE", {"#origin", "+o", "Me"});
+        reply(request, ":server ACK");
+        for (const auto &[input, flags, nick] : {std::tuple{"/op Alice", "+o", "Alice"},
+                                                 {"/deop", "-o", "Me"},
+                                                 {"/voice #origin Alice", "+v", "Alice"},
+                                                 {"/devoice", "-v", "Me"}}) {
+            request = issue(origin, input, "MODE", {"#origin", flags, nick});
+            reply(request, ":server ACK");
+        }
+        reject(origin, "/halfop Alice");
+
+        peer.send(":server 005 Me CHANMODES=beI,k,l,imnpst :are supported");
+        drain();
+        assert(channelModeGroup(network, 'b') == 0 && channelModeGroup(network, 'I') == 0);
+        peer.send(":server 005 Me PREFIX=(ohv)!%+ CHANMODES=bq,k,l,imnt CASEMAPPING=rfc1459 "
+                  ":are supported");
+        drain();
+        assert(network.prefixModes == "(ohv)!%+" && network.channelModeTypes == "bq,k,l,imnt" &&
+               network.caseMapping == "rfc1459");
+        assert(room.nicks[0].prefix.empty());
+        peer.send(":Operator!user@host MODE #origin +o Me");
+        drain();
+        assert(channelHasStatus(network, room.nicks[0], 'o') &&
+               channelHasPrivilege(network, room.nicks[0], 'h'));
+        for (const auto &[input, flags] : {std::pair{"/halfop Alice", "+h"},
+                                           {"/dehalfop Alice", "-h"},
+                                           {"/quiet *!*@quiet.example", "+q"},
+                                           {"/unquiet *!*@quiet.example", "-q"},
+                                           {"/ban *!*@ban.example", "+b"},
+                                           {"/unban *!*@ban.example", "-b"}}) {
+            const bool list = string(input).find("halfop") == string::npos;
+            const string mask = string(input).find("quiet") != string::npos ? "*!*@quiet.example"
+                                                                            : "*!*@ban.example";
+            request = issue(origin, input, "MODE", {"#origin", flags, list ? mask : "Alice"});
+            reply(request, ":server ACK");
+        }
+        network.nick = "[Me]";
+        room.nicks[0] = {"{mE}", "", "!"};
+        request = issue(origin, "/op [ME]", "MODE", {"#origin", "+o", "[ME]"});
+        reply(request, ":server ACK");
+        room.nicks[1].name = "{Alice}";
+        request = issue(origin, "/op [ALICE]", "MODE", {"#origin", "+o", "[ALICE]"});
+        reply(request, ":server ACK");
+        peer.send(":server 005 Me CASEMAPPING=ascii :are supported");
+        drain();
+        request = issue(origin, "/op [ME]", "PRIVMSG", {"ChanServ", "OP #origin [Me]"});
+        assert(room.nicks[0].name == "{mE}" && room.nicks[0].prefix == "!" &&
+               room.nicks[1].prefix.empty());
+        reply(request, ":server ACK");
+        reject(origin, "/op [ALICE]");
+        room.nicks[1].name = "Alice";
+        network.nick = "Me";
+        room.nicks[0] = {"Me", "", "!"};
+        peer.send(":server 005 Me PREFIX=(qohv)~!%+ :are supported");
+        drain();
+        reject(origin, "/quiet *!*@quiet.example");
+        reject(origin, "/unquiet *!*@quiet.example");
+        peer.send(":server 005 Me PREFIX=(ohv)!%+ :are supported");
+        drain();
+
+        request = issue(origin, "/ban Alice", "MODE", {"#origin", "+b", "Alice"});
+        reply(request, ":server ACK");
+        request = issue(origin, "/invite Guest", "INVITE", {"Guest", "#origin"});
+        reply(request, ":server ACK");
+        request = issue(origin, "/invite #target Guest", "INVITE", {"Guest", "#target"});
+        reply(request, ":server ACK");
+        request = issue(origin, "/invite Guest #target", "INVITE", {"Guest", "#target"});
+        reply(request, ":server ACK");
+        const auto beforeKickban = app.commandOrigins_;
+        app.action({"command", origin, "/kickban Alice *!*@explicit.example repeated abuse", {}});
+        peer.expect("MODE", {"#origin", "+b", "*!*@explicit.example"});
+        peer.expect("KICK", {"#origin", "Alice", "repeated abuse"});
+        assert(app.commandOrigins_.size() == beforeKickban.size() + 2);
+        drain();
+        for (const auto &input :
+             {string("/kickban Alice"), string("/kickban Missing *!*@explicit.example"),
+              string("/unban"), string("/quiet"), string("/unquiet"), string("/ban :trailing"),
+              string("/ban mask extra"), string("/op Alice,Bob"), string("/op Alice extra"),
+              string("/requestop #origin :BadService"), string("/channeltools #origin extra"),
+              string("/invite"), string("/op #missing Alice"),
+              string("/ban bad\r\nMODE #origin +o Me"), string("/ban bad\0mask", 14)})
+            reject(origin, input);
+        room.joined = false;
+        reject(origin, "/op");
+        reject(origin, "/ban");
+        reject(origin, "/channeltools");
+        room.joined = true;
+        network.state = "Connecting";
+        reject(origin, "/requestop");
+        reject(origin, "/ban *!*@explicit.example");
+        network.state = "Ready";
+
+        request = issue(origin, "/channeltools", "MODE", {"#origin"});
+        auto &tools = app.model.channelTools;
+        assert(tools.open && tools.buffer == origin && tools.server == server &&
+               tools.sessionGeneration == network.sessionGeneration && tools.modesLoading &&
+               tools.modesRequest == request.second && !tools.modesKnown);
+        assert(app.commandOrigins_.at(request.second).channelQuery == "modes" &&
+               app.commandOrigins_.at(request.second).channelTarget == "#origin");
+        reply(request, ":server 324 Me #origin +ntkl panel-secret 12");
+        assert(!tools.modesLoading && tools.modesKnown && tools.modesError.empty() &&
+               tools.modes.contains('n') && tools.modes.contains('t') &&
+               tools.modes.at('l') == "12" && tools.modes.at('k').empty());
+        for (const auto &[id, buffer] : app.model.buffers)
+            assert(std::none_of(buffer.messages.begin(), buffer.messages.end(), [](const auto &m) {
+                return m.text.find("panel-secret") != string::npos;
+            }));
+        peer.send(":Operator!user@host MODE #origin +m-t");
+        drain();
+        assert(tools.modes.contains('m') && !tools.modes.contains('t'));
+        request = issue(origin, "/mode #origin +k wire-key-secret", "MODE",
+                        {"#origin", "+k", "wire-key-secret"});
+        reply(request, ":server 324 Me #origin +ntk correlated-key-secret");
+        request = issue(origin, "/mode #origin", "MODE", {"#origin"});
+        auto keySnapshot =
+            response(request, "324", {"Me", "#origin", "+ntk", "synthetic-key-secret"}, true);
+        keySnapshot.target = "#origin";
+        keySnapshot.tags["kind"] = "mode";
+        keySnapshot.tags["command-response"] = "324 #origin +ntk synthetic-key-secret";
+        app.reduce(keySnapshot);
+        for (const auto id : {"", "retired-mode-request", "ambiguous-mode-request"}) {
+            keySnapshot.tags["command-id"] = id;
+            app.reduce(keySnapshot);
+        }
+        peer.send(":server 324 Me #origin +ntk unsolicited-key-secret");
+        drain();
+        for (const auto &[id, buffer] : app.model.buffers)
+            assert(std::none_of(buffer.messages.begin(), buffer.messages.end(), [](const auto &m) {
+                return m.text.find("key-secret") != string::npos;
+            }));
+
+        request = issue(origin, "/ban", "MODE", {"#origin", "+b"});
+        assert(tools.bansLoading && !tools.bansKnown && tools.bansRequest == request.second &&
+               app.commandOrigins_.at(request.second).channelQuery == "bans");
+        peer.send("@label=" + request.first + " :server BATCH +operator-bans labeled-response");
+        peer.send("@batch=operator-bans :server 367 Me #origin *!*@one.example Setter 123");
+        drain();
+        assert(tools.bansLoading && tools.bans.empty() && !tools.bansKnown);
+        peer.send("@batch=operator-bans :server 368 Me #origin :End of ban list");
+        peer.send(":server BATCH -operator-bans");
+        drain();
+        assert(!tools.bansLoading && tools.bansKnown && tools.bansError.empty() &&
+               tools.bans.size() == 1 && tools.bans[0].mask == "*!*@one.example" &&
+               tools.bans[0].setter == "Setter" && tools.bans[0].timestamp == 123);
+        request = issue(origin, "/ban", "MODE", {"#origin", "+b"});
+        peer.send("@label=" + request.first + " :server BATCH +operator-ban-race labeled-response");
+        peer.send(":Operator!user@host MODE #origin -b *!*@one.example");
+        peer.send(":Operator!user@host MODE #origin +b *!*@live-added.example");
+        drain();
+        assert(tools.bansLoading &&
+               std::none_of(tools.bans.begin(), tools.bans.end(),
+                            [](const auto &ban) { return ban.mask == "*!*@one.example"; }));
+        peer.send("@batch=operator-ban-race :server 367 Me #origin *!*@one.example Setter 123");
+        peer.send("@batch=operator-ban-race :server 368 Me #origin :End of ban list");
+        peer.send(":server BATCH -operator-ban-race");
+        drain();
+        assert(tools.bansKnown && !tools.bansLoading && tools.bansError.empty() &&
+               tools.bans.size() == 1 && tools.bans[0].mask == "*!*@live-added.example");
+        request = issue(origin, "/ban", "MODE", {"#origin", "+b"});
+        assert(tools.bansLoading && tools.bans.size() == 1);
+        reply(request, ":server 368 Me #origin :End of empty list");
+        assert(tools.bansKnown && !tools.bansLoading && tools.bans.empty());
+
+        request = issue(origin, "/ban", "MODE", {"#origin", "+b"});
+        const auto revision = tools.revision;
+        auto foreign = response(request, "367", {"Me", "#origin", "*!*@foreign.example"});
+        foreign.server = "wrong-server";
+        app.reduce(foreign);
+        app.reduce(response(request, "367", {"Me", "#target", "*!*@wrong-channel.example"}));
+        auto unknown = response(request, "368", {"Me", "#origin"});
+        unknown.tags["command-id"] = "unknown-channel-query";
+        app.reduce(unknown);
+        assert(tools.revision == revision && tools.bans.empty() && tools.bansLoading &&
+               app.commandOrigins_.contains(request.second));
+        reply(request, ":server 482 Me #origin :Operator privileges required");
+        assert(!tools.bansLoading && !tools.bansError.empty() && tools.bans.empty());
+        request = issue(origin, "/ban", "MODE", {"#origin", "+b"});
+        auto timeout = response(request, "", {}, true);
+        timeout.tags["kind"] = "command-complete";
+        timeout.tags["error"] = "Command response timed out";
+        app.reduce(timeout);
+        assert(!tools.bansLoading && !tools.bansError.empty() &&
+               !app.commandOrigins_.contains(request.second));
+        const auto timedOutRevision = tools.revision;
+        app.reduce(response(request, "368", {"Me", "#origin"}, true));
+        assert(tools.revision == timedOutRevision && tools.bans.empty());
+        request = issue(origin, "/ban", "MODE", {"#origin", "+b"});
+        reply(request, ":server ACK");
+        assert(!tools.bansLoading && !tools.bansError.empty());
+
+        const auto staleBans = issue(origin, "/ban", "MODE", {"#origin", "+b"});
+        const auto staleModes = issue(origin, "/channeltools", "MODE", {"#origin"});
+        request = issue(target, "/channeltools", "MODE", {"#target"});
+        const auto switchedRevision = tools.revision;
+        app.reduce(response(staleBans, "367", {"Me", "#origin", "*!*@stale.example"}));
+        app.reduce(response(staleBans, "368", {"Me", "#origin"}, true));
+        app.reduce(response(staleModes, "324", {"Me", "#origin", "+i"}, true));
+        assert(tools.buffer == target && tools.modesRequest == request.second &&
+               tools.revision == switchedRevision && tools.modesLoading && tools.bans.empty());
+        reply(request, ":server 403 Me #target :No such channel");
+        assert(!tools.modesLoading && !tools.modesError.empty() && !tools.modesKnown);
+        request = issue(target, "/channeltools", "MODE", {"#target"});
+        app.reduce(response(request, "324", {"Me", "#target", "+k"}, true));
+        assert(!tools.modesLoading && !tools.modesError.empty() && !tools.modesKnown);
+        request = issue(target, "/channeltools", "MODE", {"#target"});
+        auto modeTimeout = response(request, "", {}, true);
+        modeTimeout.tags["kind"] = "command-complete";
+        modeTimeout.tags["error"] = "Command response timed out";
+        app.reduce(modeTimeout);
+        assert(!tools.modesLoading && !tools.modesError.empty() && !tools.modesKnown);
+        request = issue(target, "/channeltools", "MODE", {"#target"});
+        reply(request, ":server 324 Me #target +");
+        assert(tools.modesKnown && !tools.modesLoading && tools.modes.empty());
+        request = issue(target, "/channeltools", "MODE", {"#target"});
+        other.joined = false;
+        app.reduce(response(request, "324", {"Me", "#target", "+i"}, true));
+        assert(!tools.modes.contains('i') && !tools.modesLoading && !tools.modesError.empty() &&
+               !tools.modesKnown && !app.commandOrigins_.contains(request.second));
+        other.joined = true;
+        request = issue(target, "/channeltools", "MODE", {"#target"});
+        const auto oldSession = network.sessionGeneration;
+        Event disconnect;
+        disconnect.type = "state";
+        disconnect.server = server;
+        disconnect.text = "Disconnected";
+        app.reduce(disconnect);
+        assert(network.state == "Disconnected" && network.sessionGeneration > oldSession);
+        assert(channelStatusSupported(network, 'o') && channelStatusSupported(network, 'v') &&
+               !channelStatusSupported(network, 'h'));
+        assert(channelModeGroup(network, 'b') == 0 && channelModeGroup(network, 'q') == -1);
+        assert(!tools.modesLoading && !tools.bansLoading);
+        assert(!tools.modesKnown && !tools.bansKnown && tools.modes.empty() && tools.bans.empty());
+        assert(!app.commandOrigins_.contains(request.second));
+        const auto resetRevision = tools.revision;
+        app.reduce(response(request, "324", {"Me", "#target", "+i"}, true));
+        assert(tools.revision == resetRevision && tools.modes.empty());
+        network.state = "Ready";
+        other.joined = true;
+        const auto retiredRequest = request;
+        request = issue(target, "/channeltools", "MODE", {"#target"});
+        reply(request, ":server 324 Me #target +nt");
+        assert(tools.modesKnown && !tools.modesLoading &&
+               tools.sessionGeneration == network.sessionGeneration && tools.modes.contains('n') &&
+               tools.modes.contains('t'));
+        const auto freshRevision = tools.revision;
+        app.reduce(response(retiredRequest, "324", {"Me", "#target", "+i"}, true));
+        assert(tools.revision == freshRevision && !tools.modes.contains('i'));
+        room.joined = oldJoined;
+        other.joined = otherJoined;
+        room.nicks = oldMembers;
+        app.model.channelTools.open = false;
+        drain();
+    }
+    static void unlabeledChannelToolsLifecycle(std::string_view scenario) {
+        RenameDrainPeer peer;
+        peer.context = "unlabeledChannelToolsLifecycle(" + string(scenario) + "): registration";
+        Application app;
+        app.model = Model{};
+        app.savingAllowed_ = false;
+        app.messageCount_ = 0;
+        app.model.now = 100;
+        app.model.settings.retentionDays = 0;
+        Identity identity;
+        identity.nick = "Me";
+        ServerConfig server;
+        server.name = "unlabeled-channel-tools";
+        server.host = "127.0.0.1";
+        server.port = peer.port;
+        server.tls = false;
+        app.model.identities = {identity};
+        app.model.servers = {server};
+        app.clients_[server.name] = std::make_unique<NetworkClient>(server, identity);
+        auto &client = *app.clients_.at(server.name);
+        client.start();
+        peer.accept();
+        peer.expect("CAP", {"LS", "302"});
+        peer.send(":server CAP * LS :message-tags");
+        peer.expect("NICK", {identity.nick});
+        peer.expect("USER", {identity.username, "0", "*", identity.realname});
+        peer.expect("CAP", {"REQ", "message-tags"});
+        peer.send(":server CAP Me ACK :message-tags");
+        peer.expect("CAP", {"END"});
+        peer.send(":server 001 Me :Welcome");
+        peer.send(":server 376 Me :End of MOTD");
+        const auto deadline = RenameDrainPeer::Clock::now() + std::chrono::seconds(3);
+        while (app.model.networks[server.name].state != "Ready") {
+            for (const auto &event : client.poll())
+                app.reduce(event);
+            RenameDrainPeer::require(RenameDrainPeer::Clock::now() < deadline,
+                                     "Unlabeled channel-tools registration deadline expired");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        auto &room = app.buffer(server.name, "#tools");
+        room.joined = true;
+        room.nicks = {{"Me", "", ""}};
+        auto &tools = app.model.channelTools;
+        string phase = "initial snapshot";
+        const auto drain = [&] {
+            peer.context =
+                "unlabeledChannelToolsLifecycle(" + string(scenario) + "): " + phase + "; draining";
+            peer.fence();
+            for (const auto &event : client.poll())
+                app.reduce(event);
+        };
+        const auto open = [&] {
+            peer.context =
+                "unlabeledChannelToolsLifecycle(" + string(scenario) + "): " + phase + "; opening";
+            app.action({"channel-tools-open", room.id, {}, {}});
+        };
+        const auto expectModes = [&] {
+            peer.context = "unlabeledChannelToolsLifecycle(" + string(scenario) + "): " + phase +
+                           "; expecting MODE #tools; open=" + std::to_string(tools.open) +
+                           ", modesLoading=" + std::to_string(tools.modesLoading) +
+                           ", modesKnown=" + std::to_string(tools.modesKnown) +
+                           ", bansLoading=" + std::to_string(tools.bansLoading);
+            const auto wire = peer.read();
+            assert(wire.command == "MODE" && wire.params == vector<string>({"#tools"}) &&
+                   !wire.tags.contains("label"));
+        };
+        open();
+        expectModes();
+        assert(tools.open && tools.modesLoading && !tools.modesKnown);
+
+        if (scenario == "reopen-before-324") {
+            phase = "reopening before primary 324";
+            const auto originalRequest = tools.modesRequest;
+            tools.open = false;
+            open();
+            drain();
+            assert(tools.open && tools.modesLoading && tools.modesRequest == originalRequest);
+            peer.send(":server 324 Me #tools +imnl 17");
+            drain();
+            assert(tools.modesKnown && !tools.modesLoading && tools.modesError.empty() &&
+                   tools.modes.size() == 4 && tools.modes.contains('i') &&
+                   tools.modes.contains('m') && tools.modes.contains('n') &&
+                   tools.modes.at('l') == "17");
+            peer.send(":server 329 Me #tools 123");
+            drain();
+            assert(tools.modesKnown && !tools.modesLoading && tools.modes.at('l') == "17");
+            return;
+        }
+        if (scenario == "closed-324-before-329") {
+            phase = "receiving primary 324 while closed";
+            tools.open = false;
+            peer.send(":server 324 Me #tools +im");
+            drain();
+            assert(!tools.open && !tools.modesKnown && tools.modes.empty());
+            phase = "reopening after discarded 324 before 329";
+            open();
+            expectModes();
+            assert(tools.open && tools.modesLoading && !tools.modesKnown);
+            peer.send(":server 324 Me #tools +ntl 23");
+            drain();
+            assert(tools.modesKnown && !tools.modesLoading && tools.modesError.empty() &&
+                   tools.modes.size() == 3 && tools.modes.contains('n') &&
+                   tools.modes.contains('t') && tools.modes.at('l') == "23" &&
+                   !tools.modes.contains('i') && !tools.modes.contains('m'));
+            peer.send(":server 329 Me #tools 123");
+            drain();
+            assert(tools.modesKnown && !tools.modesLoading && tools.modes.at('l') == "23");
+            return;
+        }
+        assert(scenario == "closed-mid-ban-with-mode-reopen");
+        phase = "completing initial mode snapshot";
+        peer.send(":server 324 Me #tools +nt");
+        peer.send(":server 329 Me #tools 123");
+        drain();
+        assert(tools.modesKnown && !tools.modesLoading);
+        phase = "requesting ban snapshot";
+        app.action({"command", room.id, "/ban", {}});
+        peer.expect("MODE", {"#tools", "+b"});
+        const auto pendingBans = tools.bansRequest;
+        peer.send(":server 367 Me #tools *!*@before-close.example BeforeSetter 111");
+        drain();
+        assert(tools.bansLoading && !tools.bansKnown && tools.bans.empty());
+        phase = "receiving ban row while closed";
+        tools.open = false;
+        peer.send(":server 367 Me #tools *!*@while-closed.example ClosedSetter 112");
+        drain();
+        assert(!tools.open && !tools.bansKnown && tools.bans.empty() &&
+               tools.bansRequest == pendingBans);
+        phase = "reopening during pending ban snapshot";
+        open();
+        expectModes();
+        assert(tools.modesLoading && tools.bansLoading && !tools.bansKnown && tools.bans.empty() &&
+               tools.bansRequest == pendingBans);
+        peer.send(":server 324 Me #tools +imnl 31");
+        drain();
+        assert(tools.modesKnown && !tools.modesLoading && tools.modesError.empty() &&
+               tools.modes.size() == 4 && tools.modes.at('l') == "31" &&
+               tools.modes.contains('i') && tools.modes.contains('m'));
+        phase = "completing preserved ban snapshot";
+        peer.send(":server 368 Me #tools :End of complete retained list");
+        peer.send(":server 329 Me #tools 123");
+        drain();
+        assert(tools.bansKnown && !tools.bansLoading && tools.bansError.empty() &&
+               tools.bansRequest == pendingBans && tools.bans.size() == 2 &&
+               tools.bans[0].mask == "*!*@before-close.example" &&
+               tools.bans[0].setter == "BeforeSetter" && tools.bans[0].timestamp == 111 &&
+               tools.bans[1].mask == "*!*@while-closed.example" &&
+               tools.bans[1].setter == "ClosedSetter" && tools.bans[1].timestamp == 112);
+        phase = "refreshing complete ban snapshot";
+        app.action({"command", room.id, "/ban", {}});
+        peer.expect("MODE", {"#tools", "+b"});
+        peer.send(":server 367 Me #tools *!*@complete-one.example SetterOne 222");
+        peer.send(":server 367 Me #tools *!*@complete-two.example SetterTwo 333");
+        drain();
+        assert(tools.bansLoading && tools.bansKnown && tools.bans.size() == 2 &&
+               tools.bans[0].mask == "*!*@before-close.example" &&
+               tools.bans[1].mask == "*!*@while-closed.example");
+        peer.send(":server 368 Me #tools :End of complete list");
+        drain();
+        assert(tools.bansKnown && !tools.bansLoading && tools.bansError.empty() &&
+               tools.bans.size() == 2 && tools.bans[0].mask == "*!*@complete-one.example" &&
+               tools.bans[0].setter == "SetterOne" && tools.bans[0].timestamp == 222 &&
+               tools.bans[1].mask == "*!*@complete-two.example" &&
+               tools.bans[1].setter == "SetterTwo" && tools.bans[1].timestamp == 333);
+    }
     static void appOriginAfterSwitch() {
         RenameDrainPeer peer;
         Application app; // Destroy the worker before its loopback peer.
@@ -1106,6 +1613,7 @@ struct ApplicationRegression {
                profile.records[0].realName == "after-filehost-update" &&
                !contains(origin, "after-filehost-update") &&
                !contains(elsewhere, "after-filehost-update"));
+        operatorCommandsAndQueries(app, peer, client, server.name, origin, elsewhere, target);
 
         // Remap both a move and a merge while commands are in flight.
         command = submit(origin, "/raw VERSION");
@@ -2746,6 +3254,7 @@ struct ApplicationRegression {
         incoming.time = "2026-11-05T00:00:00Z";
         app.reduce(incoming);
         assert(room.messages.size() == 1 && room.unread == 1 && room.messages.back().mention);
+        assert(room.messages.back().mentionNick == "Me");
         assert(app.model.effects.size() == 1 && app.model.effects.back().type == "mention" &&
                app.model.effects.back().silent);
         assert(room.readMarker == marker);
@@ -3176,7 +3685,7 @@ struct ApplicationRegression {
                sources.at(first.id).messages.back().id == "same-raw-id" &&
                sources.at(second.id).messages.size() == 1);
         const auto backfilled = app.storage_.message(first.id, "older-mention-0");
-        assert(backfilled && backfilled->mention);
+        assert(backfilled && backfilled->mention && backfilled->mentionNick == "Me");
         const auto &feed = app.model.buffers.at(GlobalMentionsBufferId);
         const Message *firstRow = nullptr, *secondRow = nullptr;
         for (const auto &row : feed.messages) {
@@ -3358,8 +3867,12 @@ struct ApplicationRegression {
         app.model.networks[second.server].nick = "Me";
         app.refreshMentions();
         assert(cached.messages.front().mention && second.messages.back().mention);
+        assert(cached.messages.front().mentionNick == "Me" &&
+               second.messages.back().mentionNick == "Me");
         app.model.networks[second.server].nick = "DifferentNick";
         app.refreshMentions();
+        assert(cached.messages.front().mentionNick == "Me" &&
+               second.messages.back().mentionNick == "Me");
         const auto &retained = app.model.mentionSources.at(second.id).messages;
         assert(cached.messages.front().mention && second.messages.back().mention &&
                std::any_of(retained.begin(), retained.end(), [&](const auto &row) {
@@ -6019,6 +6532,9 @@ struct ApplicationRegression {
         retainedSearchJump();
         correlatedSearchHistory();
         appOriginAfterSwitch();
+        unlabeledChannelToolsLifecycle("reopen-before-324");
+        unlabeledChannelToolsLifecycle("closed-324-before-329");
+        unlabeledChannelToolsLifecycle("closed-mid-ban-with-mode-reopen");
         localOriginErrors();
         closedQueuedCommandOrigin();
         networkStatusErrors();

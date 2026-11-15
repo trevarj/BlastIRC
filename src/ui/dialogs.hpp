@@ -19,6 +19,8 @@ class Dialogs final : public Node {
     Dialogs(Model &, std::function<void(std::string)> execute);
     ~Dialogs() override;
     void open(std::string_view name);
+    static bool moderationAllowed(const Model &, std::string_view buffer, std::string_view nick);
+    void moderate(std::string_view buffer, std::string_view nick, std::string_view operation);
     bool handleKey(const InputArea::KeyData &);
     bool active() const;
     bool settingsOpen() const;

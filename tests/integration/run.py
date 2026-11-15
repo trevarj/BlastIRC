@@ -254,6 +254,7 @@ accounts:
   multiclient: {{enabled: true, allowed-by-default: true, always-on: "disabled"}}
 channels:
   default-modes: +nt
+  registration: {{enabled: true}}
 history:
   enabled: true
   channel-length: 2048
@@ -275,6 +276,7 @@ limits:
   awaylen: 390
   kicklen: 390
   topiclen: 390
+  chan-list-modes: 100
   registration-messages: 1024
 logging:
   - {{method: stderr, type: "* -userinput -useroutput", level: info}}

@@ -47,6 +47,7 @@
 #include <ui/controls/select.h>
 #include <ui/controls/select_popup_context.h>
 #include <ui/controls/spinner.h>
+#include <ui/controls/toggle.h>
 #include <ui/palette.h>
 #include <utility>
 #include <variant>
@@ -4269,6 +4270,187 @@ void queuedPaneCommandCheck(bool rename) {
     assert(!model.settings.messageLayouts.contains(edgeBuffers[1]));
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
+}
+
+void channelToolsAuthorityCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    auto &source = model.buffers.at(edgeBuffers[0]);
+    source.kind = "channel";
+    source.joined = true;
+    source.nicks = {{.name = "Self", .account = "", .prefix = "@"}};
+    auto &network = model.networks[source.server];
+    network.state = "Ready";
+    network.nick = "Self";
+    network.sessionGeneration = 9;
+    auto &state = model.channelTools;
+    state.open = true;
+    state.buffer = source.id;
+    state.server = source.server;
+    state.sessionGeneration = network.sessionGeneration;
+    state.modesKnown = true;
+    ++state.revision;
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    auto *dialogs = visibleNode<Dialogs>(ui.root());
+    assert(dialogs && dialogs->active());
+    auto *requestLabel = labelWithText(*dialogs, "Request operator");
+    Node *node = requestLabel;
+    while (node && !dynamic_cast<Button *>(node))
+        node = node->parent();
+    auto *request = dynamic_cast<Button *>(node);
+    auto *modeLabel = labelWithText(*dialogs, "Moderated (+m)");
+    auto *mode = modeLabel ? visibleNode<Toggle>(*modeLabel->parent()) : nullptr;
+    auto *modeArea = mode ? visibleNode<InputArea>(*mode) : nullptr;
+    assert(request && mode && modeArea && mode->enabled());
+    const auto pending = model.actions.size();
+    model.activeBuffer = edgeBuffers[1];
+    click(dispatcher, *request->inputArea());
+    frame();
+    assert(std::any_of(model.actions.begin() + pending, model.actions.end(), [&](const Action &a) {
+        return a.type == "command" && a.buffer == source.id &&
+               a.text == "/requestop " + source.target + " ChanServ";
+    }));
+    click(dispatcher, *modeArea);
+    frame();
+    assert(!state.modes.contains('m') && !mode->checked());
+    state.modes['m'] = {};
+    ++state.revision;
+    frame();
+    assert(mode->checked());
+    const std::string mask = "BlockedNick!*@explicit.example";
+    auto *maskInput = inputWithText(*dialogs, "");
+    assert(maskInput && maskInput->insertText(mask));
+    frame();
+    auto *addLabel = labelWithText(*dialogs, "Add ban…");
+    Node *addNode = addLabel;
+    while (addNode && !dynamic_cast<Button *>(addNode))
+        addNode = addNode->parent();
+    auto *add = dynamic_cast<Button *>(addNode);
+    assert(add);
+    for (auto *ancestor = add->parent(); ancestor; ancestor = ancestor->parent())
+        if (auto *viewport = dynamic_cast<ScrollView *>(ancestor)) {
+            viewport->requestScrollIntoView(add);
+            break;
+        }
+    frame();
+    click(dispatcher, *add->inputArea());
+    frame();
+    auto *confirmation = visibleLabelContaining(*dialogs, mask);
+    assert(confirmation && confirmation->text().find(source.target) != std::string::npos);
+    const auto beforeBan = model.actions.size();
+    auto *acceptLabel = labelWithText(*dialogs, "Add ban");
+    Node *acceptNode = acceptLabel;
+    while (acceptNode && !dynamic_cast<Button *>(acceptNode))
+        acceptNode = acceptNode->parent();
+    auto *accept = dynamic_cast<Button *>(acceptNode);
+    assert(accept);
+    auto *cancelLabel = labelWithText(*dialogs, "Cancel");
+    Node *cancelNode = cancelLabel;
+    while (cancelNode && !dynamic_cast<Button *>(cancelNode))
+        cancelNode = cancelNode->parent();
+    auto *cancel = dynamic_cast<Button *>(cancelNode);
+    assert(cancel && dispatcher.focusedArea() == cancel->inputArea());
+    hostKey(ui, dispatcher, XKB_KEY_Tab);
+    assert(dispatcher.focusedArea() == accept->inputArea());
+    hostKey(ui, dispatcher, XKB_KEY_Return);
+    frame();
+    assert(std::count_if(model.actions.begin() + beforeBan, model.actions.end(),
+                         [&](const Action &action) {
+                             return action.type == "command" && action.buffer == source.id &&
+                                    action.text == "/ban " + source.target + " " + mask;
+                         }) == 1);
+    assert(state.bans.empty() && !state.bansKnown);
+    source.nicks[0].prefix.clear();
+    frame();
+    assert(!mode->enabled());
+    source.joined = false;
+    frame();
+    assert(!request->enabled());
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
+void channelOperatorSourceCheck() {
+    using namespace blast;
+    for (const int change : {0, 1, 2, 3, 4, 5, 6, 7}) {
+        auto model = edgeModel();
+        auto &source = model.buffers.at(edgeBuffers[0]);
+        source.kind = "channel";
+        source.joined = true;
+        source.nicks = {{.name = "Self[", .account = "", .prefix = "!"},
+                        {.name = "Target", .account = "", .prefix = ""}};
+        auto &network = model.networks[source.server];
+        network.state = "Ready";
+        network.nick = "sELF{";
+        network.prefixModes = "(ohv)!%+";
+        network.sessionGeneration = 7;
+        Clipboard clipboard;
+        Theme theme;
+        theme.update(model);
+        InputDispatcher dispatcher;
+        PangoRenderer renderer;
+        Ui ui(model, clipboard);
+        dispatcher.setSceneRoot(&ui.root());
+        ui.setInputDispatcher(dispatcher);
+        const auto frame = [&] {
+            ui.update(1600, 1000, 1);
+            ui.root().layout(renderer);
+        };
+        frame();
+        ui.execute("nick-action:" + source.id + "\nTarget\nmoderate:+o");
+        frame();
+        auto *dialogs = visibleNode<Dialogs>(ui.root());
+        assert(dialogs && dialogs->active());
+        const auto pending = model.actions.size();
+        const auto expected = "/mode " + source.target + " +o Target";
+        assert(source.nicks[1].prefix.empty());
+        model.activeBuffer = edgeBuffers[1];
+        if (change == 1)
+            source.nicks[0].prefix.clear();
+        else if (change == 2)
+            source.joined = false;
+        else if (change == 3)
+            model.buffers.erase(edgeBuffers[0]);
+        else if (change == 4)
+            ++network.sessionGeneration;
+        else if (change == 5)
+            source.nicks.pop_back();
+        else if (change == 6)
+            source.nicks[1].account = "different-account";
+        else if (change == 7)
+            source.nicks[1].arrived += 1;
+        auto *caption = labelWithText(*dialogs, "Confirm");
+        assert(caption);
+        Node *node = caption;
+        while (node && !dynamic_cast<Button *>(node))
+            node = node->parent();
+        auto *accept = dynamic_cast<Button *>(node);
+        assert(accept);
+        click(dispatcher, *accept->inputArea());
+        frame();
+        const auto requests = std::count_if(
+            model.actions.begin() + pending, model.actions.end(), [&](const Action &action) {
+                return action.type == "command" && action.buffer == edgeBuffers[0] &&
+                       action.text == expected;
+            });
+        assert(requests == (change == 0 ? 1 : 0));
+        if (change != 3 && change != 5)
+            assert(model.buffers.at(edgeBuffers[0]).nicks[1].prefix.empty());
+        dispatcher.setFocus(nullptr);
+        dispatcher.setSceneRoot(nullptr);
+    }
 }
 
 void peopleFriendOrderingCheck() {
@@ -10144,6 +10326,8 @@ void runUiIntegrationCheck() {
     sidebarArchiveControlsCheck();
     sidebarActivityPinsCheck();
     peopleFriendOrderingCheck();
+    channelOperatorSourceCheck();
+    channelToolsAuthorityCheck();
     activityReorderAvySourceIdentityCheck();
     messagingSourceControlsCheck();
     pinnedCurrentSendCheck();

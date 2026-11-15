@@ -657,6 +657,16 @@ struct Geometry {
     float channelPrefix() const { return inlineChannel ? timeGutter + nickGutter + 8 * scale : 0; }
     float padding(bool presence) const { return presence ? 0 : metrics.padding * scale; }
     float paddingY(bool presence) const { return presence ? 0 : verticalPadding * scale; }
+    float mentionPaddingX() const { return 12 * scale; }
+    float mentionPaddingY() const { return 8 * scale; }
+    float mentionHaloGap() const { return 8 * scale; }
+    float mentionGutterX(bool mention) const {
+        return mention ? std::max(0.f, mentionPaddingX() + mentionHaloGap() - metrics.inset * scale)
+                       : 0;
+    }
+    float mentionGutterY(bool mention) const {
+        return mention ? mentionPaddingY() + mentionHaloGap() : 0;
+    }
     float chipPadding() const { return (tight ? 4 : 6) * scale; }
     float chipPaddingY() const { return scale; }
     float activityPadding() const { return (tight ? 6 : 8) * scale; }
@@ -693,9 +703,10 @@ struct Geometry {
     float compactAvatarInset() const {
         return compactAvatarSize() > 0 ? compactAvatarSize() + 6 * scale : 0;
     }
-    float channelNickWidth(bool clockVisible) const {
-        return std::max(1.f,
-                        nickGutter - (!inlineChannel && clockVisible ? clockWidth + 8 * scale : 0));
+    float channelNickWidth(bool clockVisible, bool mention) const {
+        return std::max(1.f, nickGutter -
+                                 (!inlineChannel && clockVisible ? clockWidth + 8 * scale : 0) -
+                                 (!inlineChannel ? 2 * mentionGutterX(mention) : 0));
     }
     float prefixWidth(bool presence) const {
         return presence  ? timeGutter
@@ -882,6 +893,7 @@ struct TranscriptView::Impl {
         bool measured = false, fragmentsReady = false, day = false, grouped = false, unread = false;
         bool unreadEligible = false;
         bool friendAuthor = false;
+        bool mentionHighlight = false;
         bool footerStacked = false;
         bool showClock = true;
         bool foolOpen = false;
@@ -3176,15 +3188,19 @@ struct TranscriptView::Impl {
                       entry.timestamp >= buffer.messages[previous].timestamp &&
                       entry.timestamp - buffer.messages[previous].timestamp < 300;
         row.showClock = timestampVisible(row, buffer, index);
+        row.mentionHighlight = entry.mention && !entry.own && !entry.presence && !entry.pending &&
+                               !entry.deleted && buffer.kind != "mentions" &&
+                               buffer.kind != "search" && !foolish(buffer, entry);
     }
     float activityBodyWidth(const Row &row, const Message &entry, const Geometry &g,
                             float width) const {
         const bool notice = typedActivity(entry);
         const bool collapsed = row.activitySummary && !row.activityExpanded;
         const float available =
-            notice ? std::max(1.f, 2 * width - g.chatWidth - 2 * g.metrics.inset * g.scale) -
-                         (collapsed ? 0 : g.prefixWidth(entry.presence))
-                   : g.bodyWidth(width, entry.presence);
+            notice
+                ? std::max(1.f, 2 * width - g.chatWidth - 2 * g.metrics.inset * g.scale) -
+                      (collapsed ? 0 : g.prefixWidth(entry.presence))
+                : g.bodyWidth(width - 2 * g.mentionGutterX(row.mentionHighlight), entry.presence);
         return std::max(1.f, available - (notice ? 2 * g.activityPadding() : 0) -
                                  (row.activitySummary ? g.activityChevron() : 0));
     }
@@ -3201,8 +3217,8 @@ struct TranscriptView::Impl {
         const float line = notice ? g.activityLine : g.bodyLine;
         const float lines = std::max(1.f, std::ceil(float(text.size()) * font * .5f / bodyWidth));
         row.bodyHeight = line * lines;
-        row.bodyOffset = paddingY + (row.day ? g.day : 0) + (row.unread ? g.unread : 0) +
-                         g.groupGap(entry.presence, row.grouped) +
+        row.bodyOffset = g.mentionGutterY(row.mentionHighlight) + paddingY + (row.day ? g.day : 0) +
+                         (row.unread ? g.unread : 0) + g.groupGap(entry.presence, row.grouped) +
                          (!collapsed && g.authorHeader(row.grouped, entry.presence, row.showClock)
                               ? (g.bubbles ? g.nickHeader : g.metadataHeader)
                               : 0) +
@@ -3211,7 +3227,8 @@ struct TranscriptView::Impl {
         row.height =
             row.bodyOffset + row.bodyHeight +
             (g.footerVisible(entry) ? g.footerExtent(entry, bodyWidth) + g.footerGap() : 0) +
-            paddingY + g.rowGap(entry.presence, row.grouped);
+            paddingY + g.rowGap(entry.presence, row.grouped) +
+            g.mentionGutterY(row.mentionHighlight);
         if (!entry.reactions.empty())
             row.height += g.reaction;
         row.height += row.gapHeight;
@@ -4000,8 +4017,8 @@ struct TranscriptView::Impl {
                     .layoutHeight;
             row.quoteHeight = row.quoteAuthorHeight + row.quoteExcerptHeight + 16 * g.scale;
         }
-        row.bodyOffset = paddingY + (row.day ? g.day : 0) + (row.unread ? g.unread : 0) +
-                         g.groupGap(entry.presence, row.grouped);
+        row.bodyOffset = g.mentionGutterY(row.mentionHighlight) + paddingY + (row.day ? g.day : 0) +
+                         (row.unread ? g.unread : 0) + g.groupGap(entry.presence, row.grouped);
         row.prefixBaseline = row.prefixAscent = row.prefixHeight = 0;
         if (!collapsed && ((g.channel && g.nickVisible(row.grouped, entry.presence)) ||
                            (g.channel && !entry.presence && row.showClock) ||
@@ -4025,9 +4042,10 @@ struct TranscriptView::Impl {
             };
             if (g.nickVisible(row.grouped, entry.presence)) {
                 const auto align = g.inlineChannel ? TextAlign::End : TextAlign::Start;
-                const float nickWidth = std::max(
-                    1.f, g.channelNickWidth(row.showClock) - g.compactAvatarInset() - friendExtent -
-                             (entry.own && !entry.action ? 2 * g.chipPadding() : 0));
+                const float nickWidth =
+                    std::max(1.f, g.channelNickWidth(row.showClock, row.mentionHighlight) -
+                                      g.compactAvatarInset() - friendExtent -
+                                      (entry.own && !entry.action ? 2 * g.chipPadding() : 0));
                 if (entry.action)
                     include("↳ " + entry.nick, nickWidth, align, true);
                 else
@@ -4089,8 +4107,8 @@ struct TranscriptView::Impl {
                     const float chipPadding = entry.own && !entry.action ? g.chipPadding() : 0;
                     const float adornments =
                         g.compactAvatarInset() + 2 * chipPadding + friendExtent;
-                    const float textLimit =
-                        std::max(1.f, g.channelNickWidth(row.showClock) - adornments);
+                    const float textLimit = std::max(
+                        1.f, g.channelNickWidth(row.showClock, row.mentionHighlight) - adornments);
                     const auto text = entry.action ? "↳ " + entry.nick : entry.nick;
                     auto actorFont = themeUiFont();
                     if (entry.action)
@@ -4139,9 +4157,11 @@ struct TranscriptView::Impl {
             row.height =
                 std::max(row.height, double((row.day ? g.day : 0) + (row.unread ? g.unread : 0) +
                                             g.groupGap(entry.presence, row.grouped) +
+                                            g.mentionGutterY(row.mentionHighlight) +
                                             metrics.avatarSize * g.scale));
         if (g.footerVisible(entry))
             row.footerOffset = float(row.height) - paddingY - row.footerHeight;
+        row.height += g.mentionGutterY(row.mentionHighlight);
         row.height += g.rowGap(entry.presence, row.grouped);
         row.height += row.gapHeight;
         row.measured = true;
@@ -4373,7 +4393,8 @@ struct TranscriptView::Impl {
         if (slot.decorations)
             slot.area->removeChild(slot.decorations);
         const float top = (row.day ? g.day : 0) + (row.unread ? g.unread : 0) +
-                          g.groupGap(entry.presence, row.grouped);
+                          g.groupGap(entry.presence, row.grouped) +
+                          g.mentionGutterY(row.mentionHighlight);
         auto decorations = std::make_unique<Node>();
         slot.decorations = decorations.get();
         // Header controls must beat the full-row message node in native hit order,
@@ -4406,8 +4427,9 @@ struct TranscriptView::Impl {
             : entry.presence ? (c.width - row.surfaceWidth) * .5f
             : entry.own && g.bubbles && !entry.action
                 ? c.width - metrics.inset * g.scale - avatarLane - row.surfaceWidth
-                : metrics.inset * g.scale + avatarLane;
-        const float surfaceHeight = float(row.height - row.gapHeight) - top - gap;
+                : metrics.inset * g.scale + avatarLane + g.mentionGutterX(row.mentionHighlight);
+        const float surfaceHeight =
+            float(row.height - row.gapHeight) - top - gap - g.mentionGutterY(row.mentionHighlight);
         auto material = std::make_unique<MaterialNode>(MaterialKind::Message);
         slot.material = material.get();
         slot.material->setPosition(surfaceX, top);
@@ -4415,31 +4437,35 @@ struct TranscriptView::Impl {
         slot.material->setVisible(g.bubbles && !entry.presence && !entry.action);
         slot.material->setHitTestVisible(false);
         slot.content->addChild(std::move(material));
-        if (entry.mention && !entry.own && !entry.presence && !entry.pending && !entry.deleted &&
-            buffer.kind != "mentions" && buffer.kind != "search" && !foolish) {
-            const float outlineWidth = g.bubbles ? row.surfaceWidth : row.selectionWidth;
+        if (row.mentionHighlight) {
+            const float outlineX = surfaceX - g.mentionPaddingX();
+            const float outlineY = top - g.mentionPaddingY();
+            const float outlineWidth =
+                (g.bubbles ? row.surfaceWidth : row.selectionWidth) + 2 * g.mentionPaddingX();
+            const float outlineHeight = surfaceHeight + 2 * g.mentionPaddingY();
             auto halo = std::make_unique<Node>();
             slot.mentionHalo = halo.get();
             halo->setHitTestVisible(false);
             halo->setVisible(false);
             halo->setZIndex(-1);
-            halo->setSize(outlineWidth + 16 * g.scale, surfaceHeight + 16 * g.scale);
-            halo->setPosition(surfaceX - 8 * g.scale, top - 8 * g.scale);
+            halo->setSize(outlineWidth + 2 * g.mentionHaloGap(),
+                          outlineHeight + 2 * g.mentionHaloGap());
+            halo->setPosition(outlineX - g.mentionHaloGap(), outlineY - g.mentionHaloGap());
             RoundedRectStyle outline{};
             outline.fill = themeForegroundColor("tertiary");
             outline.softness = 4 * g.scale;
             outline.outerShadow = true;
             outline.radius = g.bubbles ? themeBubbleRadius() * .75f : g.cornerRadius;
             auto edge = std::make_unique<RectNode>();
-            edge->setPosition(8 * g.scale, 8 * g.scale);
-            edge->setSize(outlineWidth, surfaceHeight);
+            edge->setPosition(g.mentionHaloGap(), g.mentionHaloGap());
+            edge->setSize(outlineWidth, outlineHeight);
             edge->setStyle(outline);
             halo->addChild(std::move(edge));
             addRowPaint(*slot.area, std::move(halo));
             auto paint = std::make_unique<RectNode>();
             slot.mentionPaint = paint.get();
-            paint->setPosition(surfaceX, top);
-            paint->setSize(outlineWidth, surfaceHeight);
+            paint->setPosition(outlineX, outlineY);
+            paint->setSize(outlineWidth, outlineHeight);
             outline.fill = rgba(0, 0, 0, 0);
             outline.border = themeForegroundColor("tertiary");
             outline.softness = 1;
@@ -4517,7 +4543,7 @@ struct TranscriptView::Impl {
                    g.tight ? x - row.emotePrefix
                    : entry.own && !entry.action
                        ? c.width - metrics.inset * g.scale - metrics.avatarSize * g.scale
-                       : metrics.inset * g.scale,
+                       : metrics.inset * g.scale + g.mentionGutterX(row.mentionHighlight),
                    entry.action ? top + (g.tight ? g.paddingY(false) : 0)
                                 : y + row.authorOffset +
                                       (row.authorHeight + 2 * g.chipPaddingY() -
@@ -4644,7 +4670,7 @@ struct TranscriptView::Impl {
             if (g.nickVisible(row.grouped, entry.presence))
                 prefix(entry.action ? "↳ " + entry.nick : entry.nick,
                        surfaceX + padding + (stacked ? 0 : g.timeGutter),
-                       g.channelNickWidth(row.showClock), true);
+                       g.channelNickWidth(row.showClock, row.mentionHighlight), true);
             if (row.showClock && stacked)
                 prefix(clockText(entry), clusterEnd + 8 * g.scale, g.clockWidth, false);
             if (g.stackedPrefix(row.grouped, entry.presence, row.showClock))
@@ -5290,11 +5316,20 @@ struct TranscriptView::Impl {
             if (!entrance.active)
                 row.entranceStarted = -1;
             const float lane = !row.grouped && g.avatars ? g.avatarLane(false) : 0;
-            const LayoutRect revealBounds =
+            LayoutRect revealBounds =
                 g.bubbles ? LayoutRect{slot.material->x() - (entry.own ? 0 : lane), 0,
                                        slot.material->width() + lane, slot.content->height()}
                           : LayoutRect{slot.material->x(), slot.material->y(),
                                        slot.material->width(), slot.material->height()};
+            if (outline && slot.mentionPaint) {
+                const float left = std::min(revealBounds.x, slot.mentionPaint->x());
+                const float top = std::min(revealBounds.y, slot.mentionPaint->y());
+                const float right = std::max(revealBounds.x + revealBounds.width,
+                                             slot.mentionPaint->x() + slot.mentionPaint->width());
+                const float bottom = std::max(revealBounds.y + revealBounds.height,
+                                              slot.mentionPaint->y() + slot.mentionPaint->height());
+                revealBounds = {left, top, right - left, bottom - top};
+            }
             if (entrance.active && entry.own && g.bubbles) {
                 slot.reveal->setReveal(1);
                 slot.content->setPosition(entrance.x, entrance.y);

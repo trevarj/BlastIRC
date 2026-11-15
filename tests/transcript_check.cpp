@@ -7133,10 +7133,13 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                     if (auto *rect = dynamic_cast<RectNode *>(root); rect && rect->visible()) {
                         assert(rect->style().fill.a == 0);
                         near(rect->style().borderWidth, blast::themeScale());
-                        near(rect->x(), surface->x());
-                        near(rect->y(), surface->y());
-                        near(rect->width(), dense ? dense->width() : surface->width());
-                        near(rect->height(), surface->height());
+                        near(rect->x(), surface->x() - 12 * blast::themeScale());
+                        near(rect->y(), surface->y() - 8 * blast::themeScale());
+                        near(rect->width(), (dense ? dense->width() : surface->width()) +
+                                                24 * blast::themeScale());
+                        near(rect->height(), surface->height() + 16 * blast::themeScale());
+                        containedBounds(sceneBounds(*rect), sceneBounds(rendered.row));
+                        containedBounds(sceneBounds(*rect), nativeHistoryClip(view));
                         outline = true;
                     } else if (root->visible()) {
                         const auto *shadow = find<RectNode>(*root);
@@ -7144,10 +7147,13 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                         const auto shadowBounds = sceneBounds(*shadow);
                         float surfaceX, surfaceY;
                         Node::mapToScene(surface, 0, 0, surfaceX, surfaceY);
-                        near(shadowBounds.x, surfaceX);
-                        near(shadowBounds.y, surfaceY);
-                        near(shadowBounds.width, dense ? dense->width() : surface->width());
-                        near(shadowBounds.height, surface->height());
+                        near(shadowBounds.x, surfaceX - 12 * blast::themeScale());
+                        near(shadowBounds.y, surfaceY - 8 * blast::themeScale());
+                        near(shadowBounds.width, (dense ? dense->width() : surface->width()) +
+                                                     24 * blast::themeScale());
+                        near(shadowBounds.height, surface->height() + 16 * blast::themeScale());
+                        containedBounds(sceneBounds(*root), sceneBounds(rendered.row));
+                        containedBounds(sceneBounds(*root), nativeHistoryClip(view));
                         assert(root->zIndex() < rendered.content.parent()->zIndex());
                         bool beforeClip = false;
                         for (const auto &sibling : rendered.row.children()) {
@@ -7354,9 +7360,16 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
 }
 
 void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
-    for (const auto layout : {blast::MessageLayout::Irc, blast::MessageLayout::Stacked}) {
+    for (const auto &[layout, width, scale] :
+         {std::tuple{blast::MessageLayout::Bubbles, 900.f, 1.f},
+          std::tuple{blast::MessageLayout::Bubbles, 320.f, 1.5f},
+          std::tuple{blast::MessageLayout::Irc, 900.f, 1.f},
+          std::tuple{blast::MessageLayout::Irc, 320.f, 1.5f},
+          std::tuple{blast::MessageLayout::Stacked, 900.f, 1.f},
+          std::tuple{blast::MessageLayout::Stacked, 320.f, 1.5f}}) {
         blast::Model model;
         model.now = 100;
+        model.settings.scale = scale;
         model.settings.timestamps = model.settings.avatars = false;
         model.settings.reducedMotion = false;
         model.settings.fx = blast::FxLevel::Full;
@@ -7372,7 +7385,7 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         for (const char *token : {"AdjacentBefore", "GroupedOutline", "AdjacentAfter"}) {
             blast::Message entry;
             entry.id = token;
-            entry.text = std::string(token) + " Me";
+            entry.text = std::string(token) + " Me with enough text to wrap in a narrow viewport";
             entry.nick = "Peer";
             entry.timestamp = 1700000000;
             entry.history = true;
@@ -7384,7 +7397,7 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         Clipboard clipboard;
         blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
         view.setReadEligible(false);
-        const LayoutRect viewport{17, 23, 900, 600};
+        const LayoutRect viewport{17, 23, width, 600};
         const auto arrange = [&] {
             view.sync();
             view.arrange(renderer, viewport);
@@ -7400,10 +7413,21 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         near(groupedBounds.y + groupedBounds.height, nextBounds.y);
         const auto *surface = find<blast::MaterialNode>(grouped.content);
         assert(surface);
-        near(surface->y(), 0);
+        assert(surface->y() >= 16 * scale);
+        const auto surfaceBounds = sceneBounds(*surface);
+        const auto bodyBounds = sceneBounds(grouped.body);
+        if (width < 400 * scale)
+            assert(grouped.body.height() > grouped.text.height());
+        const auto *nextSurface = find<blast::MaterialNode>(next.content);
+        assert(nextSurface);
+        const auto nextSurfaceBounds = sceneBounds(*nextSurface);
+        const auto nextBodyBounds = sceneBounds(next.body);
+        near(bodyBounds.x - surfaceBounds.x, nextBodyBounds.x - nextSurfaceBounds.x);
+        near(bodyBounds.y - surfaceBounds.y, nextBodyBounds.y - nextSurfaceBounds.y);
         assert(!grouped.row.clipChildren());
         auto *rowClip = grouped.content.parent();
-        assert(rowClip && rowClip->parent() == &grouped.row && rowClip->clipChildren());
+        assert(rowClip && rowClip->parent() == &grouped.row);
+        assert(rowClip->clipChildren() == (layout != blast::MessageLayout::Bubbles));
         near(rowClip->width(), grouped.row.width());
         near(rowClip->height(), grouped.row.height());
         assert(find<blast::PixelRevealNode>(*rowClip));
@@ -7426,6 +7450,19 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         near(shadowBounds.y, outlineBounds.y);
         near(shadowBounds.width, outlineBounds.width);
         near(shadowBounds.height, outlineBounds.height);
+        near(outlineBounds.x, surfaceBounds.x - 12 * scale);
+        near(outlineBounds.y, surfaceBounds.y - 8 * scale);
+        near(outlineBounds.height, surfaceBounds.height + 16 * scale);
+        const RectNode *dense = nullptr;
+        for (const auto &child : grouped.content.children())
+            if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+                rect && rect->visible() && rect->style().borderWidth == 0 &&
+                !rect->style().outerShadow && rect->height() == surface->height())
+                dense = rect;
+        assert(layout == blast::MessageLayout::Bubbles || dense);
+        near(outlineBounds.width, (dense ? dense->width() : surface->width()) + 24 * scale);
+        containedBounds(outlineBounds, groupedBounds);
+        containedBounds(outlineBounds, nativeHistoryClip(view));
         bool haloBeforeBody = false;
         for (const auto &child : grouped.row.children()) {
             if (child.get() == rowClip) {
@@ -7435,8 +7472,13 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
             haloBeforeBody |= child.get() == halo;
         }
         const auto haloBounds = sceneBounds(*halo);
-        assert(haloBounds.y < groupedBounds.y);
-        assert(haloBounds.y + haloBounds.height > groupedBounds.y + groupedBounds.height);
+        near(haloBounds.x, outlineBounds.x - 8 * scale);
+        near(haloBounds.y, outlineBounds.y - 8 * scale);
+        near(haloBounds.width, outlineBounds.width + 16 * scale);
+        near(haloBounds.height, outlineBounds.height + 16 * scale);
+        containedBounds(haloBounds, groupedBounds);
+        assert(haloBounds.y >= previousBounds.y + previousBounds.height);
+        assert(haloBounds.y + haloBounds.height <= nextBounds.y);
         const auto haloClip = ancestorPaintClip(*halo);
         const auto viewportClip = nativeHistoryClip(view);
         near(haloClip.x, viewportClip.x);
@@ -7444,9 +7486,44 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         near(haloClip.width, viewportClip.width);
         near(haloClip.height, viewportClip.height);
         const auto visibleHalo = intersectBounds(haloBounds, haloClip);
-        assert(visibleHalo.y < groupedBounds.y);
-        assert(visibleHalo.y + visibleHalo.height > groupedBounds.y + groupedBounds.height);
+        near(visibleHalo.x, haloBounds.x);
+        near(visibleHalo.y, haloBounds.y);
+        near(visibleHalo.width, haloBounds.width);
+        near(visibleHalo.height, haloBounds.height);
         containedBounds(visibleHalo, viewportClip);
+        model.settings.mentionEffect = blast::MentionEffect::Off;
+        arrange();
+        for (const auto &[token, expected] :
+             {std::pair{"AdjacentBefore", previousBounds},
+              std::pair{"GroupedOutline", groupedBounds}, std::pair{"AdjacentAfter", nextBounds}}) {
+            const auto actual = sceneBounds(body(view, token).row);
+            near(actual.x, expected.x);
+            near(actual.y, expected.y);
+            near(actual.width, expected.width);
+            near(actual.height, expected.height);
+        }
+        const auto undecorated = body(view, "GroupedOutline");
+        const auto *undecoratedSurface = find<blast::MaterialNode>(undecorated.content);
+        assert(undecoratedSurface);
+        const auto undecoratedSurfaceBounds = sceneBounds(*undecoratedSurface);
+        const auto undecoratedBodyBounds = sceneBounds(undecorated.body);
+        near(undecoratedSurfaceBounds.x, surfaceBounds.x);
+        near(undecoratedSurfaceBounds.y, surfaceBounds.y);
+        near(undecoratedSurfaceBounds.width, surfaceBounds.width);
+        near(undecoratedSurfaceBounds.height, surfaceBounds.height);
+        near(undecoratedBodyBounds.x, bodyBounds.x);
+        near(undecoratedBodyBounds.y, bodyBounds.y);
+        near(undecoratedBodyBounds.width, bodyBounds.width);
+        near(undecoratedBodyBounds.height, bodyBounds.height);
+        buffer.messages[1].mention = false;
+        ++buffer.messagesRevision;
+        arrange();
+        near(body(view, "AdjacentBefore").row.height(), previousBounds.height);
+        near(body(view, "AdjacentAfter").row.height(), nextBounds.height);
+        buffer.messages[1].mention = true;
+        ++buffer.messagesRevision;
+        model.settings.mentionEffect = blast::MentionEffect::LuminousOutline;
+        arrange();
         model.settings.incomingMotion = blast::SendMotion::Slide;
         model.settings.incomingDurationMs = 900;
         auto arrival = buffer.messages.back();
@@ -7464,18 +7541,59 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         const auto moving = body(view, "MovingMention");
         auto *movingClip = moving.content.parent();
         assert(moving.content.x() > 0);
-        assert(movingClip && movingClip->parent() == &moving.row && movingClip->clipChildren());
+        assert(movingClip && movingClip->parent() == &moving.row);
+        assert(movingClip->clipChildren() == (layout != blast::MessageLayout::Bubbles));
         assert(find<blast::PixelRevealNode>(*movingClip));
         near(movingClip->x(), 0);
         near(movingClip->y(), 0);
         near(movingClip->width(), moving.row.width());
         near(movingClip->height(), moving.row.height());
-        containedBounds(ancestorPaintClip(moving.text), sceneBounds(moving.row));
+        if (layout != blast::MessageLayout::Bubbles)
+            containedBounds(ancestorPaintClip(moving.text), sceneBounds(moving.row));
         containedBounds(ancestorPaintClip(moving.text), nativeHistoryClip(view));
         for (const auto &child : moving.row.children())
             if (child.get() != movingClip)
                 if (const auto *rect = find<RectNode>(*child); rect && rect->style().outerShadow)
                     assert(!child->visible());
+        model.settings.incomingMotion = blast::SendMotion::None;
+        model.settings.incomingReveal = blast::SendReveal::Pixels;
+        auto pixelArrival = buffer.messages.back();
+        pixelArrival.id = "pixel-mention";
+        pixelArrival.text = "PixelMention Me";
+        pixelArrival.arrival = model.now;
+        buffer.messages.push_back(std::move(pixelArrival));
+        ++buffer.messagesRevision;
+        arrange();
+        model.now += .1;
+        arrange();
+        const auto pixel = body(view, "PixelMention");
+        auto *reveal = find<blast::PixelRevealNode>(pixel.row);
+        assert(reveal && reveal->visible() && !reveal->children().empty());
+        near(pixel.content.opacity(), 0);
+        const RectNode *pixelOutline = nullptr;
+        for (const auto &child : pixel.content.children())
+            if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+                rect && rect->visible() && rect->style().borderWidth > 0)
+                pixelOutline = rect;
+        const auto *pixelSurface = find<blast::MaterialNode>(pixel.content);
+        assert(pixelOutline && pixelSurface);
+        assert(pixelOutline->x() < pixelSurface->x() && pixelOutline->y() < pixelSurface->y());
+        float left = std::numeric_limits<float>::infinity(), top = left;
+        float right = -left, bottom = -left;
+        for (const auto &tile : reveal->children()) {
+            if (!tile->visible())
+                continue;
+            const auto *clip = tile->pixelPartitionClip();
+            assert(clip);
+            float x1, y1, x2, y2;
+            Node::mapToScene(tile.get(), clip->left, clip->top, x1, y1);
+            Node::mapToScene(tile.get(), clip->right, clip->bottom, x2, y2);
+            left = std::min(left, x1);
+            top = std::min(top, y1);
+            right = std::max(right, x2);
+            bottom = std::max(bottom, y2);
+        }
+        containedBounds(sceneBounds(*pixelOutline), {left, top, right - left, bottom - top});
     }
 }
 

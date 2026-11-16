@@ -15,7 +15,7 @@ struct PresentationMetrics {
 struct MessageSurface {
     float x = 0, y = 0, width = 0, height = 0;
     std::string_view server, target, id;
-    bool own = false, presence = false, hovered = false;
+    bool own = false, presence = false, hovered = false, mentionHighlight = false;
     float opacity = 1;
 };
 const PresentationMetrics &presentationMetrics();

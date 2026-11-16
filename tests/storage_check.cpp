@@ -2012,7 +2012,7 @@ static void protocolHistoryStorage(const fs::path &database, int64_t now) {
         const string originalTime = "2026-11-03T12:00:00.123456789+02:00";
         auto hidden = message("local-boundary", now + 1);
         hidden.time = originalTime;
-        hidden.presence = hidden.deleted = true;
+        hidden.deleted = true;
         storage.append(boundaryBuffer, hidden);
         storage.append(boundaryBuffer, message("local:no-time", now + 2));
         storage.append(boundaryBuffer, message("local-no-time", now + 3));
@@ -2021,6 +2021,10 @@ static void protocolHistoryStorage(const fs::path &database, int64_t now) {
         pending.time = originalTime;
         pending.own = pending.pending = true;
         storage.append(boundaryBuffer, pending);
+        auto presence = message("latest-live-presence", now + 7);
+        presence.time = originalTime;
+        presence.presence = true;
+        storage.append(boundaryBuffer, presence);
         auto selected = storage.latestHistoryBoundary(boundaryBuffer);
         assert(selected && selected->id == hidden.id && selected->time == originalTime);
         hidden.id.clear();
@@ -2033,6 +2037,58 @@ static void protocolHistoryStorage(const fs::path &database, int64_t now) {
         const auto anonymousPosition = storage.messagePosition(boundaryBuffer, selected->id);
         assert(anonymousPosition && anonymousPosition->first == anonymousSequence &&
                anonymousPosition->second >= 0);
+        Buffer repaired;
+        repaired.id = "HistoryNet/PresenceRepair";
+        const auto retain = [&](const string &id, int offset, bool isPresence) {
+            auto row = message(id, now + offset);
+            row.time = "2026-11-03T00:00:0" + std::to_string(offset) + ".000Z";
+            row.presence = isPresence;
+            storage.append(repaired.id, row);
+            return HistoryCursor{row.id, row.time};
+        };
+        const auto contentA = retain("repair-A", 1, false);
+        const auto olderPresence = retain("repair-older-presence", 2, true);
+        const auto newerPresence = retain("repair-newer-presence", 4, true);
+        const auto contentZ = retain("repair-Z-live-island", 5, false);
+        repaired.historyState = {
+            olderPresence, contentA, true, {{0, olderPresence, newerPresence, false}}};
+        storage.saveHistoryState(repaired);
+        const auto repairedGapId = repaired.historyState.gaps.front().id;
+        storage.loadHistoryState(repaired);
+        assert(repaired.historyState.oldest == contentA &&
+               repaired.historyState.newest == contentA && !repaired.historyState.beginning);
+        assert(repaired.historyState.gaps.size() == 1 &&
+               repaired.historyState.gaps.front().id == repairedGapId &&
+               repaired.historyState.gaps.front().older == contentA &&
+               repaired.historyState.gaps.front().newer == contentZ);
+        repaired.historyState.newest = olderPresence;
+        storage.saveHistoryState(repaired);
+        Storage reopenedRepair;
+        reopenedRepair.loadHistoryState(repaired);
+        assert(repaired.historyState.newest == contentA &&
+               repaired.historyState.gaps.front().id == repairedGapId &&
+               repaired.historyState.gaps.front().newer == contentZ);
+        Buffer fenced;
+        fenced.id = "HistoryNet/PresenceFence";
+        auto fencePresence = message("fence-presence-T1", now + 1);
+        fencePresence.time = "2026-11-03T00:00:01.000Z";
+        fencePresence.presence = true;
+        storage.append(fenced.id, fencePresence);
+        auto laterIsland = message("fence-live-content-T3", now + 3);
+        laterIsland.time = "2026-11-03T00:00:03.000Z";
+        storage.append(fenced.id, laterIsland);
+        fenced.historyState.oldest =
+            fenced.historyState.newest = {fencePresence.id, fencePresence.time};
+        storage.saveHistoryState(fenced);
+        storage.loadHistoryState(fenced);
+        assert(fenced.historyState.newest.id.empty() &&
+               fenced.historyState.newest.time == fencePresence.time &&
+               fenced.historyState.gaps.empty());
+        Storage restartedFence;
+        restartedFence.loadHistoryState(fenced);
+        assert(fenced.historyState.newest.id.empty() &&
+               fenced.historyState.newest.time == fencePresence.time &&
+               fenced.historyState.newest.time != laterIsland.time);
         buffer.historyState = {oldest, newest, true, {{0, oldest, newest, false}}};
         auto write = storage.historyWrite();
         auto row = message(oldest.id, now);

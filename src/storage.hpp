@@ -91,7 +91,7 @@ class Storage {
     // Immutable identity and durable tie rank only; never loads message bodies/reactions.
     std::optional<std::pair<int64_t, int64_t>> messagePosition(const string &buffer,
                                                                const string &id);
-    // Latest retained authoritative selector, including hidden/redacted rows outside RAM.
+    // Latest retained content selector, including hidden/redacted rows outside RAM, never presence.
     std::optional<HistoryCursor> latestHistoryBoundary(const string &buffer);
     // Changes whenever durable state changes; callers can cache retained mention views.
     uint64_t revision() const;

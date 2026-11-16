@@ -96,12 +96,15 @@ TextFont uiFont{.family = "sans-serif", .features = {}},
 float userScale = 1, messageScale = 1, surfaceAlpha = 1;
 std::uint64_t revision = 0;
 
-Color pairedForeground(Color background, Color authored) {
+float contrastRatio(Color background, Color foreground) {
     const float backgroundLuminance = relativeLuminance(background);
-    const auto contrast = [background, backgroundLuminance](Color foreground) {
-        const float luminance = relativeLuminance(lerpColor(background, foreground, foreground.a));
-        return (std::max(luminance, backgroundLuminance) + .05f) /
-               (std::min(luminance, backgroundLuminance) + .05f);
+    const float luminance = relativeLuminance(lerpColor(background, foreground, foreground.a));
+    return (std::max(luminance, backgroundLuminance) + .05f) /
+           (std::min(luminance, backgroundLuminance) + .05f);
+}
+Color pairedForeground(Color background, Color authored) {
+    const auto contrast = [background](Color foreground) {
+        return contrastRatio(background, foreground);
     };
     constexpr float minimumContrast = 4.5f;
     if (contrast(authored) >= minimumContrast)
@@ -192,6 +195,37 @@ Color themeColor(std::string_view role) {
 Color themeForegroundColor(std::string_view role) { return withAlpha(themeColor(role), 1.f); }
 Color themePairedForeground(Color background, Color authored) {
     return pairedForeground(background, authored);
+}
+Color themeMentionBackground(bool hovered) {
+    static std::uint64_t cachedRevision = ~std::uint64_t{0};
+    static Color backgrounds[2];
+    if (cachedRevision != themeRevision()) {
+        const auto base = withAlpha(themeColor("surface_container_high"), 1);
+        const auto accent = withAlpha(themeColor("tertiary_container"), 1);
+        const auto body = themeForegroundColor("on_surface");
+        const auto metadata = themeForegroundColor("on_surface_variant");
+        const float bodyMinimum = std::min(4.5f, contrastRatio(base, body));
+        const float metadataMinimum = std::min(4.5f, contrastRatio(base, metadata));
+        for (int state = 0; state < 2; ++state) {
+            float low = 0, high = state ? .575f : .5f;
+            backgrounds[state] = base;
+            // Retain the strongest readable tint, without worsening an authored low-contrast base.
+            for (int step = 0; step < 16; ++step) {
+                const float amount = step ? (low + high) * .5f : high;
+                const auto candidate = lerpColor(base, accent, amount);
+                if (contrastRatio(candidate, body) >= bodyMinimum &&
+                    contrastRatio(candidate, metadata) >= metadataMinimum) {
+                    backgrounds[state] = candidate;
+                    low = amount;
+                    if (step == 0)
+                        break;
+                } else
+                    high = amount;
+            }
+        }
+        cachedRevision = themeRevision();
+    }
+    return backgrounds[hovered ? 1 : 0];
 }
 float themeSurfaceAlpha() { return surfaceAlpha; }
 Color themeSurfaceFill(Color color) { return withAlpha(color, surfaceAlpha); }

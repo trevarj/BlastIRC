@@ -869,7 +869,9 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
         result.key += "|" + std::to_string(nick.name.size()) + ":" + nick.name;
     return result;
 }
-Color nicknameSurface(const Geometry &g, const Message &entry) {
+Color nicknameSurface(const Geometry &g, const Message &entry, bool mentionHighlight) {
+    if (mentionHighlight)
+        return themeSurfaceFill(themeMentionBackground());
     return themeSurfaceColor(g.bubbles && !entry.presence && !entry.action
                                  ? (entry.own ? "primary_container" : "surface_container_high")
                                  : "surface_container_low");
@@ -2536,7 +2538,6 @@ struct TranscriptView::Impl {
         for (auto &slot : slots)
             if (slot.buffer == active && slot.focusIdentity == selectedIdentity)
                 cancelEntrance(slot);
-        pane.following = false;
         pane.focusComposer = false;
         if (dispatcher)
             dispatcher->setFocus(keys);
@@ -3199,7 +3200,7 @@ struct TranscriptView::Impl {
         const float available =
             notice
                 ? std::max(1.f, 2 * width - g.chatWidth - 2 * g.metrics.inset * g.scale) -
-                      (collapsed ? 0 : g.prefixWidth(entry.presence))
+                      (collapsed || !row.showClock ? 0 : g.prefixWidth(entry.presence))
                 : g.bodyWidth(width - 2 * g.mentionGutterX(row.mentionHighlight), entry.presence);
         return std::max(1.f, available - (notice ? 2 * g.activityPadding() : 0) -
                                  (row.activitySummary ? g.activityChevron() : 0));
@@ -3210,7 +3211,8 @@ struct TranscriptView::Impl {
         const bool notice = typedActivity(entry);
         const bool collapsed = row.activitySummary && !row.activityExpanded;
         const float paddingY = notice ? g.activityPaddingY() : g.paddingY(entry.presence);
-        row.prefixWidth = collapsed ? 0 : g.prefixWidth(entry.presence);
+        row.prefixWidth =
+            collapsed || (notice && !row.showClock) ? 0 : g.prefixWidth(entry.presence);
         const float bodyWidth = activityBodyWidth(row, entry, g, width);
         const auto &text = collapsed ? row.activityLabel : entry.text;
         const float font = notice ? g.activityFont : g.font;
@@ -3838,7 +3840,8 @@ struct TranscriptView::Impl {
         const auto &metrics = g.metrics;
         const float padding = notice ? g.activityPadding() : g.padding(entry.presence);
         const float paddingY = notice ? g.activityPaddingY() : g.paddingY(entry.presence);
-        row.prefixWidth = collapsed ? 0 : g.prefixWidth(entry.presence);
+        row.prefixWidth =
+            collapsed || (notice && !row.showClock) ? 0 : g.prefixWidth(entry.presence);
         const float availableBody = activityBodyWidth(row, entry, g, c.width);
         auto emoteFont = themeMessageFont();
         emoteFont.weight = FontWeight::Bold;
@@ -3872,7 +3875,7 @@ struct TranscriptView::Impl {
             wrap(renderer, document, notice ? g.activityFont : g.font, bodyMax,
                  notice ? g.activityLine : g.bodyLine, model.settings.messageWrapColumns, model,
                  sourceContext(buffer, entry) ? *sourceContext(buffer, entry) : buffer, entry.nick,
-                 entry.mentionNick, nicknameSurface(g, entry));
+                 entry.mentionNick, nicknameSurface(g, entry, row.mentionHighlight));
         const auto previewLinks = detectLinks(document);
         row.previewUrl = previewLinks.empty() ? std::string{} : previewLinks.front().url;
         if (mediaController)
@@ -4026,7 +4029,7 @@ struct TranscriptView::Impl {
             float descent = 0, nickInkCenter = 0;
             auto include = [&](std::string_view text, float width, TextAlign align, bool nick) {
                 auto font = notice && !nick ? g.activityStyle : themeUiFont();
-                if (nick && entry.action)
+                if (nick)
                     font.weight = FontWeight::Bold;
                 const float size = nick     ? g.metadataFont
                                    : notice ? g.activityFont
@@ -4111,8 +4114,7 @@ struct TranscriptView::Impl {
                         1.f, g.channelNickWidth(row.showClock, row.mentionHighlight) - adornments);
                     const auto text = entry.action ? "↳ " + entry.nick : entry.nick;
                     auto actorFont = themeUiFont();
-                    if (entry.action)
-                        actorFont.weight = FontWeight::Bold;
+                    actorFont.weight = FontWeight::Bold;
                     metadataWidth = std::max(
                         metadataWidth,
                         adornments +
@@ -4582,8 +4584,7 @@ struct TranscriptView::Impl {
                     const float textLimit =
                         std::max(1.f, width - avatarInset - 2 * chipPadding - friendExtent);
                     auto actorFont = themeUiFont();
-                    if (entry.action)
-                        actorFont.weight = FontWeight::Bold;
+                    actorFont.weight = FontWeight::Bold;
                     const float textWidth = std::min(
                         textLimit,
                         std::ceil(renderer.measureText(text, g.metadataFont, actorFont).width));
@@ -4609,7 +4610,7 @@ struct TranscriptView::Impl {
                               entry.own && !entry.action
                                   ? themeForegroundColor("on_primary")
                                   : nickTextColor(model, entry.nick, sourceServer(buffer, entry),
-                                                  nicknameSurface(g, entry)),
+                                                  nicknameSurface(g, entry, row.mentionHighlight)),
                               actorFont);
                     name->setMinWidth(textWidth);
                     name->setTextAlign(g.inlineChannel ? TextAlign::End : TextAlign::Start);
@@ -4690,7 +4691,7 @@ struct TranscriptView::Impl {
                 std::max(1.f, row.emotePrefix - g.authorAvatarInset() - friendExtent - 8 * g.scale),
                 g.font,
                 nickTextColor(model, entry.nick, sourceServer(buffer, entry),
-                              nicknameSurface(g, entry)),
+                              nicknameSurface(g, entry, row.mentionHighlight)),
                 actorFont, entry.nick);
             slot.nicks.emplace_back(name, name->color());
             if (row.friendAuthor)
@@ -4770,7 +4771,7 @@ struct TranscriptView::Impl {
                              std::max(1.f, (row.contentWidth - friendExtent - 8 * g.scale) * .45f));
                 auto *actor = label(*slot.content, entry.nick, x, y, actorWidth, g.metadataFont,
                                     nickTextColor(model, entry.nick, sourceServer(buffer, entry),
-                                                  nicknameSurface(g, entry)),
+                                                  nicknameSurface(g, entry, row.mentionHighlight)),
                                     actorFont, entry.nick);
                 actor->setHitTestVisible(true);
                 actor->setFocusable(true);
@@ -5512,6 +5513,10 @@ struct TranscriptView::Impl {
             denseStyle.fill = typedActivity(entry) ? themeSurfaceColor("surface_container_high")
                               : hovered            ? themeSurfaceColor("surface_container_high")
                                                    : withAlpha(themeColor("surface"), 0);
+            if (row.mentionHighlight) {
+                denseStyle.fill = themeSurfaceFill(themeMentionBackground(hovered));
+            }
+            const bool highlighted = hovered || row.mentionHighlight;
             const float contentWidth =
                 g.bubbles || entry.presence ? slot.material->width() : row.selectionWidth;
             const float padding = 3 * g.scale;
@@ -5528,14 +5533,19 @@ struct TranscriptView::Impl {
                 {(slot.material->visible() ? themeBubbleRadius() * .75f : g.cornerRadius) + padding,
                  highlightWidth * .5f, highlightHeight * .5f});
             slot.dense->setVisible(typedActivity(entry) ||
-                                   (!entry.presence && (g.dense() || entry.action || hovered)));
-            slot.dense->setPosition(hovered ? highlightX : slot.material->x(),
-                                    hovered ? highlightY : slot.material->y());
-            slot.dense->setSize(hovered ? highlightWidth : contentWidth,
-                                hovered ? highlightHeight : slot.material->height());
-            denseStyle.radius = hovered ? highlightRadius
-                                        : std::min({g.cornerRadius, slot.dense->width() * .5f,
-                                                    slot.dense->height() * .5f});
+                                   (!entry.presence && (g.dense() || entry.action || highlighted)));
+            slot.dense->setPosition(highlighted ? highlightX : slot.material->x(),
+                                    highlighted ? highlightY : slot.material->y());
+            slot.dense->setSize(highlighted ? highlightWidth : contentWidth,
+                                highlighted ? highlightHeight : slot.material->height());
+            denseStyle.radius = highlighted ? highlightRadius
+                                            : std::min({g.cornerRadius, slot.dense->width() * .5f,
+                                                        slot.dense->height() * .5f});
+            if (row.mentionHighlight && slot.material->visible()) {
+                denseStyle.border = denseStyle.fill;
+                denseStyle.fill = rgba(0, 0, 0, 0);
+                denseStyle.borderWidth = padding;
+            }
             slot.dense->setStyle(denseStyle);
             slot.material->setMessage({.server = buffer->server,
                                        .target = buffer->target,
@@ -5543,6 +5553,7 @@ struct TranscriptView::Impl {
                                        .own = entry.own,
                                        .presence = entry.presence,
                                        .hovered = hovered,
+                                       .mentionHighlight = row.mentionHighlight,
                                        .opacity = 1});
             slot.material->sync();
             float l, t, r, b;
@@ -5931,9 +5942,10 @@ struct TranscriptView::Impl {
                 const double start = c.header + c.heights.prefix(target) + (row.day ? g.day : 0) +
                                      (row.unread ? g.unread : 0);
                 const double end = c.header + c.heights.prefix(target) + row.height;
-                if (start < desired)
+                if (start < desired) {
                     desired = start;
-                else if (end > desired + height - occlusion)
+                    pane.following = false;
+                } else if (end > desired + height - occlusion)
                     desired = std::min(start, end - (height - occlusion));
                 anchorKey.clear();
             }

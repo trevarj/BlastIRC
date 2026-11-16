@@ -100,6 +100,8 @@ struct HistoryRequest {
 // the last primary event's MSGREFTYPES-supported msgid=/timestamp= selector.
 // Mutation protocol bounds use the mutation's wire msgid, never its target Event.id;
 // without that msgid, reaction/redaction bounds retain time only.
+// These are wire pagination bounds, not application content continuity: presence
+// and mutations advance a page even when it contains no PRIVMSG/NOTICE/ACTION.
 // End carries tags[error] on rejection/timeout/disconnect; tags[rejected]=1 means
 // no protocol retry (admission/unsupported/disconnect). Deliberately canceled
 // pending initial requests also carry tags[cancelled]=1, with no generic error.

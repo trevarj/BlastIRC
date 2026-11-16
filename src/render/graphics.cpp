@@ -213,7 +213,7 @@ void rect(RenderBackend &backend, const CustomDrawContext &context, Color fill, 
 
 struct MaterialNode::Impl {
     MaterialKind kind;
-    bool own = false, presence = false, hovered = false;
+    bool own = false, presence = false, hovered = false, mentionHighlight = false;
     float opacity = 1, radius = -1;
     std::uint64_t theme = 0;
     explicit Impl(MaterialKind value) : kind(value) {}
@@ -223,11 +223,12 @@ MaterialNode::~MaterialNode() = default;
 void MaterialNode::setMessage(const MessageSurface &surface) {
     auto &p = *impl;
     if (p.own == surface.own && p.presence == surface.presence && p.hovered == surface.hovered &&
-        p.opacity == surface.opacity)
+        p.mentionHighlight == surface.mentionHighlight && p.opacity == surface.opacity)
         return;
     p.own = surface.own;
     p.presence = surface.presence;
     p.hovered = surface.hovered;
+    p.mentionHighlight = surface.mentionHighlight;
     p.opacity = surface.opacity;
     markPaintDirty();
 }
@@ -293,7 +294,9 @@ void MaterialNode::draw(RenderBackend &backend, const CustomDrawContext &incomin
         auto fill = themeColor(p.presence ? "surface_container_low"
                                : own      ? "primary_container"
                                           : "surface_container_high");
-        if (p.hovered)
+        if (p.mentionHighlight)
+            fill = themeMentionBackground(p.hovered);
+        else if (p.hovered)
             fill = lerpColor(fill, themeColor("tertiary_container"), .15f);
         rect(backend, context, themeSurfaceFill(fill),
              withAlpha(themeColor(p.hovered ? "tertiary" : "outline_variant"),

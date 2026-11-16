@@ -369,6 +369,7 @@ struct ApplicationRegression {
 
 void runComposerCheck();
 void runComposerNativeCheck();
+void runComposerPaletteNativeCheck();
 void runSettingsCheck();
 void runTranscriptCheck();
 void runUiIntegrationCheck();
@@ -393,6 +394,8 @@ int main(int argc, char **argv) {
         runComposerCheck();
     else if (check == "composer-native")
         runComposerNativeCheck();
+    else if (check == "composer-palette-native")
+        runComposerPaletteNativeCheck();
     else if (check == "settings")
         runSettingsCheck();
     else if (check == "transcript")

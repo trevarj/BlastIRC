@@ -221,6 +221,7 @@ Message storedMessage(sqlite3 *db, const Statement &query) {
 std::optional<HistoryCursor> latestStoredHistoryBoundary(sqlite3 *db, const string &buffer) {
     Statement query(
         db, "SELECT COALESCE(id,'local:' || seq),time FROM messages WHERE buffer=? AND pending=0 "
+            "AND presence=0 "
             "AND ((COALESCE(id,'')<>'' AND substr(id,1,6) NOT IN ('local:','local-')) OR time<>'') "
             "ORDER BY sort_time DESC,server_nanoseconds(time) DESC,tie_order DESC,seq DESC");
     query.bind(1, buffer);
@@ -1991,6 +1992,59 @@ void Storage::loadHistoryState(Buffer &buffer) {
                                             {gaps.text(1), gaps.text(2)},
                                             {gaps.text(3), gaps.text(4)},
                                             gaps.integer(5) != 0});
+    bool repaired = false;
+    const auto repair = [&](HistoryCursor &cursor, bool newer, bool fallback) {
+        if (cursor.id.empty())
+            return;
+        Statement presence(impl->db, "SELECT seq FROM messages WHERE buffer=? AND presence=1 "
+                                     "AND (id=? OR (id IS NULL AND seq=?))");
+        presence.bind(1, buffer.id);
+        presence.bind(2, cursor.id);
+        presence.bind(3, localSequence(cursor.id).value_or(0));
+        if (!presence.step())
+            return;
+        const auto sequence = presence.integer(0);
+        const auto select = [&](bool after) -> std::optional<HistoryCursor> {
+            const string comparison = after ? ">=" : "<=";
+            const string order = after ? " ASC" : " DESC";
+            const string sql =
+                "SELECT COALESCE(id,'local:' || seq),time FROM messages WHERE buffer=? "
+                "AND presence=0 AND pending=0 AND "
+                "(sort_time,server_nanoseconds(time),tie_order,seq) " +
+                comparison +
+                " (SELECT sort_time,server_nanoseconds(time),tie_order,seq FROM messages "
+                "WHERE seq=?) ORDER BY sort_time" +
+                order + ",server_nanoseconds(time)" + order + ",tie_order" + order + ",seq" + order;
+            Statement content(impl->db, sql.c_str());
+            content.bind(1, buffer.id);
+            content.bind(2, sequence);
+            while (content.step()) {
+                HistoryCursor candidate{content.text(0), content.text(1)};
+                if ((!candidate.id.starts_with("local:") && !candidate.id.starts_with("local-")) ||
+                    irc::parseTimestampParts(candidate.time))
+                    return candidate;
+            }
+            return {};
+        };
+        auto replacement = select(newer);
+        if (!replacement && fallback)
+            replacement = select(!newer);
+        if (replacement)
+            cursor = *replacement;
+        else
+            cursor.id.clear(); // Preserve the unknown interval rather than discard its gap.
+        repaired = true;
+    };
+    repair(buffer.historyState.oldest, false, true);
+    repair(buffer.historyState.newest, false, false);
+    for (auto &gap : buffer.historyState.gaps) {
+        repair(gap.older, false, false);
+        repair(gap.newer, true, false);
+    }
+    if (repaired) {
+        buffer.historyState.beginning = false;
+        saveHistoryState(buffer);
+    }
 }
 void Storage::saveHistoryState(Buffer &buffer) {
     if (buffer.id.empty())

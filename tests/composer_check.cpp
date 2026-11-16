@@ -145,7 +145,9 @@ RectNode *nativeCaret(Input &input) {
     for (const auto &viewport : input.children())
         if (viewport->clipChildren())
             for (const auto &node : viewport->children())
-                if (node->zIndex() == 1 && node->type() == NodeType::Rect)
+                // Native carets are pixel-aligned; rounded selection rectangles are not.
+                if (node->zIndex() == 1 && node->type() == NodeType::Rect &&
+                    static_cast<RectNode *>(node.get())->style().noAa)
                     return static_cast<RectNode *>(node.get());
     return nullptr;
 }
@@ -287,6 +289,7 @@ void within(const Node &node, const Node &container,
     withinBounds(sceneBounds(node), sceneBounds(container), caller);
 }
 void nativeSingleTextRow(Renderer &renderer, const Label &label,
+                         const Node *paintContainer = nullptr,
                          const std::source_location caller = std::source_location::current()) {
     const TextNode *text = nullptr;
     for (const auto &child : label.children())
@@ -307,7 +310,8 @@ void nativeSingleTextRow(Renderer &renderer, const Label &label,
                          .height = metrics.inkBottom - metrics.inkTop};
     // Native single-line Labels cap-center glyphs; fallback-font logical leading may
     // extend outside that box even when every actual glyph remains safely inside.
-    withinBounds(ink, bounds, caller);
+    // Button labels use advance widths; their padded input area must contain all ink.
+    withinBounds(ink, paintContainer ? paintedClip(*text, *paintContainer) : bounds, caller);
 }
 bool editingDocumentMatches(const Input &input, const Input::EditingState &expected) {
     const auto actual = input.editingState();
@@ -727,7 +731,7 @@ void checkComposerReplyCard(Renderer &renderer) {
         assert(nativeVisible(*control) && control->inputArea()->enabled() &&
                control->inputArea()->width() >= 32 && control->inputArea()->height() >= 32);
         within(*control->inputArea(), *composer);
-        nativeSingleTextRow(renderer, *control->label());
+        nativeSingleTextRow(renderer, *control->label(), control->inputArea());
     }
     within(*pasteContext->parent(), *composer);
     const auto authorTooltip = static_cast<Label *>(replyAuthor->parent())->tooltipContent();
@@ -1871,7 +1875,101 @@ void checkComposerWordPrediction(Renderer &renderer) {
     dispatcher.setSceneRoot(nullptr);
 }
 
+void checkComposerCaretPalette(Renderer &renderer) {
+    using namespace blast;
+    const char *oldHome = std::getenv("XDG_CONFIG_HOME");
+    const std::optional<std::string> previousHome =
+        oldHome ? std::optional<std::string>{oldHome} : std::nullopt;
+    char directory[] = "/tmp/blastirc-caret-palette-XXXXXX";
+    const auto *created = mkdtemp(directory);
+    assert(created && setenv("XDG_CONFIG_HOME", created, 1) == 0);
+    const auto config = std::filesystem::path(created) / "blastirc";
+    std::filesystem::create_directory(config);
+    {
+        Model model;
+        model.settings.spellcheck = false;
+        model.settings.reducedMotion = true;
+        model.settings.themeSource = "builtin";
+        auto &buffer = model.buffers["palette/#room"];
+        buffer.id = "palette/#room";
+        buffer.server = "palette";
+        buffer.target = "#room";
+        buffer.kind = "channel";
+        Theme theme;
+        theme.update(model);
+        DeferredClipboard clipboard;
+        InputDispatcher dispatcher;
+        EditorStore editors(
+            model, clipboard, [](auto) {}, [](auto) {},
+            [&](Node &node) { retireComposerPointer(dispatcher, node); });
+        PaneState pane{.id = 892, .buffer = buffer.id, .reply = {}, .focusComposer = false};
+        Node root;
+        root.setSize(640, 480);
+        auto *composer = root.addChild(editors.composer(pane));
+        auto *input = composerInput(*composer);
+        assert(input);
+        dispatcher.setSceneRoot(&root);
+        editors.setInputDispatcher(dispatcher);
+        dispatcher.setFocus(input->inputArea());
+        const auto frame = [&] {
+            editors.sync();
+            composer->arrange(renderer, {20, 300, 600, 150});
+            composer->layout(renderer);
+        };
+        const auto sameColor = [](Color a, Color b) {
+            return std::abs(a.r - b.r) < .005f && std::abs(a.g - b.g) < .005f &&
+                   std::abs(a.b - b.b) < .005f && std::abs(a.a - b.a) < 1e-6f;
+        };
+        input->setValue("caret");
+        assert(input->insertText("!"));
+        frame();
+        auto *caret = nativeCaret(*input);
+        assert(caret && caret->visible() && caret->width() > 0 && caret->height() > 0 &&
+               sameColor(caret->style().fill, themeForegroundColor("primary")));
+        const auto document = input->editingState();
+        const auto undo = document.history->undo, redo = document.history->redo;
+        const auto map = input->displayProjection()->rawToDisplay;
+        auto *file = std::fopen((config / "noctalia.toml").c_str(), "w");
+        assert(file);
+        assert(std::fputs("[colors]\nsurface='#fafafa'\nsurface_container_high='#fefefe'\n"
+                          "on_surface='#eeeeee'\nprimary='#eeeeee'\non_primary='#181818'\n"
+                          "tertiary='#aaaaaa'\nerror='#bb2222'\n",
+                          file) >= 0);
+        assert(std::fclose(file) == 0);
+        model.settings.themeSource = "auto";
+        model.settings.transparency = true;
+        for (const float opacity : {1.f, .3f}) {
+            model.settings.opacity = opacity;
+            model.now += 1;
+            theme.update(model);
+            model.now += 1;
+            theme.update(model);
+            assert(sameColor(themeColor("surface"), ::hex("#fafafa")));
+            frame();
+            const auto fill = caret->style().fill;
+            const float luminance = relativeLuminance(fill);
+            const float surfaceLuminance =
+                relativeLuminance(themeForegroundColor("surface_container_high"));
+            assert(fill.a == 1.f && !sameColor(fill, themeForegroundColor("primary")) &&
+                   (std::max(luminance, surfaceLuminance) + .05f) /
+                           (std::min(luminance, surfaceLuminance) + .05f) >=
+                       4.5f);
+            assert(input->editingStateMatches(document) && document.history->undo == undo &&
+                   document.history->redo == redo &&
+                   input->displayProjection()->rawToDisplay == map);
+        }
+        dispatcher.setFocus(nullptr);
+        dispatcher.setSceneRoot(nullptr);
+    }
+    if (previousHome)
+        assert(setenv("XDG_CONFIG_HOME", previousHome->c_str(), 1) == 0);
+    else
+        assert(unsetenv("XDG_CONFIG_HOME") == 0);
+    std::filesystem::remove_all(created);
+}
+
 void checkComposerColors(Renderer &renderer) {
+    checkComposerCaretPalette(renderer);
     using namespace blast;
     const char *oldHome = std::getenv("XDG_CONFIG_HOME");
     const std::optional<std::string> previousHome =
@@ -3753,6 +3851,24 @@ void runComposerCheck() {
     editors.setOverlayHost(nullptr);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
+}
+
+// Focused palette regression in the same private native rendering environment.
+void runComposerPaletteNativeCheck() {
+    using namespace blast;
+    codecs::installImageDecoder();
+    auto *display = wl_display_connect(nullptr);
+    assert(display);
+    {
+        GlSharedContext shared;
+        shared.initialize(display);
+        registerNativeFonts();
+        RenderContext context;
+        context.initialize(shared);
+        ScaledRenderer renderer(context, 1.f);
+        checkComposerCaretPalette(renderer);
+    }
+    wl_display_disconnect(display);
 }
 
 // Invoked separately as composer-native in the private Wayland/EGL smoke environment.

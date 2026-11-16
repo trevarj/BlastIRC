@@ -63,9 +63,9 @@ class Application {
         vector<Event> events;
         size_t bytes = 0;
         int64_t gapId = 0;
-        unsigned budget = 0, retries = 0;
+        unsigned retries = 0;
         double started = 0;
-        bool seed = false, backfillSeed = false, unsolicited = false;
+        bool seed = false, backfillSeed = false, unsolicited = false, latestSeam = false;
     };
     struct HistoryTarget {
         string name, time;
@@ -214,7 +214,7 @@ class Application {
     vector<string> historyOrder(const string &server) const;
     void scheduleHistory();
     void enqueueHistory(Buffer &, const string &cursor, bool initial);
-    void enqueueHistory(Buffer &, HistoryRequest, int64_t gapId = 0, unsigned budget = 0);
+    void enqueueHistory(Buffer &, HistoryRequest, int64_t gapId = 0);
     void submitHistory(HistoryPage);
     bool historyEvent(const Event &);
     bool applyHistoryPage(HistoryPage &, const Event &);

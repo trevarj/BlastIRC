@@ -4026,7 +4026,8 @@ struct ApplicationRegression {
                action->activity == ActivityKind::None);
         app.model.effects.clear();
 
-        // Casemapped self JOINs retain typed history and membership, never live activity.
+        // Live casemapped self JOINs update membership without live activity;
+        // replayed self JOINs do not insert rows or replace live member metadata.
         app.model.networks["activity"].nick = "[Me]";
         app.model.networks["activity"].caseMapping = "rfc1459";
         room.joined = false;
@@ -4045,13 +4046,14 @@ struct ApplicationRegression {
         event.history = true;
         event.id = "own-history-join";
         event.tags["account"] = "historical-account";
+        const auto beforeHistoricalSelf = room.messages.size();
         app.reduce(event);
         const auto historicalSelf =
             std::find_if(room.messages.begin(), room.messages.end(),
                          [&](const auto &row) { return row.id == event.id; });
-        assert(historicalSelf != room.messages.end() && historicalSelf->own &&
-               historicalSelf->history && historicalSelf->activity == ActivityKind::Join &&
-               !room.joined && room.nicks.size() == members && self->account == "live-account" &&
+        assert(historicalSelf == room.messages.end() &&
+               room.messages.size() == beforeHistoricalSelf && !room.joined &&
+               room.nicks.size() == members && self->account == "live-account" &&
                app.model.effects.empty());
         event.history = false;
         app.model.networks["activity"].nick = "Me";
@@ -4173,20 +4175,23 @@ struct ApplicationRegression {
         event.history = true;
         event.nick = "Historical";
         const auto beforeHistory = room.messages.size();
-        for (const auto &[type, kind] :
-             {std::pair{"join", ActivityKind::Join}, std::pair{"part", ActivityKind::Part},
-              std::pair{"nick", ActivityKind::Nick}, std::pair{"quit", ActivityKind::Quit}}) {
+        const auto beforeHistoryMembers = room.nicks.size();
+        const auto beforeHistoryJoined = room.joined;
+        const auto beforeHistoryNick = app.model.networks["activity"].nick;
+        for (const string type : {"join", "part", "nick", "quit"}) {
             event.type = type;
             event.id = "history-activity-" + string(type);
             event.text = "original history reason";
             app.reduce(event);
             const auto found = std::find_if(room.messages.begin(), room.messages.end(),
                                             [&](const auto &row) { return row.id == event.id; });
-            assert(found != room.messages.end() && found->activity == kind && found->presence &&
-                   found->history && found->nick == event.nick && found->time == event.time &&
-                   found->timestamp == event.timestamp);
+            assert(found == room.messages.end() && room.nicks.size() == beforeHistoryMembers &&
+                   room.joined == beforeHistoryJoined &&
+                   app.model.networks["activity"].nick == beforeHistoryNick &&
+                   std::none_of(room.nicks.begin(), room.nicks.end(),
+                                [&](const auto &nick) { return nick.name == event.nick; }));
         }
-        assert(room.messages.size() == beforeHistory + 4 && app.model.effects.empty());
+        assert(room.messages.size() == beforeHistory && app.model.effects.empty());
     }
     static void globalRead() {
         RenameDrainPeer peer;
@@ -4600,11 +4605,11 @@ struct ApplicationRegression {
                 newest.text = "new primary page";
                 newest.history = true;
                 page.events.push_back(newest);
-                const string expectedEdge = context ? newest.id : mutation.tags.at("msgid");
+                const string wireEdge = context ? newest.id : mutation.tags.at("msgid");
                 Event end;
                 end.tags = {{"direction", "latest"},
                             {"count", context ? "1" : "2"},
-                            {"oldest-id", expectedEdge},
+                            {"oldest-id", wireEdge},
                             {"oldest-time", context ? newest.time : mutation.time},
                             {"newest-id", newest.id},
                             {"newest-time", newest.time}};
@@ -4612,7 +4617,10 @@ struct ApplicationRegression {
                 assert(room.historyState.gaps.size() == 1);
                 const auto gap = room.historyState.gaps.front();
                 assert(gap.id > 0 && gap.older.id == prior.id && gap.older.time == prior.time &&
-                       gap.newer.id == expectedEdge);
+                       gap.newer.id == newest.id && gap.newer.time == newest.time);
+                assert(room.historyState.newest == (HistoryCursor{newest.id, newest.time}) &&
+                       gap.newer.id != mutation.tags.at("msgid") &&
+                       !app.storage_.message(room.id, mutation.tags.at("msgid")));
                 const auto assertMutation = [&] {
                     const auto durable = app.storage_.message(room.id, prior.id);
                     const auto *loaded = sourceMessage(app.model, room.id, prior.id);
@@ -4634,7 +4642,9 @@ struct ApplicationRegression {
                 restored.historyState = {};
                 app.storage_.loadHistoryState(restored);
                 assert(restored.historyState.gaps.size() == 1 &&
-                       restored.historyState.gaps.front().id == gap.id);
+                       restored.historyState.gaps.front().id == gap.id &&
+                       restored.historyState.gaps.front().older == gap.older &&
+                       restored.historyState.gaps.front().newer == gap.newer);
                 // Actual replay of the old boundary row, unlike a mutation that
                 // merely targets it, can close the selected directional gap.
                 Application::HistoryPage fill;
@@ -4737,7 +4747,7 @@ struct ApplicationRegression {
             }
         }
     }
-    static void latestGapUsesProtocolBoundary() {
+    static void latestGapUsesContentBoundary() {
         for (const bool includesProtocolBoundary : {false, true}) {
             Application app;
             app.model = Model{};
@@ -4750,15 +4760,16 @@ struct ApplicationRegression {
                 Message row;
                 row.id = id;
                 row.time = time;
+                row.timestamp = irc::parseTimestampParts(time)->seconds;
                 row.text = presence ? "own JOIN" : "cached chat";
                 row.presence = row.own = presence;
                 app.storage_.append(room.id, row);
                 room.messages.push_back(*app.storage_.message(room.id, id));
                 ++app.messageCount_;
             };
-            retain("protocol-join", "2026-11-01T00:00:00.000Z", true);
+            retain("protocol-join", "2026-11-01T02:00:00.000Z", true);
             room.historyState.oldest =
-                room.historyState.newest = {"protocol-join", "2026-11-01T00:00:00.000Z"};
+                room.historyState.newest = {"protocol-join", "2026-11-01T02:00:00.000Z"};
             app.storage_.saveHistoryState(room);
             retain("later-cached-chat", "2026-11-01T01:00:00.000Z", false);
             retain("new-live-join", "2026-11-02T04:00:00.000Z", true);
@@ -4781,12 +4792,15 @@ struct ApplicationRegression {
                 page.events.push_back(std::move(row));
             };
             if (includesProtocolBoundary)
-                primary("protocol-join", "2026-11-01T00:00:00.000Z", true);
+                primary("protocol-join", "2026-11-01T02:00:00.000Z", true);
             primary("offline-chat", "2026-11-02T02:00:00.000Z", false);
+            primary("offline-action", "2026-11-02T03:00:00.000Z", false);
+            page.events.back().type = "action";
+            primary("historical-join", "2026-11-02T03:30:00.000Z", true);
             primary("new-live-join", "2026-11-02T04:00:00.000Z", true);
             Event end;
             end.tags = {{"direction", "latest"},
-                        {"count", includesProtocolBoundary ? "3" : "2"},
+                        {"count", includesProtocolBoundary ? "5" : "4"},
                         {"oldest-id", page.events.front().id},
                         {"oldest-time", page.events.front().time},
                         {"newest-id", "new-live-join"},
@@ -4795,16 +4809,180 @@ struct ApplicationRegression {
             Buffer restored = room;
             restored.historyState = {};
             app.storage_.loadHistoryState(restored);
-            assert(room.historyState.gaps.size() == (includesProtocolBoundary ? 0u : 1u) &&
-                   restored.historyState.gaps.size() == room.historyState.gaps.size());
-            if (!includesProtocolBoundary) {
-                const auto &gap = room.historyState.gaps.front();
-                assert(gap.id > 0 && gap.older.id == "protocol-join" &&
-                       gap.older.time == "2026-11-01T00:00:00.000Z" &&
-                       gap.newer.id == "offline-chat" &&
-                       restored.historyState.gaps.front().id == gap.id);
-            }
+            assert(room.historyState.gaps.size() == 1 && restored.historyState.gaps.size() == 1);
+            const auto &gap = room.historyState.gaps.front();
+            assert(gap.id > 0 && gap.older.id == "later-cached-chat" &&
+                   gap.older.time == "2026-11-01T01:00:00.000Z" && gap.newer.id == "offline-chat" &&
+                   restored.historyState.gaps.front().id == gap.id);
+            assert(room.historyState.newest.id == "offline-action");
+            assert(!app.storage_.message(room.id, "historical-join"));
+            const auto action = app.storage_.message(room.id, "offline-action");
+            assert(action && action->action && !action->presence);
+            assert(app.storage_.message(room.id, "new-live-join"));
         }
+    }
+    static void presenceOnlyLatestFindsContentSeam() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("presence-only-latest", "#room");
+        app.model.activeBuffer = room.id;
+        auto &session = app.historySessions_[room.server];
+        Message cached;
+        cached.id = "presence-latest-A";
+        cached.time = "2026-11-01T00:00:00.000Z";
+        cached.text = "cached content";
+        app.storage_.append(room.id, cached);
+        room.messages.push_back(*app.storage_.message(room.id, cached.id));
+        app.messageCount_ = 1;
+        room.historyState.oldest = room.historyState.newest = {cached.id, cached.time};
+        room.historyState.beginning = true;
+        room.historyState.gaps.push_back({0,
+                                          {"older-G1-A", "2026-10-01T00:00:00.000Z"},
+                                          {"older-G1-Z", "2026-10-02T00:00:00.000Z"},
+                                          false});
+        app.storage_.saveHistoryState(room);
+        const auto olderGap = room.historyState.gaps.front();
+        room.joined = true;
+        room.topic = "live topic";
+        Nick member;
+        member.name = "Me";
+        room.nicks.push_back(member);
+        app.model.networks[room.server].nick = "Me";
+        for (const bool standalone : {false, true})
+            for (const string type : {"join", "part", "quit", "nick", "away", "kick", "mode",
+                                      "topic", "account", "chghost"}) {
+                Event presence;
+                presence.type = type;
+                presence.server = room.server;
+                presence.target = room.target;
+                presence.nick = "Me";
+                presence.own = presence.history = true;
+                presence.id = "legacy-" + type;
+                presence.text = "historical state must not replace live state";
+                if (standalone)
+                    presence.tags["history-standalone"] = "1";
+                app.reduce(presence);
+                assert(room.joined && room.topic == "live topic" && room.nicks.size() == 1 &&
+                       room.nicks.front().name == "Me" && !room.nicks.front().away &&
+                       room.messages.size() == 1 && app.model.networks[room.server].nick == "Me");
+                assert(!app.storage_.message(room.id, presence.id));
+            }
+        Application::HistoryPage page;
+        page.server = room.server;
+        page.buffer = room.id;
+        page.request.direction = HistoryDirection::Latest;
+        Event end;
+        const auto complete = [&] {
+            const auto &first = page.events.front();
+            const auto &last = page.events.back();
+            end.tags = {{"count", std::to_string(page.events.size())},
+                        {"limit", "50"},
+                        {"oldest-id", first.id},
+                        {"oldest-time", first.time},
+                        {"newest-id", last.id},
+                        {"newest-time", last.time}};
+            const bool progressed = app.applyHistoryPage(page, end);
+            app.finishHistoryPage(std::move(page), end, true, progressed);
+        };
+        for (int batch = 0; batch < 5; ++batch) {
+            for (int row = 0; row < 50; ++row) {
+                Event presence;
+                presence.type = "join";
+                presence.server = room.server;
+                presence.target = room.target;
+                presence.nick = "Other";
+                presence.id =
+                    "latest-presence-" + std::to_string(batch) + "-" + std::to_string(row);
+                presence.time = "2026-11-02T0" + std::to_string(9 - batch) + ":00:00.000Z";
+                presence.history = true;
+                page.events.push_back(std::move(presence));
+            }
+            const auto wire = page.events.front().id;
+            complete();
+            assert(session.retries.size() == 1 && room.historyState.gaps.size() == 1 &&
+                   room.historyState.gaps.front().id == olderGap.id &&
+                   room.historyState.newest.id == cached.id && room.messages.size() == 1 &&
+                   room.historyState.beginning);
+            page = std::move(session.retries.front());
+            session.retries.pop_front();
+            assert(page.latestSeam && page.request.first.id == wire && !page.gapId);
+        }
+        Event content;
+        content.type = "action";
+        content.id = "presence-latest-Z";
+        content.server = room.server;
+        content.target = room.target;
+        content.nick = "Other";
+        content.text = "waves";
+        content.time = "2026-11-02T00:00:00.000Z";
+        content.history = true;
+        page.events = {content};
+        complete();
+        assert(room.historyState.gaps.size() == 2 && session.retries.size() == 1);
+        const auto seamGap = room.historyState.gaps.back();
+        assert(seamGap.older.id == cached.id && seamGap.newer.id == content.id &&
+               room.historyState.gaps.front().id == olderGap.id &&
+               session.retries.front().gapId == seamGap.id);
+        Storage restarted;
+        Buffer restored = room;
+        restored.historyState = {};
+        restarted.loadHistoryState(restored);
+        assert(restored.historyState.gaps.size() == 2 &&
+               restored.historyState.gaps.back().id == seamGap.id &&
+               restored.historyState.gaps.back().older.id == cached.id &&
+               restored.historyState.gaps.back().newer.id == content.id);
+        page = std::move(session.retries.front());
+        session.retries.pop_front();
+        content.type = "message";
+        content.id = cached.id;
+        content.text = cached.text;
+        content.time = cached.time;
+        page.events = {content};
+        complete();
+        assert(room.historyState.gaps.size() == 1 &&
+               room.historyState.gaps.front().id == olderGap.id && session.retries.empty() &&
+               room.messages.size() == 2 && room.messages.back().action);
+        room.historyState.gaps.clear();
+        room.historyState.beginning = false;
+        app.storage_.saveHistoryState(room);
+        // Ordinary older-history demand skips raw presence pages too, but
+        // stops after its first content page without opening a LATEST seam.
+        page = {};
+        page.server = room.server;
+        page.buffer = room.id;
+        page.request.direction = HistoryDirection::Before;
+        page.request.first = {cached.id, cached.time};
+        for (int batch = 0; batch < 4; ++batch) {
+            for (int row = 0; row < 50; ++row) {
+                Event presence;
+                presence.type = "part";
+                presence.server = room.server;
+                presence.target = room.target;
+                presence.nick = "Other";
+                presence.id = "older-presence-" + std::to_string(batch) + "-" + std::to_string(row);
+                presence.time = "2026-10-31T0" + std::to_string(9 - batch) + ":00:00.000Z";
+                presence.history = true;
+                page.events.push_back(std::move(presence));
+            }
+            const auto wire = page.events.front().id;
+            complete();
+            assert(session.retries.size() == 1 && room.historyState.gaps.empty() &&
+                   room.historyState.oldest.id == cached.id && room.messages.size() == 2);
+            page = std::move(session.retries.front());
+            session.retries.pop_front();
+            assert(!page.latestSeam && !page.gapId && page.request.first.id == wire);
+        }
+        content.id = "ordinary-older-content";
+        content.text = "older content after presence";
+        content.time = "2026-10-30T00:00:00.000Z";
+        page.events = {content};
+        complete();
+        assert(room.historyState.oldest.id == content.id &&
+               room.historyState.newest.id == "presence-latest-Z" &&
+               room.historyState.gaps.empty() && session.retries.empty() &&
+               room.messages.size() == 3 && !room.historyState.beginning);
     }
     static void prunedHistoryCannotReproveEndpoints() {
         Application app;
@@ -6251,10 +6429,29 @@ struct ApplicationRegression {
         app.storage_.loadHistoryState(restored);
         assert(restored.historyState.gaps.size() == 1 &&
                restored.historyState.gaps.front().id == gap.id);
-        // One demand quantum walks at most three progressing short pages.
-        app.action({"history-gap", room.id, std::to_string(gap.id), {}});
+        // Startup itself fills the seam, including more than three full pages
+        // of presence that advance the wire selector but not the content edge.
+        string wireBoundary = "new-tail";
+        for (int page = 0; page < 4; ++page) {
+            peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=" + wireBoundary, "50"});
+            const string batch = "presence" + std::to_string(page);
+            peer.send(":server BATCH +" + batch + " chathistory #room");
+            for (int row = 0; row < 50; ++row)
+                peer.send("@batch=" + batch + ";msgid=" + batch + "-" + std::to_string(row) +
+                          ";time=2026-11-02T00:0" + std::to_string(4 - page) +
+                          ":00.000Z :Other!u@h JOIN #room");
+            peer.send(":server BATCH -" + batch);
+            wireBoundary = batch + "-0";
+            wait([&] {
+                return !app.historyPages_.empty() &&
+                       app.historyPages_.begin()->second.request.first.id == wireBoundary;
+            });
+            assert(room.historyState.gaps.front().newer.id == "new-tail" &&
+                   room.messages.size() == 3);
+            assert(!app.storage_.message(room.id, batch + "-0"));
+        }
         for (int i = 0; i < 3; ++i) {
-            const string boundary = i ? "quantum-" + std::to_string(i - 1) : "new-tail";
+            const string boundary = i ? "quantum-" + std::to_string(i - 1) : wireBoundary;
             peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=" + boundary, "50"});
             const string batch = "quantum" + std::to_string(i);
             const string id = "quantum-" + std::to_string(i);
@@ -6264,12 +6461,8 @@ struct ApplicationRegression {
             peer.send(":server BATCH -" + batch);
             wait([&] { return app.storage_.message(room.id, id).has_value(); });
         }
-        wait([&] { return !room.loading; });
         assert(room.historyState.gaps.size() == 1 && !room.historyState.beginning);
-        peer.fence(); // No fourth BEFORE may precede the PONG.
-        // A repeated boundary with no insertion/protocol progress stops this demand,
-        // but keeps the durable gap available for another explicit attempt.
-        app.action({"history-gap", room.id, std::to_string(gap.id), {}});
+        // A repeated wire boundary stops auto-continuation without losing the gap.
         peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=quantum-2", "50"});
         peer.send(":server BATCH +noadvance chathistory #room");
         peer.send("@batch=noadvance;msgid=quantum-2;time=2026-11-01T21:00:00.000Z "
@@ -6545,7 +6738,8 @@ struct ApplicationRegression {
         historyRenameContinuity();
         historyMutationTargetsAreNotPageCoverage();
         latestGapCanonicalPrimaryOverlap();
-        latestGapUsesProtocolBoundary();
+        latestGapUsesContentBoundary();
+        presenceOnlyLatestFindsContentSeam();
         prunedHistoryCannotReproveEndpoints();
         sparseAroundRollbackPreservesLoadedWindow();
         historyWriterRollback();
@@ -6773,7 +6967,7 @@ struct ApplicationRegression {
         pastJoin.history = true;
         app.reduce(pastJoin);
         auto &past = app.buffer("test", "#past");
-        assert(!past.joined && past.nicks.empty());
+        assert(!past.joined && past.nicks.empty() && past.messages.empty());
 
         app.model.effects.clear();
         app.model.settings.workspace["visible_buffers"] = "elsewhere";

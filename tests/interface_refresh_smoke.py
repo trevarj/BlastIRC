@@ -5,7 +5,7 @@ Run inside nix develop: python tests/interface_refresh_smoke.py BINARY --scope N
 Each scope owns a fresh private compositor/profile; no desktop or production profile
 is reused. BLASTIRC_SMOKE_SCREENSHOT selects the artifact basename.
 The startup-history-sync scope holds genuine private Ergo history on the wire;
-it proves discovery/LATEST, cached-chat/loading state, and automatic visible-seam BEFORE gap fill.
+it proves discovery/LATEST, cached-chat/loading state, and automatic full selected-channel seam fill.
 The jump-bottom scope proves the zero-arrival native FAB click and resumed following.
 """
 import argparse
@@ -170,7 +170,7 @@ def main():
                                  "activity-pins", "input-routing", "logo-alignment",
                                  "minimum-height", "message-links", "typing-focus", "mentions-unread",
                                  "startup-history-sync", "jump-bottom", "scrollbar", "buffer-boundaries",
-                                 "conversation-history", "soju-search-context", "mention-effects", "avatar-alignment",
+                                 "conversation-history", "soju-search-context", "mention-effects", "mention-background", "avatar-alignment",
                                  "muted-unread"))
     options, remaining = parser.parse_known_args()
     if any(option in remaining for option in ("--probe", "--probes", "--layout-only", "--ime-only", "--raw-only")):
@@ -3144,7 +3144,11 @@ def run_incoming(ctx):
                                pixels for stamp, pixels in cropped if stamp >= first_complete))}}
 
 
-def run_mention_effects(ctx):
+def run_mention_background(ctx):
+    return run_mention_effects(ctx, background_only=True)
+
+
+def run_mention_effects(ctx, *, background_only=False):
     """Compare retained real-wire rows against their own native Off raster."""
     _policy_focus(ctx, ctx['query_id'])
     _policy_chat(ctx, fools=[], receive=False)
@@ -3158,6 +3162,44 @@ def run_mention_effects(ctx):
 
     def delta(a, b):
         return sum(abs(x - y) for x, y in zip(a, b))
+
+    def background_sample(image, left, right):
+        # Same ordinary tail on both rows; its dominant color is body fill,
+        # not a comparison of differently rasterized nickname glyphs.
+        box = (right[2] + 3, left[1], right[2] + 45, left[3])
+        native = Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
+        patch = native.crop(box)
+        count, rgb = max(patch.getcolors(patch.width * patch.height))
+        assert count > patch.width * patch.height / 2, ('No dominant body background', box, rgb, count)
+        return {'region': box, 'rgb': rgb, 'background_pixels': count}
+
+    def reanchor():
+        nonlocal left, right, region
+        left, right = _policy_wait_box(ctx, left_rgb), _policy_wait_box(ctx, right_rgb)
+        assert left[0] < right[0] and abs(left[1] - right[1]) <= 1, (
+            'Fixture own nickname wrapped; cannot compare native geometry', style, left, right)
+        layout = gui.read_layout(ctx['preferences'])
+        x, y, width, height = layout['conversation']['rect']
+        scale = layout['scale']
+        region = (round(x + 2 * scale), max(round(y), left[1] - round(42 * scale)),
+                  round(x + width - 110 * scale), min(round(y + height), left[3] + round(14 * scale)))
+        assert right[2] + 45 < region[2], ('Fixture body exceeds native sample region', region, right)
+
+    def shown_fool_reference():
+        _policy_chat(ctx, fools=[ctx['query_target']])
+        gui.command('show-fools', window=ctx['window'])
+        gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
+        _policy_effects(ctx, mention='off')
+        # Eligibility changes bubble padding; only FX changes on an unchanged
+        # policy row must preserve the marker geometry checked by capture().
+        reanchor()
+        frames, item = capture('shown-fool-off')
+        sample = background_sample(gui.native_rgb_capture(ctx['window']), left, right)
+        assert sample['rgb'] == ordinary_background['rgb'], (
+            'Shown fool retained eligible mention background', style, ordinary_background, sample)
+        item['background'] = sample
+        evidence.append(dict(style=style, **item))
+        return frames[-1]
 
     def capture(label, seconds=.55):
         token = f'mention-keepalive-{time.monotonic_ns()}'
@@ -3243,23 +3285,46 @@ def run_mention_effects(ctx):
         def swatch(rgb, text):
             token = ''.join(f'{value:02X}' for value in rgb)
             return f'\x04{token},{token}{text}\x0f'
+        ordinary_left_rgb = (left_rgb[0] + 1, *left_rgb[1:])
+        ordinary_right_rgb = (right_rgb[0] + 1, *right_rgb[1:])
+        ordinary_text = (swatch(ordinary_left_rgb, 'ANCHOR') + ' ordinary ' +
+                         swatch(ordinary_right_rgb, 'BOUND') + ' unrelated body')
+        _policy_send(ctx, ordinary_text)
+        ordinary_left = _policy_wait_box(ctx, ordinary_left_rgb)
+        ordinary_right = _policy_wait_box(ctx, ordinary_right_rgb)
+        assert abs(ordinary_left[1] - ordinary_right[1]) <= 1, (
+            'Ordinary background control wrapped', style, ordinary_left, ordinary_right)
+        ordinary_background = background_sample(
+            gui.native_rgb_capture(ctx['window']), ordinary_left, ordinary_right)
+        ordinary_capture = _policy_capture(ctx, 'mention-' + style + '-ordinary-off')
         text = (swatch(left_rgb, 'ANCHOR') + ' ' + ctx['own_nick'] + ' ' +
                 swatch(right_rgb, 'BOUND') + ' unrelated body')
         _policy_send(ctx, text)
         left, right = _policy_wait_box(ctx, left_rgb), _policy_wait_box(ctx, right_rgb)
+        mention_background = background_sample(gui.native_rgb_capture(ctx['window']), left, right)
+        assert mention_background['rgb'] != ordinary_background['rgb'], (
+            'Eligible mention lost its persistent body tint with effects Off',
+            style, ordinary_background, mention_background)
         _policy_effects(ctx, mention='off', fx='full')
-        assert left[0] < right[0] and abs(left[1] - right[1]) <= 1, (
-            'Fixture own nickname wrapped; cannot compare native geometry', style, left, right)
-        layout = gui.read_layout(ctx['preferences'])
-        x, y, width, height = layout['conversation']['rect']
-        scale = layout['scale']
-        region = (round(x + 2 * scale), max(round(y), left[1] - round(42 * scale)),
-                  round(x + width - 110 * scale), min(round(y + height), left[3] + round(14 * scale)))
-        assert right[2] + 45 < region[2], ('Fixture body exceeds native sample region', region, right)
+        reanchor()
         baseline_frames, off_item = capture('off')
         assert len(set(baseline_frames)) == 1, ('Off source is not stable', style, off_item)
+        off_item['persistent_background'] = {
+            'ordinary': ordinary_background, 'mention': mention_background,
+            'ordinary_capture': str(ordinary_capture), 'fx': 'off', 'mention_effect': 'off'}
         baseline = baseline_frames[-1]
         evidence.append(dict(style=style, **off_item))
+        if background_only:
+            _policy_focus(ctx, ctx['channel_id'])
+            _policy_focus(ctx, ctx['query_id'])
+            frames, revisit = capture('background-revisit')
+            assert all(frame == baseline for frame in frames), (
+                'Persistent background changed after focus revisit', style, revisit)
+            evidence.append(dict(style=style, **revisit))
+            baseline = shown_fool_reference()
+            observe('shown-fool-neon', mention='neon_mention', strength=100, suppressed=True)
+            _policy_chat(ctx, fools=[])
+            continue
         for choice in choices:
             variant = {'outline': False} if choice == 'luminous_outline' else (
                       {'glint': False} if choice == 'accent_underline' else {})
@@ -3291,12 +3356,7 @@ def run_mention_effects(ctx):
         assert all(delta(frame, baseline) > 24 for frame in frames), (
             'Retained mention disappeared after revisit', style, revisit)
         evidence.append(dict(style=style, **revisit))
-        _policy_chat(ctx, fools=[ctx['query_target']])
-        gui.command('show-fools', window=ctx['window'])
-        gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
-        _policy_effects(ctx, mention='off')
-        fool_frames, _ = capture('shown-fool-off')
-        baseline = fool_frames[-1]
+        baseline = shown_fool_reference()
         for choice in choices:
             observe(choice + '-shown-fool', mention=choice, strength=100, suppressed=True)
         _policy_appearance(ctx, fool='hidden')
@@ -3304,6 +3364,13 @@ def run_mention_effects(ctx):
         gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
         assert_source_absent('Hidden fool source pixels leaked')
         _policy_chat(ctx, fools=[])
+
+    if background_only:
+        return _refresh_return(ctx, 'mention-background', {
+            'cases': evidence, 'layouts': ['bubbles', 'irc', 'stacked'],
+            'effects_off_background': True, 'shown_fool_background_and_fx_absent': True,
+            'focus_revisit_pixels_unchanged': True,
+            'limits': ['Search/global-mentions exclusions are covered by native_transcript_check.']})
 
     saved = _policy_effects(ctx, mention='accent_underline', strength=73, glint=True, speed=135)
     gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
@@ -7300,7 +7367,7 @@ def run_logo_alignment(ctx):
 
 
 def run_overlay_refinements(ctx):
-    """Reserved reply footer, fixed native Input, unchanged typing and /me."""
+    """Reserved reply and typing footers, fixed native Input, and unchanged /me."""
     p, w, prefs, db = ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path']
     identity = ctx['query_id']
     _policy_focus(ctx, identity)
@@ -7363,11 +7430,10 @@ def run_overlay_refinements(ctx):
     closed = reply_observation('before')
     layout_before = closed['conversation']
     closed_frame = gui.native_rgb_capture(w)
-    reply = gui.begin_native_reply(w, gui.read_layout(prefs), ctx['args'].zoom,
-                                    Path(ctx['destination']), label='overlay-two-line-reply')
-    gui._composer_native(w, draft, size, size)
-    # The context-menu pointer can remain over the rich source swatch. Move
-    # it into the actual native Input without clicking before measuring ink.
+    gui.framed_keys(w, 'ctrl+p', 'ctrl+p', 'ctrl+p')
+    gui.framed_keys(w, 'ctrl+r')
+    reply = {'method': 'keyboard', 'keys': ['ctrl+p', 'ctrl+p', 'ctrl+p', 'ctrl+r'],
+             'native_composer': gui._composer_native(w, draft, size, size)}
     pointer_offset = gui.GUI_DEBUG[w][1].stat().st_size
     gui.move_pointer(w, before['caret'][0], before['caret'][1] + before['caret'][3] / 2)
     gui.SESSION.until('native pointer leaves the measured source swatch', lambda:
@@ -7400,50 +7466,39 @@ def run_overlay_refinements(ctx):
     assert card_edges, ('No actual full-width reply border above rich excerpt', preview_marker)
     card_top = min(card_edges)
     assert card_top < preview_marker[1], ('Reply border did not enclose excerpt', card_top, preview_marker)
-    typing_top = preview_marker[3] + 1
-    typing_box = (round(layout_before[0]), typing_top,
-                  round(layout_before[0] + layout_before[2]), round(before['caret'][1]))
-    assert typing_box[1] < typing_box[3], ('No measured typing band below reply and above Input', typing_box)
     gui.move_pointer(w, layout_before[0] + layout_before[2] / 2, layout_before[1] + 1)
 
-    def typing_pixels():
-        return _policy_crop(gui.native_rgb_capture(w), typing_box)
-
-    def save_typing_pixels(label, pixels):
-        path = Path(ctx['destination']).with_name('overlay-typing-' + label + '.png')
-        Image.frombytes('RGB', (typing_box[2] - typing_box[0], typing_box[3] - typing_box[1]), pixels).save(path)
-        captures.append(str(path))
-        return str(path)
-
-    typing_baseline = typing_pixels()
-    typing_before_capture = save_typing_pixels('before', typing_baseline)
     def typing_visible():
-        _policy_typing(ctx, 'active')  # Keep genuine activity alive during native capture.
-        pixels = typing_pixels()
-        changed = [index // 3 for index in range(0, len(pixels), 3)
-                   if pixels[index:index + 3] != typing_baseline[index:index + 3]]
-        if not changed:
+        _policy_typing(ctx, 'active')
+        words = _policy_words(ctx, 'overlay-typing-active', layout_before)
+        phrase = [(word.casefold(), box) for word, box in words
+                  if word.casefold() in {'is', 'typing'} and box[3] <= card_top]
+        if {word for word, _ in phrase} != {'is', 'typing'}:
             return False
-        width = typing_box[2] - typing_box[0]
-        bounds = (typing_box[0] + min(index % width for index in changed),
-                  typing_box[1] + min(index // width for index in changed),
-                  typing_box[0] + max(index % width for index in changed) + 1,
-                  typing_box[1] + max(index // width for index in changed) + 1)
-        assert typing_box[1] < bounds[1] < bounds[3] < typing_box[3], (
-            'Typing transition crosses the measured reply/Input boundaries', typing_box, bounds)
-        return {'measured_band': typing_box, 'changed_bbox': bounds, 'changed_pixels': len(changed),
-                'before_capture': typing_before_capture, 'active_capture': save_typing_pixels('active', pixels)}
-    typing = gui.SESSION.until('real TAGMSG paints the unchanged band below reply and above Input', typing_visible)
+        observed = reply_observation('typing', replying=True)
+        shifted = observed['markers']['newest']['history_bbox']
+        opened_marker = opened['markers']['newest']['history_bbox']
+        assert shifted[1] < opened_marker[1], (
+            'Typing did not move the followed newest message above its row', shifted, opened_marker)
+        assert shifted[3] <= min(box[1] for _, box in phrase), (
+            'Typing overlaps the followed newest message', shifted, phrase)
+        assert max(box[3] for _, box in phrase) <= card_top, (
+            'Typing overlaps the reply card', phrase, card_top)
+        return {'words': phrase, 'newest_history_marker': shifted, 'observation': observed}
+
+    typing = gui.SESSION.until('real TAGMSG paints typing between followed history and reply', typing_visible)
     assert gui.native_input_rectangle(w) == before['caret']
-    reply_observation('typing', replying=True)
     assert gui._composer_native(w, draft, size, size)['caret'] == before['caret']
     _policy_typing(ctx, 'done')
+
     def typing_restored():
-        pixels = typing_pixels()
-        return pixels if pixels == typing_baseline else False
-    typing_done = gui.SESSION.until('real done exactly restores the measured typing band', typing_restored)
-    typing['done_capture'] = save_typing_pixels('done', typing_done)
-    typing['done_restores_exact_baseline'] = True
+        marker = _policy_box(ctx, (211, 121, 37))
+        return marker if marker and tuple(marker) == tuple(
+            opened['markers']['newest']['history_bbox']) else False
+
+    typing['done_history_marker'] = gui.SESSION.until(
+        'real done restores the opened reply history position', typing_restored)
+    typing['done_observation'] = reply_observation('typing-done', replying=True)
     captures.append(str(_policy_capture(ctx, 'overlay-fixed-two-lines')))
 
     card_band = (card_top, preview_marker[3])
@@ -7548,7 +7603,7 @@ def run_overlay_refinements(ctx):
     logo = _probe_logo_alignment(ctx)
     return _refresh_return(ctx, 'overlay-refinements', {
         'reply': reply,
-        'native_reply_excerpt_marker': preview_marker, 'typing_below_reply': typing,
+        'native_reply_excerpt_marker': preview_marker, 'typing_above_reply': typing,
         'input_caret_unchanged': before['caret'], 'history_anchor_relative_positions_unchanged': anchor,
         'reserved_reply_footer': reserved_footer, 'actual_wheel_frames': [],
         'footer_before_open_cancel': [closed, opened, closed_again], 'real_cancel': cancelled,
@@ -9569,6 +9624,8 @@ class _StartupHistoryRelay:
         self.held = threading.Event()
         self.release = threading.Event()
         self.completed = threading.Event()
+        self.gap_held = threading.Event()
+        self.gap_release = threading.Event()
         self.stopping = threading.Event()
         self.errors = []
         self.requests = []
@@ -9684,18 +9741,34 @@ class _StartupHistoryRelay:
                     request = next(request for request in reversed(self.requests)
                                    if request.split()[1].upper() != 'TARGETS')
                     self.pages.append({'batch': self.batch, 'request': request,
-                                       'body_frames': 0, 'fixture_messages': [],
-                                       'oldest_primary': None, 'newest_primary': None})
+                                       'body_frames': 0, 'fixture_messages': [], 'fixture_kinds': {},
+                                       'raw_primary_count': 0, 'presence_frames': [],
+                                       'oldest_wire': None, 'newest_wire': None,
+                                       'oldest_content': None, 'newest_content': None})
             if server and self.batch is not None and tags.get('batch') == self.batch:
                 self.pages[-1]['body_frames'] += 1
-                if len(parts) >= 3 and parts[0] == 'PRIVMSG' and ' :OFFLINEHISTORY' in line:
-                    self.pages[-1]['fixture_messages'].append(line.split(' :', 1)[1])
-                if (parts and parts[0] != 'BATCH' and 'draft/chathistory-context' not in tags
-                        and (tags.get('msgid') or tags.get('time'))):
+                if len(parts) >= 3 and parts[0] in ('PRIVMSG', 'NOTICE') and 'OFFLINEHISTORY' in line:
+                    body = line.split(' :', 1)[1]
+                    if body.startswith('\x01ACTION ') and body.endswith('\x01'):
+                        body = body[8:-1]
+                    self.pages[-1]['fixture_messages'].append(body)
+                    self.pages[-1]['fixture_kinds'][body] = parts[0]
+                if parts and parts[0] != 'BATCH' and 'draft/chathistory-context' not in tags:
+                    page = self.pages[-1]
+                    page['raw_primary_count'] += 1
                     cursor = [tags.get('msgid', ''), tags.get('time', '')]
-                    if self.pages[-1]['oldest_primary'] is None:
-                        self.pages[-1]['oldest_primary'] = cursor
-                    self.pages[-1]['newest_primary'] = cursor
+                    if any(cursor):
+                        if page['oldest_wire'] is None:
+                            page['oldest_wire'] = cursor
+                        page['newest_wire'] = cursor
+                        if parts[0] in ('PRIVMSG', 'NOTICE') and not any(
+                                tag in tags for tag in ('draft/edit', '+draft/edit', 'draft/delete',
+                                                        '+draft/delete', 'draft/react', '+draft/react')):
+                            if page['oldest_content'] is None:
+                                page['oldest_content'] = cursor
+                            page['newest_content'] = cursor
+                    if parts[0] in ('JOIN', 'PART', 'QUIT', 'NICK', 'KICK', 'MODE', 'TOPIC'):
+                        page['presence_frames'].append({'command': parts[0], 'cursor': cursor})
             if (server and self.batch is not None and tags.get('batch') == self.batch
                     and not self.held.is_set()):
                 self.held.set()
@@ -9703,6 +9776,13 @@ class _StartupHistoryRelay:
                 # ponytail: pause this direction, preserving nested wire-frame ordering.
                 if not await self.asyncio.to_thread(self.release.wait, 20):
                     raise TimeoutError('Private history body was not released before its deadline')
+            if (server and self.batch is not None and tags.get('batch') == self.batch
+                    and self.pages[-1]['request'].startswith('CHATHISTORY BEFORE ')
+                    and any(page['oldest_content'] for page in self.pages[:-1])
+                    and not self.gap_held.is_set()):
+                self.gap_held.set()
+                if not await self.asyncio.to_thread(self.gap_release.wait, 30):
+                    raise TimeoutError('Private seam history body was not released before its deadline')
             destination.write(frame)
             await destination.drain()
             if server and self.batch is not None and parts[:2] == ['BATCH', '-' + self.batch]:
@@ -9717,6 +9797,7 @@ class _StartupHistoryRelay:
     def close(self):
         self.stopping.set()
         self.release.set()
+        self.gap_release.set()
         if self.loop is not None and self.shutdown is not None:
             try:
                 self.loop.call_soon_threadsafe(self.shutdown.set)
@@ -9884,13 +9965,15 @@ def run_soju_search_context(ctx):
 
 
 def run_startup_history_sync(ctx):
-    """Real discovery/LATEST leaves an offscreen gap, filled automatically when exposed."""
+    """Real startup seam auto-fills beyond three pages, ignoring presence but retaining /me."""
     destination = Path(ctx['destination'])
     config = Path(ctx['preferences']).with_name('config.toml')
     _policy_focus(ctx, ctx['channel_id'])
     gui.expand_navigation(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'])
     cached = 'CACHEDHISTORY retained native startup witness'
-    remote = [f'OFFLINEHISTORY {index:02d} actual offline Ergo witness' for index in range(65)]
+    remote = [f'OFFLINEHISTORY {index:03d} actual offline Ergo witness' for index in range(215)]
+    action_indices = {17, 73, 151}
+    notice_indices = {29, 93, 177}
     _policy_send(ctx, cached, target=ctx['channel'])
     gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
 
@@ -9923,7 +10006,46 @@ def run_startup_history_sync(ctx):
     anchor = rows('SELECT id,time,text FROM messages WHERE buffer=? AND text=?',
                   (ctx['channel_id'], cached))
     assert len(anchor) == 1 and anchor[0][0] and anchor[0][1], anchor
+    churn_nick = 'historychurn'
+    churn_client = ctx['cleanup'].enter_context(gui.fixtures.BootstrapClient(
+        dict(ctx['lab'].endpoints['direct'], nick=churn_nick, username=churn_nick),
+        ctx['lab'].ca_file, authenticate=False))
+    churn_client.send('JOIN ' + ctx['channel'])
+    gui.receive_until(ctx['observer'], 'JOIN', [ctx['channel']], churn_nick,
+                      redact=ctx['lab']._redact)
+    def churn(count, reason):
+        for _ in range(count):
+            churn_client.send(f"PART {ctx['channel']} :{reason}")
+            churn_client.wait(lambda command, params, prefix:
+                command == 'PART' and params[0] == ctx['channel']
+                and prefix.split('!', 1)[0] == churn_nick)
+            ctx['observer'].wait(lambda command, params, prefix:
+                command == 'PART' and params[0] == ctx['channel']
+                and prefix.split('!', 1)[0] == churn_nick)
+            churn_client.send('JOIN ' + ctx['channel'])
+            churn_client.wait(lambda command, params, prefix:
+                command == 'JOIN' and params == [ctx['channel']]
+                and prefix.split('!', 1)[0] == churn_nick)
+            ctx['observer'].wait(lambda command, params, prefix:
+                command == 'JOIN' and params == [ctx['channel']]
+                and prefix.split('!', 1)[0] == churn_nick)
+
+    live_presence_before = rows('SELECT COUNT(*) FROM messages WHERE buffer=? AND presence=1',
+                                (ctx['channel_id'],))[0][0]
+    churn(2, 'LIVEPRESENCE after last actual cached content')
+    gui.SESSION.until('real live presence retained after cached content', lambda:
+        rows('SELECT COUNT(*) FROM messages WHERE buffer=? AND presence=1',
+             (ctx['channel_id'],))[0][0] > live_presence_before)
+    gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
     cached_source = source_snapshot()
+    initial_state = cached_source['history_state']
+    assert len(initial_state) == 1, cached_source
+    initial_newest = initial_state[0][2:4]
+    assert not any(initial_newest) or rows(
+        'SELECT id FROM messages WHERE buffer=? AND id=? AND time=? AND presence=0 AND pending=0',
+        (ctx['channel_id'], *initial_newest)), cached_source
+    cached_presence_ids = {row[0] for row in rows(
+        'SELECT id FROM messages WHERE buffer=? AND presence=1', (ctx['channel_id'],)) if row[0]}
     layout = gui.read_layout(ctx['preferences'])
     x, y, width, height = layout['conversation']['rect']
     header = (x, y, width, gui.pane_metrics(layout, ctx['args'].zoom)['header_minimum'])
@@ -9947,12 +10069,25 @@ def run_startup_history_sync(ctx):
         _, _, prefix = ctx['observer'].wait(lambda command, params, prefix:
             command == 'QUIT' and prefix.split('!', 1)[0] in departed, timeout=15)
         departed.remove(prefix.split('!', 1)[0])
-    for body in remote:
-        ctx['observer'].send(f"PRIVMSG {ctx['channel']} :{body}")
-    barrier = 'startup-history-offline-stored'
-    ctx['observer'].send('PING :' + barrier)
-    ctx['observer'].wait(lambda command, params, prefix:
-        command == 'PONG' and params[-1] == barrier, timeout=10)
+    def observer_barrier(label):
+        ctx['observer'].send('PING :' + label)
+        ctx['observer'].wait(lambda command, params, prefix:
+            command == 'PONG' and params[-1] == label, timeout=10)
+
+    for index, body in enumerate(remote):
+        if index in action_indices:
+            ctx['observer'].send(f"PRIVMSG {ctx['channel']} :\x01ACTION {body}\x01")
+        else:
+            command = 'NOTICE' if index in notice_indices else 'PRIVMSG'
+            ctx['observer'].send(f"{command} {ctx['channel']} :{body}")
+        if index % 2 == 0:
+            churn(1, 'OFFLINEPRESENCE must not enter historical transcript')
+        if index == 107:
+            observer_barrier('startup-history-content-before-central-presence')
+            churn(150, 'OFFLINEPRESENCE contiguous pages must advance without moving content edge')
+    observer_barrier('startup-history-all-offline-content-stored')
+    churn(60, 'OFFLINEPRESENCE tail after newest actual content')
+    observer_barrier('startup-history-offline-fixture-complete')
     original_config = config.read_text()
     relay = _StartupHistoryRelay(ctx['lab'], ctx['channel'])
     ctx['cleanup'].callback(relay.close)
@@ -10006,6 +10141,9 @@ def run_startup_history_sync(ctx):
         assert 'offlinehistory' not in tokens(pending_words), 'Held remote history body was painted early'
         assert offline_rows() == [], 'Held history body reached Core early'
         held_source = source_snapshot()
+        live_presence_ids = cached_presence_ids | {row[0] for row in rows(
+            'SELECT id FROM messages WHERE buffer=? AND presence=1',
+            (ctx['channel_id'],)) if row[0]}
         pending_header = [item for item in pending_words if int(item['top']) < y + header[3]]
         indication = tokens(pending_header) - tokens(baseline)
         assert indication, 'Actual pending header added no visible history indication'
@@ -10019,16 +10157,14 @@ def run_startup_history_sync(ctx):
     gui.wait_joins(ctx['observer'], ctx['channel'], (ctx['own_nick'], ctx['other_nick']))
     gui.wait_messages(ctx['proc'], ctx['database_path'], ctx['expected_messages'])
 
-    def idle_header():
-        result = words('idle-after', header)
-        return result if not indication.intersection(tokens(result)) else None
-
-    final_header = gui.SESSION.until('native history indication retired after real batch end', idle_header)
-    latest_rows = gui.SESSION.until('committed actual LATEST page', lambda: offline_rows() or None)
+    gui.SESSION.until('selected startup seam walks presence-only pages then requests content gap',
+                      lambda: relay.ready(relay.gap_held))
+    latest_rows = gui.SESSION.until('committed first actual content page after presence-only LATEST',
+                                    lambda: offline_rows() or None)
     latest_bodies = [row[2] for row in latest_rows]
     assert remote[-1] in latest_bodies and 0 < len(latest_rows) <= 50, latest_rows
     missing = [body for body in remote if body not in latest_bodies]
-    assert len(missing) >= 15 and missing == remote[:len(missing)], (missing, latest_bodies)
+    assert len(missing) > 150 and missing == remote[:len(missing)], (missing, latest_bodies)
     latest_gaps = gaps()
     diagnostic_path = destination.with_name(destination.stem + '-startup-history-gap-diagnostics.json')
     if len(latest_gaps) != 1 or latest_gaps[0][5]:
@@ -10044,33 +10180,31 @@ def run_startup_history_sync(ctx):
         'gaps': latest_gaps, 'cached_anchor': anchor, 'diagnostic': str(diagnostic_path)}
     gap = latest_gaps[0]
     held_state = held_source['history_state']
-    assert len(held_state) == 1 and (held_state[0][2] or held_state[0][3]), held_source
-    previous_newest = held_state[0][2:4]
+    assert len(held_state) == 1, held_source
+    held_newest = held_state[0][2:4]
+    previous_newest = initial_newest if any(initial_newest) else anchor[0][:2]
+    assert held_newest in (initial_newest, previous_newest), (held_source, cached_source)
     latest_page = next(page for page in relay.pages
                        if page['request'].startswith('CHATHISTORY LATEST '))
-    assert latest_page['oldest_primary'], latest_page
-    assert (gap[1], gap[2]) == previous_newest, (gap, previous_newest)
-    assert [gap[3], gap[4]] == latest_page['oldest_primary'], (gap, latest_page)
+    assert latest_page['raw_primary_count'] == 50 and latest_page['presence_frames'], latest_page
+    assert latest_page['oldest_content'] is None and not latest_page['fixture_messages'], latest_page
+    first_content_page = next(page for page in relay.pages if page['oldest_content'])
+    assert first_content_page['request'].startswith('CHATHISTORY BEFORE '), first_content_page
+    assert (gap[1], gap[2]) == tuple(previous_newest), (gap, previous_newest)
+    assert [gap[3], gap[4]] == first_content_page['oldest_content'], (gap, first_content_page)
     assert rows('SELECT id,time,text FROM messages WHERE buffer=? AND text=?',
                 (ctx['channel_id'], cached)) == anchor, 'LATEST lost the cached anchor'
-    gui.SESSION.until('actual LATEST offline history painted in native chat', lambda:
+    gui.SESSION.until('first actual offline history page painted in native chat', lambda:
         upload.label_rect(ctx['window'], destination, 'OFFLINEHISTORY',
                           region=layout['conversation']['rect']))
     final_capture = str(_policy_capture(ctx, 'startup-history-idle-after'))
 
     before_demand = list(relay.requests)
-    assert all(request.split()[1].upper() in ('TARGETS', 'LATEST')
-               for request in before_demand), ('History fetched before native gap demand', before_demand)
-    assert offline_rows() == latest_rows, 'Missing interval filled before native navigation'
-    gap_capture = str(_policy_capture(ctx, 'startup-history-gap-before-demand'))
-    navigation_offset = gui.framed_keys(ctx['window'], 'alt+less')
-
-    def exposed_demand():
-        relay.ready(relay.completed)
-        return any(request.startswith('CHATHISTORY BEFORE ')
-                   for request in relay.requests[len(before_demand):])
-
-    gui.SESSION.until('beginning-of-buffer exposure automatically demands BEFORE', exposed_demand)
+    assert any(request.startswith('CHATHISTORY BEFORE ') for request in before_demand), before_demand
+    held_gap_request = relay.pages[-1]['request']
+    assert offline_rows() == latest_rows, 'Held seam body reached Core early'
+    gap_capture = str(_policy_capture(ctx, 'startup-history-gap-auto-requested'))
+    relay.gap_release.set()
 
     def filled_gap():
         relay.ready(relay.completed)
@@ -10078,17 +10212,55 @@ def run_startup_history_sync(ctx):
         return loaded if [row[2] for row in loaded] == remote and not gaps() else None
 
     filled = gui.SESSION.until('BEFORE commits the missing interval and retires durable gap', filled_gap)
-    demand_requests = relay.requests[len(before_demand):]
-    target_demand = [request for request in demand_requests if request.split()[1].upper() != 'TARGETS']
-    assert 1 <= len(target_demand) <= 3, demand_requests
-    assert all(request.startswith('CHATHISTORY BEFORE ') for request in target_demand), demand_requests
-    assert ('msgid=' + gap[3]) in target_demand[0] or ('timestamp=' + gap[4]) in target_demand[0], (gap, target_demand)
+    target_demand = [request for request in relay.requests if request.startswith('CHATHISTORY BEFORE ')]
+    assert len(target_demand) > 3, target_demand
+    content_page_wire_edge = first_content_page['oldest_wire']
+    assert held_gap_request.split()[3] in {
+        'msgid=' + content_page_wire_edge[0], 'timestamp=' + content_page_wire_edge[1]}, (
+            first_content_page, held_gap_request)
     assert not any(request.startswith('CHATHISTORY AFTER ') for request in relay.requests), relay.requests
     assert sum(request.startswith('CHATHISTORY LATEST ') for request in relay.requests) == 1, relay.requests
     assert rows('SELECT id,time,text FROM messages WHERE buffer=? AND text=?',
                 (ctx['channel_id'], cached)) == anchor, 'Gap demand lost the cached anchor'
     assert all(row[0] and row[1] for row in filled), filled
     assert len({row[0] for row in filled}) == len(remote), 'History replay duplicated protocol IDs'
+    before_pages = [page for page in relay.pages if page['request'].startswith('CHATHISTORY BEFORE ')]
+    assert len(before_pages) == len(target_demand), (before_pages, target_demand)
+    wire_anchors = [request.split()[3] for request in target_demand]
+    assert len(wire_anchors) == len(set(wire_anchors)), ('Repeated wire cursor', target_demand)
+    for previous, following in zip([latest_page] + before_pages, before_pages):
+        cursor = previous['oldest_wire']
+        selectors = {'msgid=' + cursor[0], 'timestamp=' + cursor[1]} if cursor else set()
+        assert following['request'].split()[3] in selectors, (
+            'BEFORE did not advance to previous raw wire edge', previous, following)
+    historical_presence = [frame for page in relay.pages for frame in page['presence_frames']]
+    assert historical_presence, 'Private Ergo failed to replay genuine event-playback JOIN/PART churn'
+    presence_only_pages = [page for page in before_pages
+                           if page['raw_primary_count'] and not page['oldest_content']]
+    assert len(presence_only_pages) > 3, ('Insufficient presence-only page pressure', before_pages)
+    assert not rows('SELECT id,text FROM messages WHERE buffer=? AND presence=1 AND text LIKE ?',
+                    (ctx['channel_id'], '%OFFLINEPRESENCE%')), 'Historical PART was inserted'
+    for frame in historical_presence:
+        if frame['cursor'][0] and frame['cursor'][0] not in live_presence_ids:
+            assert not rows('SELECT id FROM messages WHERE buffer=? AND id=?',
+                            (ctx['channel_id'], frame['cursor'][0])), frame
+    content_kinds = rows('SELECT text,action,presence FROM messages WHERE buffer=? AND text LIKE ? '
+                         'ORDER BY text', (ctx['channel_id'], 'OFFLINEHISTORY %'))
+    assert len(content_kinds) == len(remote), content_kinds
+    for index, (_, action, presence) in enumerate(content_kinds):
+        assert (bool(action), bool(presence)) == (index in action_indices, False), (
+            index, content_kinds[index])
+    fixture_kinds = {body: command for page in relay.pages
+                     for body, command in page['fixture_kinds'].items()}
+    assert all(fixture_kinds.get(remote[index]) == 'NOTICE' for index in notice_indices), fixture_kinds
+    final_state = source_snapshot()['history_state']
+    assert len(final_state) == 1 and final_state[0][2:4] == filled[-1][:2], (
+        'Newest durable cursor is not the last actual offline content', final_state, filled[-1])
+    for state in final_state:
+        for message_id, message_time in (state[:2], state[2:4]):
+            assert rows('SELECT id FROM messages WHERE buffer=? AND presence=0 AND pending=0 '
+                        'AND ((?<>\'\' AND id=?) OR (?=\'\' AND time=?))',
+                        (ctx['channel_id'], message_id, message_id, message_id, message_time)), state
     display_rows = rows(
         'SELECT id,time,timestamp,sort_time,seq,text,tie_order,tie_order_confirmed FROM messages '
         'WHERE buffer=? AND text LIKE ? ORDER BY sort_time,time,tie_order,seq',
@@ -10105,7 +10277,7 @@ def run_startup_history_sync(ctx):
             'display_columns': ['id', 'time', 'timestamp', 'sort_time', 'seq', 'text',
                                 'tie_order', 'tie_order_confirmed'],
             'display_rows': display_rows, 'expected_text_order': remote,
-            'cached_anchor': anchor, 'previous_protocol_newest': previous_newest,
+            'cached_anchor': anchor, 'effective_previous_content_boundary': previous_newest,
             'durable_gaps_after_demand': gaps(), 'actual_requests': list(relay.requests),
             'actual_pages': list(relay.pages), 'native_capture': order_capture,
             'native_frame_after_debug_offset': offset,
@@ -10116,6 +10288,10 @@ def run_startup_history_sync(ctx):
         not upload.label_rect(ctx['window'], destination, 'Missing messages',
                               region=layout['conversation']['rect']))
     filled_capture = str(_policy_capture(ctx, 'startup-history-gap-filled'))
+    navigation_offset = gui.framed_keys(ctx['window'], 'alt+less')
+    final_header = gui.SESSION.until('native history indication retires after full seam fill', lambda:
+        (observed if not indication.intersection(tokens(observed)) else None)
+        if (observed := words('idle-after', header)) else None)
     prefix_scrolls = []
 
     def native_prefix():
@@ -10128,7 +10304,7 @@ def run_startup_history_sync(ctx):
         visible = []
         for word, number in zip(observed, observed[1:]):
             if (word['text'].casefold() == 'offlinehistory'
-                    and re.fullmatch(r'[0-9]{2}', number['text'])
+                    and re.fullmatch(r'[0-9]{3}', number['text'])
                     and abs(int(word['top']) - int(number['top'])) <= 12):
                 visible.append((int(word['top']), int(number['text'])))
         visible.sort()
@@ -10139,21 +10315,35 @@ def run_startup_history_sync(ctx):
             'native_visible_offline_indices': indices, 'words': observed}
         return visible
 
-    prefix_visible = gui.SESSION.until('native wheel reveals recovered 00 then 01 in wire order',
+    prefix_visible = gui.SESSION.until('native wheel reveals recovered 000 then 001 in wire order',
                                        native_prefix)
     prefix_capture = str(_policy_capture(ctx, 'startup-history-filled-prefix'))
     return _refresh_return(ctx, 'startup-history-sync', {
         'actual_requests': list(relay.requests), 'actual_held_batch': relay.held_batch,
-        'actual_pages': list(relay.pages), 'requests_before_native_gap_demand': before_demand,
+        'actual_pages': list(relay.pages), 'requests_before_seam_release': before_demand,
         'native_gap_reveal': {'keys': 'M-<', 'trace_offset': navigation_offset,
-                              'upward_wheel': False, 'load_button_click': False},
-        'durable_gap_before_demand': gap,
-        'previous_protocol_newest': previous_newest,
+                              'after_automatic_full_fill': True, 'load_button_click': False},
+        'durable_gap_before_fill': gap,
+        'effective_previous_content_boundary': previous_newest,
+        'initial_persisted_history_state': initial_state,
+        'cached_content_fallback_used': not any(initial_newest),
         'offline_seed_count': len(remote), 'latest_fixture_count': len(latest_rows),
-        'missing_until_native_demand': missing, 'filled_fixture_count': len(filled),
+        'missing_before_seam_release': missing, 'filled_fixture_count': len(filled),
         'persisted_display_text_order': display_order,
         'native_recovered_prefix_rows': prefix_visible, 'native_prefix_scrolls': prefix_scrolls,
         'durable_gaps_after_demand': gaps(), 'cached_protocol_anchor_preserved': anchor,
+        'startup_auto_requested_before_navigation': True,
+        'wire_pagination_anchors': wire_anchors, 'final_content_state': final_state,
+        'offline_action_indices': sorted(action_indices), 'offline_notice_indices': sorted(notice_indices),
+        'live_presence_after_cached_content': True, 'real_part_join_cycles': 320,
+        'historical_presence_frames': historical_presence,
+        'presence_only_pages': presence_only_pages,
+        'presence_replay_capability': 'private Ergo stores JOIN/PART; draft/event-playback requested',
+        'initial_latest_presence_only': True, 'first_content_page': first_content_page,
+        'initial_latest_wire_endpoint': latest_page['oldest_wire'],
+        'barriers': ['startup-history-content-before-central-presence',
+                     'startup-history-all-offline-content-stored',
+                     'startup-history-offline-fixture-complete'],
         'held_observation_seconds': held_seconds,
         'cached_message': cached, 'offline_messages': remote,
         'dynamic_pending_header_tokens': sorted(indication),

@@ -9104,11 +9104,12 @@ void messageReplyCheck() {
             composer = composer->parent();
         const auto composerBounds = bounds(*composer), inputBounds = bounds(*input);
         const auto latestBeforeReply = latestBounds();
+        assert(historyScroll->maxScrollOffset() > 1.f);
         const float contentViewportHeight = historyScroll->contentViewportHeight();
         const float historyHeight = history->height(), viewportHeight = historyScroll->height();
         const auto historyBounds = bounds(*history);
         Node *card = nullptr;
-        const auto stableReplyGeometry = [&](bool replying = true) {
+        const auto stableReplyGeometry = [&](bool replying = true, float typingHeight = 0) {
             const float reserved =
                 replying ? std::max(0.f, historyBounds[3] - bounds(*card)[1]) : 0;
             assert(std::abs(history->height() - historyHeight) < .1f &&
@@ -9117,7 +9118,7 @@ void messageReplyCheck() {
                             (contentViewportHeight - reserved)) < .1f);
             const auto latest = latestBounds(), currentComposer = bounds(*composer),
                        currentInput = bounds(*input);
-            assert(std::abs(latest[1] - latestBeforeReply[1]) < 1.f);
+            assert(std::abs(latest[1] - latestBeforeReply[1] + reserved + typingHeight) < 1.f);
             for (std::size_t i = 0; i < latest.size(); ++i) {
                 assert(std::abs(currentComposer[i] - composerBounds[i]) < .5f);
                 assert(std::abs(currentInput[i] - inputBounds[i]) < .5f);
@@ -9126,6 +9127,8 @@ void messageReplyCheck() {
                 assert(std::abs(bounds(*historyScroll)[3] - bounds(*card)[1]) < .1f &&
                        std::abs(bounds(*composer)[1] - bounds(*card)[3] -
                                 4 * model.settings.scale) < .1f);
+            if (replying)
+                assert(latest[3] <= bounds(*card)[1] - typingHeight + .5f);
         };
         hostKey(ui, dispatcher, 'r', KeyMod::Ctrl);
         frame();
@@ -9272,7 +9275,6 @@ void messageReplyCheck() {
         assert(!visible(*cancelReply) && input->editingStateMatches(before) &&
                before.history->undo == beforeUndo && before.history->redo == beforeRedo);
         hostKey(ui, dispatcher, 'p', KeyMod::Ctrl);
-        frame();
         hostKey(ui, dispatcher, 'r', KeyMod::Ctrl);
         frame();
         assert(visible(*cancelReply) && input->editingStateMatches(before));
@@ -9285,7 +9287,22 @@ void messageReplyCheck() {
             if (phase != 0)
                 live.typing["OverlayPeer"] = model.now - (phase == 2 ? 30 : 0);
             frame();
-            stableReplyGeometry();
+            const float typingHeight =
+                phase == 1 ? typingIndicatorHeight(renderer, model.settings.scale,
+                                                   messageTextSize(model.settings, live))
+                           : 0;
+            stableReplyGeometry(true, typingHeight);
+            if (phase == 1) {
+                auto *typingLabel = visibleLabelContaining(*history, "OverlayPeer");
+                assert(typingLabel && latestBounds()[3] <= bounds(*typingLabel)[1] + .5f &&
+                       bounds(*typingLabel)[3] <= bounds(*card)[1] + .5f);
+                click(dispatcher, *cancelReply);
+                frame();
+                stableReplyGeometry(false, typingHeight);
+                assert(history->replyToMessage(*originalTarget));
+                frame();
+                stableReplyGeometry(true, typingHeight);
+            }
             if (phase == 1)
                 assert(historyScroll->maxScrollOffset() > idleReplyMaximum + .1f);
             assert(visible(*cancelReply) && input->editingStateMatches(before) &&

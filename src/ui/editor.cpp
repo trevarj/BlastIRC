@@ -3435,9 +3435,11 @@ void EditorStore::Impl::Composer::sync() {
             input->inputArea()->focused() ? std::max(1.f, 2 * scale) : std::max(1.f, scale));
     };
     styleSurface(*tools);
-    input->setTextColors({}, themeSurfaceColor("primary_container"),
-                         themeForegroundColor("on_primary_container"),
-                         themeForegroundColor("on_surface"));
+    input->setTextColors(
+        {}, themeSurfaceColor("primary_container"), themeForegroundColor("on_primary_container"),
+        withAlpha(themePairedForeground(themeForegroundColor("surface_container_high"),
+                                        themeForegroundColor("primary")),
+                  1.f));
     const auto &settings = owner.model.settings;
     const auto shape = settings.cursorShape == "box"         ? Input::CaretShape::Box
                        : settings.cursorShape == "underline" ? Input::CaretShape::Underline

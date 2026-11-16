@@ -837,7 +837,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
     model.settings.timestamps = false;
     model.settings.uiFont = "sans-serif";
     model.settings.messageFont = "serif";
-    model.settings.uiFontWeight = 700;
+    model.settings.uiFontWeight = 400;
     model.settings.messageFontWeight = 300;
     model.settings.friends.insert("Peer");
     model.settings.avatars = true;
@@ -885,6 +885,9 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
             const auto rendered = body(view, "DecorationBody" + std::to_string(i), true);
             auto *nick = plainText(rendered.content, buffer.messages[i].nick);
             assert(nick && nick->visible());
+            assert(nick->font().weight == FontWeight::Bold);
+            assert(rendered.text.font().weight ==
+                   static_cast<FontWeight>(model.settings.messageFontWeight));
             auto *hit = dynamic_cast<InputArea *>(nick->parent()->parent());
             assert(hit && hit->visible());
             float hx, hy;
@@ -4339,6 +4342,60 @@ void channelActivity(TranscriptTestRenderer &renderer, float zoom) {
     arrange();
     for (std::size_t i = 0; i < std::size(original); ++i)
         actual(i);
+    // Measure the same typed event, not shorter replacement prose: suppressing
+    // its clock removes the gutter while retaining centered, unclipped padding.
+    const auto activityGeometry = [&](bool clockShown) {
+        model.settings.timestamps = clockShown;
+        arrange();
+        const auto rendered = body(view, original[0]);
+        RectNode *pill = nullptr;
+        for (const auto &child : rendered.content.children())
+            if (auto *rect = dynamic_cast<RectNode *>(child.get());
+                rect && rect->visible() && rect->style().fill.a > 0) {
+                assert(!pill);
+                pill = rect;
+            }
+        assert(pill);
+        const auto bounds = sceneBounds(*pill);
+        const auto text = sceneBounds(rendered.fragment);
+        containedBounds(nativeTextInk(renderer, rendered.text), bounds);
+        containedBounds(bounds, nativeHistoryClip(view));
+        const float leftPadding = text.x - bounds.x;
+        const float rightPadding = bounds.x + bounds.width - text.x - text.width;
+        assert(leftPadding > 0 && rightPadding > 0);
+        auto *clock = plainText(rendered.content, "12:34");
+        assert((clock && clock->visible()) == clockShown);
+        if (clockShown)
+            containedBounds(nativeTextInk(renderer, *clock), bounds);
+        else
+            near(leftPadding, rightPadding);
+        return std::array{bounds.width,
+                          bounds.height,
+                          leftPadding,
+                          rightPadding,
+                          clockShown ? sceneBounds(*clock).width : 0.f,
+                          bounds.x + bounds.width * .5f};
+    };
+    const auto clockedActivity = activityGeometry(true);
+    const auto compactActivity = activityGeometry(false);
+    const float removedGutter = clockedActivity[0] - compactActivity[0];
+    assert(removedGutter >= clockedActivity[4] && removedGutter > 0);
+    near(removedGutter, clockedActivity[2] - compactActivity[2]);
+    near(clockedActivity[1], compactActivity[1]);
+    near(clockedActivity[3], compactActivity[3]);
+    near(clockedActivity[5], compactActivity[5]);
+    model.settings.timestamps = true;
+    auto &event = buffer.messages[5];
+    event.action = true;
+    event.presence = false;
+    ++buffer.messagesRevision;
+    arrange();
+    for (const auto &child : body(view, original[0]).content.children())
+        if (const auto *rect = dynamic_cast<RectNode *>(child.get()))
+            assert(!rect->visible() || rect->style().fill.a == 0);
+    event.action = false;
+    event.presence = true;
+    ++buffer.messagesRevision;
     model.settings.channelPresence[buffer.id] = blast::PresenceMode::Global;
     assert(blast::effectivePresenceMode(model.settings, buffer.id, buffer.target) ==
            blast::PresenceMode::Hidden);
@@ -5413,7 +5470,7 @@ void messageNavigation(TranscriptTestRenderer &renderer, bool traditional) {
     const auto queued = selected("Me");
     buffer.draft = "Retained composer draft";
     const auto draft = buffer.draft;
-    assert(queued.canReply && !queued.canReact && !pane.following && !pane.focusComposer);
+    assert(queued.canReply && !queued.canReact && pane.following && !pane.focusComposer);
     assert(view.replyToMessage(queued) && pane.reply == "echo:navigation-send" &&
            pane.focusComposer && buffer.draft == draft && model.actions.empty());
     assert(!view.reactToMessage(queued, "👍"));
@@ -5523,6 +5580,30 @@ void messageNavigation(TranscriptTestRenderer &renderer, bool traditional) {
     assert(!view.resolveMessage(queued) && !view.replyToMessage(queued) &&
            !view.reactToMessage(queued, "👍"));
     assert(model.actions.empty());
+    for (int i = 0; i < 64; ++i) {
+        blast::Message message;
+        message.id = "navigation-overflow-" + std::to_string(i);
+        message.text = "Navigation overflow " + std::to_string(i);
+        message.nick = "Peer";
+        buffer.messages.push_back(std::move(message));
+    }
+    ++buffer.messagesRevision;
+    assert(view.scrollToBoundary(true));
+    arrange();
+    auto *scroll = find<ScrollView>(view);
+    assert(scroll && scroll->maxScrollOffset() > 0 && pane.following);
+    const float tailOffset = scroll->scrollOffset();
+    dispatcher.setFocus(input->inputArea());
+    for (int i = 0; i < 64; ++i) {
+        assert(view.navigateMessage(-1));
+        arrange();
+    }
+    assert(!pane.following && scroll->scrollOffset() < tailOffset);
+    const float anchoredOffset = scroll->scrollOffset();
+    const auto older = selected("Peer");
+    assert(view.replyToMessage(older));
+    arrange();
+    assert(!pane.following && std::abs(scroll->scrollOffset() - anchoredOffset) < .1f);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -7008,7 +7089,7 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                         if (child.get() == rendered.content.parent())
                             continue;
                         if (auto *rect = dynamic_cast<RectNode *>(child.get());
-                            rect && rect->style().borderWidth > 0)
+                            rect && rect->style().borderWidth > 0 && rect->zIndex() >= 0)
                             result.push_back(rect);
                         else if (child.get() != &rendered.body &&
                                  !dynamic_cast<InputArea *>(child.get()) &&
@@ -7048,6 +7129,20 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                 return result;
             };
             const auto decorated = [&] { return !signature(body(view, "PersistentBody")).empty(); };
+            const auto backdrop = [&](const Body &rendered) {
+                // The persistent body tint is distinct from ordinary hovered
+                // or activity surfaces, which may also paint behind the text.
+                const auto ordinaryFill = blast::themeSurfaceColor("surface_container_high");
+                for (const auto &child : rendered.content.children())
+                    if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+                        rect && rect->visible() && rect->zIndex() < 0 &&
+                        rect->width() >= rendered.fragment.width() &&
+                        rect->height() >= rendered.fragment.height() &&
+                        ((rect->style().borderWidth > 0 && rect->style().border.a > 0) ||
+                         (rect->style().fill.a > 0 && rect->style().fill != ordinaryFill)))
+                        return true;
+                return false;
+            };
             const auto originals = [&] {
                 std::vector<std::tuple<std::string, Color, float>> result;
                 for (const auto &area : body(view, "PersistentBody").body.children())
@@ -7058,7 +7153,7 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                 return result;
             };
             arrange();
-            assert(decorated());
+            assert(decorated() && backdrop(body(view, "PersistentBody")));
             const auto sortedChildren = [&](auto &&self, const Node &node) -> void {
                 int previous = std::numeric_limits<int>::min();
                 for (const auto &child : node.children()) {
@@ -7071,11 +7166,6 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
             const auto originalInk = originals();
             const auto height = body(view, "PersistentBody").row.height();
             rail(body(view, "PersistentBody"), {});
-            for (const auto &child : body(view, "PersistentBody").content.children())
-                if (auto *rect = dynamic_cast<RectNode *>(child.get());
-                    rect && rect->visible() && rect->width() > viewport.width * .5f &&
-                    rect->height() >= height * .5f)
-                    assert(rect->style().fill.a == 0);
             if (effect != blast::MentionEffect::LuminousOutline) {
                 int splitFragments = 0;
                 for (const auto &area : body(view, "PersistentBody").body.children())
@@ -7124,10 +7214,17 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                 if (layout != blast::MessageLayout::Bubbles)
                     for (const auto &child : rendered.content.children())
                         if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                            rect && rect->visible() && rect->style().borderWidth == 0 &&
+                            rect && rect->visible() && rect->zIndex() < 0 &&
+                            rect->style().fill.a > 0 && rect->style().borderWidth == 0 &&
                             rect->width() > 0 && rect->height() >= surface->height())
                             dense = rect;
                 assert(layout == blast::MessageLayout::Bubbles || dense);
+                // The persistent backdrop extends outside the selection;
+                // optional outline/halo geometry still surrounds that selection.
+                const float backdropInset = dense ? surface->x() - dense->x() : 0;
+                assert(backdropInset >= 0);
+                const float outlinedBodyWidth =
+                    dense ? dense->width() - 2 * backdropInset : surface->width();
                 bool outline = false, halo = false;
                 for (auto *root : roots(rendered)) {
                     if (auto *rect = dynamic_cast<RectNode *>(root); rect && rect->visible()) {
@@ -7135,8 +7232,7 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                         near(rect->style().borderWidth, blast::themeScale());
                         near(rect->x(), surface->x() - 12 * blast::themeScale());
                         near(rect->y(), surface->y() - 8 * blast::themeScale());
-                        near(rect->width(), (dense ? dense->width() : surface->width()) +
-                                                24 * blast::themeScale());
+                        near(rect->width(), outlinedBodyWidth + 24 * blast::themeScale());
                         near(rect->height(), surface->height() + 16 * blast::themeScale());
                         containedBounds(sceneBounds(*rect), sceneBounds(rendered.row));
                         containedBounds(sceneBounds(*rect), nativeHistoryClip(view));
@@ -7149,8 +7245,7 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                         Node::mapToScene(surface, 0, 0, surfaceX, surfaceY);
                         near(shadowBounds.x, surfaceX - 12 * blast::themeScale());
                         near(shadowBounds.y, surfaceY - 8 * blast::themeScale());
-                        near(shadowBounds.width, (dense ? dense->width() : surface->width()) +
-                                                     24 * blast::themeScale());
+                        near(shadowBounds.width, outlinedBodyWidth + 24 * blast::themeScale());
                         near(shadowBounds.height, surface->height() + 16 * blast::themeScale());
                         containedBounds(sceneBounds(*root), sceneBounds(rendered.row));
                         containedBounds(sceneBounds(*root), nativeHistoryClip(view));
@@ -7197,15 +7292,16 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
             assert(signature(body(view, "PersistentBody")).front() > weak.front());
             model.settings.mentionStrength = 0;
             arrange();
-            assert(!decorated());
+            assert(!decorated() && backdrop(body(view, "PersistentBody")));
             model.settings.mentionStrength = .6f;
             model.settings.fx = blast::FxLevel::Off;
             arrange();
-            assert(!decorated() && originals() == originalInk);
+            assert(!decorated() && backdrop(body(view, "PersistentBody")) &&
+                   originals() == originalInk);
             model.settings.fx = blast::FxLevel::Full;
             model.settings.mentionEffect = blast::MentionEffect::Off;
             arrange();
-            assert(!decorated());
+            assert(!decorated() && backdrop(body(view, "PersistentBody")));
             model.settings.mentionEffect = effect;
             model.settings.reducedMotion = false;
             view.setWindowActive(true);
@@ -7292,6 +7388,7 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                 const bool legacyOutline =
                     effect == blast::MentionEffect::LuminousOutline && exclusion >= 6;
                 assert(signature(body(view, token)).empty() != legacyOutline);
+                assert(backdrop(body(view, token)) == (exclusion >= 6));
             }
             model.settings.fools.clear();
             buffer.messages.front() = message;
@@ -7312,7 +7409,7 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                 model.settings.fools.insert(message.nick);
                 model.settings.foolDisplay = policy;
                 arrange();
-                assert(!decorated());
+                assert(!decorated() && !backdrop(body(view, "PersistentBody")));
             }
             model.settings.fools.clear();
             arrange();
@@ -7353,7 +7450,7 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
                 model.mentionSources[buffer.id] = retained;
                 pane.buffer = synthetic.id;
                 arrange();
-                assert(!decorated());
+                assert(!decorated() && !backdrop(body(view, "PersistentBody")));
             }
             dispatcher.setSceneRoot(nullptr);
         }
@@ -7440,7 +7537,7 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         const RectNode *outline = nullptr;
         for (const auto &child : grouped.content.children())
             if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                rect && rect->visible() && rect->style().borderWidth > 0)
+                rect && rect->visible() && rect->style().borderWidth > 0 && rect->zIndex() >= 0)
                 outline = rect;
         const auto *shadow = find<RectNode>(*halo);
         assert(outline && shadow);
@@ -7456,11 +7553,16 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         const RectNode *dense = nullptr;
         for (const auto &child : grouped.content.children())
             if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                rect && rect->visible() && rect->style().borderWidth == 0 &&
-                !rect->style().outerShadow && rect->height() == surface->height())
+                rect && rect->visible() && rect->zIndex() < 0 && rect->style().fill.a > 0 &&
+                rect->style().borderWidth == 0 && !rect->style().outerShadow &&
+                rect->height() >= surface->height())
                 dense = rect;
         assert(layout == blast::MessageLayout::Bubbles || dense);
-        near(outlineBounds.width, (dense ? dense->width() : surface->width()) + 24 * scale);
+        const float backdropInset = dense ? surface->x() - dense->x() : 0;
+        assert(backdropInset >= 0);
+        const float outlinedBodyWidth =
+            dense ? dense->width() - 2 * backdropInset : surface->width();
+        near(outlineBounds.width, outlinedBodyWidth + 24 * scale);
         containedBounds(outlineBounds, groupedBounds);
         containedBounds(outlineBounds, nativeHistoryClip(view));
         bool haloBeforeBody = false;
@@ -7573,7 +7675,7 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         const RectNode *pixelOutline = nullptr;
         for (const auto &child : pixel.content.children())
             if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                rect && rect->visible() && rect->style().borderWidth > 0)
+                rect && rect->visible() && rect->style().borderWidth > 0 && rect->zIndex() >= 0)
                 pixelOutline = rect;
         const auto *pixelSurface = find<blast::MaterialNode>(pixel.content);
         assert(pixelOutline && pixelSurface);

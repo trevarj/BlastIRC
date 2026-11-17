@@ -182,13 +182,19 @@ class SuggestionRow final : public InputArea {
         const bool hover = hovered() && !highlight;
         RoundedRectStyle style{};
         style.fill = highlight ? themeSurfaceColor("primary_container")
-                     : hover   ? themeSurfaceColor("hover")
+                     : hover   ? lerpColor(themeSurfaceColor("surface_container_high"),
+                                           themeSurfaceColor("primary_container"), .5f)
                                : Color{0, 0, 0, 0};
         style.radius = themeCornerRadius();
         background->setStyle(style);
-        const auto foreground = themeForegroundColor(highlight ? "on_primary_container"
-                                                     : hover   ? "on_hover"
-                                                               : "on_surface");
+        const auto popup = themeSurfaceColor("surface_container_high");
+        const auto plate = lerpColor(themeForegroundColor("surface"), popup, popup.a);
+        const auto rowBackground = withAlpha(lerpColor(plate, style.fill, style.fill.a), 1.f);
+        const auto foreground = withAlpha(
+            themePairedForeground(
+                rowBackground,
+                themeForegroundColor(highlight || hover ? "on_primary_container" : "on_surface")),
+            1.f);
         glyph->setColor(foreground);
         shortcode->setColor(foreground);
         name->setColor(highlight || hover ? foreground

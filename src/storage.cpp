@@ -2312,6 +2312,7 @@ void Storage::load(Model &model) {
     for (auto &[id, buffer] : loaded.buffers) {
         loadHistoryState(buffer);
         seedChatActivity(buffer);
+        const bool contentOnly = buffer.kind == "channel" || buffer.kind == "query";
         Statement query(
             impl->db,
             "SELECT seq,COALESCE(id,'local:' || seq),nick,text,time,reply,label,"
@@ -2319,11 +2320,13 @@ void Storage::load(Model &model) {
             "action,presence,local_echo,activity,activity_target,sort_time,tie_order,mention_nick "
             "FROM "
             "messages WHERE seq IN "
-            "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 ORDER BY "
+            "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 "
+            "AND (?2=0 OR (presence=0 AND NOT(own=1 AND local_echo=1))) ORDER BY "
             "sort_time DESC,server_nanoseconds(time) DESC,tie_order DESC,seq DESC LIMIT 200) "
             "UNION SELECT seq FROM messages WHERE buffer=?1 AND own=1 AND "
             "local_echo=1) ORDER BY sort_time,server_nanoseconds(time),tie_order,seq");
         query.bind(1, id);
+        query.bind(2, static_cast<int64_t>(contentOnly));
         while (query.step())
             buffer.messages.push_back(storedMessage(impl->db, query));
     }
@@ -2804,6 +2807,14 @@ vector<Message> Storage::history(const string &buffer, int limit, const string &
         return {};
     if (limit > 0)
         limit = std::min(limit, impl->maxMessages);
+    bool contentOnly = false;
+    if (limit > 0) {
+        Statement source(impl->db, "SELECT kind,target FROM buffers WHERE id=?");
+        source.bind(1, buffer);
+        if (source.step() && (source.text(0) == "channel" || source.text(0) == "query") &&
+            source.text(1) != "*server*")
+            contentOnly = true;
+    }
     int64_t beforeTime = std::numeric_limits<int64_t>::max(),
             beforeSequence = std::numeric_limits<int64_t>::max();
     int64_t beforeOrder = std::numeric_limits<int64_t>::max();
@@ -2876,16 +2887,20 @@ vector<Message> Storage::history(const string &buffer, int limit, const string &
                     "seq),nick,text,time,reply,label,timestamp,own,pending,deleted,"
                     "mention,action,presence,local_echo,activity,activity_target,sort_time,"
                     "tie_order,mention_nick FROM messages WHERE seq IN "
-                    "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
+                    "(SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 "
+                    "AND (?7=0 OR (presence=0 AND NOT(own=1 AND local_echo=1))) AND "
                     "sort_time=?2 AND server_nanoseconds(time)=?3 AND tie_order=?4 "
                     "AND seq<?5 ORDER BY seq DESC LIMIT ?6) UNION ALL "
-                    "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
+                    "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 "
+                    "AND (?7=0 OR (presence=0 AND NOT(own=1 AND local_echo=1))) AND "
                     "sort_time=?2 AND server_nanoseconds(time)=?3 AND tie_order<?4 "
                     "ORDER BY tie_order DESC,seq DESC LIMIT ?6) UNION ALL "
-                    "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
+                    "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 "
+                    "AND (?7=0 OR (presence=0 AND NOT(own=1 AND local_echo=1))) AND "
                     "sort_time=?2 AND server_nanoseconds(time)<?3 ORDER BY "
                     "server_nanoseconds(time) DESC,tie_order DESC,seq DESC LIMIT ?6) UNION ALL "
-                    "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 AND "
+                    "SELECT seq FROM (SELECT seq FROM messages WHERE buffer=?1 "
+                    "AND (?7=0 OR (presence=0 AND NOT(own=1 AND local_echo=1))) AND "
                     "sort_time<?2 ORDER BY sort_time DESC,server_nanoseconds(time) DESC,"
                     "tie_order DESC,seq DESC LIMIT ?6)) ORDER BY sort_time DESC,"
                     "server_nanoseconds(time) DESC,tie_order DESC,seq DESC LIMIT ?6");
@@ -2895,6 +2910,7 @@ vector<Message> Storage::history(const string &buffer, int limit, const string &
     query.bind(4, beforeOrder);
     query.bind(5, beforeSequence);
     query.bind(6, static_cast<int64_t>(limit));
+    query.bind(7, static_cast<int64_t>(contentOnly));
     vector<Message> messages;
     while (query.step())
         messages.push_back(storedMessage(impl->db, query));

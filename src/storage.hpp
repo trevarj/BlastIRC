@@ -52,6 +52,7 @@ class Storage {
     std::optional<string> historyDiscarded(const string &buffer);
     // load is all-or-nothing; a configuration failure blocks save until reload.
     // Restores metadata/drafts/read state, latest 200 rows and all provisional own rows.
+    // Channel/query windows count only non-presence rows excluding own local echoes.
     // Restored own local echoes have Unknown sendStatus even after pending times out;
     // other own non-presence rows are Confirmed. Incoming rows retain None.
     // Activity kinds round-trip explicitly; legacy rows remain ActivityKind::None.
@@ -84,6 +85,7 @@ class Storage {
     void recoverSend(const Buffer &, const string &label);
     // Oldest-to-newest by seconds, server-time nanoseconds, then durable history order.
     // before is a stored message ID or RFC3339 server time (exclusive).
+    // Positive channel/query windows exclude presence and provisional own local echoes.
     // limit=-1 returns every retained row, for validated source jumps.
     vector<Message> history(const string &buffer, int limit = 200, const string &before = "");
     // Indexed exact lookup, including rows outside the in-memory history tail.

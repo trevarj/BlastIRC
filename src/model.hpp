@@ -211,6 +211,15 @@ struct Buffer {
     bool loading = false, joined = false;
     bool muted = false, archived = false;
 };
+inline const Message *oldestHistoryMessage(const Buffer &buffer) {
+    for (const auto &message : buffer.messages)
+        if ((buffer.kind != "channel" && buffer.kind != "query") ||
+            (!message.presence &&
+             !(message.own && (message.pending || message.sendStatus == SendStatus::Queued ||
+                               message.sendStatus == SendStatus::Unknown))))
+            return &message;
+    return nullptr;
+}
 // Durable chat ordering, independent of presence, unread state, and pin rank.
 inline bool chatActivityBefore(const Buffer &a, const Buffer &b) {
     if (a.lastChatTimestamp != b.lastChatTimestamp)

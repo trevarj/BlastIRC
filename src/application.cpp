@@ -18,6 +18,8 @@
 
 namespace blast {
 namespace {
+int64_t historyMillis(const string &time);
+string historyTime(int64_t millis);
 int64_t epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -2144,7 +2146,10 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
         historyReferences_[b->server] = "timestamp";
     const bool timestampRequest =
         tag(end, "ref-type") == "timestamp" || zncPlayback(b->server) ||
-        (tag(end, "ref-type").empty() && !historyUsesMsgid(b->server, page.request.first.id));
+        (tag(end, "ref-type").empty() &&
+         !historyUsesMsgid(b->server, page.request.direction == HistoryDirection::Latest
+                                          ? wireOldest.id
+                                          : page.request.first.id));
     auto ownsNewer = [&](const HistoryGap &gap) {
         const bool unchanged = usable(page.gapBoundary) ? page.gapBoundary == gap.newer
                                                         : identical(page.request.first, gap.newer);
@@ -2169,11 +2174,18 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
         std::from_chars(countText.data(), countText.data() + countText.size(), count);
     if (countText.empty() || parsed.ec != std::errc{})
         count = page.events.size();
+    const auto limitText = tag(end, "limit");
+    size_t limit = page.request.limit;
+    if (!limitText.empty())
+        std::from_chars(limitText.data(), limitText.data() + limitText.size(), limit);
+    const bool timestampFull = timestampRequest && count >= limit && count != 0;
+    const auto overlapTime = historyTime(historyMillis(wireOldest.time) + 1);
     const bool bounded = usable(oldest) && usable(newest);
     set<string> ids;
     for (const auto &event : page.events) {
         const auto &id = historyProtocolId(event);
-        if (historyPrimary(event) && !id.empty())
+        if (historyPrimary(event) && !id.empty() &&
+            (!timestampFull || historyMillis(event.time) > historyMillis(wireOldest.time)))
             ids.insert(id);
     }
     const auto savedState = b->historyState;
@@ -2325,9 +2337,14 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
             HistoryCursor gapNewer = oldest;
             if (gapNewer.id.empty())
                 gapNewer.id = oldestAnchor;
+            if (timestampFull && irc::parseTimestampParts(wireOldest.time))
+                gapNewer = {{}, overlapTime};
             HistoryCursor newestBoundary = newest;
             if (newestBoundary.id.empty())
                 newestBoundary.id = newestAnchor;
+            if (page.gapId && std::any_of(before.gaps.begin(), before.gaps.end(), ownsNewer) &&
+                timeLess(newestBoundary, page.gapBoundary))
+                newestBoundary = page.gapBoundary;
             const bool includesPrevious =
                 (!previousNewest.id.empty() && ids.contains(previousNewest.id)) ||
                 (!previousAnchor.empty() && ids.contains(previousAnchor));
@@ -2390,11 +2407,13 @@ bool Application::applyHistoryPage(HistoryPage &page, const Event &end) {
                 (page.request.direction == HistoryDirection::Latest &&
                  !timeLess(newest, state.newest)))
                 state.newest = newest;
-            if (flag(end, "end") && page.request.direction == HistoryDirection::Latest &&
+            if (!timestampFull && flag(end, "end") &&
+                page.request.direction == HistoryDirection::Latest &&
                 page.request.first.id.empty() && page.request.first.time.empty())
                 state.beginning = true;
         }
-        if (page.request.direction == HistoryDirection::Before && (flag(end, "end") || !count)) {
+        if (!timestampFull && page.request.direction == HistoryDirection::Before &&
+            (flag(end, "end") || !count)) {
             if (page.gapId) {
                 for (auto &gap : state.gaps)
                     if (gap.id == page.gapId)
@@ -3637,6 +3656,9 @@ void Application::enqueueHistory(Buffer &b, HistoryRequest request, int64_t gapI
         for (const auto &gap : b.historyState.gaps)
             if (gap.id == gapId)
                 gapBoundary = gap.newer;
+    if (gapId && !gapBoundary.id.empty() && request.first == gapBoundary &&
+        irc::parseTimestampParts(request.first.time))
+        request.first.time = historyTime(historyMillis(request.first.time) + 1);
     const auto &network = model.networks[b.server];
     for (auto *cursor : {&request.first, &request.second})
         if (!historyUsesMsgid(b.server, cursor->id))
@@ -3769,7 +3791,13 @@ void Application::planHistory(const string &server, bool seeds) {
                                                            markerTime(advertised->second.time)));
         if (seeds && advertised == s.advertised.end())
             continue;
-        b.initialHistorySync = changed ? HistorySyncState::Queued : HistorySyncState::Idle;
+        const bool gaps =
+            !seeds && !s.refused.contains(id) &&
+            std::any_of(b.historyState.gaps.begin(), b.historyState.gaps.end(),
+                        [&](const auto &gap) {
+                            return !gap.unavailable && !s.attemptedGaps.contains({id, gap.id});
+                        });
+        b.initialHistorySync = changed || gaps ? HistorySyncState::Queued : HistorySyncState::Idle;
     }
     size_t count = 0;
     for (const auto &target : historyOrder(server)) {
@@ -3911,7 +3939,26 @@ void Application::scheduleHistory() {
                 const auto id = s.visible.front();
                 s.visible.pop_front();
                 if (auto b = findBuffer(id)) {
-                    enqueueHistory(*b, "", true);
+                    const auto advertised = s.advertised.find(fold(server, b->target));
+                    const bool current = (!b->historyState.newest.id.empty() ||
+                                          !b->historyState.newest.time.empty()) &&
+                                         (advertised == s.advertised.end() ||
+                                          markerTime(b->historyState.newest.time) >=
+                                              markerTime(advertised->second.time));
+                    const auto gap = std::find_if(
+                        b->historyState.gaps.begin(), b->historyState.gaps.end(),
+                        [&](const auto &value) {
+                            return !value.unavailable && !s.attemptedGaps.contains({id, value.id});
+                        });
+                    if (current && gap != b->historyState.gaps.end()) {
+                        HistoryRequest request;
+                        request.direction = HistoryDirection::Before;
+                        request.first = gap->newer;
+                        request.initial = true;
+                        s.attemptedGaps.insert({id, gap->id});
+                        enqueueHistory(*b, std::move(request), gap->id);
+                    } else
+                        enqueueHistory(*b, "", true);
                     ++active;
                 }
             }
@@ -3958,6 +4005,33 @@ void Application::scheduleHistory() {
                     page.seed = true;
                     page.backfillSeed = &paced == &s.seeds;
                     page.request.target = b->target;
+                    if (!page.backfillSeed) {
+                        const auto advertised = s.advertised.find(fold(server, b->target));
+                        const bool current = (!b->historyState.newest.id.empty() ||
+                                              !b->historyState.newest.time.empty()) &&
+                                             (advertised == s.advertised.end() ||
+                                              markerTime(b->historyState.newest.time) >=
+                                                  markerTime(advertised->second.time));
+                        const auto gap =
+                            std::find_if(b->historyState.gaps.begin(), b->historyState.gaps.end(),
+                                         [&](const auto &value) {
+                                             return !value.unavailable &&
+                                                    !s.attemptedGaps.contains({id, value.id});
+                                         });
+                        if (current && gap != b->historyState.gaps.end()) {
+                            page.request.direction = HistoryDirection::Before;
+                            page.request.first = gap->newer;
+                            if (!gap->newer.id.empty() &&
+                                irc::parseTimestampParts(page.request.first.time))
+                                page.request.first.time =
+                                    historyTime(historyMillis(page.request.first.time) + 1);
+                            page.gapId = gap->id;
+                            page.gapBoundary = gap->newer;
+                            if (!historyUsesMsgid(server, page.request.first.id))
+                                page.request.first.id.clear();
+                            s.attemptedGaps.insert({id, gap->id});
+                        }
+                    }
                     submitHistory(std::move(page));
                 }
                 s.nextTarget = model.now + .5;
@@ -4146,58 +4220,91 @@ void Application::finishHistoryPage(HistoryPage page, const Event &end, bool app
     }
     const auto actualLimit =
         tag(end, "limit").empty() ? std::to_string(page.request.limit) : tag(end, "limit");
-    const bool timestampFull =
-        tag(end, "ref-type") == "timestamp" && tag(end, "count") == actualLimit;
+    const bool timestampRequest =
+        tag(end, "ref-type") == "timestamp" ||
+        (tag(end, "ref-type").empty() &&
+         !historyUsesMsgid(page.server, page.request.direction == HistoryDirection::Latest
+                                            ? tag(end, "oldest-id")
+                                            : page.request.first.id));
+    const bool timestampFull = timestampRequest && tag(end, "count") == actualLimit;
     if (b && page.request.initial && (timestampFull || flag(end, "incomplete")))
         requestedHistory_.erase(b->id);
+    if (!b || !applied || error || flag(end, "incomplete"))
+        return;
     const auto firstContent = std::find_if(page.events.begin(), page.events.end(), historyPrimary);
-    const bool startSeam = b && ((page.request.direction == HistoryDirection::Latest &&
-                                  (page.request.initial || b->id == model.activeBuffer)) ||
-                                 (page.latestSeam && progressed));
+    const bool startSeam = (page.request.direction == HistoryDirection::Latest &&
+                            (page.request.initial || b->id == model.activeBuffer || page.seed)) ||
+                           page.latestSeam;
     const bool olderPresence = page.request.direction == HistoryDirection::Before && !page.gapId &&
                                !page.latestSeam && progressed && firstContent == page.events.end();
-    if (b && applied && !error && !timestampFull && !flag(end, "incomplete") &&
-        (startSeam || ((page.gapId || olderPresence) && progressed && tag(end, "count") != "0"))) {
-        const auto gap = std::find_if(
-            b->historyState.gaps.begin(), b->historyState.gaps.end(), [&](const auto &value) {
-                if (value.unavailable)
-                    return false;
-                if (!startSeam)
-                    return value.id == page.gapId;
-                if (firstContent == page.events.end())
-                    return false;
-                const auto &id = historyProtocolId(*firstContent);
-                return id.empty() ? value.newer.time == firstContent->time : value.newer.id == id;
-            });
-        const bool seekingContent =
-            (startSeam || olderPresence) && !flag(end, "end") && tag(end, "count") != "0" &&
-            firstContent == page.events.end() &&
-            (!tag(end, "oldest-id").empty() || irc::parseTimestampParts(tag(end, "oldest-time")));
-        if (gap != b->historyState.gaps.end() || seekingContent) {
-            HistoryPage next;
-            next.server = page.server;
-            next.buffer = b->id;
-            next.session = page.session;
-            if (gap != b->historyState.gaps.end()) {
-                next.gapId = gap->id;
-                next.gapBoundary = gap->newer;
-            } else
-                next.latestSeam = startSeam;
-            next.request.direction = HistoryDirection::Before;
-            next.request.target = b->target;
-            next.request.first =
-                startSeam && !seekingContent
-                    ? gap->newer
-                    : HistoryCursor{tag(end, "oldest-id"), tag(end, "oldest-time")};
-            if (!historyUsesMsgid(b->server, next.request.first.id))
-                next.request.first.id.clear();
-            if (found != historySessions_.end()) {
-                found->second.retries.push_back(std::move(next));
-                b->loading = true;
-            } else
-                submitHistory(std::move(next));
+    HistoryCursor cursor{tag(end, "oldest-id"), tag(end, "oldest-time")};
+    bool advancing = progressed;
+    if (timestampFull && irc::parseTimestampParts(cursor.time)) {
+        cursor = {{}, historyTime(historyMillis(cursor.time) + 1)};
+        advancing = page.request.direction == HistoryDirection::Latest ||
+                    historyMillis(cursor.time) < historyMillis(page.request.first.time);
+    }
+    auto gap = std::find_if(b->historyState.gaps.begin(), b->historyState.gaps.end(),
+                            [&](const auto &value) { return value.id == page.gapId; });
+    const bool owned = gap != b->historyState.gaps.end();
+    if (page.gapId && found != historySessions_.end())
+        found->second.attemptedGaps.insert({b->id, page.gapId});
+    const bool seekingContent = !page.gapId && (startSeam || olderPresence) && !flag(end, "end") &&
+                                tag(end, "count") != "0" && firstContent == page.events.end() &&
+                                irc::parseTimestampParts(cursor.time);
+    if ((!owned || (found != historySessions_.end() && (!advancing || gap->unavailable))) &&
+        (startSeam || page.gapId) && !seekingContent) {
+        if (startSeam && firstContent != page.events.end()) {
+            const HistoryCursor seam =
+                timestampFull ? cursor
+                              : HistoryCursor{historyProtocolId(*firstContent), firstContent->time};
+            gap = std::find_if(
+                b->historyState.gaps.begin(), b->historyState.gaps.end(), [&](const auto &value) {
+                    return !value.unavailable && (seam.id.empty() ? value.newer.time == seam.time
+                                                                  : value.newer.id == seam.id);
+                });
+        } else
+            gap = b->historyState.gaps.end();
+        if (gap == b->historyState.gaps.end())
+            gap = std::find_if(
+                b->historyState.gaps.begin(), b->historyState.gaps.end(), [&](const auto &value) {
+                    return value.id != page.gapId && !value.unavailable &&
+                           (found == historySessions_.end() ||
+                            !found->second.attemptedGaps.contains({b->id, value.id}));
+                });
+        if (gap != b->historyState.gaps.end()) {
+            cursor = gap->newer;
+            if (!cursor.id.empty() && irc::parseTimestampParts(cursor.time))
+                cursor.time = historyTime(historyMillis(cursor.time) + 1);
+            advancing = true;
         }
     }
+    if (seekingContent && page.request.direction == HistoryDirection::Latest)
+        advancing = true;
+    if (!advancing || (gap == b->historyState.gaps.end() && !seekingContent) ||
+        (gap != b->historyState.gaps.end() && gap->unavailable))
+        return;
+    HistoryPage next;
+    next.server = page.server;
+    next.buffer = b->id;
+    next.session = page.session;
+    if (gap != b->historyState.gaps.end()) {
+        next.gapId = gap->id;
+        next.gapBoundary = gap->newer;
+        if (found != historySessions_.end())
+            found->second.attemptedGaps.insert({b->id, gap->id});
+    } else
+        next.latestSeam = startSeam;
+    next.request.direction = HistoryDirection::Before;
+    next.request.target = b->target;
+    next.request.first = std::move(cursor);
+    if (!historyUsesMsgid(b->server, next.request.first.id))
+        next.request.first.id.clear();
+    if (found != historySessions_.end()) {
+        found->second.retries.push_back(std::move(next));
+        b->loading = true;
+    } else
+        submitHistory(std::move(next));
 }
 void Application::requestHistory(Buffer &b, const string &before, bool initial) {
     const auto &n = model.networks[b.server];
@@ -5408,8 +5515,17 @@ void Application::action(const Action &a) {
     if (a.type == "history") {
         if (b->loading)
             return;
-        const string before =
-            a.extra.empty() ? (b->messages.empty() ? string{} : b->messages.front().id) : a.extra;
+        const auto *oldestLoaded = oldestHistoryMessage(*b);
+        string before = a.extra.empty() ? (oldestLoaded ? oldestLoaded->id : string{}) : a.extra;
+        if ((b->kind == "channel" || b->kind == "query") && !a.extra.empty())
+            for (const auto &row : b->messages)
+                if (row.id == a.extra &&
+                    (row.presence ||
+                     (row.own && (row.pending || row.sendStatus == SendStatus::Queued ||
+                                  row.sendStatus == SendStatus::Unknown)))) {
+                    before = oldestLoaded ? oldestLoaded->id : string{};
+                    break;
+                }
         if (savingAllowed_)
             try {
                 auto page = storage_.history(b->id, 200, before);
@@ -5426,12 +5542,13 @@ void Application::action(const Action &a) {
             }
         if (b->historyState.beginning)
             return;
-        string remote = b->messages.empty() ? before : b->messages.front().id;
+        string remote = before;
         // Locally assigned ids are not valid CHATHISTORY selectors.
         if (remote.starts_with("local:") || remote.starts_with("local-")) {
-            auto oldest = std::find_if(b->messages.begin(), b->messages.end(),
-                                       [](const auto &m) { return !m.time.empty(); });
-            remote = oldest == b->messages.end() ? string{} : "timestamp=" + oldest->time;
+            const auto row = std::find_if(b->messages.begin(), b->messages.end(),
+                                          [&](const auto &value) { return value.id == remote; });
+            remote = row != b->messages.end() && !row->time.empty() ? "timestamp=" + row->time
+                                                                    : string{};
         }
         requestHistory(*b, remote, false);
         return;

@@ -78,6 +78,7 @@ class Application {
         std::deque<HistoryPage> retries;
         string upper, lower, highwater, tieTime, checkpoint;
         set<string> tieTargets, refused;
+        set<std::pair<string, int64_t>> attemptedGaps;
         double nextTarget = 0, nextDiscovery = 0;
         unsigned width = 6, clean = 0;
         bool discovering = true, backfill = false, discoveryFailed = false, shortTie = false,

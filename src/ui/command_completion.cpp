@@ -125,7 +125,8 @@ class Row final : public InputArea {
         const bool hover = hovered() && !highlight;
         RoundedRectStyle style{};
         style.fill = highlight ? themeSurfaceColor("primary_container")
-                     : hover   ? themeSurfaceColor("hover")
+                     : hover   ? lerpColor(themeSurfaceColor("surface_container_high"),
+                                           themeSurfaceColor("primary_container"), .5f)
                                : Color{0, 0, 0, 0};
         style.radius = themeCornerRadius();
         background->setStyle(style);
@@ -135,17 +136,18 @@ class Row final : public InputArea {
         const auto rowBackground = withAlpha(lerpColor(plate, style.fill, style.fill.a), 1.f);
         const auto accent = themePairedForeground(
             rowBackground, themeForegroundColor(highlight ? "on_primary_container" : "primary"));
-        icon->setColor(accent);
+        icon->setColor(withAlpha(accent, 1.f));
         // Neutral text keeps selected names legible without relying on a marginal accent pair.
         const auto text =
             highlight ? themePairedForeground(rowBackground, themeForegroundColor("on_surface"))
                       : accent;
-        command->setColor(text);
-        description->setColor(
+        command->setColor(withAlpha(text, 1.f));
+        description->setColor(withAlpha(
             highlight ? text
-                      : themePairedForeground(
-                            rowBackground,
-                            themeForegroundColor(hover ? "on_hover" : "on_surface_variant")));
+                      : themePairedForeground(rowBackground,
+                                              themeForegroundColor(hover ? "on_primary_container"
+                                                                         : "on_surface_variant")),
+            1.f));
     }
 
     RectNode *background;

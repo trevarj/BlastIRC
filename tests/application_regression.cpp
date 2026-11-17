@@ -4942,8 +4942,18 @@ struct ApplicationRegression {
         page.events = {content};
         complete();
         assert(room.historyState.gaps.size() == 1 &&
-               room.historyState.gaps.front().id == olderGap.id && session.retries.empty() &&
+               room.historyState.gaps.front().id == olderGap.id && session.retries.size() == 1 &&
                room.messages.size() == 2 && room.messages.back().action);
+        page = std::move(session.retries.front());
+        session.retries.pop_front();
+        assert(page.gapId == olderGap.id && page.request.first.id == olderGap.newer.id &&
+               page.gapBoundary == olderGap.newer);
+        page.events.clear();
+        end.tags = {{"count", "0"}, {"limit", "50"}, {"end", "1"}};
+        const bool progressed = app.applyHistoryPage(page, end);
+        app.finishHistoryPage(std::move(page), end, true, progressed);
+        assert(session.retries.empty() && room.historyState.gaps.size() == 1 &&
+               room.historyState.gaps.front().unavailable);
         room.historyState.gaps.clear();
         room.historyState.beginning = false;
         app.storage_.saveHistoryState(room);
@@ -6277,6 +6287,51 @@ struct ApplicationRegression {
         assert(session.discoveryFailed && !session.discovering);
         assert(app.storage_.historyDiscovery(server).watermark == "2026-10-31T00:00:00.000Z");
     }
+    static void localHistorySkipsProvisionalWindowEdge() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("local-window-edge", "#room");
+        vector<Message> rows;
+        for (int i = 0; i < 205; ++i) {
+            Message row;
+            row.id = "window-" + std::to_string(i);
+            row.timestamp = 1793491200;
+            const string millis = i < 10    ? "00" + std::to_string(i)
+                                  : i < 100 ? "0" + std::to_string(i)
+                                            : std::to_string(i);
+            row.time = "2026-11-01T00:00:00." + millis + "Z";
+            row.text = row.id;
+            row.own = i == 200;
+            row.sendStatus = row.own ? SendStatus::Confirmed : SendStatus::None;
+            app.storage_.append(room.id, row);
+            rows.push_back(row);
+        }
+        for (bool explicitEcho : {false, true}) {
+            room.messages.clear();
+            Message echo;
+            echo.id = "local:old-provisional";
+            echo.timestamp = 1793491198;
+            echo.time = "2026-10-31T23:59:58.000Z";
+            echo.own = true;
+            echo.sendStatus = SendStatus::Unknown;
+            room.messages.push_back(echo);
+            Message presence;
+            presence.id = "hidden-presence";
+            presence.timestamp = 1793491199;
+            presence.time = "2026-10-31T23:59:59.000Z";
+            presence.presence = true;
+            room.messages.push_back(presence);
+            for (size_t i = 200; i < rows.size(); ++i)
+                room.messages.push_back(rows[i]);
+            assert(oldestHistoryMessage(room)->id == "window-200");
+            app.action({"history", room.id, {}, explicitEcho ? echo.id : string{}});
+            for (const auto &row : rows)
+                assert(std::count_if(room.messages.begin(), room.messages.end(),
+                                     [&](const auto &loaded) { return loaded.id == row.id; }) == 1);
+        }
+    }
     static void discoveredLatestHistory() {
         RenameDrainPeer peer;
         Application app;
@@ -6396,8 +6451,17 @@ struct ApplicationRegression {
         assert(std::none_of(app.model.buffers.begin(), app.model.buffers.end(),
                             [](const auto &entry) { return entry.second.target == "#unknown"; }));
         peer.send(":server BATCH +viewed chathistory Viewed");
+        peer.send("@batch=viewed;msgid=viewed-presence;time=2026-11-01T23:00:00.000Z "
+                  ":Other!u@h JOIN Viewed");
         peer.send(":server BATCH -viewed");
         wait([&] { return viewed.initialHistorySync == HistorySyncState::Idle; });
+        peer.expect("CHATHISTORY", {"BEFORE", "Viewed", "msgid=viewed-presence", "50"});
+        peer.send(":server BATCH +viewedcontent chathistory Viewed");
+        peer.send("@batch=viewedcontent;msgid=viewed-older;time=2026-11-01T22:00:00.000Z "
+                  ":Other!u@h PRIVMSG Viewed :content below a short presence-only latest page");
+        peer.send(":server BATCH -viewedcontent");
+        wait([&] { return app.storage_.message(viewed.id, "viewed-older").has_value(); });
+        assert(!app.storage_.message(viewed.id, "viewed-presence") && !viewed.loading);
         peer.expect("CHATHISTORY", {"LATEST", "Pinned", "*", "50"});
         peer.send(":server BATCH +pinned chathistory Pinned");
         peer.send(":server BATCH -pinned");
@@ -6471,17 +6535,93 @@ struct ApplicationRegression {
         wait([&] { return !room.loading; });
         assert(room.historyState.gaps.size() == 1 && !room.historyState.gaps.front().unavailable);
         peer.fence();
-        // A full timestamp-selected page cannot safely skip equal-time siblings:
-        // stop this quantum despite real inserts, leaving the gap retryable.
+        // Full timestamp pages replay the oldest millisecond before stepping
+        // below it, including siblings omitted from a mixed boundary cohort.
         peer.send(":server 005 Me MSGREFTYPES=timestamp :supported");
         wait([&] { return app.historyReferences_[server.name] == "timestamp"; });
         app.action({"history-gap", room.id, std::to_string(gap.id), {}});
-        peer.expect("CHATHISTORY", {"BEFORE", "#room", "timestamp=2026-11-01T21:00:00.000Z", "50"});
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "timestamp=2026-11-01T21:00:00.001Z", "50"});
         peer.send(":server BATCH +timestampfull chathistory #room");
-        for (int i = 0; i < 50; ++i)
-            peer.send("@batch=timestampfull;msgid=stamp-" + std::to_string(i) +
-                      ";time=2026-11-01T20:00:00.000Z :Other!u@h PRIVMSG #room :equal time");
+        for (int row = 0; row < 50; ++row) {
+            const string millis = row < 10 ? "00" + std::to_string(row) : "0" + std::to_string(row);
+            peer.send("@batch=timestampfull;msgid=timestamp-presence-" + std::to_string(row) +
+                      ";time=2026-11-01T20:45:00." + millis + "Z :Other!u@h JOIN #room");
+        }
         peer.send(":server BATCH -timestampfull");
+        wait([&] {
+            return std::any_of(
+                app.historyPages_.begin(), app.historyPages_.end(), [](const auto &entry) {
+                    return entry.second.request.first.time == "2026-11-01T20:45:00.001Z";
+                });
+        });
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "timestamp=2026-11-01T20:45:00.001Z", "50"});
+        peer.send(":server BATCH +presenceboundary chathistory #room");
+        peer.send("@batch=presenceboundary;msgid=timestamp-presence-0;"
+                  "time=2026-11-01T20:45:00.000Z :Other!u@h JOIN #room");
+        peer.send(":server BATCH -presenceboundary");
+        wait([&] {
+            return std::any_of(
+                app.historyPages_.begin(), app.historyPages_.end(), [](const auto &entry) {
+                    return entry.second.request.first.time == "2026-11-01T20:45:00.000Z";
+                });
+        });
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "timestamp=2026-11-01T20:45:00.000Z", "50"});
+        assert(!app.storage_.message(room.id, "timestamp-presence-0"));
+        peer.send(":server BATCH +timestampfull chathistory #room");
+        for (int page = 0; page < 3; ++page) {
+            const string batch = "advancing" + std::to_string(page);
+            if (page)
+                peer.send(":server BATCH +" + batch + " chathistory #room");
+            for (int row = 0; row < 50; ++row) {
+                const string millis =
+                    row < 10 ? "00" + std::to_string(row) : "0" + std::to_string(row);
+                peer.send("@batch=" + (page ? batch : string("timestampfull")) + ";msgid=adv-" +
+                          std::to_string(page) + "-" + std::to_string(row) + ";time=2026-11-01T" +
+                          std::to_string(20 - page) + ":30:00." + millis +
+                          "Z :Other!u@h PRIVMSG #room :advancing timestamp page");
+            }
+            peer.send(":server BATCH -" + (page ? batch : string("timestampfull")));
+            wait([&] {
+                return app.storage_.message(room.id, "adv-" + std::to_string(page) + "-0")
+                    .has_value();
+            });
+            peer.expect("CHATHISTORY",
+                        {"BEFORE", "#room",
+                         "timestamp=2026-11-01T" + std::to_string(20 - page) + ":30:00.001Z",
+                         "50"});
+            const string replay = batch + "tie";
+            peer.send(":server BATCH +" + replay + " chathistory #room");
+            peer.send("@batch=" + replay + ";msgid=adv-" + std::to_string(page) +
+                      "-0;time=2026-11-01T" + std::to_string(20 - page) +
+                      ":30:00.000Z :Other!u@h PRIVMSG #room :advancing timestamp page");
+            peer.send("@batch=" + replay + ";msgid=sibling-" + std::to_string(page) +
+                      ";time=2026-11-01T" + std::to_string(20 - page) +
+                      ":30:00.000Z :Other!u@h PRIVMSG #room :boundary sibling");
+            peer.send("@batch=" + replay + ";msgid=presence-" + std::to_string(page) +
+                      ";time=2026-11-01T" + std::to_string(20 - page) +
+                      ":30:00.000Z :Other!u@h JOIN #room");
+            peer.send(":server BATCH -" + replay);
+            wait([&] {
+                return app.storage_.message(room.id, "sibling-" + std::to_string(page)).has_value();
+            });
+            assert(!app.storage_.message(room.id, "presence-" + std::to_string(page)));
+            peer.expect("CHATHISTORY",
+                        {"BEFORE", "#room",
+                         "timestamp=2026-11-01T" + std::to_string(20 - page) + ":30:00.000Z",
+                         "50"});
+        }
+        peer.send(":server BATCH +saturated chathistory #room");
+        for (int i = 0; i < 50; ++i)
+            peer.send("@batch=saturated;msgid=stamp-" + std::to_string(i) +
+                      ";time=2026-11-01T17:00:00.000Z :Other!u@h PRIVMSG #room :equal time");
+        peer.send(":server BATCH -saturated");
+        wait([&] { return app.storage_.message(room.id, "stamp-0").has_value(); });
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "timestamp=2026-11-01T17:00:00.001Z", "50"});
+        peer.send(":server BATCH +saturatedrepeat chathistory #room");
+        for (int i = 0; i < 50; ++i)
+            peer.send("@batch=saturatedrepeat;msgid=stamp-" + std::to_string(i) +
+                      ";time=2026-11-01T17:00:00.000Z :Other!u@h PRIVMSG #room :equal time");
+        peer.send(":server BATCH -saturatedrepeat");
         wait([&] { return !room.loading; });
         assert(room.historyState.gaps.size() == 1 && !room.historyState.gaps.front().unavailable &&
                !room.historyState.beginning);
@@ -6489,7 +6629,7 @@ struct ApplicationRegression {
         peer.send(":server 005 Me MSGREFTYPES=msgid,timestamp :supported");
         wait([&] { return app.historyReferences_[server.name] == "msgid,timestamp"; });
         app.action({"history-gap", room.id, std::to_string(gap.id), {}});
-        peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=stamp-0", "50"});
+        peer.expect("CHATHISTORY", {"BEFORE", "#room", "timestamp=2026-11-01T17:00:00.001Z", "50"});
         peer.send(":server BATCH +fill chathistory #room");
         peer.send("@batch=fill;msgid=cached-tail;time=2026-11-01T00:00:00.000Z "
                   ":Other!u@h PRIVMSG #room :cached transcript remains visible");
@@ -6497,7 +6637,7 @@ struct ApplicationRegression {
                   ":Other!u@h PRIVMSG #room :bridges the gap");
         peer.send(":server BATCH -fill");
         wait([&] { return !room.loading; });
-        assert(room.historyState.gaps.empty() && room.messages.size() == 57 &&
+        assert(room.historyState.gaps.empty() && room.messages.size() == 210 &&
                !room.historyState.beginning);
         app.storage_.loadHistoryState(restored);
         assert(restored.historyState.gaps.empty());
@@ -6525,7 +6665,7 @@ struct ApplicationRegression {
         const auto localGap = localRoom.historyState.gaps.front();
         app.action({"history-gap", localRoom.id, std::to_string(localGap.id), {}});
         peer.expect("CHATHISTORY",
-                    {"BEFORE", "LocalGap", "timestamp=2026-11-02T00:00:00.000Z", "50"});
+                    {"BEFORE", "LocalGap", "timestamp=2026-11-02T00:00:00.001Z", "50"});
         peer.send(":server BATCH +localinterior chathistory LocalGap");
         for (const auto &id : {"gap-wire-a", "gap-wire-b"})
             peer.send("@batch=localinterior;msgid=" + string(id) +
@@ -6573,8 +6713,25 @@ struct ApplicationRegression {
         localReopened.loadHistoryState(localRestored);
         assert(localRestored.historyState.gaps.empty());
 
-        // Timestamp-only negotiation makes a new ID at the same instant no
-        // paging progress, even though reconciliation inserted a durable row.
+        // Replay a saved gap's upper millisecond before stepping below it:
+        // unseen siblings at its canonical newer edge must remain enumerable.
+        const auto repeatUpperBoundary = [&](const string &id, const string &batch) {
+            wait([&] {
+                return std::any_of(
+                    app.historyPages_.begin(), app.historyPages_.end(), [&](const auto &entry) {
+                        return entry.second.buffer == localRoom.id &&
+                               entry.second.request.first.id.empty() &&
+                               entry.second.request.first.time == "2026-11-01T12:00:00.000000007Z";
+                    });
+            });
+            peer.expect("CHATHISTORY",
+                        {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.000Z", "50"});
+            peer.send(":server BATCH +" + batch + " chathistory LocalGap");
+            peer.send("@batch=" + batch + ";msgid=" + id +
+                      ";time=2026-11-01T12:00:00.000000007Z "
+                      ":Other!u@h PRIVMSG LocalGap :same body");
+            peer.send(":server BATCH -" + batch);
+        };
         localRoom.historyState.gaps.push_back({0,
                                                localRoom.historyState.oldest,
                                                {"gap-wire-a", "2026-11-01T12:00:00.000000007Z"},
@@ -6587,12 +6744,13 @@ struct ApplicationRegression {
                     std::to_string(localRoom.historyState.gaps.front().id),
                     {}});
         peer.expect("CHATHISTORY",
-                    {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.000Z", "50"});
+                    {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.001Z", "50"});
         peer.send(":server BATCH +localequal chathistory LocalGap");
         peer.send("@batch=localequal;msgid=gap-wire-c;"
                   "time=2026-11-01T12:00:00.000000007Z "
                   ":Other!u@h PRIVMSG LocalGap :same body");
         peer.send(":server BATCH -localequal");
+        repeatUpperBoundary("gap-wire-c", "localequalrepeat");
         wait([&] { return !localRoom.loading; });
         assert(app.storage_.message(localRoom.id, "gap-wire-c").has_value() &&
                localRoom.historyState.gaps.size() == 1);
@@ -6608,12 +6766,13 @@ struct ApplicationRegression {
         peer.expect("CHATHISTORY", {"BEFORE", "LocalGap", "msgid=gap-wire-c", "50"});
         peer.send(":server FAIL CHATHISTORY INVALID_MSGREFTYPE LocalGap :use timestamp");
         peer.expect("CHATHISTORY",
-                    {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.000Z", "50"});
+                    {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.001Z", "50"});
         peer.send(":server BATCH +localfallback chathistory LocalGap");
         peer.send("@batch=localfallback;msgid=gap-wire-d;"
                   "time=2026-11-01T12:00:00.000000007Z "
                   ":Other!u@h PRIVMSG LocalGap :same body");
         peer.send(":server BATCH -localfallback");
+        repeatUpperBoundary("gap-wire-d", "localfallbackolder");
         wait([&] { return !localRoom.loading; });
         assert(app.storage_.message(localRoom.id, "gap-wire-d").has_value());
         peer.fence();
@@ -6622,12 +6781,13 @@ struct ApplicationRegression {
                     std::to_string(localRoom.historyState.gaps.front().id),
                     {}});
         peer.expect("CHATHISTORY",
-                    {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.000Z", "50"});
+                    {"BEFORE", "LocalGap", "timestamp=2026-11-01T12:00:00.001Z", "50"});
         peer.send(":server BATCH +localfallbackrepeat chathistory LocalGap");
         peer.send("@batch=localfallbackrepeat;msgid=gap-wire-d;"
                   "time=2026-11-01T12:00:00.000000007Z "
                   ":Other!u@h PRIVMSG LocalGap :same body");
         peer.send(":server BATCH -localfallbackrepeat");
+        repeatUpperBoundary("gap-wire-d", "localfallbackrepeatolder");
         wait([&] { return !localRoom.loading; });
         peer.fence();
         peer.send(":server 005 Me MSGREFTYPES=msgid,timestamp :supported");
@@ -6676,6 +6836,77 @@ struct ApplicationRegression {
                    localRoom.historyState.gaps.front().id == owned.id &&
                    localRoom.historyState.gaps.front().newer == owned.newer);
         }
+        auto &startupActive = app.buffer(server.name, "#startup-active");
+        auto &startupOther = app.buffer(server.name, "#startup-other");
+        for (auto *target : {&startupActive, &startupOther}) {
+            target->joined = true;
+            target->historyState.oldest = {"startup-old", "2026-11-01T00:00:00.000Z"};
+            target->historyState.newest = {"startup-new", "2026-11-01T04:00:00.000Z"};
+            target->historyState.gaps = {
+                {0,
+                 {"blocked-old", "2026-11-01T04:30:00.000Z"},
+                 {"blocked-new", "2026-11-01T05:00:00.000Z"},
+                 false},
+                {0, target->historyState.oldest, target->historyState.newest, false},
+                {0,
+                 {"overlap-old", "2026-11-01T01:00:00.000Z"},
+                 {"overlap-new", "2026-11-01T03:00:00.000Z"},
+                 false},
+                {0,
+                 {"unavailable-old", "2026-10-30T00:00:00.000Z"},
+                 {"unavailable-new", "2026-10-31T00:00:00.000Z"},
+                 true}};
+            target->historyState.newest = {"blocked-new", "2026-11-01T05:00:00.000Z"};
+            app.storage_.saveHistoryState(*target);
+            target->historyState = {};
+            app.storage_.loadHistoryState(*target);
+        }
+        auto &startupSession = app.historySessions_.at(server.name);
+        startupSession.advertised.clear();
+        for (const auto &[id, target] : app.model.buffers)
+            if (id != startupActive.id && id != startupOther.id)
+                startupSession.refused.insert(id);
+        app.model.activeBuffer = startupActive.id;
+        app.planHistory(server.name);
+        app.scheduleHistory();
+        for (auto *target : {&startupActive, &startupOther}) {
+            peer.expect("CHATHISTORY", {"BEFORE", target->target, "msgid=blocked-new", "50"});
+            const string blocked = target == &startupActive ? "blockedactive" : "blockedother";
+            peer.send(":server BATCH +" + blocked + " chathistory " + target->target);
+            peer.send(":server BATCH -" + blocked);
+            wait([&] {
+                return std::any_of(target->historyState.gaps.begin(),
+                                   target->historyState.gaps.end(), [](const auto &gap) {
+                                       return gap.newer.id == "blocked-new" && gap.unavailable;
+                                   });
+            });
+            assert(!target->historyState.beginning);
+            peer.expect("CHATHISTORY", {"BEFORE", target->target, "msgid=startup-new", "50"});
+            const string batch = target == &startupActive ? "startupactive" : "startupother";
+            peer.send(":server BATCH +" + batch + " chathistory " + target->target);
+            peer.send("@batch=" + batch +
+                      ";msgid=startup-old;time=2026-11-01T00:00:00.000Z "
+                      ":Other!u@h PRIVMSG " +
+                      target->target + " :recovered old edge");
+            peer.send("@batch=" + batch +
+                      ";msgid=startup-middle;time=2026-11-01T02:00:00.000Z "
+                      ":Other!u@h PRIVMSG " +
+                      target->target + " :recovered middle");
+            peer.send(":server BATCH -" + batch);
+            wait([&] { return app.storage_.message(target->id, "startup-middle").has_value(); });
+            assert(target->historyState.gaps.size() == 2 &&
+                   std::all_of(target->historyState.gaps.begin(), target->historyState.gaps.end(),
+                               [](const auto &gap) { return gap.unavailable; }));
+            Buffer durable = *target;
+            durable.historyState = {};
+            app.storage_.loadHistoryState(durable);
+            assert(durable.historyState.gaps.size() == 2 &&
+                   std::all_of(durable.historyState.gaps.begin(), durable.historyState.gaps.end(),
+                               [](const auto &gap) { return gap.unavailable; }));
+        }
+        peer.fence();
+        startupSession.refused.clear();
+        app.model.activeBuffer = viewed.id;
         // Failed correlated pages discard partial data and never alter discovery proof.
         app.requestHistory(room, "cached-tail", false);
         peer.expect("CHATHISTORY", {"BEFORE", "#room", "msgid=cached-tail", "50"});
@@ -6720,6 +6951,7 @@ struct ApplicationRegression {
         assert(app.storage_.historyDiscovery(server.name).watermark == "2026-11-02T04:00:00.000Z");
     }
     static void run() {
+        localHistorySkipsProvisionalWindowEdge();
         commandArgumentContext();
         repeatSearch();
         retainedSearchJump();

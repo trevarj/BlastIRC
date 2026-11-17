@@ -2722,6 +2722,9 @@ void tailAppendKeepsActions(TranscriptTestRenderer &renderer) {
     scroll->setScrollOffset(0);
     view.sync();
     view.arrange(renderer, viewport);
+    assert(scroll->scrollOffset() == 0);
+    assert(!host.open);
+    assert(model.actions.empty());
     const std::string oldId = buffer.messages.front().id;
     const std::string oldText = buffer.messages.front().text;
     const auto retained = body(view, oldText);
@@ -2753,7 +2756,9 @@ void tailAppendKeepsActions(TranscriptTestRenderer &renderer) {
     dispatcher.pointerMotion(x + 6, y, 55);
     dispatcher.pointerMotion(x, y, 56);
     dispatcher.pointerButton(x, y, BTN_LEFT, false, 57, 570, true);
-    assert(!host.open && model.actions.empty() && scroll->scrollOffset() == 0);
+    assert(!host.open);
+    assert(model.actions.empty());
+    assert(scroll->scrollOffset() == 0);
     assert(dispatcher.focusedArea() == input->inputArea() &&
            input->editingStateMatches(composition));
     assert(dispatcher.pointerButton(x, y, BTN_LEFT, true, 51, 510, true));
@@ -3062,7 +3067,7 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
                     }
                 return newest;
             };
-            buffer.historyState.gaps.front().newer.id = "offscreen-boundary";
+            buffer.historyState.gaps.front().newer.time = "2026-11-07T12:34:58.987654321Z";
             arrange();
             assert(model.actions.empty()); // Hidden seams never auto-drain.
             demandScroll->setScrollOffset(gap->y());

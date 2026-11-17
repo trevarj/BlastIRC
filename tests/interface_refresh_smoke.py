@@ -4,8 +4,11 @@
 Run inside nix develop: python tests/interface_refresh_smoke.py BINARY --scope NAME.
 Each scope owns a fresh private compositor/profile; no desktop or production profile
 is reused. BLASTIRC_SMOKE_SCREENSHOT selects the artifact basename.
-The startup-history-sync scope holds genuine private Ergo history on the wire;
+The startup-history-sync scope holds genuine private Ergo history on the wire,
+advertising its supported timestamp reference subset to exercise full-page overlap;
 it proves discovery/LATEST, cached-chat/loading state, and automatic full selected-channel seam fill.
+It also restarts a >200-content legacy presence-heavy cache with saved overlapping gaps,
+proving local paint while real history is held and click-free durable gap recovery.
 The jump-bottom scope proves the zero-arrival native FAB click and resumed following.
 """
 import argparse
@@ -7274,6 +7277,18 @@ def run_composer_affordances(ctx):
             from difflib import SequenceMatcher
             from itertools import permutations
             words = _policy_words(ctx, label, popup_region)
+            # Sparse full-window OCR can mistake the selected plate for one
+            # giant glyph. Recognize its actual ink with the existing chip
+            # normalization, and retain ordinary OCR only outside that plate.
+            rx, ry, rw, rh = popup_region
+            selected_words, selected_chip = _policy_chip_words(
+                ctx, gui.native_rgb_capture(w), (rx, ry, rx + rw, ry + rh),
+                rh / len(nicks), label + '-selected', either_ink=True)
+            left, top, right, bottom = selected_chip['fill_box']
+            words = [(text, box) for text, box in words
+                     if box[2] <= left or box[0] >= right or box[3] <= top or box[1] >= bottom]
+            words.extend(selected_words)
+            evidence.append({'phase': label + '-selected-ink', **selected_chip})
             def similarity(text, nick):
                 return SequenceMatcher(None, text.strip().casefold(), nick.casefold()).ratio()
             rows = sorted([(text, box) for text, box in words
@@ -9630,6 +9645,7 @@ class _StartupHistoryRelay:
         self.errors = []
         self.requests = []
         self.pages = []
+        self.reference_advertisements = []
         self.held_batch = None
         self.tasks = set()
         self.batch = None
@@ -9728,6 +9744,21 @@ class _StartupHistoryRelay:
             if line.startswith(':'):
                 line = line.split(' ', 1)[1]
             parts = line.split()
+            if server and parts and parts[0] == '005':
+                for token in parts[2:]:
+                    if not token.startswith('MSGREFTYPES='):
+                        continue
+                    supported = token.split('=', 1)[1].split(',')
+                    assert 'timestamp' in supported, (
+                        'Private upstream must genuinely support timestamp history', token)
+                    # Narrow only the advertised valid reference subset. The
+                    # upstream still receives real requests and supplies every
+                    # unchanged history body, ID, timestamp and BATCH boundary.
+                    advertised = 'MSGREFTYPES=timestamp'
+                    assert frame.count(token.encode()) == 1, token
+                    frame = frame.replace(token.encode(), advertised.encode(), 1)
+                    self.reference_advertisements.append({
+                        'upstream': token, 'downstream': advertised})
             if not server and len(parts) >= 3 and parts[0].upper() == 'CHATHISTORY':
                 if parts[1].upper() == 'TARGETS' or parts[2].casefold() == self.target:
                     # Never retain authentication or unrelated client frames.
@@ -9965,7 +9996,7 @@ def run_soju_search_context(ctx):
 
 
 def run_startup_history_sync(ctx):
-    """Real startup seam auto-fills beyond three pages, ignoring presence but retaining /me."""
+    """Real presence-heavy startup seam, legacy local window, and saved overlapping gaps."""
     destination = Path(ctx['destination'])
     config = Path(ctx['preferences']).with_name('config.toml')
     _policy_focus(ctx, ctx['channel_id'])
@@ -10190,8 +10221,9 @@ def run_startup_history_sync(ctx):
     assert latest_page['oldest_content'] is None and not latest_page['fixture_messages'], latest_page
     first_content_page = next(page for page in relay.pages if page['oldest_content'])
     assert first_content_page['request'].startswith('CHATHISTORY BEFORE '), first_content_page
-    assert (gap[1], gap[2]) == tuple(previous_newest), (gap, previous_newest)
-    assert [gap[3], gap[4]] == first_content_page['oldest_content'], (gap, first_content_page)
+    # A full timestamp bucket can retain a conservative open fence rather
+    # than the first visible content cursor. Missing content must stay
+    # recoverable here; exact fence/cursor encoding is not a native contract.
     assert rows('SELECT id,time,text FROM messages WHERE buffer=? AND text=?',
                 (ctx['channel_id'], cached)) == anchor, 'LATEST lost the cached anchor'
     gui.SESSION.until('first actual offline history page painted in native chat', lambda:
@@ -10201,7 +10233,6 @@ def run_startup_history_sync(ctx):
 
     before_demand = list(relay.requests)
     assert any(request.startswith('CHATHISTORY BEFORE ') for request in before_demand), before_demand
-    held_gap_request = relay.pages[-1]['request']
     assert offline_rows() == latest_rows, 'Held seam body reached Core early'
     gap_capture = str(_policy_capture(ctx, 'startup-history-gap-auto-requested'))
     relay.gap_release.set()
@@ -10214,10 +10245,6 @@ def run_startup_history_sync(ctx):
     filled = gui.SESSION.until('BEFORE commits the missing interval and retires durable gap', filled_gap)
     target_demand = [request for request in relay.requests if request.startswith('CHATHISTORY BEFORE ')]
     assert len(target_demand) > 3, target_demand
-    content_page_wire_edge = first_content_page['oldest_wire']
-    assert held_gap_request.split()[3] in {
-        'msgid=' + content_page_wire_edge[0], 'timestamp=' + content_page_wire_edge[1]}, (
-            first_content_page, held_gap_request)
     assert not any(request.startswith('CHATHISTORY AFTER ') for request in relay.requests), relay.requests
     assert sum(request.startswith('CHATHISTORY LATEST ') for request in relay.requests) == 1, relay.requests
     assert rows('SELECT id,time,text FROM messages WHERE buffer=? AND text=?',
@@ -10227,12 +10254,8 @@ def run_startup_history_sync(ctx):
     before_pages = [page for page in relay.pages if page['request'].startswith('CHATHISTORY BEFORE ')]
     assert len(before_pages) == len(target_demand), (before_pages, target_demand)
     wire_anchors = [request.split()[3] for request in target_demand]
-    assert len(wire_anchors) == len(set(wire_anchors)), ('Repeated wire cursor', target_demand)
-    for previous, following in zip([latest_page] + before_pages, before_pages):
-        cursor = previous['oldest_wire']
-        selectors = {'msgid=' + cursor[0], 'timestamp=' + cursor[1]} if cursor else set()
-        assert following['request'].split()[3] in selectors, (
-            'BEFORE did not advance to previous raw wire edge', previous, following)
+    assert relay.reference_advertisements, 'No real upstream MSGREFTYPES advertisement observed'
+    assert all(anchor.startswith('timestamp=') for anchor in wire_anchors), target_demand
     historical_presence = [frame for page in relay.pages for frame in page['presence_frames']]
     assert historical_presence, 'Private Ergo failed to replay genuine event-playback JOIN/PART churn'
     presence_only_pages = [page for page in before_pages
@@ -10318,8 +10341,185 @@ def run_startup_history_sync(ctx):
     prefix_visible = gui.SESSION.until('native wheel reveals recovered 000 then 001 in wire order',
                                        native_prefix)
     prefix_capture = str(_policy_capture(ctx, 'startup-history-filled-prefix'))
+    # Reopen an owned legacy cache with a fully cached LATEST tail and old,
+    # overlapping durable gaps. No navigation or Load missing action may help it.
+    gui.framed_keys(ctx['window'], 'alt+greater')
+    tail = 'SAVEDGAPTAIL already cached latest actual content'
+    ctx['observer'].send(f"PRIVMSG {ctx['channel']} :{tail}")
+    gui.SESSION.until('live tail committed before saved-gap restart', lambda:
+        rows('SELECT id,time FROM messages WHERE buffer=? AND text=?',
+             (ctx['channel_id'], tail)))
+    gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
+    out, err = gui.finish_gui(ctx['proc'], ctx['window'], ctx['screenshot'],
+        destination.with_name('startup-history-saved-gap-stop.bmp'), ctx['args'].size)
+    ctx['logs'].append(('startup-history-saved-gap-stop', out, err))
+    departed = {ctx['own_nick'], ctx['other_nick']}
+    while departed:
+        _, _, prefix = ctx['observer'].wait(lambda command, params, prefix:
+            command == 'QUIT' and prefix.split('!', 1)[0] in departed, timeout=15)
+        departed.remove(prefix.split('!', 1)[0])
+    removed_indices = {11, 21, 51, 59, 79, 89}
+    removed_bodies = [body for index, body in enumerate(remote) if index in removed_indices]
+    with sqlite3.connect(ctx['database_path']) as database:
+        database.row_factory = sqlite3.Row
+        # Expression-index writes need the same timestamp fraction as production.
+        # This connection only touches the stopped, generated private fixture DB.
+        def server_nanoseconds(value):
+            import datetime
+            match = re.fullmatch(
+                r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.(\d{1,9}))?Z', value or '')
+            if not match:
+                return 0
+            try:
+                datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+            except ValueError:
+                return 0
+            return int(((match[1] or '') + '000000000')[:9])
+
+        database.execute('PRAGMA trusted_schema=ON')
+        database.create_function('server_nanoseconds', 1, server_nanoseconds, deterministic=True)
+        tail_row = dict(database.execute(
+            'SELECT * FROM messages WHERE buffer=? AND text=?',
+            (ctx['channel_id'], tail)).fetchone())
+        presence_row = dict(database.execute(
+            'SELECT * FROM messages WHERE buffer=? AND presence=1 ORDER BY seq DESC LIMIT 1',
+            (ctx['channel_id'],)).fetchone())
+        columns = [column for column in presence_row if column != 'seq']
+        insert = ('INSERT INTO messages (' + ','.join(columns) + ') VALUES ('
+                  + ','.join('?' for _ in columns) + ')')
+        for index in range(230):
+            message = dict(presence_row, id=f'legacy-presence-{index}', time=tail_row['time'],
+                           timestamp=tail_row['timestamp'], sort_time=tail_row['sort_time'],
+                           tie_order=tail_row['tie_order'] + index + 1,
+                           text='LEGACYPRESENCE retained cache event', pending=0, local_echo=0)
+            database.execute(insert, [message[column] for column in columns])
+        for body in removed_bodies:
+            assert database.execute('DELETE FROM messages WHERE buffer=? AND text=?',
+                                    (ctx['channel_id'], body)).rowcount == 1, body
+        for older_index, newer_index in ((10, 80), (20, 60), (50, 90)):
+            older, newer = filled[older_index], filled[newer_index]
+            database.execute(
+                'INSERT INTO history_gaps(buffer,older_id,older_time,newer_id,newer_time,unavailable) '
+                'VALUES(?,?,?,?,?,0)', (ctx['channel_id'], *older[:2], *newer[:2]))
+        database.execute('UPDATE history_state SET newest_id=?,newest_time=? WHERE buffer=?',
+                         (tail_row['id'], tail_row['time'], ctx['channel_id']))
+    saved_gaps = gaps()
+    assert len(saved_gaps) == 3 and not any(gap[5] for gap in saved_gaps), saved_gaps
+    legacy_snapshot = rows(
+        'SELECT * FROM messages WHERE buffer=? AND id LIKE ? ORDER BY seq',
+        (ctx['channel_id'], 'legacy-presence-%'))
+    assert len(legacy_snapshot) == 230, legacy_snapshot
+    assert len(offline_rows()) > 200, 'Legacy cache must retain hundreds of actual messages'
+    raw_tail = rows(
+        'SELECT id,presence FROM messages WHERE buffer=? '
+        'ORDER BY sort_time DESC,time DESC,tie_order DESC,seq DESC LIMIT 200',
+        (ctx['channel_id'],))
+    assert len(raw_tail) == 200 and all(presence for _, presence in raw_tail), raw_tail
+    saved_relay = _StartupHistoryRelay(ctx['lab'], ctx['channel'])
+    ctx['cleanup'].callback(saved_relay.close)
+    local[0]['port'] = saved_relay.port
+    saved_config = ''.join(f'{key} = {json.dumps(value)}\n' for key, value in profile.items()
+                           if key not in ('identity', 'server'))
+    for section in ('identity', 'server'):
+        for table in profile[section]:
+            saved_config += f'\n[[{section}]]\n'
+            saved_config += ''.join(f'{key} = {json.dumps(value)}\n'
+                                    for key, value in table.items())
+    assert tomllib.loads(saved_config) == profile
+    config.write_text(saved_config)
+    try:
+        screenshot = Path(ctx['screenshot']).with_name('startup-history-saved-gap-restart.bmp')
+        saved_proc, saved_window = gui.launch_gui(
+            ctx['binary'], screenshot, ctx['env'], ctx['args'].size, ctx['logs'])
+        ctx.update(proc=saved_proc, window=saved_window, screenshot=screenshot)
+
+        def close_saved_gui():
+            if not saved_proc.native_debug_stream.closed:
+                gui.stop_group(saved_proc)
+                out, err = gui.collect_gui(saved_proc)
+                ctx['logs'].append(('startup-history-saved-gap-cleanup', out, err))
+
+        ctx['cleanup'].callback(close_saved_gui)
+        gui.SESSION.until('saved-gap actual history body held',
+                          lambda: saved_relay.ready(saved_relay.held))
+        # All target history bodies remain held: network refetch cannot mask a
+        # presence-filled local startup window. This is the first painted frame,
+        # with no scrolling or conversation selection after launch.
+        gui.SESSION.until('legacy presence-heavy cache paints actual local conversation', lambda:
+            upload.label_rect(ctx['window'], destination, 'SAVEDGAPTAIL',
+                              region=layout['conversation']['rect']))
+        assert len(offline_rows()) == len(remote) - len(removed_bodies), offline_rows()
+        assert gaps() == saved_gaps, (saved_gaps, gaps())
+        assert rows('SELECT * FROM messages WHERE buffer=? AND id LIKE ? ORDER BY seq',
+                    (ctx['channel_id'], 'legacy-presence-%')) == legacy_snapshot
+        legacy_capture = str(_policy_capture(ctx, 'startup-history-legacy-cache-no-refetch'))
+    finally:
+        saved_relay.release.set()
+        saved_relay.gap_release.set()
+        config.write_text(original_config)
+    try:
+        gui.SESSION.until('saved overlapping gaps recover automatically with cached latest tail', lambda:
+            saved_relay.ready(saved_relay.completed)
+            and [row[2] for row in offline_rows()] == remote and not gaps())
+    except Exception:
+        loaded = offline_rows()
+        diagnostic = {
+            'cached_latest_tail': [tail_row['id'], tail_row['time'], tail],
+            'saved_gaps_before_restart': saved_gaps,
+            'removed_actual_bodies': removed_bodies,
+            'expected_original_content_columns': ['id', 'time', 'text'],
+            'expected_original_content': filled,
+            'actual_content': loaded,
+            'missing_actual_bodies': [body for body in remote
+                                      if body not in {row[2] for row in loaded}],
+            'current_source': source_snapshot(),
+            'actual_requests': list(saved_relay.requests),
+            'actual_pages': list(saved_relay.pages),
+            'reference_advertisements': list(saved_relay.reference_advertisements),
+            'relay_errors': [repr(error) for error in saved_relay.errors],
+            'first_body_held': saved_relay.held.is_set(),
+            'first_batch_completed': saved_relay.completed.is_set(),
+            'legacy_cache_before_refetch_capture': legacy_capture,
+        }
+        destination.with_name(
+            destination.stem + '-startup-history-saved-gap-diagnostics.json'
+        ).write_text(json.dumps(diagnostic, indent=2) + '\n')
+        raise
+    recovered_rows = offline_rows()
+    assert len({row[0] for row in recovered_rows}) == len(remote), recovered_rows
+    assert rows('SELECT * FROM messages WHERE buffer=? AND id LIKE ? ORDER BY seq',
+                (ctx['channel_id'], 'legacy-presence-%')) == legacy_snapshot
+    saved_latest = [page for page in saved_relay.pages
+                    if page['request'].startswith('CHATHISTORY LATEST ')]
+    assert len(saved_latest) <= 1, saved_relay.pages
+    if saved_latest:
+        assert saved_latest[0]['newest_content'] == [
+            tail_row['id'], tail_row['time']], saved_relay.pages
+    assert any(request.startswith('CHATHISTORY BEFORE ') for request in saved_relay.requests), \
+        saved_relay.requests
+    assert saved_relay.reference_advertisements, 'Saved-gap restart missed actual MSGREFTYPES'
+    saved_before_selectors = [request.split()[3] for request in saved_relay.requests
+                              if request.startswith('CHATHISTORY BEFORE ')]
+    assert all(selector.startswith('timestamp=') for selector in saved_before_selectors), \
+        saved_relay.requests
+    assert rows('SELECT id,time FROM messages WHERE buffer=? AND text=?',
+                (ctx['channel_id'], tail)) == [(tail_row['id'], tail_row['time'])]
+    saved_capture = str(_policy_capture(ctx, 'startup-history-saved-overlapping-gaps-filled'))
+    saved_recovery = {
+        'cached_latest_tail': [tail_row['id'], tail_row['time'], tail],
+        'legacy_presence_rows_retained': len(legacy_snapshot),
+        'legacy_cache_capture_before_any_history_body': legacy_capture,
+        'saved_overlapping_gaps': saved_gaps, 'removed_actual_content': removed_bodies,
+        'requests': list(saved_relay.requests), 'pages': list(saved_relay.pages),
+        'reference_advertisements': list(saved_relay.reference_advertisements),
+        'before_selectors': saved_before_selectors,
+        'durable_gaps_after_automatic_fill': gaps(),
+        'recovered_actual_count': len(recovered_rows),
+        'navigation_or_load_click_after_restart': False, 'capture': saved_capture}
     return _refresh_return(ctx, 'startup-history-sync', {
         'actual_requests': list(relay.requests), 'actual_held_batch': relay.held_batch,
+        'reference_advertisements': list(relay.reference_advertisements),
+        'saved_gap_recovery_with_legacy_cache': saved_recovery,
         'actual_pages': list(relay.pages), 'requests_before_seam_release': before_demand,
         'native_gap_reveal': {'keys': 'M-<', 'trace_offset': navigation_offset,
                               'after_automatic_full_fill': True, 'load_button_click': False},

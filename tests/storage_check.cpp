@@ -156,9 +156,8 @@ static void chatActivityMetadata(int64_t now) {
     Model loaded;
     storage.load(loaded);
     const auto &room = loaded.buffers.at(id), &query = loaded.buffers.at(peer);
-    assert(room.messages.size() == 200 &&
-           std::all_of(room.messages.begin(), room.messages.end(),
-                       [](const auto &row) { return row.presence; }));
+    assert(room.messages.size() == 1 && room.messages.front().id == "same-source-id" &&
+           !room.messages.front().presence);
     assert(room.lastChatTimestamp == now && room.lastChatSequence == first &&
            room.lastChatTime == chat.time && query.lastChatSequence == second &&
            chatActivityBefore(query, room));
@@ -187,6 +186,88 @@ static void chatActivityMetadata(int64_t now) {
     storage.load(loaded);
     assert(loaded.settings.pinnedBuffers == vector<string>{peer} && !loaded.buffers.contains(id));
 }
+static void contentHistoryWindows(int64_t now) {
+    Storage storage;
+    Model model;
+    storage.load(model);
+    storage.clearHistory();
+    model.settings.retentionDays = 0;
+    model.settings.maxMessages = 10000;
+    const string id = "Libera/#content-window", peer = "Libera/content-window-query",
+                 server = "Libera/*server*", empty = "Libera/#presence-only";
+    for (const auto &source : {id, peer, server, empty})
+        model.buffers[source] = sendBuffer(source);
+    model.buffers[peer].kind = "query";
+    model.buffers[server].kind = "server";
+    storage.save(model);
+    auto pending = message("local:old-window-echo", now - 1);
+    pending.own = pending.pending = true;
+    storage.append(id, pending);
+    pending.pending = false;
+    storage.update(id, pending);
+    auto presence = message("", now);
+    presence.presence = true;
+    for (int index = 0; index < 405; ++index) {
+        auto row = message("content-" + std::to_string(index), now + index);
+        row.action = index == 10;
+        row.own = index == 13;
+        if (index == 11)
+            row.nick = "notice";
+        row.deleted = index == 12;
+        storage.append(id, row);
+        for (int event = 0; event < 3; ++event) {
+            presence.id = "interleaved-" + std::to_string(index) + "-" + std::to_string(event);
+            presence.timestamp = now + index;
+            storage.append(id, presence);
+        }
+    }
+    for (int index = 0; index < 250; ++index) {
+        presence.id = "tail-" + std::to_string(index);
+        presence.timestamp = now + 405 + index;
+        storage.append(id, presence);
+        storage.append(peer, presence);
+        storage.append(server, presence);
+    }
+    storage.append(empty, presence);
+    auto queryRow = message("query-content", now);
+    queryRow.action = true;
+    storage.append(peer, queryRow);
+    const auto all = storage.history(id, -1);
+    assert(all.size() == 1871 && std::count_if(all.begin(), all.end(), [](const auto &row) {
+                                     return row.presence;
+                                 }) == 1465);
+    Model loaded;
+    storage.load(loaded);
+    const auto &startup = loaded.buffers.at(id).messages;
+    assert(startup.size() == 201 && startup.front().id == pending.id &&
+           startup.front().sendStatus == SendStatus::Unknown && startup.front().pending &&
+           startup[1].id == "content-205" && startup.back().id == "content-404");
+    const auto latest = storage.history(id);
+    assert(latest.size() == 200 && latest.front().id == startup[1].id &&
+           latest.back().id == startup.back().id);
+    const auto older = storage.history(id, 200, latest.front().id);
+    assert(older.size() == 200 && older.front().id == "content-5" &&
+           older.back().id == "content-204" && older[5].action && older[6].nick == "notice" &&
+           older[7].deleted && older[7].text.empty() && older[8].own &&
+           older[8].sendStatus == SendStatus::Confirmed);
+    const auto oldest = storage.history(id, 200, older.front().id);
+    assert(oldest.size() == 5 && oldest.front().id == "content-0" &&
+           oldest.back().id == "content-4" && storage.history(id, 200, oldest.front().id).empty());
+    assert(storage.history(id, 1, pending.id).empty());
+    assert(storage.history(id, 1, "interleaved-205-0").front().id == "content-205");
+    assert(storage.history(id, 0).empty() && storage.history(id, -2).empty());
+    assert(storage.history(peer).size() == 1 && loaded.buffers.at(peer).messages.size() == 1 &&
+           loaded.buffers.at(peer).messages.front().action);
+    assert(storage.history(empty).empty() && loaded.buffers.at(empty).messages.empty() &&
+           storage.history(empty, -1).size() == 1);
+    assert(storage.history(server).size() == 200 && storage.history(server).front().presence &&
+           loaded.buffers.at(server).messages.size() == 200 &&
+           loaded.buffers.at(server).messages.front().presence &&
+           storage.history(server, -1).size() == 250);
+    assert(storage.history(id, -1).size() == all.size());
+    storage.clearHistory();
+}
+
 static void fractionalHistory(const fs::path &database) {
     constexpr int64_t second = 1700000000; // 2023-11-14T22:13:20Z
     const string id = "Libera/#fractional-history";
@@ -217,15 +298,15 @@ static void fractionalHistory(const fs::path &database) {
         for (int index = 0; index < 200; ++index)
             storage.append(id, timed("early-" + std::to_string(index), "2023-11-14T22:13:20.100Z"));
         const auto page = storage.history(id);
-        assert(page.size() == 200 && page.front().id == "early-1" && page.back().id == "late");
+        assert(page.size() == 200 && page.front().id == "early-0" && page.back().id == "early-199");
         const auto older = storage.history(id, 200, page.front().id);
-        assert(older.size() == 2 && older[0].id == pending.id && older[1].id == "early-0");
+        assert(older.empty());
         assert(storage.history(id, 1, "late").front().id == "early-199");
         assert(storage.history(id, 1, "2023-11-15T00:13:20.5+02:00").front().id == "early-199");
         storage.load(model);
         const auto &loaded = model.buffers.at(id).messages;
-        assert(loaded.size() == 201 && loaded.front().id == pending.id && loaded.front().pending &&
-               loaded[1].id == "early-1" && loaded.back().id == "late" && loaded.back().own &&
+        assert(loaded.size() == 202 && loaded.front().id == pending.id && loaded.front().pending &&
+               loaded[1].id == "early-0" && loaded.back().id == "late" && loaded.back().own &&
                loaded.back().pending);
     }
     {
@@ -233,13 +314,13 @@ static void fractionalHistory(const fs::path &database) {
         Model model;
         storage.load(model);
         const auto &loaded = model.buffers.at(id).messages;
-        assert(loaded.size() == 201 && loaded.front().id == "local:fractional-pending" &&
-               loaded.front().pending && loaded[1].id == "early-1" && loaded.back().id == "late" &&
+        assert(loaded.size() == 202 && loaded.front().id == "local:fractional-pending" &&
+               loaded.front().pending && loaded[1].id == "early-0" && loaded.back().id == "late" &&
                loaded.back().own && loaded.back().pending);
         const auto page = storage.history(id);
-        assert(page.size() == 200 && page.front().id == "early-1" && page.back().id == "late");
+        assert(page.size() == 200 && page.front().id == "early-0" && page.back().id == "early-199");
         const auto older = storage.history(id, 200, page.front().id);
-        assert(older.size() == 2 && older.back().id == "early-0");
+        assert(older.empty());
         storage.clearHistory();
 
         storage.append(id, timed("late", "2023-11-14T22:13:20.900Z"));
@@ -303,7 +384,8 @@ static void fractionalHistory(const fs::path &database) {
         }
         const string opaqueBuffer = id + "-opaque";
         const string timestampId = "2023-11-14T22:13:20.500Z";
-        storage.append(opaqueBuffer, timed("time-match", timestampId));
+        const auto opaqueSource = sendBuffer(opaqueBuffer);
+        storage.append(opaqueBuffer, timed("time-match", timestampId), "", 0, false, &opaqueSource);
         storage.append(opaqueBuffer, timed("middle", "2023-11-14T22:13:20.800Z"));
         storage.append(opaqueBuffer, timed(timestampId, "2023-11-14T22:13:20.900Z"));
         assert(storage.history(opaqueBuffer, 1, timestampId).front().id == "middle");
@@ -487,7 +569,7 @@ static void queuedSends(const fs::path &database, int64_t now) {
         auto confirmed = ghost("confirmed-same-label", first + ".part3");
         confirmed.pending = false;
         storage.append(id, confirmed, "", 0, true);
-        const auto rows = storage.history(id);
+        const auto rows = storage.history(id, -1);
         assert(rows.size() == 5 && rows[1].id == part.id && !rows[1].pending &&
                rows[1].sendStatus == SendStatus::Unknown);
         assert(rows[3].id == incoming.id && rows[3].sendStatus == SendStatus::None);
@@ -507,7 +589,7 @@ static void queuedSends(const fs::path &database, int64_t now) {
                buffer.messages[1].sendStatus == SendStatus::None);
         assert(buffer.messages[2].id == "confirmed-same-label" &&
                buffer.messages[2].sendStatus == SendStatus::Confirmed);
-        const auto rows = storage.history(id);
+        const auto rows = storage.history(id, -1);
         assert(rows.size() == 3 && rows[0].sendStatus == SendStatus::Unknown &&
                rows[1].sendStatus == SendStatus::None &&
                rows[2].sendStatus == SendStatus::Confirmed);
@@ -773,7 +855,7 @@ static void sendBoundaries(const fs::path &database, int64_t now) {
             auto row = ghost(partLabel("over-cap", part), "line " + std::to_string(part));
             assert(!storage.append(id, row, part == 200 ? "over-cap" : "", 201));
         }
-        assert(storage.history(id).size() == 200);
+        assert(storage.history(id).empty() && storage.history(id, -1).size() == 200);
         assert(scalar(database, "SELECT COUNT(*) FROM queued_sends") == 1);
     }
     {
@@ -794,8 +876,8 @@ static void sendBoundaries(const fs::path &database, int64_t now) {
             row.pending = false;
             storage.update(id, row); // A visual timeout is not actual confirmation.
         }
-        assert(storage.history(id).size() == 200);
-        for (const auto &row : storage.history(id))
+        assert(storage.history(id).empty() && storage.history(id, -1).size() == 201);
+        for (const auto &row : storage.history(id, -1))
             assert(row.own && !row.pending && row.sendStatus == SendStatus::Unknown);
         assert(scalar(database, "SELECT COUNT(*) FROM messages WHERE buffer="
                                 "'Libera/#send-boundary' AND pending<>0") == 0);
@@ -813,7 +895,7 @@ static void sendBoundaries(const fs::path &database, int64_t now) {
                    row.label == partLabel("beyond-tail", part) &&
                    row.text == "line " + std::to_string(part));
         }
-        for (const auto &row : storage.history(id))
+        for (const auto &row : storage.history(id, -1))
             assert(row.own && !row.pending && row.sendStatus == SendStatus::Unknown);
         storage.clearHistory(id);
         storage.queueSend(buffer, "cleared-handoff", "first\nlast");
@@ -894,9 +976,10 @@ static void sendBoundaries(const fs::path &database, int64_t now) {
         auto presence = message("own-presence", 0);
         presence.own = presence.presence = true;
         storage.append(id, presence);
-        assert(storage.history(id).back().sendStatus == SendStatus::None);
+        assert(storage.history(id, -1).back().sendStatus == SendStatus::None);
         storage.load(model);
-        assert(model.buffers.at(id).messages.back().sendStatus == SendStatus::None);
+        assert(model.buffers.at(id).messages.size() == 1 &&
+               model.buffers.at(id).messages.front().sendStatus == SendStatus::Confirmed);
         storage.clearHistory();
     }
     const string closed = "Libera/#handed-close", savedClose = "Libera/#saved-close";
@@ -1515,17 +1598,16 @@ static void activityRoundTrip(int64_t now) {
         Storage storage;
         Model model;
         storage.load(model);
-        const auto history = storage.history(id);
+        const auto history = storage.history(id, -1);
         const auto &loaded = model.buffers.at(id).messages;
-        assert(history.size() == 7 && loaded.size() == history.size());
+        assert(history.size() == 7 && loaded.size() == 3);
         for (int index = 0; index < 5; ++index) {
             assert(history[index].activity == kinds[index] && history[index].text == "updated");
-            assert(loaded[index].activity == kinds[index] && loaded[index].history);
-            assert(history[index].activityTarget == (index == 4 ? "new-nick" : "") &&
-                   loaded[index].activityTarget == history[index].activityTarget);
+            assert(history[index].activityTarget == (index == 4 ? "new-nick" : ""));
         }
-        assert(history[5].activity == ActivityKind::Quit &&
-               loaded[6].sendStatus == SendStatus::Confirmed);
+        assert(loaded[0].id == history[0].id && loaded[0].history &&
+               loaded[1].id == history[5].id && loaded[1].activity == ActivityKind::Quit &&
+               loaded[2].id == history[6].id && loaded[2].sendStatus == SendStatus::Confirmed);
         storage.clearHistory();
     }
 }
@@ -1558,7 +1640,7 @@ static void activitySchema6Migration(const fs::path &database, const fs::path &c
         local.own = local.pending = true;
         local.label = "migration-local-token";
         storage.append(id, local);
-        localId = storage.history(id).back().id;
+        localId = storage.history(id, -1).back().id;
         storage.queueSend(sendBuffer("Libera/#migration-queue"), "migration-queue-token",
                           "queued migration text");
     }
@@ -1593,7 +1675,7 @@ static void activitySchema6Migration(const fs::path &database, const fs::path &c
         storage.load(loaded);
         const auto &buffer = loaded.buffers.at(id);
         assert(loaded.activeBuffer == id && buffer.draft == "migration draft\nsecond line" &&
-               buffer.readMarker == "migration-server-id" && buffer.messages.size() == 2 &&
+               buffer.readMarker == "migration-server-id" && buffer.messages.size() == 1 &&
                buffer.messages.back().id == localId &&
                buffer.messages.back().sendStatus == SendStatus::Unknown);
         assert(loaded.settings.presence == PresenceMode::Hidden &&
@@ -2648,7 +2730,7 @@ int main() {
             ghost.id = "server-id";
             ghost.pending = false;
             storage.update(buffer.id, ghost);
-            const auto rows = storage.history(buffer.id);
+            const auto rows = storage.history(buffer.id, -1);
             assert(rows.size() == 2 && rows[1].id == "server-id" && !rows[1].pending);
             assert(rows[0].id == quoted.id && rows[0].reply == "parent-id" &&
                    rows[0].reactions == quoted.reactions);
@@ -2668,7 +2750,7 @@ int main() {
             assert(storage.message(buffer.id, rejected.id));
             storage.eraseMessage(buffer.id, rejected.id);
             assert(!storage.message(buffer.id, rejected.id) &&
-                   storage.history(buffer.id).size() == 2);
+                   storage.history(buffer.id, -1).size() == 2);
             storage.append(buffer.id, message("", now + 3, "anonymous rejected row"));
             const auto anonymousId = storage.history(buffer.id, 1).back().id;
             storage.eraseMessage(buffer.id, anonymousId);
@@ -2713,15 +2795,15 @@ int main() {
             const auto &buffer = actual.buffers.at("Libera/#a");
             assert(buffer.draft == expected.buffers.at(buffer.id).draft &&
                    buffer.readMarker == "1970-01-01T00:00:00Z" && buffer.unread == 7);
-            assert(buffer.messages.size() == 2 && buffer.title == "Channel A" &&
+            assert(buffer.messages.size() == 1 && buffer.title == "Channel A" &&
                    buffer.topic == "local topic");
-            auto deleted = buffer.messages.front();
+            auto deleted = storage.history(buffer.id, -1).front();
             deleted.deleted = true;
             storage.update(buffer.id, deleted);
             deleted.deleted = false;
             deleted.text = "must not resurrect";
             storage.append(buffer.id, deleted);
-            const auto tombstone = storage.history(buffer.id).front();
+            const auto tombstone = storage.history(buffer.id, -1).front();
             assert(tombstone.deleted && tombstone.text.empty() && tombstone.reactions.empty());
             storage.read(buffer.id, "server-id");
             Model readBack;
@@ -2747,7 +2829,7 @@ int main() {
             auto anonymousRow = message("", 0, "ID-less local row");
             anonymousRow.own = anonymousRow.pending = true;
             storage.append(buffer.id, anonymousRow);
-            const auto localRows = storage.history(buffer.id);
+            const auto localRows = storage.history(buffer.id, -1);
             assert(localRows.size() == 2 && localRows[0].id == local.id &&
                    localRows[1].id.starts_with("local:"));
             assert(storage.message(buffer.id, localRows[1].id)->text == "ID-less local row");
@@ -2760,7 +2842,7 @@ int main() {
         }
         {
             Storage reopened;
-            const auto localRows = reopened.history("Libera/#a");
+            const auto localRows = reopened.history("Libera/#a", -1);
             assert(localRows.size() == 2 && localRows[0].id == "local:outgoing-check");
             assert(localRows[1].id.starts_with("local:") && localRows[1].deleted &&
                    localRows[1].text.empty());
@@ -2874,6 +2956,7 @@ int main() {
         activitySchema6Migration(data / "state.sqlite3", config, now);
         chatFlags(data / "state.sqlite3", config, now);
         chatActivityMetadata(now);
+        contentHistoryWindows(now);
         retainedMentions(data / "state.sqlite3", now);
         protocolHistoryStorage(data / "state.sqlite3", now);
         historyPlaybackOrdering(data / "state.sqlite3", now);

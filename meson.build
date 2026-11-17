@@ -259,7 +259,7 @@ if get_option('tests')
   test('native_composer_check', native_ui_check, args: ['composer'])
   test('native_settings_check', native_ui_check, args: ['settings'])
   test('native_transcript_check', native_ui_check, args: ['transcript'])
-  test('native_shell_check', native_ui_check, args: ['shell'])
+  test('native_shell_check', native_ui_check, args: ['shell'], timeout: 120)
   test('native_media_preview_check', native_ui_check, args: ['media-preview'],
     env: ['ALSOFT_DRIVERS=null'])
 

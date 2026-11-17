@@ -1345,11 +1345,9 @@ struct TranscriptView::Impl {
         history->setOnClick([this] {
             if (auto *buffer = current(); buffer && !buffer->loading) {
                 focus(pane.id);
+                const auto *oldest = oldestHistoryMessage(*buffer);
                 model.actions.push_back(
-                    {"history",
-                     buffer->id,
-                     {},
-                     buffer->messages.empty() ? std::string{} : buffer->messages.front().id});
+                    {"history", buffer->id, {}, oldest ? oldest->id : std::string{}});
             }
         });
         canvas->addChild(std::move(load));
@@ -4077,7 +4075,10 @@ struct TranscriptView::Impl {
                     std::max(row.prefixHeight,
                              2 * std::max(size * center - offset, size * (1 - center) + offset));
             }
-            row.prefixAscent += (row.prefixHeight - textHeight) * .5f;
+            row.prefixAscent =
+                entry.own && !entry.action && g.nickVisible(row.grouped, entry.presence)
+                    ? row.prefixHeight * .5f - nickInkCenter
+                    : row.prefixAscent + (row.prefixHeight - textHeight) * .5f;
             row.prefixBaseline = row.bodyOffset + row.prefixAscent;
         }
         if (!collapsed && (!emote || g.channel) &&
@@ -5785,9 +5786,9 @@ struct TranscriptView::Impl {
                       [this](const auto &entry) { return model.now - entry.second > .5; });
         if (pane.following && !focusRevealTarget && cache->pendingArrivals == 0)
             pane.unseen = 0;
-        const bool localOlder = !buffer->messages.empty() &&
-                                !buffer->historyState.oldest.id.empty() &&
-                                buffer->historyState.oldest.id != buffer->messages.front().id;
+        const auto *oldestLoaded = oldestHistoryMessage(*buffer);
+        const bool localOlder = oldestLoaded && !buffer->historyState.oldest.id.empty() &&
+                                buffer->historyState.oldest.id != oldestLoaded->id;
         history->setVisible(buffer->kind != "mentions" &&
                             (!buffer->historyState.beginning || localOlder));
         history->setEnabled(history->visible() && !buffer->loading);
@@ -5878,13 +5879,15 @@ struct TranscriptView::Impl {
         const float oldScroll = switched || !allowFocusReveal ? c.scroll : scroll->scrollOffset();
         const size_t oldAnchor = c.heights.at(std::max(0., double(oldScroll - c.header)));
         std::string anchorKey;
+        bool anchorMeasured = false;
         double oldBodyTop = 0, oldBodyHeight = 0, oldRowHeight = 0;
         std::optional<double> footerAnchor;
         if (!pane.following && jumpTarget.empty() && oldAnchor < c.rows.size()) {
             const auto &row = c.rows[oldAnchor];
             const double rowTop = c.header + c.heights.prefix(oldAnchor) + row.gapHeight;
             anchorKey = row.key;
-            oldBodyTop = rowTop + row.bodyOffset;
+            anchorMeasured = row.revision != 0;
+            oldBodyTop = rowTop + (anchorMeasured ? row.bodyOffset : 0);
             oldBodyHeight = row.bodyHeight;
             oldRowHeight = row.height;
             const double footerTop = rowTop + row.footerOffset;
@@ -5976,9 +5979,9 @@ struct TranscriptView::Impl {
                                             ? row.footerOffset + *footerAnchor * row.footerHeight
                                             : row.contentEnd);
                 } else
-                    desired =
-                        ui_logic::anchoredBodyScroll(oldScroll, oldBodyTop, rowTop + row.bodyOffset,
-                                                     oldBodyHeight, row.bodyHeight, reflow);
+                    desired = ui_logic::anchoredBodyScroll(
+                        oldScroll, oldBodyTop, rowTop + (anchorMeasured ? row.bodyOffset : 0),
+                        oldBodyHeight, row.bodyHeight, reflow && anchorMeasured);
                 const double rowEnd = rowTop + row.height;
                 if ((reflow || row.height != oldRowHeight) && desired >= rowEnd)
                     desired = std::nextafter(static_cast<float>(rowEnd),
@@ -6346,8 +6349,8 @@ struct TranscriptView::Impl {
             !buffer->server.empty() && (buffer->kind == "channel" || buffer->kind == "query");
         if (c.historyDemandActive && !historyPending && !visibleGap && history->visible() &&
             olderAvailable && desired <= gapExtent) {
-            const auto oldest =
-                buffer->messages.empty() ? std::string{} : buffer->messages.front().id;
+            const auto *oldestMessage = oldestHistoryMessage(*buffer);
+            const auto oldest = oldestMessage ? oldestMessage->id : std::string{};
             const auto key = "older:" + oldest;
             if (c.historyDemandKeys.insert(key).second) {
                 model.actions.push_back({"history", buffer->id, {}, oldest});

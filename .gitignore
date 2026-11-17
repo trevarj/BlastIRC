@@ -10,5 +10,6 @@
 /subprojects/noctalia-*/
 /subprojects/packagecache/
 /subprojects/.wraplock
+/vendor/.wraplock
 *.bmp
 __pycache__/

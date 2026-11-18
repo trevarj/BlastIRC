@@ -174,7 +174,7 @@ def main():
                                  "minimum-height", "message-links", "typing-focus", "mentions-unread",
                                  "startup-history-sync", "jump-bottom", "scrollbar", "buffer-boundaries",
                                  "conversation-history", "soju-search-context", "mention-effects", "mention-background", "avatar-alignment",
-                                 "muted-unread"))
+                                 "muted-unread", "network-sidebar"))
     options, remaining = parser.parse_known_args()
     if any(option in remaining for option in ("--probe", "--probes", "--layout-only", "--ime-only", "--raw-only")):
         parser.error("--scope selects the focused fixture; do not combine other GUI scopes")
@@ -217,7 +217,7 @@ def main():
     # Reuse the existing owned fixture and teardown, not a second GUI harness.
     gui.run_advanced_scope = run
     sys.argv = [sys.argv[0], *remaining, "--probe", "shell"]
-    gui.run(allow_focused_geometry=options.scope == 'typing-bubble')
+    gui.run(allow_focused_geometry=options.scope in ('typing-bubble', 'network-sidebar'))
 
 
 """Sections for interface_refresh_smoke.py; only owned gui_smoke fixture state is used.
@@ -276,6 +276,176 @@ def _refresh_restart(ctx, section, values, *, focus=None):
 def _refresh_return(ctx, scope, evidence):
     return {'scope': scope, 'native_consumer': True, 'private_fixture_only': True,
             'evidence': evidence}
+
+
+def run_network_sidebar(ctx):
+    import sqlite3
+    p, w, prefs, db = ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path']
+    destination, z = Path(ctx['destination']), ctx['args'].zoom
+    evidence = {'captures': []}
+
+    def rows(sql, params=()):
+        with sqlite3.connect(f'file:{db}?mode=ro', uri=True) as connection:
+            return connection.execute(sql, params).fetchall()
+
+    def capture(label):
+        path = gui.capture_window(w, destination, 'network-sidebar-' + label)
+        evidence['captures'].append(str(path))
+        return str(path)
+
+    def saved():
+        state = gui.save_state(p, prefs, db)
+        return state, tomllib.loads(Path(prefs).read_text())['workspace']
+
+    def toggle(visible):
+        before, workspace = saved()
+        gui.activate_shell_action(w, prefs, 'networks')
+        after, current = saved()
+        assert current['native_server_rail_visible'] == str(visible).lower(), current
+        for key in ('native_navigation_mode', 'selected_server', 'server_rail_width'):
+            assert current.get(key) == workspace.get(key), (key, workspace, current)
+        assert before[1:] == after[1:], ('Rail toggle changed buffer data', before, after)
+        return current
+
+    _policy_focus(ctx, ctx['channel_id'])
+    body = ('Native mention paint ' + ctx['own_nick'] + ' plain and \x02' +
+            ctx['own_nick'] + '\x02 bold')
+    _policy_send(ctx, body, target=ctx['channel'])
+    gui.wait_read_marker(p, db, ctx['channel_id'])
+    gui.SESSION.until('incoming mention body is painted in the native conversation', lambda:
+        upload.label_rect(w, destination, 'Native mention paint',
+                          region=gui.read_layout(prefs)['conversation']['rect']))
+    capture('plain-and-irc-bold-mentions')
+    _policy_focus(ctx, ctx['query_id'])
+    gui.set_navigation(p, w, prefs, db, 'hidden', 'network-sidebar-baseline')
+    draft = 'Network visibility keeps this draft'
+    upload.focus_composer(w)
+    gui.type_text(draft)
+    size = len(draft.encode('utf-8'))
+    gui._composer_native(w, draft, size, size)
+    baseline, workspace = saved()
+    assert workspace.get('native_server_rail_visible', 'true') == 'true'
+    layout = gui.read_layout(prefs)
+    before_caret = gui.native_input_rectangle(w)
+    toggle(False)
+    upload.focus_composer(w)
+    after_caret = gui.native_input_rectangle(w)
+    reclaimed = layout['rail']['rect'][2] + layout['rail']['rect'][0]
+    assert abs((before_caret[0] - after_caret[0]) - reclaimed) <= 2*z, (
+        'Native composer did not reclaim the complete rail and gap', before_caret, after_caret, reclaimed)
+    gui._composer_native(w, draft, size, size)
+    capture('hidden-full-width')
+    x, y, width, _ = layout['rail']['rect']
+    marker = gui.GUI_DEBUG[w][1].stat().st_size
+    gui.click(w, x + width/2, y + 126*z)
+    gui.await_native_frame(w, marker,
+        re.compile(r'wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)'))
+    inactive, current = saved()
+    assert current['selected_server'] == workspace['selected_server']
+    assert inactive[1:] == baseline[1:], ('Hidden server hit target remained active', inactive)
+    upload.focus_composer(w)
+    gui._composer_native(w, draft, size, size)
+    for mode in ('expanded', 'compact', 'hidden'):
+        gui.set_navigation(p, w, prefs, db, mode, 'network-sidebar-independent-' + mode)
+        state, current = saved()
+        assert current['native_server_rail_visible'] == 'false'
+        assert current['native_navigation_mode'] == mode
+        assert state[1:] == baseline[1:], ('Channels cycle changed buffer or draft', state, baseline)
+    toggle(True)
+    toggle(False)
+    gui.open_settings(w, prefs, from_icon=True)
+    capture('hidden-settings')
+    gui.close_settings_navigation(w)
+    gui.open_settings(w, prefs, from_icon=True, action='add_network')
+    capture('hidden-add-network')
+    gui.close_settings_navigation(w)
+    gui.activate_shell_action(w, prefs, 'mentions')
+    mention_state, current = saved()
+    assert mention_state[1] == ('!global-mentions',), mention_state
+    assert current['native_server_rail_visible'] == 'false'
+    assert gui.native_input_state(w) is None, 'Mentions retained hidden editable input'
+    capture('hidden-mentions')
+    _policy_focus(ctx, ctx['query_id'], expected=(draft, size, size))
+    if gui.shell_actions(gui.read_layout(prefs))['unread']:
+        gui.activate_shell_action(w, prefs, 'mark_all_read')
+        saved()
+    gui.wait_rows(p, db, 'SELECT COUNT(*) FROM buffers WHERE unread<>0', (), [(0,)])
+    actions = gui.shell_actions(gui.read_layout(prefs))
+    empty_menu_height = None
+    if actions['read_folded']:
+        popup = gui.open_native_popup(w, lambda: gui.click(w, *actions['application']))
+        empty_menu_height = popup['rect'][3]
+        gui.popup_keys(w, popup, 'Escape')
+    extent = max(32, (32 if gui.read_layout(prefs)['compact'] else 34)*z)
+    nav_x, cy = actions['navigation']
+    read_region = (nav_x-1.5*extent-8*z, cy-extent/2,
+                   nav_x-.5*extent-8*z, cy+extent/2)
+    gui.move_pointer(w, 0, 0)
+    no_unread = _policy_crop(gui.native_rgb_capture(w), read_region)
+    _policy_send(ctx, 'Native hidden rail global unread ' + str(time.monotonic_ns()),
+                 target=ctx['channel'])
+    pending, _ = saved()
+    assert pending[1] == (ctx['query_id'],), ('Unread proof selected a background channel', pending)
+    gui.SESSION.until('real background arrivals are durably unread', lambda:
+        rows('SELECT COUNT(*) FROM buffers WHERE id IN (?,?) AND unread>0',
+             (ctx['channel_id'], ctx['other_channel_id'])) == [(2,)])
+    history = rows('SELECT * FROM messages WHERE presence=0 ORDER BY seq')
+    actions = gui.shell_actions(gui.read_layout(prefs))
+    assert actions['unread']
+    if actions['read_folded']:
+        popup = gui.open_native_popup(w, lambda: gui.click(w, *actions['application']))
+        assert popup['rect'][3] > empty_menu_height, ('Conditional read item did not appear', popup)
+        evidence['folded_menu'] = str(gui.capture_native_popup(w, popup, destination,
+                                                            'network-sidebar-folded-read'))
+        gui.select_native_menu(w, popup, [2])
+    else:
+        gui.move_pointer(w, 0, 0)
+        gui.SESSION.until('conditional native topbar read control appears', lambda:
+            _policy_crop(gui.native_rgb_capture(w), read_region) != no_unread)
+        gui.activate_shell_action(w, prefs, 'mark_all_read')
+    saved()
+    for identity in (ctx['channel_id'], ctx['other_channel_id']):
+        gui.wait_read_marker(p, db, identity)
+    gui.wait_rows(p, db, 'SELECT COUNT(*) FROM buffers WHERE unread<>0', (), [(0,)])
+    assert rows('SELECT * FROM messages WHERE presence=0 ORDER BY seq') == history
+    assert not gui.shell_actions(gui.read_layout(prefs))['unread']
+    if actions['read_folded']:
+        popup = gui.open_native_popup(w, lambda: gui.click(w, *actions['application']))
+        assert popup['rect'][3] == empty_menu_height, ('Read item did not retire', popup)
+        gui.popup_keys(w, popup, 'Escape')
+    else:
+        gui.move_pointer(w, 0, 0)
+        gui.SESSION.until('conditional native topbar read control retires', lambda:
+            _policy_crop(gui.native_rgb_capture(w), read_region) == no_unread)
+    capture('global-read-cleared')
+    retained, workspace = saved()
+    target = destination.with_name(destination.stem + '-network-sidebar-before-restart.bmp')
+    out, err = gui.finish_gui(p, w, ctx['screenshot'], target, ctx['args'].size)
+    ctx['logs'].append(('network-sidebar-before-restart', out, err))
+    departed = {ctx['own_nick'], ctx['other_nick']}
+    while departed:
+        _, _, prefix = ctx['observer'].wait(lambda command, params, prefix:
+            command == 'QUIT' and prefix.split('!', 1)[0] in departed, timeout=15)
+        departed.remove(prefix.split('!', 1)[0])
+    screenshot = Path(ctx['screenshot']).with_name('network-sidebar-restart.bmp')
+    p, w = gui.launch_gui(ctx['binary'], screenshot, ctx['env'], ctx['args'].size, ctx['logs'])
+    ctx.update(proc=p, window=w, screenshot=screenshot)
+    gui.wait_joins(ctx['observer'], ctx['channel'], (ctx['own_nick'], ctx['other_nick']))
+    restarted, current = saved()
+    assert current['native_server_rail_visible'] == 'false'
+    for key in ('server_rail_width', 'selected_server', 'native_navigation_mode'):
+        assert current.get(key) == workspace.get(key), (workspace, current)
+    assert restarted[1] == retained[1], (retained, restarted)
+    assert rows('SELECT draft FROM buffers WHERE id=?', (ctx['query_id'],)) == [(draft,)]
+    upload.focus_composer(w)
+    gui._composer_native(w, draft, size, size)
+    capture('restart-hidden')
+    toggle(True)
+    capture('restart-restored')
+    evidence.update(reclaimed_native_width=reclaimed, selected_buffer=retained[1][0],
+                    draft=draft, hidden_restart=True, folded_read=actions['read_folded'],
+                    incoming_mention_body=body)
+    return _refresh_return(ctx, 'network-sidebar', evidence)
 
 
 def _refresh_clipboard(ctx, data, mime):
@@ -1329,29 +1499,26 @@ def run_badges(ctx):
     def layout():
         return gui.read_layout(prefs)
 
-    def footer_point():
-        x, y, width, height = layout()['rail']['rect']
-        extent, pad, gap = max(32, 36 * args.zoom), 6 * args.zoom, 6 * args.zoom
-        top = max(pad, height - pad - 3 * extent - 2 * gap)
-        return (x + width / 2, y + top + extent / 2), extent, gap
+    def read_point():
+        shell = layout()
+        extent = max(32, (32 if shell['compact'] else 34) * args.zoom)
+        cx, cy = gui.shell_actions(shell)['navigation']
+        return (cx - extent - 8 * args.zoom, cy), extent
 
     def nonsearch_unread():
         return database.execute("SELECT id,unread FROM buffers WHERE kind<>'search' AND unread>0 ORDER BY id").fetchall()
 
     def click_read():
-        point, extent, gap = footer_point()
+        point, extent = read_point()
         assert nonsearch_unread(), 'Read action must be justified by durable nonsearch unread'
-        marker = gui.GUI_DEBUG[w][1].stat().st_size
-        gui.click(w, *point)
-        gui.await_native_frame(w, marker, re.compile(r'wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)'))
+        gui.activate_shell_action(w, prefs, 'mark_all_read')
         saved()
         gui.wait_rows(p, db, "SELECT COUNT(*) FROM buffers WHERE kind<>'search' AND unread<>0", (), [(0,)])
-        return {'read': point, 'add': (point[0], point[1] + extent + gap)}
+        return {'read': point}
 
-    def rail_row(image):
-        (cx, cy), extent, _ = footer_point()
-        x, _, width, _ = layout()['rail']['rect']
-        left, right = round(x + 6 * args.zoom), round(x + width - 6 * args.zoom)
+    def read_row(image):
+        (cx, cy), extent = read_point()
+        left, right = round(cx - extent / 2), round(cx + extent / 2)
         return b''.join(image['pixels'][(row * image['width'] + left) * 3:
                                       (row * image['width'] + right) * 3]
                         for row in range(round(cy - extent / 2), round(cy + extent / 2)))
@@ -1447,7 +1614,7 @@ def run_badges(ctx):
             click_read()
         gui.set_navigation(p, w, prefs, db, 'expanded', 'refresh-badges-baseline')
         assert not nonsearch_unread()
-        empty_row = rail_row(capture())
+        empty_row = read_row(capture())
         upload.focus_composer(w)
         gui.wait_read_marker(p, db, ctx['query_id'])
         before_input = gui.native_input_state(w)
@@ -1477,20 +1644,19 @@ def run_badges(ctx):
         gui.set_navigation(p, w, prefs, db, 'expanded', 'refresh-badges-read-action')
         history = database.execute('SELECT * FROM messages WHERE presence=0 ORDER BY seq').fetchall()
         before = nonsearch_unread()
-        visible_row = rail_row(capture())
-        assert visible_row != empty_row, 'Conditional read row never appeared above Add'
+        visible_row = read_row(capture())
+        assert visible_row != empty_row, 'Conditional topbar read control never appeared'
         # Prove this retained action by its native click and durable effects,
         # not by incidental tooltip text or tooltip presentation timing.
         report['global_read'] = click_read()
         gui.move_pointer(w, 0, 0)
-        gui.SESSION.until('conditional read row retired above unchanged Add/Settings',
-                          lambda: rail_row(capture()) == empty_row)
+        gui.SESSION.until('conditional topbar read control retired',
+                          lambda: read_row(capture()) == empty_row)
         assert database.execute('SELECT * FROM messages WHERE presence=0 ORDER BY seq').fetchall() == history
         assert database.execute('SELECT id,draft FROM buffers ORDER BY id').fetchall() == protected
         assert database.execute('SELECT read_marker FROM buffers WHERE id=?', (ctx['query_id'],)).fetchone() == query_marker
         for identity, _ in before:
             gui.wait_read_marker(p, db, identity)
-        assert report['global_read']['read'][1] < report['global_read']['add'][1]
         report['global_read'].update(unread_before=before, history_preserved=True,
                                      drafts_preserved=True, retired_when_nonsearch_read=True)
         gui.select_native_buffer(p, w, prefs, db, args, ctx['query_id'])
@@ -9336,24 +9502,22 @@ def run_muted_unread(ctx):
                     and item['pixels'] >= (right-left)*(bottom-top)*.6):
                 found.append(item['bbox'])
         return found
-    def footer():
+    def read_slot():
         upload.focus_composer(w)
         gui.move_pointer(w, 0, 0)
         layout = gui.read_layout(prefs)
-        x, y, width, height = layout['rail']['rect']
-        extent, pad, gap = max(32, 36*z), 6*z, 6*z
-        top = y + max(pad, height-pad-3*extent-2*gap)
+        actions = gui.shell_actions(layout)
+        extent = max(32, (32 if layout['compact'] else 34)*z)
+        nav_x, cy = actions['navigation']
+        point = (nav_x-extent-8*z, cy)
         image = gui.native_rgb_capture(w)
-        read_box = (x+pad, top, x+width-pad, top+extent)
-        lower_box = (x+pad, top+extent+gap, x+width-pad, y+height-pad)
-        return (_policy_crop(image, read_box), _policy_crop(image, lower_box),
-                (x+width/2, top+extent/2))
+        return _policy_crop(image, (point[0]-extent/2, cy-extent/2,
+                                   point[0]+extent/2, cy+extent/2)), point
 
     def read_action(label, visible):
         def observed():
-            read_pixels, lower_pixels, point = footer()
-            if ((read_pixels != empty_footer[0]) == visible and lower_pixels == empty_footer[1]):
-                return read_pixels, point
+            read_pixels, point = read_slot()
+            return (read_pixels, point) if (read_pixels != empty_read_slot[0]) == visible else None
         read_pixels, point = gui.SESSION.until('native read action visible=' + str(visible), observed)
         fresh_click_buffer = None
         if not visible:
@@ -9366,17 +9530,14 @@ def run_muted_unread(ctx):
             fresh_click_buffer = state[1][0]
             assert fresh_click_buffer in (ctx['query_id'], '!global-mentions'), (
                 'Retired read slot activated an unexpected action', state[1])
-            assert retained() == before, 'Fresh reclaimed-footer click acknowledged unread or changed data'
+            assert retained() == before, 'Fresh reclaimed-topbar click acknowledged unread or changed data'
             if fresh_click_buffer == '!global-mentions':
-                # Reflow legitimately gives Mentions the old read-button slot.
-                # A new click may activate it; it must never clear stored unread.
                 _policy_focus(ctx, ctx['query_id'])
             saved()
             assert retained() == before, 'Restoring the unrelated query acknowledged the muted target'
-            assert observed(), 'Reclaimed footer did not return to its zero-unread layout'
+            assert observed(), 'Reclaimed topbar did not return to its zero-unread layout'
         return {'visible': visible, 'former_read_point': point,
                 'read_row_sha256': hashlib.sha256(read_pixels).hexdigest(),
-                'add_settings_same_pixels_and_position': True,
                 'fresh_reclaimed_slot_active_buffer': fresh_click_buffer,
                 'capture': str(gui.capture_window(w, destination, 'muted-unread-read-action-' + label))}
 
@@ -9478,7 +9639,7 @@ def run_muted_unread(ctx):
     saved()
     assert rows('SELECT SUM(unread) FROM buffers') == [(0,)], 'Fixture unread baseline is not isolated'
     gui.set_navigation(p, w, prefs, db, 'expanded', 'muted-unread-empty-baseline')
-    empty_footer = footer()
+    empty_read_slot = read_slot()
     evidence['empty_read_action'] = read_action('empty', False)
     _policy_send(ctx, 'Native mute count retention ' + str(time.monotonic_ns()), target=ctx['channel'])
     saved()

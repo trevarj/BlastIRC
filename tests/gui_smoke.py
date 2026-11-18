@@ -670,6 +670,7 @@ def read_layout(path):
     status_height = (22 if tight else 26 if compact else 30) * scale
     outer = (4 if tight else 8 if compact else 12) * scale
     rail_width = float(workspace.get("server_rail_width", 76)) * scale
+    rail_visible = workspace.get("native_server_rail_visible", "true") == "true"
     top = title_height + outer
     content_height = max(1, height - top - status_height - outer)
     navigation_intent = workspace["native_navigation_mode"]
@@ -684,10 +685,13 @@ def read_layout(path):
         rail_width = min(rail_width, max(56 * scale,
             width - 4 * outer - compact_width - chat_minimum))
     rail_width = min(rail_width, max(0, width - 2 * outer))
+    if not rail_visible:
+        rail_width = 0
     widths = {"expanded": float(workspace.get("channel_sidebar_width", 250)) * scale,
               "compact": compact_width, "hidden": 0}
     people_widths = {"expanded": 220 * scale, "compact": 56 * scale, "hidden": 0}
-    remaining = max(1, width - 2 * outer - rail_width - outer)
+    rail_gap = outer if rail_visible else 0
+    remaining = max(1, width - 2 * outer - rail_width - rail_gap)
 
     def available():
         return (remaining - widths[navigation] - (outer if navigation != "hidden" else 0)
@@ -700,11 +704,12 @@ def read_layout(path):
     if available() < chat_minimum and people == "compact":
         people = "hidden"
     sidebar_width, people_width = widths[navigation], people_widths[people]
-    sidebar_x = outer + rail_width + outer
+    sidebar_x = outer + rail_width + rail_gap
     left = sidebar_x + sidebar_width + (outer if navigation != "hidden" else 0)
     right = width - outer - people_width - (outer if people != "hidden" else 0)
     chat = (left, top, max(1, right - left), content_height)
     layout = {"compact": compact, "tight": tight, "scale": scale,
+              "rail_visible": rail_visible,
               "topbar": {"rect": (0, 0, width, title_height)},
               "navigation_intent": navigation_intent,
               "active_buffer": active_buffer,
@@ -730,21 +735,40 @@ def shell_actions(layout):
     extent = max(32, (32 if layout["compact"] else 34) * zoom)
     outer, gap = layout["rail"]["rect"][0], 8 * zoom
     left = width - outer - 3 * extent - 2 * gap
-    x, y, rail_width, rail_height = layout["rail"]["rect"]
-    footer_extent, padding = max(32, 36 * zoom), 6 * zoom
-    footer_top = max(padding, rail_height - padding - 2 * footer_extent - 6 * zoom)
+    database_path = next(reversed(GUI_DEBUG.values()))[0].native_database_path
+    with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as database:
+        unread = database.execute(
+            "SELECT COUNT(*) FROM buffers WHERE kind<>'search' AND muted=0 AND unread>0").fetchone()[0] > 0
+    folded = width < 760 * zoom
+    extra = extent + gap
     return {"navigation": (left + extent / 2, height / 2),
             "palette": (left + 1.5 * extent + gap, height / 2),
-            "settings": (x + rail_width / 2, y + footer_top + 1.5 * footer_extent + 6 * zoom)}
+            "application": (outer + 60 * zoom, height / 2),
+            "networks": (left - (3 if unread and not folded else 2) * extra + extent / 2, height / 2),
+            "mentions": (left - (2 if unread and not folded else 1) * extra + extent / 2, height / 2),
+            "mark_all_read": ((left - extra + extent / 2, height / 2)
+                              if unread and not folded else None),
+            "read_folded": folded, "unread": unread}
 
 
-def open_settings(window, preferences, *, from_icon=False):
-    """Use the existing native Settings command without requiring a saved workspace."""
-    if from_icon:
+def activate_shell_action(window, preferences, action):
+    actions = shell_actions(read_layout(preferences))
+    if action in ("settings", "add_network") or (action == "mark_all_read" and actions["read_folded"]):
+        popup = open_native_popup(window, lambda: click(window, *actions["application"]))
+        index = {"add_network": 0, "settings": 1, "mark_all_read": 2}[action]
+        select_native_menu(window, popup, [index])
+    else:
+        assert actions[action] is not None, ("Unavailable shell action", action, actions)
         marker = GUI_DEBUG[window][1].stat().st_size
-        click(window, *shell_actions(read_layout(preferences))["settings"])
+        click(window, *actions[action])
         await_native_frame(window, marker,
                            re.compile(r"wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)"))
+
+
+def open_settings(window, preferences, *, from_icon=False, action="settings"):
+    """Use the existing native Settings command without requiring a saved workspace."""
+    if from_icon:
+        activate_shell_action(window, preferences, action)
     else:
         command("settings", window=window)
     # Bookkeeping must follow the real rendered modal, not merely a queued command.
@@ -756,6 +780,7 @@ def open_settings(window, preferences, *, from_icon=False):
     compact = width < 760 * scale or height < 440 * scale
     padding = (8 if compact else 12) * scale
     left, top = (geometry["WIDTH"] - width) / 2 + padding, (geometry["HEIGHT"] - height) / 2 + padding
+    move_pointer(window, geometry["WIDTH"] - 2, geometry["HEIGHT"] - 2)
     with tempfile.TemporaryDirectory(prefix="blastirc-settings-caption-", dir=SESSION.env["XDG_RUNTIME_DIR"]) as temporary:
         caption = Path(temporary) / "caption.png"
 
@@ -1967,7 +1992,8 @@ def database_buffer_kind(path, buffer):
 
 
 def semantic_workspace(workspace):
-    fields = {"visible_buffers", "people_mode", "selected_server", "native_navigation_mode"}
+    fields = {"visible_buffers", "people_mode", "selected_server", "native_navigation_mode",
+              "native_server_rail_visible"}
     return {key: value for key, value in workspace.items()
             if key in fields or key.startswith("last_buffer:")}
 
@@ -5843,11 +5869,11 @@ def probe_menu_reachability(proc, window, preferences, database_path, args, dest
                                                         'retained_root': root['popup']})
 
     def outside_settings_click(root, child, native_before):
-        point = shell_actions(read_layout(preferences))['settings']
+        point = shell_actions(read_layout(preferences))['application']
         for member in (root, child):
             x, y, width, height = member['rect']
             assert not (x <= point[0] < x + width and y <= point[1] < y + height), (
-                'Live Settings control is not outside this actual popup family', point, member)
+                'Application menu control is not outside this actual popup family', point, member)
         photograph(child, 'outside-settings-before', retain=True)
         marker = debug.stat().st_size
         move_pointer(window, *point)
@@ -5858,11 +5884,10 @@ def probe_menu_reachability(proc, window, preferences, database_path, args, dest
         SESSION.until('outside click actual pointer release delivered', lambda:
                       release.search(debug.read_bytes()[marker:].decode(errors='replace')) is not None)
         saved = persist('outside-settings-click-swallowed')
-        assert saved == compact, ('Outside click activated underlying live Settings control', compact, saved)
+        assert saved == compact, ('Outside click activated underlying application control', compact, saved)
         SESSION.until('outside click retains exact native editing context', lambda:
                       native_input_state(window) == native_before)
-        report['outside_click'] = {'point': point, 'live_control': 'Settings',
-                                   'liveness_evidence': 'real Settings opened/saved at zoom two before traversal',
+        report['outside_click'] = {'point': point, 'live_control': 'Application menu',
                                    'protocol_offset': marker, 'family': [root['popup'], child['popup']],
                                    'release_delivered': True, 'settings_unchanged': True,
                                    'native_input': native_input_state(window),
@@ -6154,48 +6179,25 @@ def probe_shell_interactions(proc, window, preferences, database_path, args, des
             assert proc.poll() is None
             time.sleep(.025)
         history = database.execute("SELECT * FROM messages WHERE presence=0 ORDER BY seq").fetchall()
-        rail_layout = read_layout(preferences)
-        x, y, width, height = rail_layout["rail"]["rect"]
-        extent, padding, gap = max(32, 36 * args.zoom), 6 * args.zoom, 6 * args.zoom
-        # Conditional rail-mark-all-read is immediately ABOVE Add, then Settings.
-        # Its locator follows allocation; durable read markers prove activation.
-        footer_top = max(padding, height - padding - 3 * extent - 2 * gap)
-        point = (x + width / 2, y + footer_top + extent / 2)
-        add_point = (point[0], point[1] + extent + gap)
-        assert point[1] < add_point[1]
-        assert database.execute(
-            "SELECT COUNT(*) FROM buffers WHERE kind<>'search' AND unread>0").fetchone()[0] > 0
-        move_pointer(window, 0, 0)
-        visible_rail = native_rgb_capture(window)
-        marker = GUI_DEBUG[window][1].stat().st_size
-        click(window, *point)
-        await_native_frame(window, marker,
-            re.compile(r"wl_pointer[@#]\d+\.button\(\d+,\s*\d+,\s*272,\s*0\)"))
+        actions = shell_actions(read_layout(preferences))
+        assert actions["unread"], actions
+        activate_shell_action(window, preferences, "mark_all_read")
         for buffer in (channel_id, other_channel_id):
             wait_read_marker(proc, database_path, buffer)
         wait_rows(proc, database_path, "SELECT COUNT(*) FROM buffers WHERE unread<>0", (), [(0,)])
         assert database.execute("SELECT * FROM messages WHERE presence=0 ORDER BY seq").fetchall() == history
-        # Retiring the conditional row refocuses Add. Restore the original
-        # Composer at its known end caret, without replacing its durable draft.
         cx, cy, cw, ch = native["caret"]
         click(window, cx + cw / 2, cy + ch / 2)
         framed_keys(window, "ctrl+End")
         move_pointer(window, 0, 0)
-        hidden_rail = native_rgb_capture(window)
-        left, top = round(x + padding), round(point[1] - extent / 2)
-        right, bottom = round(x + width - padding), round(point[1] + extent / 2)
-        def row_pixels(image):
-            return b"".join(image["pixels"][(row * image["width"] + left) * 3:
-                (row * image["width"] + right) * 3] for row in range(top, bottom))
-        assert row_pixels(visible_rail) != row_pixels(hidden_rail), "Read rail row did not retire"
+        assert not shell_actions(read_layout(preferences))["unread"]
         assert database.execute(
             "SELECT COUNT(*) FROM buffers WHERE kind<>'search' AND unread>0").fetchone() == (0,)
         retained()
-        report["global_read"] = {"trigger": point, "target": "rail-mark-all-read",
-                                "above_add": add_point, "unread_before": unread,
-                                "conditional_row_retired": True,
+        report["global_read"] = {"target": "shell-mark-all-read", "unread_before": unread,
+                                "conditional_action_retired": True,
                                 "covered_buffers": (channel_id, other_channel_id)}
-        report["captures"].append(str(capture_window(window, destination, "shell-rail-global-read")))
+        report["captures"].append(str(capture_window(window, destination, "shell-global-read")))
     finally:
         database.close()
     framed_keys(window, "ctrl+End")
@@ -7060,8 +7062,8 @@ def run(*, allow_focused_geometry=False):
                 layout = read_layout(preferences)
                 assert "settings" not in layout, layout
                 filter_sidebar(window, layout, args.zoom, "no-native-filter-match", 2)
-                move_pointer(window, *shell_actions(layout)["settings"])
-                capture_window(window, destination, "settings-icon-hover")
+                move_pointer(window, *shell_actions(layout)["application"])
+                capture_window(window, destination, "application-menu-hover")
                 open_settings(window, preferences, from_icon=True)
                 # Dialog metadata is live model state until a real user save;
                 # observing disk is not a promise of save-on-open/autosave timing.

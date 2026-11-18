@@ -110,6 +110,7 @@ const std::map<std::string, std::string> &defaultBindings() {
         {"settings", "C-,"},
         {"toggle-people", ""},
         {"toggle-navigation", ""},
+        {"toggle-networks", ""},
         {"send", "RET"},
         {"newline", "S-RET"},
         {"beginning-of-line", "C-a"},
@@ -167,6 +168,7 @@ std::string_view commandDisplayName(std::string_view command) {
         {"settings", "Settings"},
         {"toggle-people", "Toggle People"},
         {"toggle-navigation", "Toggle navigation"},
+        {"toggle-networks", "Toggle Networks"},
         {"mute-buffer", "Mute conversation"},
         {"unmute-buffer", "Unmute conversation"},
         {"archive-buffer", "Archive conversation"},
@@ -360,6 +362,8 @@ std::string_view paletteCommandIcon(std::string_view command) {
         return "scan";
     if (command == "toggle-navigation")
         return "compass";
+    if (command == "toggle-networks")
+        return "server";
     if (command == "toggle-people" || command.starts_with("presence:"))
         return "users";
     if (command == "search")
@@ -518,9 +522,9 @@ bool workspaceCommand(std::string_view name) {
     return name == "switch-buffer" || name == "execute-command" || name == "jump-channel" ||
            name == "conversation-back" || name == "conversation-forward" || name == "settings" ||
            name == "search" || name == "cancel" || name == "toggle-people" ||
-           name == "toggle-navigation" || name == "quit" || name == "connect" ||
-           name == "disconnect" || name == "load-history" || name == "clear-history" ||
-           name == "manage-networks" || name == "mark-all-read" ||
+           name == "toggle-navigation" || name == "toggle-networks" || name == "quit" ||
+           name == "connect" || name == "disconnect" || name == "load-history" ||
+           name == "clear-history" || name == "manage-networks" || name == "mark-all-read" ||
            name.starts_with("message-style:") || name == "message-prev" || name == "message-next" ||
            name == "message-reply" || name == "message-react" || name == "mute-buffer" ||
            name == "unmute-buffer" || name == "archive-buffer" || name == "unarchive-buffer" ||
@@ -909,7 +913,7 @@ class JumpOverlay final : public InputArea {
 class UiRoot final : public Node {
   public:
     std::function<bool()> afterChildrenLayout;
-    std::function<void()> beforeChildrenLayout;
+    std::function<void(Renderer &)> beforeChildrenLayout;
     bool inLayout = false;
 
   protected:
@@ -922,7 +926,7 @@ class UiRoot final : public Node {
             ~ResetLayout() { value = false; }
         } reset{inLayout};
         if (beforeChildrenLayout)
-            beforeChildrenLayout();
+            beforeChildrenLayout(renderer);
         Node::doLayout(renderer);
         if (afterChildrenLayout && afterChildrenLayout())
             Node::doLayout(renderer);
@@ -947,6 +951,9 @@ struct Ui::Impl {
     MaterialNode *backdrop = nullptr, *peopleMaterial = nullptr;
     AppLogo *logo = nullptr;
     InputArea *titleMove = nullptr;
+    InputArea *applicationMenu = nullptr;
+    IconButton *networksButton = nullptr, *mentionsButton = nullptr, *readAllButton = nullptr;
+    bool foldReadAll = false;
     Label *title = nullptr;
     Flex *titleRow = nullptr;
     ModeLine *modeLine = nullptr;
@@ -956,7 +963,7 @@ struct Ui::Impl {
     std::map<std::uint64_t, PaneView *> views;
     std::array<InputArea *, 8> resizeEdges{};
     std::array<IconButton *, 3> windowButtons{};
-    std::array<std::string, 2> windowBindings;
+    std::array<std::string, 4> windowBindings;
     std::optional<SidebarMode> navigationHintPreferred, navigationHintEffective;
     ServerRail *rail = nullptr;
     std::array<Box *, 2> navigationDividers{};
@@ -967,7 +974,7 @@ struct Ui::Impl {
     bool widthDragChanged = false;
     SidebarMode widthDragMode = SidebarMode::Expanded;
     AnimationManager::Id panelAnimation = 0;
-    std::array<float, 2> panelExtent{}, panelTarget{};
+    std::array<float, 3> panelExtent{}, panelTarget{};
     std::array<SidebarMode, 2> panelPresentation{SidebarMode::Hidden, SidebarMode::Hidden};
     bool panelGeometryReady = false, animatePanelToggle = false, snapPanelMotion = false;
     bool panelFramePending = false;
@@ -1141,11 +1148,25 @@ struct Ui::Impl {
             else
                 model.settings.bindings.try_emplace(name, binding);
         }
-        scene->beforeChildrenLayout = [this] {
+        scene->beforeChildrenLayout = [this](Renderer &renderer) {
             if (panelFramePending) {
                 panelFramePending = false;
                 refresh();
             }
+            const float naturalWidth =
+                renderer
+                    .measureText(title->text(), title->fontSize(), title->font(), 0, 1,
+                                 title->textAlign(), title->ellipsize(), false)
+                    .width;
+            const float right = networksButton->x() - 8 * scale;
+            const float titleWidth =
+                std::min(naturalWidth, std::max(0.f, right - titleRow->x() - 64 * scale));
+            title->setMaxWidth(titleWidth);
+            titleRow->setSize(titleWidth, titleRow->height());
+            applicationMenu->setSize(titleRow->x() + titleWidth - applicationMenu->x(),
+                                     applicationMenu->height());
+            titleMove->setPosition(titleRow->x() + titleWidth, 0);
+            titleMove->setSize(std::max(0.f, right - titleMove->x()), titleMove->height());
         };
         scene->afterChildrenLayout = [this] {
             inputGeometryPending = false;
@@ -1204,7 +1225,7 @@ struct Ui::Impl {
                     dispatcher->setFocus(nullptr);
             })));
         const std::array<std::pair<const char *, const char *>, 3> tools = {
-            {{"panel-left", "Toggle navigation"},
+            {{"panel-left", "Toggle Channels"},
              {"terminal", "Execute command"},
              {"x", "Close window"}}};
         constexpr std::array<const char *, 3> controlKeys = {"topbar-navigation", "topbar-command",
@@ -1227,6 +1248,42 @@ struct Ui::Impl {
                 button->setFocusOnPointerPress(false);
             windowButtons[i] = static_cast<IconButton *>(scene->addChild(std::move(button)));
         }
+        applicationMenu = static_cast<InputArea *>(scene->addChild(std::make_unique<InputArea>()));
+        applicationMenu->setTabFocusKey("topbar-application");
+        applicationMenu->setTooltip("BlastIRC application menu");
+        const auto openApplicationMenu = [this] {
+            std::vector<std::string> commands;
+            std::vector<ContextMenuEntry> entries;
+            entries.push_back(menuLeaf(commands, "Add network", "plus", "add-server"));
+            entries.push_back(menuLeaf(commands, commandLabel(model, "Settings", "settings"),
+                                       "settings", "settings"));
+            if (foldReadAll && hasUnread())
+                entries.push_back(
+                    menuLeaf(commands, "Mark all read", "check-check", "mark-all-read"));
+            menu(*applicationMenu, std::move(entries), std::move(commands), {});
+        };
+        applicationMenu->setFocusable(true);
+        applicationMenu->setOnClick(
+            [openApplicationMenu](const InputArea::PointerData &) { openApplicationMenu(); });
+        applicationMenu->setOnKeyDown([openApplicationMenu](const InputArea::KeyData &key) {
+            if (key.sym == XKB_KEY_Return || key.sym == XKB_KEY_KP_Enter ||
+                key.sym == XKB_KEY_space)
+                openApplicationMenu();
+        });
+        const auto topbarButton = [this](const char *icon, const char *hint, const char *key,
+                                         const char *command) {
+            auto button = std::make_unique<IconButton>(
+                icon, hint, [this, command] { pending.emplace_back(command); });
+            button->setTabFocusKey(key);
+            button->setFocusOnPointerPress(false);
+            return static_cast<IconButton *>(scene->addChild(std::move(button)));
+        };
+        networksButton =
+            topbarButton("server", "Toggle Networks", "topbar-networks", "toggle-networks");
+        mentionsButton = topbarButton("at-sign", "Mentions — all networks", "topbar-mentions",
+                                      "global-mentions");
+        readAllButton = topbarButton("check-check", "Mark all read — all buffers on every network",
+                                     "topbar-mark-all-read", "mark-all-read");
         peopleMaterial =
             static_cast<MaterialNode *>(scene->addChild(std::make_unique<MaterialNode>()));
         peopleMaterial->setHitTestVisible(false);
@@ -1386,7 +1443,12 @@ struct Ui::Impl {
     bool synchronizeKeyInput(std::uint32_t sym);
     bool synchronizePointerInput(float x, float y, bool targetInput, bool pendingReplay = true);
     void updateRegularPanelModes();
-    void updatePanelMotion(std::array<float, 2> target);
+    void updatePanelMotion(std::array<float, 3> target);
+    bool hasUnread() const {
+        return std::any_of(model.buffers.begin(), model.buffers.end(), [](const auto &entry) {
+            return entry.second.kind != "search" && !entry.second.muted && entry.second.unread > 0;
+        });
+    }
     bool motionEnabled() const {
         return model.settings.fx != FxLevel::Off && !model.settings.reducedMotion;
     }
@@ -1592,15 +1654,16 @@ struct Ui::Impl::PaneView final : Node {
         welcomeScroll->setViewportPaddingH(0);
         welcomeScroll->setViewportPaddingV(0);
         welcomeScroll->setReserveScrollbarGutter(true);
-        welcome = static_cast<Flex *>(welcomeScroll->content()->addChild(ui::column(
-            {.gap = 12},
-            ui::label({.out = &welcomeTitle,
-                       .text = "Welcome to BlastIRC",
-                       .fontSize = 22,
-                       .maxLines = 0}),
-            ui::label({.out = &welcomeBody,
-                       .text = "Add a network from the left rail, then choose a conversation.",
-                       .maxLines = 0}))));
+        welcome = static_cast<Flex *>(welcomeScroll->content()->addChild(
+            ui::column({.gap = 12},
+                       ui::label({.out = &welcomeTitle,
+                                  .text = "Welcome to BlastIRC",
+                                  .fontSize = 22,
+                                  .maxLines = 0}),
+                       ui::label({.out = &welcomeBody,
+                                  .text = "Add a network from the BlastIRC application menu, then "
+                                          "choose a conversation.",
+                                  .maxLines = 0}))));
         welcomeScroll->content()->setAlign(FlexAlign::Stretch);
         welcome->setFillWidth(true);
         motionHost = addChild(std::make_unique<Node>());
@@ -1747,7 +1810,7 @@ void Ui::Impl::shutdownMedia() {
     media->invalidate();
     media.reset();
 }
-void Ui::Impl::updatePanelMotion(std::array<float, 2> target) {
+void Ui::Impl::updatePanelMotion(std::array<float, 3> target) {
     auto *manager = scene->animationManager();
     const bool changed = target != panelTarget;
     const bool snap = !panelGeometryReady || snapPanelMotion || !motionEnabled() || !manager ||
@@ -1763,6 +1826,8 @@ void Ui::Impl::updatePanelMotion(std::array<float, 2> target) {
             panelPresentation = modes;
         } else {
             const auto from = panelExtent;
+            if (target[2] > 0 && from[2] == 0)
+                rail->setVisible(true);
             for (std::size_t i = 0; i < modes.size(); ++i)
                 if (modes[i] != SidebarMode::Hidden &&
                     (panelPresentation[i] != SidebarMode::Expanded || from[i] == 0))
@@ -1791,8 +1856,10 @@ void Ui::Impl::updatePanelMotion(std::array<float, 2> target) {
 void Ui::Impl::updateRegularPanelModes() {
     const float currentScale = ui_logic::userScale(model.settings.scale);
     const float outer = shellOuterPadding(width, height, currentScale);
-    const float rail = fittedRailWidth(workspace, width, outer, outer, currentScale);
-    const float remaining = std::max(1.f, width - 2 * outer - rail - outer);
+    const float rail = workspace.serverRailVisible
+                           ? fittedRailWidth(workspace, width, outer, outer, currentScale) + outer
+                           : 0.f;
+    const float remaining = std::max(1.f, width - 2 * outer - rail);
     const float minimum =
         std::max(360 * currentScale,
                  EditorStore::minimumComposerWidth(currentScale) + 2 * panePaddingX * currentScale);
@@ -3815,6 +3882,17 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         startJump();
         return;
     }
+    if (command == "toggle-networks") {
+        if (widthDrag)
+            retirePointerCapture();
+        workspace.serverRailVisible = !workspace.serverRailVisible;
+        if (!workspace.serverRailVisible)
+            retirePanel(*rail, networksButton, true);
+        animatePanelToggle = true;
+        updateRegularPanelModes();
+        queue(model, "save");
+        return;
+    }
     if (command == "toggle-navigation") {
         if (widthDrag)
             retirePointerCapture();
@@ -4005,20 +4083,26 @@ void Ui::Impl::refresh(bool panelResize) {
     const bool tight = height < 360 * scale;
     const float outer = shellOuterPadding(width, height, scale);
     const float boundary = outer;
-    const float railWidth = fittedRailWidth(workspace, width, outer, boundary, scale);
-    const auto avatarBox = serverAvatarBox(railWidth, scale);
+    const float preferredRailWidth = fittedRailWidth(workspace, width, outer, boundary, scale);
+    const auto avatarBox = serverAvatarBox(76.f * scale, scale);
     const float logoExtent = avatarBox.width;
     const float extent = std::max(32.f, (compact ? 32.f : 34.f) * scale);
     const float gap = 8 * scale;
     const float titlePadding = (tight ? 5.f : compact ? 8.f : 10.f) * scale;
     const float titleHeight = std::max(extent, logoExtent) + 2 * titlePadding;
-    const float controls = windowButtons.size() * extent + (windowButtons.size() - 1) * gap;
+    foldReadAll = width < 760 * scale;
+    const bool showReadAll = !foldReadAll && hasUnread();
+    const std::size_t controlCount = windowButtons.size() + 2 + (showReadAll ? 1 : 0);
+    const float controls = controlCount * extent + (controlCount - 1) * gap;
     const float controlsLeft = width - outer - controls;
     const float logoLeft = outer + avatarBox.x;
     const float titleLeft = logoLeft + logoExtent + gap;
-    const float titleWidth = std::max(0.f, controlsLeft - gap - titleLeft);
+    const float titleWidth = std::max(0.f, controlsLeft - gap - titleLeft - 64 * scale);
     place(*logo, logoLeft, (titleHeight - logoExtent) / 2, logoExtent, logoExtent);
-    place(*titleMove, titleLeft, (titleHeight - extent) / 2, titleWidth, extent);
+    place(*applicationMenu, outer, (titleHeight - extent) / 2, titleLeft + titleWidth - outer,
+          extent);
+    place(*titleMove, titleLeft + titleWidth, 0,
+          std::max(0.f, controlsLeft - gap - titleLeft - titleWidth), titleHeight);
     // The rounded body spans approximately y=340..1074 in the 1254px master; exclude collar,
     // fuse, spark and tail.
     constexpr float logoBodyCenter = 707.f / 1254.f;
@@ -4029,18 +4113,46 @@ void Ui::Impl::refresh(bool panelResize) {
     title->setFontSize(16 * scale);
     if (title->font().features != themeUiFont().features)
         title->setFontFeatures(themeUiFont().features);
-    title->setColor(themeForegroundColor("primary"));
+    title->setColor(themeForegroundColor(
+        applicationMenu->focused() || applicationMenu->hovered() ? "secondary" : "primary"));
     int unread = 0;
     for (const auto &[id, b] : model.buffers)
         if (!b.muted)
             unread += b.unread;
     if (savedUnread != unread) {
-        title->setText("BlastIRC" + (unread ? " · " + std::to_string(unread) + " unread" : ""));
+        title->setText("BlastIRC ▾" + (unread ? " · " + std::to_string(unread) + " unread" : ""));
         savedUnread = unread;
     }
-    for (std::size_t i = 0; i < windowButtons.size(); ++i) {
-        place(*windowButtons[i], controlsLeft + i * (extent + gap), (titleHeight - extent) / 2,
+    const auto updateTopbarHint = [this](IconButton &button, std::size_t index, const char *label,
+                                         const char *command) {
+        const auto binding = model.settings.bindings.find(command);
+        const std::string_view value =
+            binding == model.settings.bindings.end() ? std::string_view{} : binding->second;
+        if (windowBindings[index] != value) {
+            windowBindings[index] = value;
+            button.hint(commandLabel(model, label, command));
+        }
+    };
+    updateTopbarHint(*networksButton, 2, "Toggle Networks", "toggle-networks");
+    networksButton->selected(workspace.serverRailVisible);
+    updateTopbarHint(*mentionsButton, 3, "Mentions — all networks", "global-mentions");
+    mentionsButton->selected(model.activeBuffer == GlobalMentionsBufferId);
+    if (!showReadAll && readAllButton->visible())
+        retirePanel(*readAllButton, applicationMenu, true);
+    readAllButton->setVisible(showReadAll);
+    readAllButton->setEnabled(showReadAll);
+    readAllButton->setExcludeSubtreeFromTabOrder(!showReadAll);
+    std::size_t controlIndex = 0;
+    for (auto *button : {networksButton, mentionsButton, readAllButton}) {
+        if (button == readAllButton && !showReadAll)
+            continue;
+        place(*button, controlsLeft + controlIndex++ * (extent + gap), (titleHeight - extent) / 2,
               extent, extent);
+        button->sync(scale, motionEnabled());
+    }
+    for (std::size_t i = 0; i < windowButtons.size(); ++i) {
+        place(*windowButtons[i], controlsLeft + (controlIndex + i) * (extent + gap),
+              (titleHeight - extent) / 2, extent, extent);
         if (i != 0)
             windowButtons[i]->sync(scale, motionEnabled());
     }
@@ -4100,7 +4212,8 @@ void Ui::Impl::refresh(bool panelResize) {
     const float expandedPeopleWidth = peopleExpandedExtent * scale;
     const float chatMinimum =
         std::max(360 * scale, EditorStore::minimumComposerWidth(scale) + 2 * panePaddingX * scale);
-    const float remaining = std::max(1.f, width - 2 * outer - railWidth - boundary);
+    const float targetRail = workspace.serverRailVisible ? preferredRailWidth + boundary : 0.f;
+    const float remaining = std::max(1.f, width - 2 * outer - targetRail);
     const auto regularModes =
         fitSidebarModes(navigationRegularMode, peopleRegularMode, remaining, boundary, scale,
                         chatMinimum, expandedWidth, compactNavigationWidth);
@@ -4125,9 +4238,12 @@ void Ui::Impl::refresh(bool panelResize) {
         panelWidth(navigationMode, expandedWidth, compactNavigationWidth);
     const float targetPeople = panelWidth(peopleMode, expandedPeopleWidth, compactWidth);
     updatePanelMotion({targetNavigation + (navigationMode != SidebarMode::Hidden ? boundary : 0.f),
-                       targetPeople + (peopleMode != SidebarMode::Hidden ? boundary : 0.f)});
+                       targetPeople + (peopleMode != SidebarMode::Hidden ? boundary : 0.f),
+                       targetRail});
     const float navigationGap = std::min(boundary, panelExtent[0]);
     const float peopleGap = std::min(boundary, panelExtent[1]);
+    const float railGap = std::min(boundary, panelExtent[2]);
+    const float railWidth = panelExtent[2] - railGap;
     const float navigationWidth = panelExtent[0] - navigationGap;
     const float peopleWidth = panelExtent[1] - peopleGap;
     if (panelResize && (rail->width() != railWidth || sidebar->width() != navigationWidth)) {
@@ -4156,8 +4272,12 @@ void Ui::Impl::refresh(bool panelResize) {
     };
     const WorkspaceRect railRect{outer, contentTop, railWidth, contentHeight};
     place(*rail, railRect);
-    rail->sync(selectedServer, railRect.width, railRect.height, scale);
-    float left = outer + railWidth + boundary;
+    if (railWidth > 0)
+        rail->sync(selectedServer, railRect.width, railRect.height, scale);
+    rail->setVisible(panelExtent[2] > 0);
+    rail->setHitTestVisible(workspace.serverRailVisible);
+    rail->setExcludeSubtreeFromTabOrder(!workspace.serverRailVisible);
+    float left = outer + panelExtent[2];
     const WorkspaceRect navigationRect{left, contentTop, navigationWidth, contentHeight};
     place(*sidebar, navigationRect);
     sidebar->sync(selectedServer, lastBuffer, navigationRect.width, navigationRect.height, scale,
@@ -4166,8 +4286,9 @@ void Ui::Impl::refresh(bool panelResize) {
     sidebar->setHitTestVisible(navigationMode != SidebarMode::Hidden);
     sidebar->setExcludeSubtreeFromTabOrder(navigationMode == SidebarMode::Hidden);
     const auto dividerColor = withAlpha(themeColor("outline_variant"), .18f * themeSurfaceAlpha());
-    const float dividerX = outer + railWidth + (boundary - 1.f) / 2;
+    const float dividerX = outer + railWidth + (railGap - 1.f) / 2;
     place(*navigationDividers[0], dividerX, contentTop, 1.f, contentHeight);
+    navigationDividers[0]->setVisible(panelExtent[2] > 0);
     place(*navigationDividers[1], left + navigationWidth + (navigationGap - 1.f) / 2, contentTop,
           1.f, contentHeight);
     navigationDividers[1]->setVisible(panelExtent[0] > 0);
@@ -4178,7 +4299,12 @@ void Ui::Impl::refresh(bool panelResize) {
     place(*widthHandles[0], dividerX - handleWidth / 2, contentTop, handleWidth, contentHeight);
     place(*widthHandles[1], left + navigationWidth + navigationGap / 2 - handleWidth / 2,
           contentTop, handleWidth, contentHeight);
-    widthHandles[0]->setVisible(!jumpOpen && !paletteOpen && !dialogs->active());
+    const bool railHandleVisible =
+        workspace.serverRailVisible && !jumpOpen && !paletteOpen && !dialogs->active();
+    if (!railHandleVisible && widthHandles[0]->visible())
+        retirePanel(*widthHandles[0], networksButton, true);
+    widthHandles[0]->setVisible(railHandleVisible);
+    widthHandles[0]->setExcludeSubtreeFromTabOrder(!railHandleVisible);
     widthHandles[1]->setVisible(navigationMode != SidebarMode::Hidden && !jumpOpen &&
                                 !paletteOpen && !dialogs->active());
     left += panelExtent[0];

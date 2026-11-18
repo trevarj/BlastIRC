@@ -5251,7 +5251,7 @@ void messageLinkEnter(TranscriptTestRenderer &renderer) {
     const auto record = launchDirectory.path / "xdg-open.url";
     auto *script = std::fopen(executable.c_str(), "w");
     assert(script);
-    assert(std::fputs("#!/bin/sh\nprintf '%s' \"$1\" > \"$0.url\"\n", script) >= 0);
+    assert(std::fputs("#!" BLASTIRC_TEST_SHELL "\nprintf '%s' \"$1\" > \"$0.url\"\n", script) >= 0);
     assert(std::fclose(script) == 0);
     std::filesystem::permissions(executable, std::filesystem::perms::owner_all);
     const auto oldPath =
@@ -9859,7 +9859,6 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
     assert(chips.empty());
     for (auto *area : {alice, brackets})
         assert(area->focusable() && area->hitTestVisible());
-    assert(aliceText->fontWeight() == FontWeight::Bold);
     renderer.paintedGlyphInk(*aliceText);
     const float nicknameLuminance = relativeLuminance(renderer.lastGlyphTint());
     const float bubbleLuminance =
@@ -9957,8 +9956,6 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
             for (const auto &fragment : child->children())
                 if (auto *text = dynamic_cast<TextNode *>(fragment.get());
                     text && decodedMarkup(text->text()).find(nick) != std::string::npos) {
-                    assert(text->fontWeight() ==
-                           (annotated ? FontWeight::Bold : blast::themeMessageFont().weight));
                     if (annotated)
                         assert(decodedMarkup(text->text()) == nick);
                     renderer.paintedGlyphInk(*text);
@@ -10023,6 +10020,30 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
         }
     }
     assert(adjusted && preserved);
+    buffer.messages.front().text = "Alice \x02[nICK]\x02 plain";
+    for (const auto layout :
+         {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc, blast::MessageLayout::Stacked})
+        for (const int weight : {300, 400, 600}) {
+            model.settings.messageLayouts[buffer.id] = layout;
+            model.settings.messageFontWeight = weight;
+            theme.update(model);
+            arrange();
+            const auto current = body(view, "Alice [nICK] plain", true);
+            bool regularMention = false, boldMention = false, surrounding = false;
+            for (const auto &area : current.body.children())
+                for (const auto &child : area->children())
+                    if (const auto *text = dynamic_cast<TextNode *>(child.get())) {
+                        const auto plain = decodedMarkup(text->text());
+                        const bool bold = plain == "[nICK]";
+                        assert(text->fontWeight() ==
+                               (bold ? FontWeight::Bold : static_cast<FontWeight>(weight)));
+                        assert((text->text().find("weight=\"bold\"") != std::string::npos) == bold);
+                        regularMention |= plain == "Alice";
+                        boldMention |= bold;
+                        surrounding |= plain.find("plain") != std::string::npos;
+                    }
+            assert(regularMention && boldMention && surrounding);
+        }
 }
 
 void smartPresenceRedactionInvalidation(TranscriptTestRenderer &renderer) {

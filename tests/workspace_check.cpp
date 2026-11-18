@@ -188,6 +188,49 @@ void navigationPreference() {
         assert(bindings(reloaded) == bindings(w) && reloaded.focused == room);
     }
 }
+void serverRailPreference() {
+    for (const auto *token : {"missing", "false", "true", "", "other"}) {
+        auto m = model();
+        if (std::string_view(token) != "missing")
+            m.settings.workspace["native_server_rail_visible"] = token;
+        Workspace w(m);
+        const bool expected = std::string_view(token) != "false";
+        assert(w.serverRailVisible == expected);
+        assert(m.settings.workspace.at("native_server_rail_visible") ==
+               (expected ? "true" : "false"));
+        assert(!w.serverRailWidth());
+        Workspace reloaded(m);
+        assert(reloaded.serverRailVisible == expected && !reloaded.serverRailWidth());
+    }
+
+    auto m = model();
+    Workspace w(m);
+    w.setServerRailWidth(93.25f);
+    w.setChannelSidebarWidth(287.125f);
+    w.setCompactChannelSidebarWidth(72.125f);
+    for (const auto mode : {SidebarMode::Hidden, SidebarMode::Compact, SidebarMode::Expanded}) {
+        w.navigationMode = mode;
+        for (const bool visible : {false, true}) {
+            w.serverRailVisible = visible;
+            w.reconcile();
+            w.persist();
+            assert(w.serverRailVisible == visible && w.navigationMode == mode);
+            assert(w.serverRailWidth() == 93.25f);
+            assert(w.channelSidebarWidth() == 287.125f);
+            assert(w.compactChannelSidebarWidth() == 72.125f);
+            assert(m.settings.workspace.at("native_server_rail_visible") ==
+                   (visible ? "true" : "false"));
+            auto restarted = model();
+            restarted.settings.workspace = m.settings.workspace;
+            Workspace reloaded(restarted);
+            assert(reloaded.serverRailVisible == visible && reloaded.navigationMode == mode);
+            assert(reloaded.serverRailWidth() == 93.25f);
+            assert(reloaded.channelSidebarWidth() == 287.125f);
+            assert(reloaded.compactChannelSidebarWidth() == 72.125f);
+            assert(restarted.settings.workspace == m.settings.workspace);
+        }
+    }
+}
 void sidebarWidths() {
     auto m = model();
     Workspace w(m);
@@ -876,6 +919,7 @@ int main() {
     retainedSelectionCache();
     persistenceAndReload();
     navigationPreference();
+    serverRailPreference();
     sidebarWidths();
     invalidSidebarWidths();
     numericBindingIdentityAndAllocation();

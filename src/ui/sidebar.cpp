@@ -897,52 +897,21 @@ struct ServerRail::Impl {
     ServerRail &owner;
     Model &model;
     std::function<void(std::string)> execute;
-    std::function<void(Node &, InputArea *)> retire;
     Popup popup;
     ScrollView *scroll = nullptr;
     Node *canvas = nullptr;
-    Row *mentions = nullptr, *readAll = nullptr, *add = nullptr, *settings = nullptr;
     std::map<std::string, Entry> servers;
     std::vector<std::string> order;
     std::uint64_t epoch = 0;
     float zoom = 1;
-    std::string settingsBinding;
 
-    Impl(ServerRail &node, Model &value, std::function<void(std::string)> command,
-         std::function<void(Node &, InputArea *)> retireInput)
-        : owner(node), model(value), execute(std::move(command)), retire(std::move(retireInput)),
-          popup(node) {
+    Impl(ServerRail &node, Model &value, std::function<void(std::string)> command)
+        : owner(node), model(value), execute(std::move(command)), popup(node) {
         scroll = child<ScrollView>(owner);
         scroll->setViewportPaddingH(0);
         scroll->setViewportPaddingV(0);
         canvas = child<Node>(*scroll->content());
-        mentions = child<Row>(owner, "at-sign");
-        mentions->setTabFocusKey("rail-global-mentions");
-        mentions->tooltip(commandLabel(model, "Mentions — all networks", "global-mentions"));
-        mentions->activate = [this](Row &) { execute("global-mentions"); };
-        readAll = child<Row>(owner, "check-check");
-        readAll->setTabFocusKey("rail-mark-all-read");
-        readAll->tooltip("Mark all read — all buffers on every network");
-        readAll->activate = [this](Row &row) {
-            if (row.visible() && hasUnread())
-                execute("mark-all-read");
-        };
-        add = child<Row>(owner, "plus");
-        add->setTabFocusKey("rail-add-server");
-        add->tooltip("Add network");
-        add->activate = [this](Row &) { execute("add-server"); };
-        settings = child<Row>(owner, "settings");
-        settings->setTabFocusKey("rail-settings");
-        settings->tooltip(commandLabel(model, "Settings", "settings"));
-        settings->activate = [this](Row &) { execute("settings"); };
     }
-
-    bool hasUnread() const {
-        return std::any_of(model.buffers.begin(), model.buffers.end(), [](const auto &entry) {
-            return entry.second.kind != "search" && !entry.second.muted && entry.second.unread > 0;
-        });
-    }
-
     Entry &entry(const std::string &name) {
         auto [it, inserted] = servers.try_emplace(name);
         auto &result = it->second;
@@ -975,7 +944,6 @@ struct ServerRail::Impl {
         const std::string_view activeServer = activeBuffer == model.buffers.end()
                                                   ? std::string_view{}
                                                   : std::string_view(activeBuffer->second.server);
-        const auto binding = model.settings.bindings.find("settings");
         for (auto &[name, item] : servers) {
             item.unread = 0;
             item.mentioned = false;
@@ -993,26 +961,10 @@ struct ServerRail::Impl {
                 item->second.mentioned |= ui_logic::hasUnreadMention(model, buffer);
             }
         }
-        const std::string_view current =
-            binding == model.settings.bindings.end() ? std::string_view{} : binding->second;
-        if (settingsBinding != current) {
-            settingsBinding = current;
-            settings->tooltip(commandLabel(model, "Settings", "settings"));
-        }
         const float padding = railPadding * scale, gap = 6 * scale;
-        const float footerExtent = std::max(32.f, 36 * scale);
-        const bool showReadAll = hasUnread();
-        if (!showReadAll && readAll->visible())
-            retire(*readAll, add);
-        readAll->setVisible(showReadAll);
-        readAll->setEnabled(showReadAll);
-        readAll->setExcludeSubtreeFromTabOrder(!showReadAll);
-        const float footerRows = showReadAll ? 4.f : 3.f;
-        const float footerY = std::max(padding, height - padding - footerRows * footerExtent -
-                                                    (footerRows - 1) * gap);
         const float inner = std::max(0.f, width - 2 * padding);
         scroll->setPosition(padding, padding);
-        scroll->setSize(inner, std::max(0.f, footerY - 2 * padding));
+        scroll->setSize(inner, std::max(0.f, height - 2 * padding));
         scroll->setContentScale(scale);
         const float itemHeight = inner + avatarRowExtra * scale;
         float y = 0;
@@ -1142,21 +1094,12 @@ struct ServerRail::Impl {
                 item.capsule->setVisible(false);
         std::erase_if(order, [this](const std::string &name) { return !servers.contains(name); });
         canvas->setSize(inner, y);
-        float footerTop = footerY;
-        for (auto *row : {mentions, readAll, add, settings}) {
-            if (!row->visible())
-                continue;
-            row->style(scale, row == mentions && model.activeBuffer == GlobalMentionsBufferId);
-            row->setPosition(padding, footerTop);
-            row->setSize(inner, footerExtent);
-            footerTop += footerExtent + gap;
-        }
     }
 };
 
 ServerRail::ServerRail(Model &model, std::function<void(std::string)> execute,
-                       std::function<void(Node &, InputArea *)> retire)
-    : impl_(std::make_unique<Impl>(*this, model, std::move(execute), std::move(retire))) {
+                       std::function<void(Node &, InputArea *)>)
+    : impl_(std::make_unique<Impl>(*this, model, std::move(execute))) {
     setClipChildren(true);
 }
 ServerRail::~ServerRail() = default;
@@ -1995,12 +1938,12 @@ struct Sidebar::Impl {
                                      : filter == ui_logic::SidebarFilter::Dms  ? "DMs"
                                                                                : "All";
             empty->setText(
-                noNetworks ? "Your conversations live here. Add a network from the + button "
-                             "in the server rail."
+                noNetworks ? "Your conversations live here. Add a network from the "
+                             "BlastIRC application menu."
                 : !hasSelected
                     ? (pinnedCurrent ? "No other conversations are shown for this network "
-                                       "selection. Choose a network from the server rail."
-                                     : "Select a network from the server rail.")
+                                       "selection. Show Networks to choose a network."
+                                     : "Show Networks to select a network.")
                     : std::string(pinnedCurrent ? "No other conversations match "
                                                 : "No conversations match ") +
                           filterName + (search->value().empty() ? "." : " and this search."));

@@ -254,7 +254,9 @@ if get_option('tests')
     include_directories: src_inc,
     dependencies: native_ui_deps,
     link_whole: native_ui_core,
-    cpp_args: check_args + app_cpp_args)
+    cpp_args: check_args + app_cpp_args + [
+      '-DBLASTIRC_TEST_SHELL="' + find_program('sh').full_path() + '"',
+    ])
   test('native_rename_check', native_ui_check, args: ['rename'])
   test('native_composer_check', native_ui_check, args: ['composer'])
   test('native_settings_check', native_ui_check, args: ['settings'])

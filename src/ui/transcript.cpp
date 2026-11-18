@@ -455,23 +455,19 @@ RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, flo
                         }
                     }
                 auto style = run.style;
-                auto pieceFont = font;
-                if (!nick.empty()) {
-                    if (!style.reverse && style.foregroundSource.kind == IrcColor::Kind::Foreground)
-                        style.foreground = nickTextColor(model, nick, buffer.server,
-                                                         style.background.value_or(background));
-                    style.bold = true;
-                    pieceFont.weight = FontWeight::Bold;
-                }
+                if (!nick.empty() && !style.reverse &&
+                    style.foregroundSource.kind == IrcColor::Kind::Foreground)
+                    style.foreground = nickTextColor(model, nick, buffer.server,
+                                                     style.background.value_or(background));
                 auto text = markup(std::string_view(document.text).substr(at, next - at), style,
                                    link != nullptr);
-                const auto metrics = renderer.measureText(
-                    text, size, pieceFont, 0, 1, TextAlign::Start, TextEllipsize::End, true);
+                const auto metrics = renderer.measureText(text, size, font, 0, 1, TextAlign::Start,
+                                                          TextEllipsize::End, true);
                 const float cellWidth = metrics.width;
                 if (emit)
                     result.fragments.push_back({std::move(text),
                                                 link ? link->url : std::string{},
-                                                pieceFont,
+                                                font,
                                                 style.foreground,
                                                 x,
                                                 y,

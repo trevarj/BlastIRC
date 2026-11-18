@@ -616,6 +616,33 @@ void shellMotionCheck() {
     ui.execute("toggle-navigation");
     advance(800);
     assert(sidebar->width() == expanded);
+    ServerRail *serverRail = nullptr;
+    for (const auto &child : ui.root().children())
+        if (auto *panel = dynamic_cast<ServerRail *>(child.get()))
+            serverRail = panel;
+    assert(serverRail);
+    const float fullRailWidth = serverRail->width();
+    const auto navigationPreference = model.settings.workspace.at("native_navigation_mode");
+    ui.execute("toggle-networks");
+    assert(serverRail->width() == fullRailWidth && visible(*serverRail));
+    assert(!serverRail->hitTestVisible() && serverRail->excludeSubtreeFromTabOrder());
+    assert(dispatcher.firstTabFocusUnder(serverRail) == nullptr);
+    advance(60);
+    assert(serverRail->width() > 0 && serverRail->width() < fullRailWidth);
+    const auto halfwayRailWidth = serverRail->width();
+    ui.execute("toggle-networks");
+    assert(serverRail->width() == halfwayRailWidth && serverRail->hitTestVisible());
+    advance(800);
+    assert(serverRail->width() == fullRailWidth);
+    ui.execute("toggle-networks");
+    advance(60);
+    model.settings.reducedMotion = true;
+    frame();
+    assert(!visible(*serverRail) && serverRail->width() == 0);
+    ui.execute("toggle-networks");
+    assert(visible(*serverRail) && serverRail->width() == fullRailWidth);
+    assert(model.settings.workspace.at("native_navigation_mode") == navigationPreference);
+    model.settings.reducedMotion = false;
     dispatcher.setFocus(composer->inputArea());
     ui.execute("execute-command");
     Node *palettePanel = dispatcher.focusedArea();
@@ -1327,41 +1354,6 @@ void nativePanelResizeCheck() {
             ui.root().layout(renderer);
         };
         frame();
-        auto *logo = visibleNode<Image>(ui.root());
-        assert(logo && logo->hasImage());
-        const int logoSourceWidth = logo->sourceWidth();
-        const int logoSourceHeight = logo->sourceHeight();
-        assert(logoSourceWidth > 320 && logoSourceHeight > 320);
-        const auto logoGeometry = [&] {
-            const auto width = model.settings.workspace.find("server_rail_width");
-            const float railWidth =
-                (width == model.settings.workspace.end() ? 76.f : std::stof(width->second)) * scale;
-            const auto box = serverAvatarBox(railWidth, scale);
-            auto *server = areaWithKey(ui.root(), "server:test");
-            assert(server && visible(*server) && visible(*logo));
-            RectNode *avatar = nullptr;
-            for (const auto &child : server->children())
-                if (auto *rect = dynamic_cast<RectNode *>(child.get());
-                    rect && visible(*rect) && std::abs(rect->width() - box.width) < .1f &&
-                    std::abs(rect->height() - box.height) < .1f)
-                    avatar = rect;
-            assert(avatar);
-            assert(std::abs(logo->width() - box.width) < .1f &&
-                   std::abs(logo->height() - box.height) < .1f);
-            float logoX, logoY, avatarX, avatarY;
-            Node::mapToScene(logo, logo->width() * .5f, logo->height() * .5f, logoX, logoY);
-            Node::mapToScene(avatar, avatar->width() * .5f, avatar->height() * .5f, avatarX,
-                             avatarY);
-            assert(std::abs(logoX - avatarX) < .1f);
-            assert(logo->sourceWidth() == logoSourceWidth &&
-                   logo->sourceHeight() == logoSourceHeight);
-            // Relayout of the real image must reuse the original decode/upload.
-            const auto uploads = renderer.uploadCount();
-            logo->parent()->markLayoutDirty();
-            logo->parent()->layout(renderer);
-            assert(renderer.uploadCount() == uploads);
-        };
-        logoGeometry();
         auto *composer = inputWithText(ui.root(), edgeDrafts[0]);
         assert(composer && visible(*composer));
         auto state = composer->editingState();
@@ -1390,8 +1382,6 @@ void nativePanelResizeCheck() {
             dispatcher.pointerMotion(end[0], end[1], 1000);
             frame();
             assert(dispatcher.pointerCaptured());
-            if (key == "server-rail-resize")
-                logoGeometry();
             pointerButton(dispatcher, end, BTN_LEFT, false);
             assert(!dispatcher.pointerCaptured());
             frame();
@@ -1408,7 +1398,6 @@ void nativePanelResizeCheck() {
         assert(std::abs(pointerPoint(*rail)[0] - liveStart[0]) < .1f);
         frame();
         assert(std::abs(pointerPoint(*rail)[0] - liveStart[0] - 20 * scale) < .1f);
-        logoGeometry();
         assert(dispatcher.pointerCaptured());
         dispatcher.cancelPointerCapture();
         frame();
@@ -1499,6 +1488,67 @@ void nativePanelResizeCheck() {
         frame();
         assert(std::abs(pointerPoint(*rail)[0] - savedRail[0]) < .1f);
         assert(std::abs(pointerPoint(*channels)[0] - savedChannels[0]) < .1f);
+        auto *serverRow = areaWithKey(ui.root(), "server:test");
+        auto *networkToggle = areaWithKey(ui.root(), "topbar-networks");
+        assert(serverRow && networkToggle);
+        Node *ancestor = serverRow;
+        while (ancestor && !dynamic_cast<ServerRail *>(ancestor))
+            ancestor = ancestor->parent();
+        auto *serverRail = dynamic_cast<ServerRail *>(ancestor);
+        assert(serverRail);
+        assert(!areaWithKey(*serverRail, "rail-add-server") &&
+               !areaWithKey(*serverRail, "rail-settings") &&
+               !areaWithKey(*serverRail, "rail-mark-all-read"));
+        const float reclaimedRailExtent = serverRail->width() + serverRail->x();
+        const auto visibleComposerWidth = composer->width();
+        const auto visibleSidebarX = pointerPoint(*channels)[0];
+        const auto hiddenState = [&] {
+            assert(!visible(*serverRail) && serverRail->width() == 0);
+            assert(!visible(*serverRow) && !visible(*rail));
+            assert(dispatcher.firstTabFocusUnder(serverRail) == nullptr &&
+                   dispatcher.firstTabFocusUnder(rail) == nullptr);
+            assert(std::stof(model.settings.workspace.at("server_rail_width")) == 100);
+            assert(model.settings.workspace.at("native_server_rail_visible") == "false");
+            unchanged();
+        };
+        for (const bool touch : {false, true}) {
+            const auto point = pointerPoint(*serverRow);
+            dispatcher.setFocus(serverRow);
+            ui.beginPointerInteraction(point[0], point[1]);
+            assert(!ui.handlePointerButton(BTN_LEFT, true, point[0], point[1], touch));
+            dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 301, 3010, touch);
+            ui.execute("toggle-networks");
+            frame();
+            hiddenState();
+            assert(!dispatcher.pointerCaptured() && dispatcher.focusedArea() != serverRow);
+            assert(std::abs(composer->width() - visibleComposerWidth - reclaimedRailExtent) < .1f);
+            assert(std::abs(pointerPoint(*channels)[0] - visibleSidebarX + reclaimedRailExtent) <
+                   .1f);
+            ui.execute("toggle-networks");
+            frame();
+            assert(visible(*serverRow) && visible(*rail));
+            assert(ui.handlePointerButton(BTN_LEFT, false, point[0], point[1], touch));
+            frame();
+            unchanged();
+            assert(std::abs(composer->width() - visibleComposerWidth) < .1f);
+        }
+        click(dispatcher, *networkToggle);
+        frame();
+        hiddenState();
+        click(dispatcher, *networkToggle);
+        frame();
+        unchanged();
+        const auto dragPoint = pointerPoint(*rail);
+        pointerButton(dispatcher, dragPoint, BTN_LEFT, true);
+        dispatcher.pointerMotion(dragPoint[0] + 32 * scale, dragPoint[1], 1004);
+        ui.execute("toggle-networks");
+        frame();
+        hiddenState();
+        assert(!dispatcher.pointerCaptured());
+        pointerButton(dispatcher, dragPoint, BTN_LEFT, false);
+        ui.execute("toggle-networks");
+        frame();
+        dispatcher.setFocus(composer->inputArea());
         expectedNavigation = "compact";
         ui.execute("toggle-navigation");
         frame();
@@ -1530,6 +1580,16 @@ void nativePanelResizeCheck() {
         unchanged();
         assert(visible(*channels));
         assert(std::abs(pointerPoint(*channels)[0] - savedChannels[0]) < .1f);
+        ui.execute("toggle-networks");
+        frame();
+        hiddenState();
+        for (const auto mode : {"compact", "hidden", "expanded"}) {
+            expectedNavigation = mode;
+            ui.execute("toggle-navigation");
+            frame();
+            hiddenState();
+            assert(visible(*channels) == (expectedNavigation != "hidden"));
+        }
         ui.flush();
         storage.save(model);
         dispatcher.setFocus(nullptr);
@@ -1550,8 +1610,15 @@ void nativePanelResizeCheck() {
         restarted.root().layout(renderer);
         auto *restoredRail = areaWithKey(restarted.root(), "server-rail-resize");
         auto *restoredChannels = areaWithKey(restarted.root(), "channel-sidebar-resize");
-        assert(restoredRail && restoredChannels && visible(*restoredRail) &&
+        assert(restoredRail && restoredChannels && !visible(*restoredRail) &&
                visible(*restoredChannels));
+        assert(restored.settings.workspace.at("native_server_rail_visible") == "false");
+        assert(std::abs(pointerPoint(*restoredChannels)[0] - savedChannels[0] +
+                        reclaimedRailExtent) < .1f);
+        restarted.execute("toggle-networks");
+        restarted.update(2400, 1200, 1);
+        restarted.root().layout(renderer);
+        assert(visible(*restoredRail));
         assert(std::abs(pointerPoint(*restoredRail)[0] - savedRail[0]) < .1f);
         assert(std::abs(pointerPoint(*restoredChannels)[0] - savedChannels[0]) < .1f);
         assert(inputWithText(restarted.root(), edgeDrafts[0]));
@@ -1623,6 +1690,8 @@ void sidebarConversationFilterCheck() {
     dispatcher.setSceneRoot(&ui.root());
     ui.setInputDispatcher(dispatcher);
     ui.setWindowActive(true);
+    MenuHost menu;
+    ui.root().setPopupContext(&menu);
     const auto frame = [&] {
         ui.update(1600, 1000, 1);
         ui.root().layout(renderer);
@@ -1702,19 +1771,27 @@ void sidebarConversationFilterCheck() {
         if (auto *candidate = dynamic_cast<Dialogs *>(child.get()))
             dialogs = candidate;
     assert(dialogs);
-    auto *settings = areaWithKey(ui.root(), "rail-settings");
-    assert(settings && visible(*settings));
-    activate(*settings);
+    auto *application = areaWithKey(ui.root(), "topbar-application");
+    assert(application && visible(*application));
+    activate(*application);
+    assert(menu.open);
+    const auto settingsEntry = std::find_if(
+        menu.request.menu.begin(), menu.request.menu.end(),
+        [](const ContextMenuEntry &entry) { return entry.label.starts_with("Settings"); });
+    assert(settingsEntry != menu.request.menu.end());
+    menu.select(settingsEntry->label);
+    frame();
     assert(dialogs->settingsOpen() && visible(*dialogs));
     unchangedSelection();
     ui.execute("settings");
     frame();
     assert(!dialogs->active() && !visible(*dialogs));
     unchangedSelection();
-    auto *addNetwork = areaWithKey(ui.root(), "rail-add-server");
-    assert(addNetwork && visible(*addNetwork));
+    activate(*application);
+    assert(menu.open);
     const auto profilesBefore = model.servers.size();
-    activate(*addNetwork);
+    menu.select("Add network");
+    frame();
     assert(dialogs->active() && visible(*dialogs) && model.servers.size() == profilesBefore + 1);
     auto *address = inputWithText(*dialogs, model.servers.back().host);
     assert(address);
@@ -2754,7 +2831,7 @@ void titlebarGeometryCheck() {
         theme.update(model);
         ui.update(1600, 1000, 1);
         ui.root().layout(renderer);
-        auto *title = labelWithText(ui.root(), "BlastIRC");
+        auto *title = visibleLabelContaining(ui.root(), "BlastIRC");
         auto *logo = visibleNode<Image>(ui.root());
         auto *control = areaWithKey(ui.root(), "topbar-navigation");
         assert(title && logo && logo->hasImage() && control);
@@ -2768,114 +2845,153 @@ void titlebarGeometryCheck() {
         Node::mapToScene(logo, 0, logo->height() / 2, logoX, logoCenter);
         assert(std::abs(controlCenter - logoCenter) <= .5f);
         assert(control->width() >= 32 * scale && control->height() >= 32 * scale);
+        auto *application = areaWithKey(ui.root(), "topbar-application");
+        assert(application && visible(*application));
+        const auto naturalTitle =
+            renderer.measureText(title->text(), title->fontSize(), title->font(), 0, 1,
+                                 title->textAlign(), title->ellipsize(), false);
+        assert(title->width() + .5f >= naturalTitle.width);
+        assert(application->x() + application->width() + 64 * scale <=
+               areaWithKey(ui.root(), "topbar-networks")->x());
+        InputArea *previous = nullptr;
+        for (const auto key : {"topbar-networks", "topbar-mentions", "topbar-mark-all-read",
+                               "topbar-navigation", "topbar-command", "topbar-close"}) {
+            auto *button = areaWithKey(ui.root(), key);
+            assert(button);
+            if (!visible(*button))
+                continue;
+            assert(button->width() >= 32 && button->height() >= 32);
+            const auto point = pointerPoint(*button);
+            assert(point[0] > 0 && point[0] < 1600);
+            if (previous) {
+                float previousRight = 0, previousY = 0, left = 0, y = 0;
+                Node::mapToScene(previous, previous->width(), 0, previousRight, previousY);
+                Node::mapToScene(button, 0, 0, left, y);
+                assert(std::abs(left - previousRight - 8 * scale) < .1f &&
+                       std::abs(y - previousY) < .1f);
+            }
+            previous = button;
+        }
     }
 }
 
-void railReadAllCheck() {
+void topbarReadAllCheck() {
     using namespace blast;
     auto model = edgeModel();
     for (auto &[id, buffer] : model.buffers)
         buffer.unread = 0;
-    auto &search = model.buffers["search:rail"];
+    auto &search = model.buffers["search:topbar"];
     search.kind = "search";
     search.unread = 9;
     auto &serverLog = model.buffers["other/*server*"];
     serverLog.id = "other/*server*";
     serverLog.server = "other";
     serverLog.kind = "server";
+    auto &feed = model.buffers[GlobalMentionsBufferId];
+    feed.id = GlobalMentionsBufferId;
+    feed.kind = "mentions";
+    feed.target = "Mentions";
     Theme theme;
-    theme.update(model);
     PangoRenderer renderer;
     InputDispatcher dispatcher;
-    std::vector<std::string> commands;
-    ServerRail rail(
-        model, [&](std::string command) { commands.push_back(std::move(command)); },
-        [&](Node &row, InputArea *replacement) {
-            if (dispatcher.capturedArea() == &row || dispatcher.pendingTouchPressArea() == &row)
-                dispatcher.cancelPointerCapture();
-            if (dispatcher.focusedArea() == &row)
-                dispatcher.setFocus(replacement);
-        });
-    rail.setSize(76, 600);
-    dispatcher.setSceneRoot(&rail);
-    const auto frame = [&] {
-        rail.sync("test", 76, 600, 1);
-        rail.layout(renderer);
-        dispatcher.syncPointerHover();
-    };
-    frame();
-    auto *readAll = areaWithKey(rail, "rail-mark-all-read");
-    auto *add = areaWithKey(rail, "rail-add-server");
-    auto *scroll = visibleNode<ScrollView>(rail);
-    assert(readAll && add && scroll && !visible(*readAll) && !readAll->enabled());
-    const float emptyScrollHeight = scroll->height(), addTop = add->y();
-    assert(dispatcher.firstTabFocusUnder(readAll) == nullptr);
-    serverLog.unread = 1;
-    frame();
-    assert(areaWithKey(rail, "rail-mark-all-read") == readAll && visible(*readAll));
-    assert(readAll->y() + readAll->height() < add->y() && add->y() == addTop);
-    assert(scroll->height() < emptyScrollHeight);
-    dispatcher.setFocus(readAll);
-    for (const auto key : {XKB_KEY_Return, XKB_KEY_space}) {
-        const auto before = commands.size();
-        dispatcher.keyEvent(key, 0, 0, true);
-        dispatcher.keyEvent(key, 0, 0, false);
-        assert(commands.size() == before + 1 && commands.back() == "mark-all-read");
-    }
-    for (const bool touch : {false, true}) {
-        auto point = pointerPoint(*readAll);
-        const auto before = commands.size();
-        dispatcher.pointerMotion(point[0], point[1], 100);
-        assert(dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 101, 1010, touch));
-        serverLog.muted = true;
-        frame();
-        assert(!visible(*readAll) && !readAll->enabled());
-        assert(!dispatcher.pointerCaptured() && dispatcher.focusedArea() != readAll);
-        assert(serverLog.unread == 1 && dispatcher.firstTabFocusUnder(readAll) == nullptr);
-        assert(scroll->height() == emptyScrollHeight && add->y() == addTop);
-        serverLog.muted = false;
-        frame();
-        dispatcher.pointerButton(point[0], point[1], BTN_LEFT, false, 102, 1020, touch);
-        assert(commands.size() == before); // Retired streams cannot click the restored row.
-        point = pointerPoint(*readAll);
-        dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 103, 1030, touch);
-        dispatcher.pointerButton(point[0], point[1], BTN_LEFT, false, 104, 1040, touch);
-        assert(commands.size() == before + 1 && commands.back() == "mark-all-read");
-    }
-    dispatcher.setSceneRoot(nullptr);
     Clipboard clipboard;
+    MenuHost menu;
     Ui ui(model, clipboard);
     dispatcher.setSceneRoot(&ui.root());
     ui.setInputDispatcher(dispatcher);
     ui.setWindowActive(true);
-    const auto uiFrame = [&] {
-        ui.update(1600, 1000, 1);
+    ui.root().setPopupContext(&menu);
+    float currentWidth = 1600;
+    const auto frame = [&](float width = 1600) {
+        theme.update(model);
+        currentWidth = width;
+        ui.update(width, 1000, 1);
         ui.root().layout(renderer);
     };
-    for (const bool touch : {false, true}) {
-        uiFrame();
-        auto *row = areaWithKey(ui.root(), "rail-mark-all-read");
-        assert(row && visible(*row));
-        const auto point = pointerPoint(*row);
-        dispatcher.setFocus(row);
-        ui.beginPointerInteraction(point[0], point[1]);
-        assert(!ui.handlePointerButton(BTN_LEFT, true, point[0], point[1], touch));
-        dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 201, 2010, touch);
-        serverLog.unread = 0;
-        uiFrame();
-        assert(!visible(*row) && !dispatcher.pointerCaptured());
-        assert(dispatcher.focusedArea() == areaWithKey(ui.root(), "rail-add-server"));
-        serverLog.unread = 1;
-        uiFrame();
-        assert(ui.handlePointerButton(BTN_LEFT, false, point[0], point[1], touch));
-        uiFrame(); // Drain retained-control commands before asserting the retired stream was inert.
-        assert(std::none_of(model.actions.begin(), model.actions.end(),
-                            [](const Action &action) { return action.type == "read-all"; }));
+    frame();
+    auto *readAll = areaWithKey(ui.root(), "topbar-mark-all-read");
+    auto *application = areaWithKey(ui.root(), "topbar-application");
+    assert(readAll && application && !visible(*readAll));
+    assert(dispatcher.firstTabFocusUnder(readAll) == nullptr);
+    const auto menuHasReadAll = [&] {
+        click(dispatcher, *application);
+        frame(currentWidth);
+        assert(menu.open);
+        const bool found = std::any_of(menu.request.menu.begin(), menu.request.menu.end(),
+                                       [](const ContextMenuEntry &entry) {
+                                           return entry.label == "Mark all read" && entry.enabled;
+                                       });
+        menu.closeSelectDropdown();
+        return found;
+    };
+    assert(!menuHasReadAll()); // Search-result unread is not eligible.
+    auto *mentions = areaWithKey(ui.root(), "topbar-mentions");
+    auto *composer = inputWithText(ui.root(), edgeDrafts[0]);
+    assert(mentions && visible(*mentions) && composer);
+    const auto document = composer->editingState();
+    const auto selectedServer = model.settings.workspace.at("selected_server");
+    click(dispatcher, *mentions);
+    frame();
+    assert(model.activeBuffer == GlobalMentionsBufferId);
+    assert(model.settings.workspace.at("selected_server") == selectedServer);
+    ui.execute("buffer:" + std::string(edgeBuffers[0]));
+    frame();
+    assert(inputWithText(ui.root(), edgeDrafts[0]) == composer &&
+           composer->editingStateMatches(document));
+    serverLog.unread = 1;
+    for (const float scale : {1.f, 1.5f, 2.f}) {
+        model.settings.scale = scale;
+        frame(760 * scale);
+        assert(visible(*readAll) && !menuHasReadAll());
+        frame(760 * scale - 1);
+        assert(!visible(*readAll) && dispatcher.firstTabFocusUnder(readAll) == nullptr);
+        assert(menuHasReadAll());
+        frame(760 * scale);
+        assert(visible(*readAll));
     }
-    click(dispatcher, *areaWithKey(ui.root(), "rail-mark-all-read"));
-    uiFrame(); // The rail queues its command; the surface update dispatches it.
-    assert(std::any_of(model.actions.begin(), model.actions.end(),
-                       [](const Action &action) { return action.type == "read-all"; }));
+    model.settings.scale = 1;
+    frame();
+    for (const auto key : {XKB_KEY_Return, XKB_KEY_space}) {
+        dispatcher.setFocus(readAll);
+        const auto before = model.actions.size();
+        nativeKey(ui, dispatcher, key);
+        frame();
+        assert(std::count_if(model.actions.begin() + before, model.actions.end(),
+                             [](const Action &action) { return action.type == "read-all"; }) == 1);
+    }
+    model.actions.clear();
+    for (const bool touch : {false, true}) {
+        for (const bool fold : {false, true}) {
+            frame();
+            const auto point = pointerPoint(*readAll);
+            dispatcher.setFocus(readAll);
+            ui.beginPointerInteraction(point[0], point[1]);
+            assert(!ui.handlePointerButton(BTN_LEFT, true, point[0], point[1], touch));
+            dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 201, 2010, touch);
+            serverLog.muted = !fold;
+            frame(fold ? 759 : 1600);
+            assert(!visible(*readAll) && !dispatcher.pointerCaptured());
+            assert(dispatcher.focusedArea() != readAll &&
+                   dispatcher.firstTabFocusUnder(readAll) == nullptr);
+            serverLog.muted = false;
+            frame();
+            assert(ui.handlePointerButton(BTN_LEFT, false, point[0], point[1], touch));
+            frame();
+            assert(std::none_of(model.actions.begin(), model.actions.end(),
+                                [](const Action &action) { return action.type == "read-all"; }));
+        }
+    }
+    frame(759);
+    click(dispatcher, *application);
+    frame();
+    assert(menu.open);
+    menu.select("Mark all read");
+    frame(759);
+    assert(std::count_if(model.actions.begin(), model.actions.end(),
+                         [](const Action &action) { return action.type == "read-all"; }) == 1);
+    serverLog.unread = 0;
+    frame(759);
+    assert(!menuHasReadAll());
     dispatcher.setSceneRoot(nullptr);
 }
 
@@ -6743,9 +6859,6 @@ void alphaForegroundCheck() {
                     unread.muted = true;
                     frame();
                     assert(!visible(*serverBadge) && visible(*accountBadge));
-                    assert(labelWithText(ui.root(), "BlastIRC · " +
-                                                        std::to_string(accountUnread.unread) +
-                                                        " unread"));
                     const Color mutedFill = themeForegroundColor("surface_container_highest");
                     assert(mutedFill != unmutedFill);
                     assert(relativeLuminance(mutedFill) < relativeLuminance(unmutedFill));
@@ -6761,9 +6874,6 @@ void alphaForegroundCheck() {
                     unread.muted = false;
                     frame();
                     assert(visible(*serverBadge) && visible(*accountBadge));
-                    assert(labelWithText(
-                        ui.root(),
-                        "BlastIRC · " + std::to_string(count + accountUnread.unread) + " unread"));
                     assert(label.color() == unmutedInk && label.text() == text);
                     checkBadge(*row, label, unmutedFill);
                 };
@@ -8013,7 +8123,6 @@ void hiddenUnreadStatusCheck(
         assert(segment("Remote/#same") && segment("Local/#same"));
     }
     // Muting retires a real summary control without consuming either buffer's unread state.
-    assert(labelWithText(ui.root(), "BlastIRC · 2 unread"));
     const auto marker = model.buffers.at(normal).readMarker;
     ui.setWindowActive(true);
     dispatcher.setFocus(overflow);
@@ -8022,7 +8131,6 @@ void hiddenUnreadStatusCheck(
     assert(!segment("Local/#same") && segment("Remote/#same"));
     assert(!visible(*overflow) && dispatcher.firstTabFocusUnder(overflow) == nullptr);
     assert(dispatcher.focusedArea() != overflow);
-    assert(labelWithText(ui.root(), "BlastIRC · 1 unread"));
     assert(model.buffers.at(normal).unread == 1 && model.buffers.at(normal).readMarker == marker &&
            model.buffers.at(mention).unread == 1);
     clickPoint(overflowPoint);
@@ -8034,7 +8142,6 @@ void hiddenUnreadStatusCheck(
     model.buffers.at(normal).muted = false;
     frame();
     assert(segment("Local/#same") && segment("Remote/#same") && visible(*overflow));
-    assert(labelWithText(ui.root(), "BlastIRC · 2 unread"));
     assert(model.buffers.at(normal).unread == 1 && model.buffers.at(normal).readMarker == marker);
     model.buffers.at(normal).unread = 0;
     model.buffers.at(mention).unread = 0;
@@ -10380,7 +10487,7 @@ void runUiIntegrationCheck() {
     sidebarAvatarCheck();
     statusIdentityCheck();
     initialHistoryConsumerCheck();
-    railReadAllCheck();
+    topbarReadAllCheck();
     serverLogConsumerCheck();
     queuedServerLogPaletteCheck();
     sojuDisplayNameConsumerCheck();

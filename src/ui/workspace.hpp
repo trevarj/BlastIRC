@@ -21,6 +21,7 @@ class Workspace {
     std::map<std::uint64_t, PaneState> panes;
     std::uint64_t focused = 0;
     SidebarMode navigationMode = SidebarMode::Expanded;
+    bool serverRailVisible = true;
 
     static constexpr float minServerRailWidth = 56, maxServerRailWidth = 160;
     static constexpr float minChannelSidebarWidth = 160, maxChannelSidebarWidth = 420;

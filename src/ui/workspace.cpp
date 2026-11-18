@@ -73,6 +73,8 @@ Workspace::Workspace(Model &model) : model_(model), publishedActive_(model.activ
     compactChannelSidebarWidth_ =
         loadWidth(settings, compactChannelSidebarWidthKey, minCompactChannelSidebarWidth,
                   maxCompactChannelSidebarWidth);
+    if (const auto visible = settings.find("native_server_rail_visible"); visible != settings.end())
+        serverRailVisible = visible->second != "false";
     if (const auto mode = settings.find("native_navigation_mode"); mode != settings.end()) {
         if (mode->second == "compact")
             navigationMode = SidebarMode::Compact;
@@ -378,6 +380,7 @@ void Workspace::persist() {
     assign(settings, "focused", serialized_);
     assign(settings, "visible_buffers", panes.at(focused).buffer);
     assign(settings, "native_navigation_mode", std::string(sidebarModeToken(navigationMode)));
+    assign(settings, "native_server_rail_visible", serverRailVisible ? "true" : "false");
     saveWidth(settings, serverRailWidthKey, serverRailWidth_, serialized_);
     saveWidth(settings, channelSidebarWidthKey, channelSidebarWidth_, serialized_);
     saveWidth(settings, compactChannelSidebarWidthKey, compactChannelSidebarWidth_, serialized_);

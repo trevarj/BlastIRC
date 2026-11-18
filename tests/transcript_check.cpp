@@ -3077,7 +3077,8 @@ void durableHistoryGaps(TranscriptTestRenderer &renderer) {
             const auto firstApproach = newestVisibleEvent();
             const float firstApproachOffset = demandScroll->scrollOffset();
             const auto firstClip = nativeHistoryClip(view);
-            assert(firstApproach && *firstApproach > 0);
+            assert(firstApproach && *firstApproach > 0 &&
+                   *firstApproach + 1 < buffer.messages.size());
             const auto olderRow =
                 sceneBounds(body(view, buffer.messages[*firstApproach - 1].text, true).row);
             const float olderEventCenter =

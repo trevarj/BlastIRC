@@ -6254,11 +6254,12 @@ struct TranscriptView::Impl {
                            : std::min(c.rows.size() - 1,
                                       c.heights.at(std::max(0., desired + height - c.header)));
         // A gap/header-only edge has no nameable event; do not invent one.
-        if (approachRow != absent &&
-            (c.rows[approachRow].hiddenActivity ||
-             c.header + c.heights.prefix(approachRow) + c.rows[approachRow].gapHeight >=
-                 desired + height ||
-             c.header + c.heights.prefix(approachRow + 1) <= desired))
+        while (approachRow != absent &&
+               (c.rows[approachRow].hiddenActivity ||
+                c.header + c.heights.prefix(approachRow) + c.rows[approachRow].gapHeight >=
+                    desired + height))
+            approachRow = c.rows[approachRow].previousVisible;
+        if (approachRow != absent && c.header + c.heights.prefix(approachRow + 1) <= desired)
             approachRow = absent;
         const uint64_t approachIdentity =
             approachRow < c.rows.size() ? c.rows[approachRow].focusIdentity : 0;

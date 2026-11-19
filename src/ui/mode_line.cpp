@@ -171,9 +171,9 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
             p.foolUnread = model.settings.foolUnread;
             p.fools = model.settings.fools;
         }
-        for (const auto &[id, channel] : model.buffers) {
-            if (channel.kind != "channel" || channel.archived || channel.muted ||
-                channel.unread <= 0)
+        for (const auto &[id, chat] : model.buffers) {
+            if ((chat.kind != "channel" && chat.kind != "query") || chat.archived || chat.muted ||
+                chat.unread <= 0)
                 continue;
             if (p.unreadCount == p.unread.size()) {
                 const auto slot = p.unread.size();
@@ -206,37 +206,36 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
             auto &entry = p.unread[p.unreadCount++];
             if (!entry.id.empty() && entry.id != id)
                 p.retire(*entry.area);
-            const std::string_view name = serverDisplayName(model, channel.server);
-            const auto network = model.networks.find(channel.server);
+            const std::string_view name = serverDisplayName(model, chat.server);
+            const auto network = model.networks.find(chat.server);
             const std::string_view mapping = network == model.networks.end()
                                                  ? std::string_view{"rfc1459"}
                                                  : std::string_view(network->second.caseMapping);
-            const bool changed = entry.id != id || entry.count != channel.unread ||
-                                 entry.marker != channel.readMarker ||
-                                 entry.size != channel.messages.size() ||
-                                 entry.revision != channel.messagesRevision ||
-                                 entry.caseMapping != mapping || foolRulesChanged;
+            const bool changed =
+                entry.id != id || entry.count != chat.unread || entry.marker != chat.readMarker ||
+                entry.size != chat.messages.size() || entry.revision != chat.messagesRevision ||
+                entry.caseMapping != mapping || foolRulesChanged;
             const bool mentioned =
-                changed ? ui_logic::hasUnreadMention(model, channel) : entry.mentioned;
-            if (entry.id != id || entry.count != channel.unread || entry.name != name ||
-                entry.target != channel.target || entry.mentioned != mentioned) {
+                changed ? ui_logic::hasUnreadMention(model, chat) : entry.mentioned;
+            if (entry.id != id || entry.count != chat.unread || entry.name != name ||
+                entry.target != chat.target || entry.mentioned != mentioned) {
                 std::string caption;
                 if (mentioned)
                     caption += '@';
-                caption.append(name).append("/").append(channel.target).append(": ");
-                caption += std::to_string(channel.unread);
+                caption.append(name).append("/").append(chat.target).append(": ");
+                caption += std::to_string(chat.unread);
                 if (entry.label->setText(caption))
                     entry.area->setTooltip(caption);
                 entry.name = name;
-                entry.target = channel.target;
+                entry.target = chat.target;
             }
             if (changed) {
                 entry.id = id;
                 entry.area->setTabFocusKey("buffer:" + id);
-                entry.count = channel.unread;
-                entry.marker = channel.readMarker;
-                entry.size = channel.messages.size();
-                entry.revision = channel.messagesRevision;
+                entry.count = chat.unread;
+                entry.marker = chat.readMarker;
+                entry.size = chat.messages.size();
+                entry.revision = chat.messagesRevision;
                 entry.caseMapping = mapping;
                 entry.mentioned = mentioned;
             }

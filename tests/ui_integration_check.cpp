@@ -7905,6 +7905,7 @@ void hiddenUnreadStatusCheck(
     model.buffers.at(archived).archived = true;
     incoming(system);
     incoming(edgeBuffers[1]);
+    incoming(edgeBuffers[1]);
     model.settings.fools.insert("FOOL");
     incoming(fools);
     incoming(fools, false, false, true, "fool");
@@ -7934,7 +7935,15 @@ void hiddenUnreadStatusCheck(
     assert(local->text().find(std::to_string(model.buffers.at(normal).unread)) !=
            std::string_view::npos);
     assert(other->text().front() != '@' && fool->text().front() != '@');
-    assert(!segment("#archived") && !segment("*server*") && !segment("second"));
+    assert(!segment("#archived") && !segment("*server*"));
+    auto *query = segment("Local/second");
+    assert(query && query->text() == "Local/second: 2");
+    click(dispatcher, *query);
+    frame();
+    assert(model.activeBuffer == edgeBuffers[1]);
+    model.buffers.at(edgeBuffers[1]).unread = 0;
+    frame();
+    assert(!segment("Local/second"));
     const auto normalColor = other->color();
     const auto normalWeight = other->font().weight;
     const auto newestMention = incoming(mention, false, false, true);

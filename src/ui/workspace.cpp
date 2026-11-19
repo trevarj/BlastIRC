@@ -147,8 +147,13 @@ void Workspace::publish() {
     const auto &buffer = panes.at(focused).buffer;
     if (model_.activeBuffer != buffer)
         model_.activeBuffer = buffer;
-    if (publishedActive_ != buffer)
+    if (publishedActive_ != buffer) {
+        if (activityOrigin_ && !advancingActivity_) {
+            activityOrigin_.reset();
+            activityPending_.clear();
+        }
         publishedActive_ = buffer;
+    }
 }
 Id Workspace::open(std::string_view buffer) {
     for (const auto &[id, pane] : panes)
@@ -239,7 +244,45 @@ std::optional<Id> Workspace::navigateHistory(bool forward) {
         return pane;
     }
 }
-void Workspace::remapHistory(const std::string &oldId, const std::string &newId) {
+std::optional<Id> Workspace::navigateActivity() {
+    const auto unreadChannel = [](const Buffer &buffer) {
+        return buffer.kind == "channel" && !buffer.archived && buffer.unread > 0;
+    };
+    if (!activityOrigin_) {
+        std::vector<const Buffer *> candidates;
+        for (const auto &[id, buffer] : model_.buffers)
+            if (id != publishedActive_ && unreadChannel(buffer))
+                candidates.push_back(&buffer);
+        if (candidates.empty())
+            return std::nullopt;
+        std::ranges::sort(candidates, [](const Buffer *a, const Buffer *b) {
+            return chatActivityBefore(*b, *a);
+        });
+        activityPending_.reserve(candidates.size());
+        for (const auto *buffer : candidates)
+            activityPending_.push_back(buffer->id);
+        activityOrigin_ = publishedActive_;
+    }
+    while (!activityPending_.empty()) {
+        auto target = std::move(activityPending_.back());
+        activityPending_.pop_back();
+        const auto found = model_.buffers.find(target);
+        if (found != model_.buffers.end() && unreadChannel(found->second)) {
+            advancingActivity_ = true;
+            const auto pane = open(target);
+            advancingActivity_ = false;
+            return pane;
+        }
+    }
+    const auto origin = std::move(*activityOrigin_);
+    activityOrigin_.reset();
+    if (model_.buffers.contains(origin))
+        return open(origin);
+    return std::nullopt;
+}
+void Workspace::remapNavigation(const std::string &oldId, const std::string &newId) {
+    if (activityOrigin_ && *activityOrigin_ == oldId)
+        *activityOrigin_ = newId;
     std::size_t count = 0;
     const auto oldCursor = historyCursor_;
     for (std::size_t i = 0; i < history_.size(); ++i) {
@@ -282,7 +325,7 @@ void Workspace::reconcile() {
             if (pane.buffer != setting->second && model_.buffers.contains(pane.buffer))
                 pane.reply.clear();
             else if (pane.buffer != setting->second) {
-                remapHistory(pane.buffer, setting->second);
+                remapNavigation(pane.buffer, setting->second);
                 if (publishedActive_ == pane.buffer)
                     publishedActive_ = setting->second;
             }
@@ -340,7 +383,7 @@ void Workspace::remapBuffer(std::string_view oldId, std::string_view newId) {
         return;
     // Callers may borrow either name from a pane that is renamed or merged below.
     const std::string oldBuffer(oldId), newBuffer(newId);
-    remapHistory(oldBuffer, newBuffer);
+    remapNavigation(oldBuffer, newBuffer);
     for (auto &[id, pane] : panes)
         if (pane.buffer == oldBuffer) {
             pane.buffer = newBuffer;

@@ -4998,7 +4998,7 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
     baseline = tomllib.loads(prefs.read_text())
     bindings = baseline['bindings'].copy()
     for name, value in (('execute-command', 'M-x'), ('backward-char', 'C-b'),
-                        ('forward-char', 'C-f'), ('set-mark', 'C-SPC'),
+                        ('forward-char', 'C-f'), ('set-mark', 'C-S-SPC'),
                         ('beginning-of-buffer', 'M-<'), ('end-of-buffer', 'M->'),
                         ('settings', 'C-,')):
         assert bindings[name] == value, (name, bindings[name], value)

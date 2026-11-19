@@ -3875,9 +3875,9 @@ bool EditorStore::handleCompositionKey(std::uint32_t sym, std::uint32_t utf32,
         bool prefix = false, messagePrefix = false;
         for (const auto *command :
              {"message-prev", "message-next", "message-reply", "message-react", "conversation-back",
-              "conversation-forward", "scroll-up", "scroll-down", "beginning-of-buffer",
-              "end-of-buffer", "paste", "yank", "transpose-chars", "backward-kill-line", "redo",
-              "copy", "cut", "select-all"}) {
+              "conversation-forward", "next-activity", "scroll-up", "scroll-down",
+              "beginning-of-buffer", "end-of-buffer", "paste", "yank", "transpose-chars",
+              "backward-kill-line", "redo", "copy", "cut", "select-all"}) {
             const auto binding = store.model.settings.bindings.find(command);
             if (binding == store.model.settings.bindings.end())
                 continue;

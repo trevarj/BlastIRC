@@ -1827,9 +1827,10 @@ struct Dialogs::Impl {
                 name == "transpose-chars" || name == "cycle-spelling")
                 return 2;
             if (name == "switch-buffer" || name == "execute-command" || name == "jump-channel" ||
-                name == "conversation-back" || name == "conversation-forward" ||
-                name.starts_with("toggle-") || name == "search" || name == "settings" ||
-                name == "cancel" || name == "beginning-of-buffer" || name == "end-of-buffer")
+                name == "next-activity" || name == "conversation-back" ||
+                name == "conversation-forward" || name.starts_with("toggle-") || name == "search" ||
+                name == "settings" || name == "cancel" || name == "beginning-of-buffer" ||
+                name == "end-of-buffer")
                 return 3;
             return 4;
         };

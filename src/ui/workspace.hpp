@@ -37,6 +37,7 @@ class Workspace {
     std::uint64_t open(std::string_view buffer);
     void focus(std::uint64_t id);
     std::optional<std::uint64_t> navigateHistory(bool forward);
+    std::optional<std::uint64_t> navigateActivity();
     void reconcile();
     void remapBuffer(std::string_view oldId, std::string_view newId);
     void persist();
@@ -53,6 +54,9 @@ class Workspace {
     std::vector<std::string> history_;
     std::size_t historyCursor_ = 0;
     bool suppressHistory_ = true;
+    std::optional<std::string> activityOrigin_;
+    std::vector<std::string> activityPending_;
+    bool advancingActivity_ = false;
 
     std::uint64_t freshId();
     const std::string &fallbackBuffer() const;
@@ -61,6 +65,6 @@ class Workspace {
     void publish();
     bool historyEligible(const std::string &buffer) const;
     void recordHistory(const std::string &buffer);
-    void remapHistory(const std::string &oldId, const std::string &newId);
+    void remapNavigation(const std::string &oldId, const std::string &newId);
 };
 } // namespace blast

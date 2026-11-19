@@ -95,6 +95,7 @@ const std::map<std::string, std::string> &defaultBindings() {
         {"jump-channel", "C-x j"},
         {"conversation-back", "C-o"},
         {"conversation-forward", "C-i"},
+        {"next-activity", "C-SPC"},
         {"global-mentions", ""},
         {"toggle-fools", "C-x f"},
         {"show-fools", ""},
@@ -140,7 +141,7 @@ const std::map<std::string, std::string> &defaultBindings() {
         {"select-all", ""},
         {"transpose-chars", "C-t"},
         {"backward-kill-line", ""},
-        {"set-mark", "C-SPC"},
+        {"set-mark", "C-S-SPC"},
         {"history-previous", "M-p"},
         {"history-next", "M-n"},
         {"complete", "TAB"}};
@@ -153,6 +154,7 @@ std::string_view commandDisplayName(std::string_view command) {
         {"jump-channel", "Jump to channel or conversation"},
         {"conversation-back", "Previous viewed conversation"},
         {"conversation-forward", "Next viewed conversation"},
+        {"next-activity", "Next channel with activity"},
         {"global-mentions", "Global mentions"},
         {"toggle-fools", "Toggle fools in this conversation"},
         {"show-fools", "Show fools"},
@@ -520,10 +522,10 @@ std::string bindingStroke(const InputArea::KeyData &key) {
 namespace {
 bool workspaceCommand(std::string_view name) {
     return name == "switch-buffer" || name == "execute-command" || name == "jump-channel" ||
-           name == "conversation-back" || name == "conversation-forward" || name == "settings" ||
-           name == "search" || name == "cancel" || name == "toggle-people" ||
-           name == "toggle-navigation" || name == "toggle-networks" || name == "quit" ||
-           name == "connect" || name == "disconnect" || name == "load-history" ||
+           name == "conversation-back" || name == "conversation-forward" ||
+           name == "next-activity" || name == "settings" || name == "search" || name == "cancel" ||
+           name == "toggle-people" || name == "toggle-navigation" || name == "toggle-networks" ||
+           name == "quit" || name == "connect" || name == "disconnect" || name == "load-history" ||
            name == "clear-history" || name == "manage-networks" || name == "mark-all-read" ||
            name.starts_with("message-style:") || name == "message-prev" || name == "message-next" ||
            name == "message-reply" || name == "message-react" || name == "mute-buffer" ||
@@ -1136,9 +1138,13 @@ struct Ui::Impl {
         ui_logic::migrateMessageBindings(model.settings.bindings, [this](std::string_view name) {
             return model.settings.bindings.contains(std::string(name));
         });
+        ui_logic::migrateActivityBinding(model.settings.bindings, [this](std::string_view name) {
+            return model.settings.bindings.contains(std::string(name));
+        });
         for (const auto &[name, binding] : defaultBindings()) {
             if ((name == "jump-channel" || name == "toggle-fools" || name == "conversation-back" ||
-                 name == "conversation-forward" || name == "cycle-spelling") &&
+                 name == "conversation-forward" || name == "next-activity" ||
+                 name == "cycle-spelling") &&
                 !model.settings.bindings.contains(name) &&
                 std::any_of(model.settings.bindings.begin(), model.settings.bindings.end(),
                             [&](const auto &entry) {
@@ -3818,6 +3824,11 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
             focus(*pane);
         return;
     }
+    if (command == "next-activity") {
+        if (const auto pane = workspace.navigateActivity())
+            focus(*pane);
+        return;
+    }
     if (command.starts_with("select-server:")) {
         selectServer(std::string_view(command).substr(14));
         return;
@@ -4831,7 +4842,8 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
             (dialogs->active() &&
              (command == "message-prev" || command == "message-next" ||
               command == "message-reply" || command == "message-react" ||
-              command == "conversation-back" || command == "conversation-forward")))
+              command == "conversation-back" || command == "conversation-forward" ||
+              command == "next-activity")))
             continue;
         if (candidate == full) {
             if (!synchronizeInput())

@@ -9765,6 +9765,82 @@ void messagingSourceControlsCheck() {
     dispatcher.setSceneRoot(nullptr);
 }
 
+void nextActivityNativeCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    auto remoteServer = model.servers.front();
+    remoteServer.name = "remote";
+    model.servers.push_back(remoteServer);
+    model.networks["remote"].nick = "Me";
+    const auto addChannel = [&](const char *server, const char *target, int timestamp) -> Buffer & {
+        const auto id = std::string(server) + "/" + target;
+        auto &buffer = model.buffers[id];
+        buffer.id = id;
+        buffer.server = server;
+        buffer.target = target;
+        buffer.kind = "channel";
+        buffer.draft = id;
+        buffer.joined = true;
+        buffer.unread = 1;
+        buffer.lastChatTimestamp = timestamp;
+        return buffer;
+    };
+    auto &older = addChannel("test", "#older", 10);
+    auto &newer = addChannel("remote", "#newer", 20);
+    newer.muted = true;
+    addChannel("test", "#archived", 30).archived = true;
+    auto &query = model.buffers.at(edgeBuffers[2]);
+    query.unread = 1;
+    query.lastChatTimestamp = 40;
+
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    const auto at = [&](const std::string &id) {
+        assert(model.activeBuffer == id);
+        auto *composer = inputWithText(ui.root(), model.buffers.at(id).draft);
+        assert(composer && visible(*composer) && dispatcher.focusedArea() == composer->inputArea());
+    };
+    const auto next = [&](const std::string &id) {
+        hostKey(ui, dispatcher, XKB_KEY_space, KeyMod::Ctrl, ' ');
+        frame();
+        at(id);
+    };
+    frame();
+    auto *origin = inputWithText(ui.root(), edgeDrafts[0]);
+    assert(origin && visible(*origin));
+    dispatcher.setFocus(origin->inputArea());
+    at(edgeBuffers[0]);
+    next(newer.id);
+    next(older.id);
+    // Read requests have not reached the Application, so neither visit has cleared unread.
+    assert(newer.unread && older.unread);
+    next(edgeBuffers[0]);
+    newer.unread = older.unread = 0;
+    next(edgeBuffers[0]);
+
+    newer.unread = older.unread = 1;
+    next(newer.id);
+    ui.execute("buffer:" + query.id);
+    frame();
+    at(query.id);
+    next(newer.id); // Manual navigation starts a fresh cycle.
+    older.unread = 0;
+    next(query.id); // A buffer read after the snapshot is skipped.
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
 void conversationHistoryNativeCheck() {
     using namespace blast;
     auto model = edgeModel();
@@ -10469,6 +10545,7 @@ void runUiIntegrationCheck() {
     codecs::installImageDecoder();
     wordPredictionBindingsCheck();
     cycleSpellingBindingsCheck();
+    nextActivityNativeCheck();
     conversationHistoryNativeCheck();
     conversationHistorySelectionCheck(false);
     conversationHistorySelectionCheck(true);

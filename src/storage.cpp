@@ -479,6 +479,7 @@ Settings defaults() {
     settings.bindings = {{"switch-buffer", "C-x b"},
                          {"execute-command", "M-x"},
                          {"jump-channel", "C-x j"},
+                         {"next-activity", "C-SPC"},
                          {"conversation-back", "C-o"},
                          {"conversation-forward", "C-i"},
                          {"cancel", "C-g"},
@@ -525,7 +526,7 @@ Settings defaults() {
                          {"cut", ""},
                          {"paste", ""},
                          {"select-all", ""},
-                         {"set-mark", "C-SPC"},
+                         {"set-mark", "C-S-SPC"},
                          {"history-previous", "M-p"},
                          {"history-next", "M-n"},
                          {"complete", "TAB"}};
@@ -1002,7 +1003,11 @@ void parseSettings(const toml::table &document, Settings &settings) {
                    ui_logic::bindingConflicts("C-t", entry.second);
         }))
         settings.bindings.at("transpose-chars").clear();
-    for (const char *name : {"conversation-back", "conversation-forward", "cycle-spelling"}) {
+    ui_logic::migrateActivityBinding(settings.bindings, [&](std::string_view name) {
+        return savedBindings && savedBindings->contains(name);
+    });
+    for (const char *name :
+         {"conversation-back", "conversation-forward", "cycle-spelling", "next-activity"}) {
         if (savedBindings && savedBindings->contains(name))
             continue;
         auto &binding = settings.bindings.at(name);

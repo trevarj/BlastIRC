@@ -1230,6 +1230,8 @@ static void conversationBindingPreferences(const fs::path &config) {
         defaults = model.settings.bindings;
         assert(defaults.at("conversation-back") == "C-o");
         assert(defaults.at("conversation-forward") == "C-i");
+        assert(defaults.at("next-activity") == "C-SPC");
+        assert(defaults.at("set-mark") == "C-S-SPC");
     }
     struct Case {
         string source, back, forward;
@@ -1256,7 +1258,29 @@ static void conversationBindingPreferences(const fs::path &config) {
          {{"toggle-navigation", "C-i"}}},
         {"conversation-back = 'C-i x'\n", "C-i x", "", {}},
         {"conversation-forward = 'C-o x'\n", "", "C-o x", {}},
-        {"conversation-back = 'C-i'\nconversation-forward = 'C-o'\n", "C-i", "C-o", {}}};
+        {"conversation-back = 'C-i'\nconversation-forward = 'C-o'\n", "C-i", "C-o", {}},
+        {"set-mark = ' c-SpC '\n", "C-o", "C-i", {}},
+        {"set-mark = 'C-SPC x'\n", "C-o", "C-i", {{"set-mark", "C-SPC x"}, {"next-activity", ""}}},
+        {"set-mark = 'M-SPC'\n", "C-o", "C-i", {{"set-mark", "M-SPC"}}},
+        {"set-mark = ''\n", "C-o", "C-i", {{"set-mark", ""}}},
+        {"set-mark = 'C-SPC'\ntoggle-navigation = ' c-S-SPC x '\n",
+         "C-o",
+         "C-i",
+         {{"set-mark", ""}, {"toggle-navigation", " c-S-SPC x "}}},
+        {"next-activity = 'C-S-SPC'\n",
+         "C-o",
+         "C-i",
+         {{"set-mark", ""}, {"next-activity", "C-S-SPC"}}},
+        {"toggle-navigation = 'C-SPC x'\n",
+         "C-o",
+         "C-i",
+         {{"next-activity", ""}, {"toggle-navigation", "C-SPC x"}}},
+        {"set-mark = 'C-SPC'\nnext-activity = ''\n",
+         "C-o",
+         "C-i",
+         {{"set-mark", "C-SPC"}, {"next-activity", ""}}},
+        {"next-activity = 'M-SPC'\n", "C-o", "C-i", {{"next-activity", "M-SPC"}}},
+    };
     for (const auto &test : cases) {
         {
             std::ofstream output(config / "settings.toml");

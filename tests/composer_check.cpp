@@ -5018,7 +5018,7 @@ void runComposerNativeCheck() {
                 state.current.cursorPos = state.current.selectionAnchor = 1;
                 input->restoreEditingState(state);
                 dispatcher.setFocus(input->inputArea());
-                key(XKB_KEY_space, KeyMod::Ctrl);
+                key(XKB_KEY_space, KeyMod::Ctrl | KeyMod::Shift);
                 key(XKB_KEY_e, KeyMod::Ctrl);
                 assert(input->editingState().current.selectionAnchor == 1 &&
                        input->editingState().current.cursorPos == 5 && input->value() == draft &&
@@ -5076,7 +5076,7 @@ void runComposerNativeCheck() {
                 key(XKB_KEY_w, KeyMod::Alt);
                 assert(clipboard.copied == buffer.messages.front().text);
                 clipboard.copied = "sentinel";
-                key(XKB_KEY_space, KeyMod::Ctrl);
+                key(XKB_KEY_space, KeyMod::Ctrl | KeyMod::Shift);
                 key(XKB_KEY_w, KeyMod::Alt);
                 assert(clipboard.copied == "sentinel");
                 key(XKB_KEY_Right, 0);
@@ -5095,13 +5095,13 @@ void runComposerNativeCheck() {
                 assert(readerOwnsFocus() && !transcript->keyboardTextSelection());
                 const auto nextBinding = model.settings.bindings.at("message-next");
                 model.settings.bindings["message-next"] = "RIGHT";
-                key(XKB_KEY_space, KeyMod::Ctrl);
+                key(XKB_KEY_space, KeyMod::Ctrl | KeyMod::Shift);
                 key(XKB_KEY_Right, 0);
                 assert(!transcript->keyboardTextSelection() && readerOwnsFocus());
                 key(XKB_KEY_w, KeyMod::Alt);
                 assert(clipboard.copied == buffer.messages[1].text);
                 model.settings.bindings["message-next"] = "RIGHT x";
-                key(XKB_KEY_space, KeyMod::Ctrl);
+                key(XKB_KEY_space, KeyMod::Ctrl | KeyMod::Shift);
                 key(XKB_KEY_Right, 0);
                 assert(transcript->keyboardTextSelection());
                 key(XKB_KEY_x, 0);

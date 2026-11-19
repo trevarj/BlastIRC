@@ -376,6 +376,19 @@ inline bool bindingConflicts(std::string_view first, std::string_view second) {
     return b.starts_with(a) && (a.size() == b.size() || b[a.size()] == ' ');
 }
 template <class Bindings, class HasSavedBinding>
+inline void migrateActivityBinding(Bindings &bindings, HasSavedBinding hasSavedBinding) {
+    const auto mark = bindings.find("set-mark");
+    // C-SPC was the stock mark until the activity command was introduced.
+    if (mark != bindings.end() && hasSavedBinding("set-mark") &&
+        (hasSavedBinding("next-activity") || canonical(mark->second) != "c-spc"))
+        return;
+    constexpr auto stock = "C-S-SPC";
+    const bool conflict = std::any_of(bindings.begin(), bindings.end(), [&](const auto &entry) {
+        return entry.first != "set-mark" && bindingConflicts(stock, entry.second);
+    });
+    bindings.insert_or_assign("set-mark", conflict ? "" : stock);
+}
+template <class Bindings, class HasSavedBinding>
 inline void migrateMessageBindings(Bindings &bindings, HasSavedBinding hasSavedBinding) {
     constexpr std::array messageNames = {"message-prev", "message-next", "message-reply",
                                          "message-react"};

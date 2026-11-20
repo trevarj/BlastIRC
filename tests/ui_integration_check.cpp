@@ -1222,11 +1222,7 @@ void retainedBufferStateCheck(bool directMessage, blast::SidebarMode peoplePrefe
             if (cancel) {
                 nativeKey(ui, dispatcher, XKB_KEY_Escape);
             } else {
-                auto *row = areaWithKey(ui.root(), std::string("buffer:") + buffers[1]);
-                Sidebar *sidebar = nullptr;
-                for (Node *node = row; node; node = node->parent())
-                    if (auto *candidate = dynamic_cast<Sidebar *>(node))
-                        sidebar = candidate;
+                auto *sidebar = visibleNode<Sidebar>(ui.root());
                 assert(sidebar);
                 Label *choice = nullptr;
                 for (const auto &hint : sidebar->hintRects())
@@ -1273,7 +1269,9 @@ void retainedBufferStateCheck(bool directMessage, blast::SidebarMode peoplePrefe
         frame(720, 480);
         if (directMessage) {
             // A preceding queued DM switch frees left-panel space before the next toggle.
-            auto *query = areaWithKey(ui.root(), "buffer:" + destination);
+            auto *sidebar = visibleNode<Sidebar>(ui.root());
+            assert(sidebar);
+            auto *query = areaWithKey(*sidebar, "buffer:" + destination);
             assert(query && visible(*query));
             click(dispatcher, *query);
             click(dispatcher, *navigationToggle);
@@ -1844,8 +1842,8 @@ void sidebarConversationFilterCheck() {
     // Selection changes painted geometry even with every color ignored.
     assert(selectionGeometry(*firstServer) != selectedGeometry);
     assert(selectionGeometry(*secondServer) != unselectedGeometry);
-    first = areaWithKey(ui.root(), "buffer:" + queryId);
-    second = areaWithKey(ui.root(), "buffer:" + secondQueryId);
+    first = areaWithKey(*sidebar, "buffer:" + queryId);
+    second = areaWithKey(*sidebar, "buffer:" + secondQueryId);
     assert((!first || !visible(*first)) && second && visible(*second));
     assert(visible(*firstServer) && visible(*secondServer));
     activate(*firstServer);
@@ -1853,11 +1851,11 @@ void sidebarConversationFilterCheck() {
     assert(model.activeBuffer == queryId); // Each server restores its last conversation.
     assert(selectionGeometry(*firstServer) == selectedGeometry);
     assert(selectionGeometry(*secondServer) == unselectedGeometry);
-    first = areaWithKey(ui.root(), "buffer:" + queryId);
-    second = areaWithKey(ui.root(), "buffer:" + secondQueryId);
-    channelRow = areaWithKey(ui.root(), "buffer:" + channelId);
-    queryRow = areaWithKey(ui.root(), "buffer:" + queryId);
-    assert(first && channelRow && queryRow);
+    first = areaWithKey(*sidebar, "buffer:" + queryId);
+    second = areaWithKey(*sidebar, "buffer:" + secondQueryId);
+    channelRow = areaWithKey(*sidebar, "buffer:" + channelId);
+    queryRow = first;
+    assert(first && channelRow);
     activate(*dms->inputArea());
     assert(visible(*first));
     search->setValue("");
@@ -6707,7 +6705,9 @@ void alphaForegroundCheck() {
                         assert(rect->style().fill.a == (transparent ? .4f : 1.f));
                     }
                 assert(privilegePlate);
-                auto *row = areaWithKey(ui.root(), std::string("buffer:") + edgeBuffers[2]);
+                auto *sidebar = visibleNode<Sidebar>(ui.root());
+                assert(sidebar);
+                auto *row = areaWithKey(*sidebar, std::string("buffer:") + edgeBuffers[2]);
                 assert(row && visible(*row));
                 auto *badge = labelWithText(*row, "7");
                 assert(badge && visible(*badge));

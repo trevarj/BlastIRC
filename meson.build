@@ -200,7 +200,7 @@ if get_option('tests')
 
   workspace_check = executable('blastirc-workspace-check',
     'tests/workspace_check.cpp', 'src/ui/workspace.cpp',
-    include_directories: src_inc, cpp_args: check_args)
+    dependencies: irc_dep, cpp_args: check_args)
   test('workspace_check', workspace_check)
 
   native_input_check = executable('blastirc-native-input-check', 'tests/native_input_check.cpp',

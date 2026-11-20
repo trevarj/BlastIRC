@@ -836,7 +836,7 @@ struct Dialogs::Impl {
                 colorSpecFromRole(error ? ColorRole::Error : ColorRole::OnSurfaceVariant));
             feedback->setVisible(!message.empty());
             feedback->setParticipatesInLayout(!message.empty());
-            if (!message.empty() && scroll)
+            if (!message.empty() && scroll && mode != "first-run")
                 scroll->requestScrollIntoView(feedback);
         }
     }
@@ -1262,7 +1262,7 @@ struct Dialogs::Impl {
         } else {
             chrome->addChild(std::move(viewport));
         }
-        feedback = label(*scroll->content(), "");
+        feedback = label(mode == "first-run" ? *chrome : *scroll->content(), "");
         feedback->setColor(colorSpecFromRole(ColorRole::Error));
         feedback->setVisible(false);
         feedback->setParticipatesInLayout(false);
@@ -1286,6 +1286,16 @@ struct Dialogs::Impl {
             footer->setJustify(FlexJustify::End);
             button(*footer, "Close", [this] { dismiss(); });
         } else if (mode == "first-run") {
+            connectButton = button(
+                *footer, "Save and connect",
+                [this] {
+                    if (displayedServer) {
+                        const auto index = resolveServer(displayedServer);
+                        if (index < model.servers.size())
+                            connect(index);
+                    }
+                },
+                ButtonVariant::Primary);
             saveButton = button(*footer, "Configure offline", [this] {
                 if (pendingSaveRequest)
                     return;
@@ -1411,7 +1421,8 @@ struct Dialogs::Impl {
         detach(page, *scroll->content());
         themeStatus = applicationStatus = motionStatus = soundStatus = cursorStatus =
             identityScope = connectionStatus = nullptr;
-        connectButton = nullptr;
+        if (mode != "first-run")
+            connectButton = nullptr;
         sojuStatus = nullptr;
         displayedServer.reset();
         sojuMutationButtons.clear();
@@ -1462,9 +1473,8 @@ struct Dialogs::Impl {
             profileError->setTextColors(themeForegroundColor("error"), {}, {}, {});
             updateProfile();
         } else if (mode == "first-run") {
-            label(*page, "Make yourself at home", true);
-            label(*page, "Connect directly or through your soju/ZNC bouncer. Your profiles, drafts "
-                         "and workspace stay on this device.");
+            label(*page, "Enter your IRC server and identity to connect. You can change these "
+                         "later in Settings.");
             connection(true);
             applicationStatus = label(*page, "");
             applicationStatus->setColor(colorSpecFromRole(ColorRole::Error));
@@ -2332,6 +2342,8 @@ struct Dialogs::Impl {
             return;
         if (!invalidFields.empty()) {
             setFeedback("Correct the highlighted fields before connecting.");
+            if (mode == "first-run" && dispatcher)
+                dispatcher->setFocus((*invalidFields.begin())->inputArea());
             return;
         }
         if (auto error = validateServerProfile(model, index); !error.empty()) {
@@ -2340,7 +2352,7 @@ struct Dialogs::Impl {
         }
         const std::string name = model.servers[index].name;
         model.firstRun = false;
-        save(name);
+        save(name, mode == "first-run");
     }
 
     std::string sharingNetworks(std::string_view identity) const {
@@ -2709,19 +2721,21 @@ struct Dialogs::Impl {
                     updateIdentityScope();
                 }));
         }
-        text(*endpoint, server.sojuAccount ? "Account alias" : "Display alias", server.alias,
-             onServer(source, [this](std::size_t si, const std::string &value) {
-                 model.servers.at(si).alias = value;
-             }));
-        text(*endpoint, "Avatar image path", server.avatar,
-             onServer(source, [this](std::size_t si, const std::string &value) {
-                 model.servers.at(si).avatar = value;
-             }));
-        label(*endpoint, server.sojuAccount
-                             ? "Account alias changes its display name, not its stable profile key "
-                               "or saved conversations."
-                             : "Alias and local avatar image change the server rail only; "
-                               "the network name identifies saved conversations.");
+        if (!first) {
+            text(*endpoint, server.sojuAccount ? "Account alias" : "Display alias", server.alias,
+                 onServer(source, [this](std::size_t si, const std::string &value) {
+                     model.servers.at(si).alias = value;
+                 }));
+            text(*endpoint, "Avatar image path", server.avatar,
+                 onServer(source, [this](std::size_t si, const std::string &value) {
+                     model.servers.at(si).avatar = value;
+                 }));
+            label(*endpoint, server.sojuAccount
+                                 ? "Account alias changes its display name, not its stable profile key "
+                                   "or saved conversations."
+                                 : "The alias is the display name. The network name identifies saved "
+                                   "conversations. Choose a local image for the server rail.");
+        }
         text(*endpoint, "Server address", server.host,
              onServer(source, [this](std::size_t si, const std::string &value) {
                  model.servers.at(si).host = value;
@@ -2744,6 +2758,7 @@ struct Dialogs::Impl {
             label(*endpoint, "Plaintext exposes messages and credentials to the network.");
         tlsWarning->setColor(colorSpecFromRole(ColorRole::Error));
         tlsWarning->setVisible(!server.tls);
+        tlsWarning->setParticipatesInLayout(!server.tls);
         toggle(*endpoint, "TLS (recommended)", server.tls,
                onServer(source, [this, port, tlsWarning](std::size_t si, bool value) {
                    auto &selected = model.servers.at(si);
@@ -2755,6 +2770,7 @@ struct Dialogs::Impl {
                        invalidFields.erase(port);
                    }
                    tlsWarning->setVisible(!value);
+                   tlsWarning->setParticipatesInLayout(!value);
                }));
         if (!server.sojuAccount) {
             text(*endpoint, "Server password (this network only)", server.password,
@@ -2916,14 +2932,14 @@ struct Dialogs::Impl {
                 }));
             sojuAssociation(server.name, *startup);
         }
-        auto *actionSection = first ? page : section("networks.actions", "Actions");
-        auto *actions = row(*actionSection);
-        connectButton = button(*actions, "Save and connect",
-                               onServer(source, [this](std::size_t si) { connect(si); }),
-                               ButtonVariant::Primary);
-        label(*actionSection, "Save and connect saves first; a save error keeps the current "
-                              "connection unchanged, and appearance changes never reconnect.");
         if (!first) {
+            auto *actionSection = section("networks.actions", "Actions");
+            auto *actions = row(*actionSection);
+            connectButton = button(*actions, "Save and connect",
+                                   onServer(source, [this](std::size_t si) { connect(si); }),
+                                   ButtonVariant::Primary);
+            label(*actionSection, "Save and connect saves first; a save error keeps the current "
+                                  "connection unchanged, and appearance changes never reconnect.");
             button(*actions, "Disconnect", onServer(source, [this](std::size_t si) {
                 model.actions.push_back(
                     {"disconnect", model.servers.at(si).name + "/*server*", {}, {}});

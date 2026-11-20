@@ -135,7 +135,7 @@ struct BufferTitleLine::Impl {
     float scale = 1;
     bool compact = false, active = false;
     SidebarMode navigationMode = SidebarMode::Expanded;
-    bool channel = false, serverLog = false;
+    bool channel = false, wantsIdentity = false;
     bool hiddenTools = false;
     float measuredScale = 0, measuredRenderScale = 0;
     std::uint64_t measuredGeneration = 0;
@@ -263,7 +263,7 @@ struct BufferTitleLine::Impl {
         historySpinner->setSpinnerSize(12 * scale);
         labelStyle(*historyStatus, 11 * scale, "on_surface_variant");
         const bool nextChannel = buffer && buffer->kind == "channel";
-        serverLog = buffer && buffer->kind == "server";
+        const bool serverLog = buffer && buffer->kind == "server";
         const bool changedSource =
             changedPane || cachedBuffer != state.buffer || channel != nextChannel;
         cachedBuffer = state.buffer;
@@ -272,10 +272,20 @@ struct BufferTitleLine::Impl {
             owner.markLayoutDirty();
         }
         const bool mentions = buffer && buffer->kind == "mentions";
-        const std::string_view name = !buffer     ? std::string_view("Conversation")
-                                      : mentions  ? std::string_view("Mentions")
-                                      : serverLog ? std::string_view("Server log")
-                                                  : std::string_view(buffer->target);
+        const bool search = buffer && buffer->kind == "search";
+        const bool nextIdentity =
+            navigationMode != SidebarMode::Expanded || serverLog || mentions || search;
+        if (wantsIdentity != nextIdentity) {
+            wantsIdentity = nextIdentity;
+            owner.markLayoutDirty();
+        }
+        const std::string_view name =
+            !buffer     ? std::string_view("Conversation")
+            : mentions  ? std::string_view("Mentions")
+            : serverLog ? std::string_view("Server log")
+            : search    ? (buffer->title.empty() ? std::string_view("Search")
+                                                 : std::string_view(buffer->title))
+                        : std::string_view(buffer->target);
         const std::string_view server = mentions ? std::string_view("All networks")
                                         : buffer ? serverDisplayName(model, buffer->server)
                                                  : "";
@@ -310,7 +320,7 @@ struct BufferTitleLine::Impl {
             avatarImage->setVisible(false);
             owner.markLayoutDirty();
         }
-        if (navigationMode == SidebarMode::Expanded && !serverLog) {
+        if (!wantsIdentity) {
             identity->setVisible(false);
             avatarImage->setVisible(false);
         }
@@ -384,9 +394,8 @@ struct BufferTitleLine::Impl {
                 ? 0.f
                 : std::min(networkNaturalWidth, networkInitialsWidth) + 2 * chipPadding;
         const float networkReserve = minimumNetworkWidth > 0 ? minimumNetworkWidth + gap : 0.f;
-        hiddenTools = (navigationMode != SidebarMode::Expanded || serverLog) &&
-                      available - fullReserved - gap <
-                          avatarExtent + gap + readableTitleWidth + networkReserve;
+        const float readableIdentity = avatarExtent + gap + readableTitleWidth + networkReserve;
+        hiddenTools = wantsIdentity && available - fullReserved - gap < readableIdentity;
         // Keep topic and People together when search folds into More.
         const bool showTopic = channel;
         const bool showPeople = channel;
@@ -394,7 +403,6 @@ struct BufferTitleLine::Impl {
         const int count = hiddenTools ? (channel ? 3 : 1) : fullCount;
         const float reserved = count * extent + (count - 1) * gap;
         const float leftBudget = std::max(0.f, available - reserved - gap);
-        const bool wantsIdentity = navigationMode != SidebarMode::Expanded || serverLog;
         const float identityMinimum = wantsIdentity ? avatarExtent + gap + minimumTitleWidth : 0.f;
         const float historyNatural =
             historySync == HistorySyncState::Idle

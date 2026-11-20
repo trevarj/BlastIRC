@@ -314,6 +314,40 @@ void predictionControls(blast::Model &model, blast::Dialogs &dialogs, InputDispa
     assert(model.settings.wordPrediction);
 }
 
+void welcomeControls() {
+    using namespace blast;
+    Model model;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    Dialogs dialogs(model, [](std::string) {});
+    dispatcher.setSceneRoot(&dialogs);
+    dialogs.setInputDispatcher(dispatcher);
+    dialogs.open("first-run");
+    const auto frame = [&] { dialogs.sync(720, 480, 1); };
+    frame();
+    auto *connect = button(dialogs, "Save and connect");
+    assert(connect->parent() == button(dialogs, "Configure offline")->parent());
+    auto *port = named<Input>(dialogs, "Port (1–65535)");
+    edit(dispatcher, *port, "99999");
+    press(dispatcher, *connect);
+    assert(model.actions.empty() && dispatcher.focusedArea() == port->inputArea());
+    edit(dispatcher, *port, "6697");
+    press(dispatcher, *connect);
+    assert(model.actions.size() == 1 && model.actions.back().type == "save-connect");
+    auto request = model.actions.back().requestId;
+    model.settingsSaveResult = {request + 1, true, {}};
+    frame();
+    assert(dialogs.visible());
+    model.settingsSaveResult = {request, false, "Cannot save profile"};
+    frame();
+    assert(find<Label>(dialogs, [](const Label &l) { return l.text() == "Cannot save profile"; }));
+    press(dispatcher, *connect);
+    model.settingsSaveResult = {model.actions.back().requestId, true, {}};
+    frame();
+    assert(!dialogs.visible());
+}
+
 void settingsTreeControls() {
     using namespace blast;
     Model model;
@@ -1287,6 +1321,7 @@ void nativePopupFonts() {
 void runSettingsCheck() {
     using namespace blast;
     nativePopupFonts();
+    welcomeControls();
     settingsTreeControls();
     settingsTreeAnimatedSelection();
     dialogOpeningMotion();

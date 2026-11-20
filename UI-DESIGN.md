@@ -21,6 +21,7 @@ The frontend remains native C++23 with the pinned Noctalia C++ library, Wayland/
 - Show the avatar, channel/peer name, and small network chip whenever channel navigation is Compact or Hidden. Identity is static, never a focusable picker/dropdown. Keep actions accessible through More when direct tools would obscure the name. Expanded regular filters pin the active conversation rather than hiding its send destination.
 - Put the channel topic icon beside People in the chat header. Open a selectable, read-only formatted popover with an honest empty state. Typed 332/331/TOPIC updates change topic state without generated transcript announcements; an explicitly correlated `/topic` response may still be origin-routed. Preserve stored historical topic lines and never classify arbitrary chat text as topic protocol.
 - Server logs never become ordinary, filtered/pinned or compact channel rows. Source-bound **Open server log** on the server-avatar menu ensures even an inactive saved profile has a log, then opens it with **Server log + network** identity visible in the header. Keep global-picker access and all stored log data.
+- Keep the current search query and global Mentions identity visible in the conversation header in all navigation modes.
 - Chat fills the remaining center. The composer stays outside scrolling history. The right member list independently cycles Expanded → Compact → Hidden. Compact uses centered initials, privilege badges, full-name tooltips, and existing member actions; Hidden occupies no width. DMs/utility views suppress it without changing its saved preference.
 - Show the history scrollbar only during scrolling and thumb capture, then fade it after a brief idle pause. Hover, incoming messages and typing-footer layout do not reveal it. Keep the gutter and native drag target stable while hidden; reduced motion and Effects Off suppress the fade, not idle hiding.
 - The bottom status bar groups current nick, network, reserved connection state, feedback, and pending keyboard chord with native Tabler icons, semantic colors, and faint separators. The healthy label is Connected with a plug icon, meaning completed IRC registration for that network, not nick presence or application health. Removed-network history must not borrow another network's state. Long identities elide before state or failure feedback.
@@ -269,10 +270,11 @@ The trusted FILEHOST receives the parent account's actual username and password 
 
 | State | Behavior |
 | --- | --- |
-| No configured networks | Clear native setup/connect action |
-| No matching sidebar rows | Keep the current conversation identifiable, explain no other matches, and offer Clear filters |
+| No configured networks | Welcome keeps the server endpoint ahead of cosmetic settings and Save and connect beside Configure offline outside the scrolling form. Keep errors visible; dismiss on successful save, not on submission or connection readiness. |
+| No matching sidebar rows | Keep the current conversation identifiable, name the actual filter, and offer Clear filters; with no conversations or filters, explain how to join a channel. |
 | Connecting/disconnected/failed | Network-specific state/error and recovery actions; retain history/draft |
 | Empty channel/DM | Appropriate empty view and honest send availability |
+| Empty search/Mentions | Identify missing results or mentions rather than an empty chat; neither feed offers conversation-history pagination. |
 | History loading | Older-history indicator without replacing timeline or losing anchor |
 | Long names/topics/messages | Measured wrapping/elision; full identity accessible |
 | Unsupported server feature | Disable/hide unsupported action, retain local history/search |

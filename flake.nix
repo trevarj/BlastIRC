@@ -95,6 +95,14 @@
           hunspell
         ])
         ++ [ stbHeaders ];
+      fallbackFonts = pkgs.makeFontsConf {
+        includes = [ "${pkgs.fontconfig.out}/etc/fonts/conf.d" ];
+        impureFontDirectories = [ ];
+        fontDirectories = [
+          "${pkgs.dejavu_fonts}/share/fonts"
+          "${pkgs.nerd-fonts.jetbrains-mono}/share/fonts"
+        ];
+      };
       nativeTools = with pkgs; [
         meson
         ninja
@@ -154,16 +162,7 @@
           export XDG_CONFIG_HOME="$TMPDIR/blastirc-test-config"
           export XDG_DATA_HOME="$TMPDIR/blastirc-test-data"
           mkdir -m 700 -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
-          export FONTCONFIG_FILE="${
-            pkgs.makeFontsConf {
-              includes = [ "${pkgs.fontconfig.out}/etc/fonts/conf.d" ];
-              impureFontDirectories = [ ];
-              fontDirectories = [
-                "${pkgs.dejavu_fonts}/share/fonts"
-                "${pkgs.nerd-fonts.jetbrains-mono}/share/fonts"
-              ];
-            }
-          }"
+          export FONTCONFIG_FILE="${fallbackFonts}"
         '';
         postInstall = ''
           install -Dm644 ${pkgs.hunspellDicts.en_US}/share/doc/hunspell-dict-en-us-wordlist.txt \
@@ -173,6 +172,7 @@
         '';
         postFixup = ''
           wrapProgram $out/bin/blastirc \
+            --run 'if [[ ! -v FONTCONFIG_FILE && ! -v FONTCONFIG_PATH && ! -v FONTCONFIG_SYSROOT && ! -r /etc/fonts/fonts.conf ]]; then export FONTCONFIG_FILE=${fallbackFonts}; fi' \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.libnotify ]} \
             --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libheif ]}
           substituteInPlace $out/share/blastirc/noctalia-template/apply.sh \

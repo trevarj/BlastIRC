@@ -2104,6 +2104,22 @@ void serverLogConsumerCheck() {
     assert(!visibleLabelContaining(*header, "Server log"));
     assert(!visibleLabelContaining(*header, "logged"));
     assert(input->editingStateMatches(document));
+    ui.execute("toggle-navigation");
+    ui.execute("toggle-navigation");
+    for (const auto &[kind, caption] :
+         {std::pair{"search", "Search: missing word"}, std::pair{"mentions", "Mentions"}}) {
+        const std::string id = std::string("test/*") + kind + "*";
+        auto &utility = model.buffers[id];
+        utility.id = id;
+        utility.server = "test";
+        utility.kind = kind;
+        utility.target = id;
+        utility.title = caption;
+        ui.execute("buffer:" + id);
+        frame();
+        auto *utilityHeader = visibleNode<BufferTitleLine>(ui.root());
+        assert(utilityHeader && visibleLabelContaining(*utilityHeader, caption));
+    }
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -4138,6 +4154,10 @@ void sidebarArchiveControlsCheck() {
     assert(model.buffers.at("one/#room").unread == 7 &&
            model.buffers.at("one/#room").draft == "retained draft");
     assert(dynamic_cast<Button *>(archived->parent())->label()->text() == "Archived");
+    model.buffers.at("one/#room").archived = false;
+    frame();
+    assert(labelWithText(sidebar, "No conversations match Archived."));
+    model.buffers.at("one/#room").archived = true;
     model.buffers.at("one/#room").muted = false;
     frame();
     // Natural filter captions retain the unread count through resize, zoom and count changes.

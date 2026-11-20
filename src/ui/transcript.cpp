@@ -5785,12 +5785,15 @@ struct TranscriptView::Impl {
         const auto *oldestLoaded = oldestHistoryMessage(*buffer);
         const bool localOlder = oldestLoaded && !buffer->historyState.oldest.id.empty() &&
                                 buffer->historyState.oldest.id != oldestLoaded->id;
-        history->setVisible(buffer->kind != "mentions" &&
+        history->setVisible(buffer->kind != "mentions" && buffer->kind != "search" &&
                             (!buffer->historyState.beginning || localOlder));
         history->setEnabled(history->visible() && !buffer->loading);
         history->setText(buffer->loading ? "Loading history…" : "Load older messages");
         empty->setVisible(buffer->messages.empty());
-        empty->setText(buffer->loading ? "Loading messages…" : "No messages yet");
+        empty->setText(buffer->loading           ? "Loading messages…"
+                       : buffer->kind == "search"   ? "No matching messages."
+                       : buffer->kind == "mentions" ? "No mentions yet."
+                                                    : "No messages yet");
         size_t typerCount = 0;
         bool typersChanged = false;
         const auto eligibleTyper = [&](const auto &entry) {

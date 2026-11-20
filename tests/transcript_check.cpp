@@ -3761,6 +3761,24 @@ void focusRevealIntents(TranscriptTestRenderer &renderer) {
                 assert(plainText(view, "No messages yet"));
         }
     }
+    buffer.messages.clear();
+    ++buffer.messagesRevision;
+    const auto visibleText = [&](std::string_view value) {
+        for (const Node *node = plainText(view, value); node; node = node->parent()) {
+            if (!node->visible())
+                return false;
+            if (node == &view)
+                return true;
+        }
+        return false;
+    };
+    for (const auto &[kind, caption] : {std::pair{"search", "No matching messages."},
+                                        std::pair{"mentions", "No mentions yet."}}) {
+        buffer.kind = kind;
+        arrange();
+        assert(visibleText(caption));
+        assert(!visibleText("Load older messages"));
+    }
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }

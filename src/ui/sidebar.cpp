@@ -1934,9 +1934,10 @@ struct Sidebar::Impl {
         clear->setExcludeSubtreeFromTabOrder(!showClear || !expandedInteractive);
         if (showEmpty) {
             orderChild(*empty);
-            const char *filterName = filter == ui_logic::SidebarFilter::Unread ? "Unread"
-                                     : filter == ui_logic::SidebarFilter::Dms  ? "DMs"
-                                                                               : "All";
+            const char *filterName = filter == ui_logic::SidebarFilter::Unread     ? "Unread"
+                                     : filter == ui_logic::SidebarFilter::Dms      ? "DMs"
+                                     : filter == ui_logic::SidebarFilter::Archived ? "Archived"
+                                                                                   : "All";
             empty->setText(
                 noNetworks ? "Your conversations live here. Add a network from the "
                              "BlastIRC application menu."
@@ -1944,6 +1945,7 @@ struct Sidebar::Impl {
                     ? (pinnedCurrent ? "No other conversations are shown for this network "
                                        "selection. Show Networks to choose a network."
                                      : "Show Networks to select a network.")
+                : !showClear ? "No conversations yet. Join a channel with /join #channel."
                     : std::string(pinnedCurrent ? "No other conversations match "
                                                 : "No conversations match ") +
                           filterName + (search->value().empty() ? "." : " and this search."));

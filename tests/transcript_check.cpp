@@ -869,12 +869,12 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
         view.sync();
         view.arrange(renderer, viewport);
     };
-    const auto avatar = [&](const Body &rendered) {
+    const auto avatar = [&](const Body &rendered, float size) {
         Node *result = nullptr;
         for (const auto &child : rendered.content.children())
             if ((dynamic_cast<RectNode *>(child.get()) || dynamic_cast<Image *>(child.get())) &&
-                child->visible() && std::abs(child->width() - 20 * zoom) < .02f &&
-                std::abs(child->height() - 20 * zoom) < .02f) {
+                child->visible() && std::abs(child->width() - size) < .02f &&
+                std::abs(child->height() - size) < .02f) {
                 assert(!result);
                 result = child.get();
             }
@@ -904,7 +904,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 viewport.width <= 240 * zoom ||
                 model.settings.messageLayouts.at(buffer.id) == blast::MessageLayout::Stacked;
             if (stacked) {
-                near(bodyBounds.x, hx + (enabled ? 26 * zoom : 0));
+                near(bodyBounds.x, hx + (enabled ? 40 * zoom : 0));
                 near(bodyBounds.x,
                      labelBounds.x -
                          (i == 1 ? labelBounds.x - sceneBounds(*find<RectNode>(*hit)).x : 0));
@@ -926,7 +926,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
             }
             assert(hx >= viewport.x - .02f &&
                    hx + hit->width() <= viewport.x + viewport.width + .02f);
-            auto *picture = avatar(rendered);
+            auto *picture = avatar(rendered, (stacked ? 34 : 20) * zoom);
             assert(bool(picture) == enabled);
             if (picture) {
                 float ax, ay;
@@ -937,8 +937,15 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 Node::absolutePosition(nick->parent(), labelX, labelY);
                 assert(ax + picture->width() <= labelX + .02f);
                 assert(labelX - ax - picture->width() <= 20 * zoom + .02f);
-                assert(std::abs((ay + picture->height() * .5f) - (hy + hit->height() * .5f)) <=
-                       hit->height());
+                if (stacked) {
+                    assert(ay >= hy - .02f && ay <= bodyBounds.y + .02f);
+                    assert(ay + picture->height() > bodyBounds.y + 3 * zoom);
+                    const auto rowBounds = sceneBounds(rendered.row);
+                    assert(ay + picture->height() <= rowBounds.y + rowBounds.height + .02f);
+                } else {
+                    assert(std::abs((ay + picture->height() * .5f) - (hy + hit->height() * .5f)) <=
+                           hit->height());
+                }
                 if (monogram) {
                     assert(dynamic_cast<RectNode *>(picture));
                     auto *initial = plainText(rendered.content, i == 1 ? "M" : i == 2 ? "P" : "א");
@@ -1033,7 +1040,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
     assert(scroll && scroll->maxScrollOffset() > 0);
     scroll->setScrollOffset(scroll->maxScrollOffset());
     arrange();
-    assert(avatar(body(view, "DecorationBody79", true)));
+    assert(avatar(body(view, "DecorationBody79", true), 34 * zoom));
     scroll->setScrollOffset(0);
     arrange();
     geometry(true, true);
@@ -8529,25 +8536,8 @@ void typingFooterGeometry(TranscriptTestRenderer &renderer) {
                         view.arrange(renderer,
                                      {viewport.x, viewport.y, width * zoom, viewport.height});
                         typingRow(participants);
-                        if (avatars && width >= 360) {
+                        if (avatars && width >= 360)
                             assert(avatarCount() == participants.size());
-                            scroll->setScrollOffset(scroll->maxScrollOffset());
-                            view.arrange(renderer,
-                                         {viewport.x, viewport.y, width * zoom, viewport.height});
-                            const auto &message = body(view, "FooterRow-31");
-                            const auto matchingAvatar = [&](auto &&self, Node &node) -> bool {
-                                if (auto *rect = dynamic_cast<RectNode *>(&node);
-                                    rect && rect->visible() &&
-                                    std::abs(rect->width() - avatarSize()) < .02f &&
-                                    std::abs(rect->height() - avatarSize()) < .02f)
-                                    return true;
-                                for (const auto &child : node.children())
-                                    if (self(self, *child))
-                                        return true;
-                                return false;
-                            };
-                            assert(matchingAvatar(matchingAvatar, message.row));
-                        }
                     }
             }
             if (zoom == 1 && messageZoom == 1) {

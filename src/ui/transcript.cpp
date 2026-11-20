@@ -695,9 +695,15 @@ struct Geometry {
     float authorAvatarInset() const {
         return bubbles && tight && avatars ? (metrics.avatarSize + 6) * scale : 0;
     }
-    float compactAvatarSize() const { return channel && avatars ? 20 * scale : 0; }
-    float compactAvatarInset() const {
-        return compactAvatarSize() > 0 ? compactAvatarSize() + 6 * scale : 0;
+    float compactAvatarSize(bool inlineLayout) const {
+        return channel && avatars ? (inlineLayout ? 20 : 34) * scale : 0;
+    }
+    float compactAvatarInset(bool inlineLayout) const {
+        const float size = compactAvatarSize(inlineLayout);
+        return size > 0 ? size + 6 * scale : 0;
+    }
+    float stackedAvatarY(float prefixHeight) const {
+        return std::max(0.f, (prefixHeight + bodyLine - compactAvatarSize(false)) * .5f);
     }
     float channelNickWidth(bool clockVisible, bool mention) const {
         return std::max(1.f, nickGutter -
@@ -706,7 +712,7 @@ struct Geometry {
     }
     float prefixWidth(bool presence) const {
         return presence  ? timeGutter
-               : channel ? (inlineChannel ? channelPrefix() : compactAvatarInset())
+               : channel ? (inlineChannel ? channelPrefix() : compactAvatarInset(false))
                : dense() ? timeGutter
                          : 0;
     }
@@ -822,7 +828,7 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
     result.unread = std::max(30 * result.scale, result.header + 10 * result.scale);
     if (result.channel) {
         const float available = std::max(1.f, width - 2 * result.metrics.inset * result.scale);
-        const float nickAdornment = result.compactAvatarInset() + 2 * result.chipPadding();
+        const float nickAdornment = result.compactAvatarInset(true) + 2 * result.chipPadding();
         auto actorFont = themeUiFont();
         actorFont.weight = FontWeight::Bold;
         const float preferredNick =
@@ -4041,7 +4047,7 @@ struct TranscriptView::Impl {
                 const auto align = g.inlineChannel ? TextAlign::End : TextAlign::Start;
                 const float nickWidth =
                     std::max(1.f, g.channelNickWidth(row.showClock, row.mentionHighlight) -
-                                      g.compactAvatarInset() - friendExtent -
+                                      g.compactAvatarInset(g.inlineChannel) - friendExtent -
                                       (entry.own && !entry.action ? 2 * g.chipPadding() : 0));
                 if (entry.action)
                     include("↳ " + entry.nick, nickWidth, align, true);
@@ -4057,19 +4063,18 @@ struct TranscriptView::Impl {
             const float textHeight = row.prefixAscent + descent;
             row.prefixHeight = std::max(entry.presence ? 0.f : g.metadataHeader, textHeight);
             if (g.nickVisible(row.grouped, entry.presence))
-                row.prefixHeight =
-                    std::max(row.prefixHeight,
-                             std::max(g.compactAvatarSize(),
-                                      g.metadataHeader + (entry.own ? 2 * g.chipPaddingY() : 0)));
-            if (g.nickVisible(row.grouped, entry.presence) && g.compactAvatarSize() > 0) {
-                const float size = g.compactAvatarSize();
+                row.prefixHeight = std::max(
+                    row.prefixHeight, g.metadataHeader + (entry.own ? 2 * g.chipPaddingY() : 0));
+            if (g.inlineChannel && g.nickVisible(row.grouped, entry.presence) &&
+                g.compactAvatarSize(true) > 0) {
+                const float size = g.compactAvatarSize(true);
                 const float center = avatarBodyCenter(buffer, entry);
                 const float offset = entry.own && !entry.action
                                          ? 0
                                          : row.prefixAscent + nickInkCenter - textHeight * .5f;
                 row.prefixHeight =
-                    std::max(row.prefixHeight,
-                             2 * std::max(size * center - offset, size * (1 - center) + offset));
+                    std::max({row.prefixHeight, size,
+                              2 * std::max(size * center - offset, size * (1 - center) + offset)});
             }
             row.prefixAscent =
                 entry.own && !entry.action && g.nickVisible(row.grouped, entry.presence)
@@ -4106,7 +4111,7 @@ struct TranscriptView::Impl {
                 if (g.nickVisible(row.grouped, entry.presence)) {
                     const float chipPadding = entry.own && !entry.action ? g.chipPadding() : 0;
                     const float adornments =
-                        g.compactAvatarInset() + 2 * chipPadding + friendExtent;
+                        g.compactAvatarInset(false) + 2 * chipPadding + friendExtent;
                     const float textLimit = std::max(
                         1.f, g.channelNickWidth(row.showClock, row.mentionHighlight) - adornments);
                     const auto text = entry.action ? "↳ " + entry.nick : entry.nick;
@@ -4150,6 +4155,10 @@ struct TranscriptView::Impl {
         if (!row.reactions.empty())
             bodyEnd += g.reaction;
         row.contentEnd = bodyEnd;
+        if (!collapsed && g.stackedPrefix(row.grouped, entry.presence, row.showClock) && g.avatars)
+            bodyEnd = std::max(bodyEnd, row.prefixBaseline - row.prefixAscent +
+                                            g.stackedAvatarY(row.prefixHeight) +
+                                            g.compactAvatarSize(false));
         row.height =
             bodyEnd + (g.footerVisible(entry) ? row.footerHeight + g.footerGap() : 0) + paddingY;
         if (g.bubbles && g.avatars && !row.grouped && !entry.presence)
@@ -4272,10 +4281,10 @@ struct TranscriptView::Impl {
                                                  ? std::string_view("rfc1459")
                                                  : std::string_view(network->second.caseMapping);
             auto image = std::make_unique<Image>();
-            image->setPosition(
-                x, entry.action && cache->geometry.bubbles
-                       ? y
-                       : y + size * (.5f - foundryAvatarBodyCenterY(entry.nick, mapping)));
+            const auto &g = cache->geometry;
+            if (g.inlineChannel || (g.bubbles && !entry.action))
+                y += size * (.5f - foundryAvatarBodyCenterY(entry.nick, mapping));
+            image->setPosition(x, y);
             image->setSize(size, size);
             image->setFit(ImageFit::Contain);
             image->setHitTestVisible(false);
@@ -4575,8 +4584,8 @@ struct TranscriptView::Impl {
                             nickMenu(buffer, nick, {}, identity);
                         }
                     });
-                    const float avatarSize = g.compactAvatarSize();
-                    const float avatarInset = g.compactAvatarInset();
+                    const float avatarSize = g.compactAvatarSize(g.inlineChannel);
+                    const float avatarInset = g.compactAvatarInset(g.inlineChannel);
                     const float chipPadding = entry.own && !entry.action ? g.chipPadding() : 0;
                     const float textLimit =
                         std::max(1.f, width - avatarInset - 2 * chipPadding - friendExtent);
@@ -4619,7 +4628,10 @@ struct TranscriptView::Impl {
                     name->setPosition(nameX + chipPadding,
                                       slot.ownNickChip ? (row.prefixHeight - name->height()) * .5f
                                                        : row.prefixAscent - name->baselineOffset());
-                    if (avatarSize > 0) {
+                    if (avatarSize > 0 && stacked) {
+                        avatar(renderer, slot, entry, left,
+                               area->y() + g.stackedAvatarY(row.prefixHeight), avatarSize);
+                    } else if (avatarSize > 0) {
                         const auto ink =
                             renderer.measureText(text, g.metadataFont, actorFont, textLimit, 1);
                         const float center =
@@ -6431,7 +6443,8 @@ struct TranscriptView::Impl {
             std::max(0.f, trayWidth - dotsWidth - (reserveOverflow ? overflowWidth + textGap : 0)),
             fullPhraseWidth));
         float phraseReserve = phraseWidth + dotsWidth;
-        const float avatarSize = g.bubbles ? g.metrics.avatarSize * g.scale : g.compactAvatarSize();
+        const float avatarSize =
+            g.bubbles ? g.metrics.avatarSize * g.scale : g.compactAvatarSize(true);
         const float avatarStep = avatarSize * .5625f;
         const float avatarGap = 8 * g.scale;
         size_t avatarCount = g.avatars ? std::min(typingParticipants.size(), size_t(3)) : 0;

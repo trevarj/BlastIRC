@@ -5,15 +5,22 @@
 namespace blast::foundryAtlas {
 inline constexpr std::size_t tileSize = 96;
 inline constexpr std::size_t columns = 16;
-inline constexpr std::size_t tileCount = 74;
+inline constexpr std::size_t tileCount = 85;
 inline constexpr std::size_t width = 1536;
-inline constexpr std::size_t height = 480;
+inline constexpr std::size_t height = 576;
+inline constexpr std::size_t bodyKinds = 5;
+inline constexpr std::size_t faceKinds = 4;
+inline constexpr std::size_t gearKinds = 5;
 inline constexpr std::size_t fuseOffset = 0;
-inline constexpr std::size_t fuseCount = 12;
-inline constexpr std::size_t bodyOffset = 12;
-inline constexpr std::size_t bodyCount = 24;
-inline constexpr std::size_t accessoryOffset = 36;
-inline constexpr std::size_t accessoryCount = 30;
-inline constexpr std::size_t markOffset = 66;
-inline constexpr std::size_t markCount = 8;
+inline constexpr std::size_t fuseCount = 5;
+inline constexpr std::size_t bodyOffset = 5;
+inline constexpr std::size_t bodyCount = 5;
+inline constexpr std::size_t tintOffset = 10;
+inline constexpr std::size_t tintCount = 5;
+inline constexpr std::size_t faceOffset = 15;
+inline constexpr std::size_t faceCount = 20;
+inline constexpr std::size_t backGearOffset = 35;
+inline constexpr std::size_t backGearCount = 25;
+inline constexpr std::size_t frontGearOffset = 60;
+inline constexpr std::size_t frontGearCount = 25;
 } // namespace blast::foundryAtlas

@@ -7,7 +7,6 @@
 #include <core/files/resource_paths.h>
 #include <fstream>
 #include <iostream>
-#include <limits>
 #include <openssl/sha.h>
 #include <render/core/image_decoder.h>
 #include <render/core/texture_manager.h>
@@ -17,69 +16,45 @@ namespace blast {
 namespace {
 namespace atlas = foundryAtlas;
 constexpr std::size_t tileBytes = atlas::tileSize * atlas::tileSize * 4;
-static_assert(atlas::fuseCount == 12 && atlas::bodyCount == 24 && atlas::accessoryCount == 30 &&
-              atlas::markCount == 8 && atlas::tileCount == 74);
+static_assert(atlas::fuseCount == atlas::bodyKinds && atlas::bodyCount == atlas::bodyKinds &&
+              atlas::tintCount == atlas::bodyKinds &&
+              atlas::faceCount == atlas::bodyKinds * atlas::faceKinds &&
+              atlas::backGearCount == atlas::bodyKinds * atlas::gearKinds &&
+              atlas::frontGearCount == atlas::backGearCount);
 
-using Rgb = std::array<float, 3>;
-constexpr std::array<std::array<Rgb, 3>, 6> bodyPalettes{{
-    {{{72, 81, 89}, {120, 134, 140}, {48, 55, 63}}},
-    {{{174, 99, 66}, {228, 164, 107}, {113, 61, 50}}},
-    {{{224, 131, 50}, {255, 193, 107}, {157, 77, 40}}},
-    {{{40, 110, 118}, {100, 169, 165}, {32, 72, 80}}},
-    {{{110, 135, 144}, {164, 192, 196}, {64, 91, 101}}},
-    {{{178, 139, 61}, {231, 194, 107}, {118, 90, 49}}},
-}};
+struct Traits {
+    std::size_t body, face, gear;
+};
 
-std::array<Rgb, 6> bodyRoles(std::size_t palette) {
-    const auto &colors = bodyPalettes[palette];
-    return {colors[0],       colors[1],          colors[2],
-            Rgb{32, 39, 43}, Rgb{246, 223, 173}, Rgb{169, 164, 154}};
+const std::uint8_t *tileRow(const DecodedRasterImage &image, std::size_t tile, std::size_t row) {
+    const auto x = tile % atlas::columns * atlas::tileSize;
+    const auto y = tile / atlas::columns * atlas::tileSize;
+    return image.pixels.data() + ((y + row) * atlas::width + x) * 4;
 }
 
-std::array<Rgb, 6> tintedRoles(const std::array<Rgb, 6> &source, const Color &color) {
-    auto target = source;
-    target[0] = {255 * std::clamp(color.r, 0.f, 1.f), 255 * std::clamp(color.g, 0.f, 1.f),
-                 255 * std::clamp(color.b, 0.f, 1.f)};
-    for (int channel = 0; channel < 3; ++channel) {
-        const float highlight =
-            (source[1][channel] - source[0][channel]) / (255 - source[0][channel]);
-        target[1][channel] = target[0][channel] + (255 - target[0][channel]) * highlight;
-        target[2][channel] = target[0][channel] * source[2][channel] / source[0][channel];
-    }
-    return target;
-}
-
-Rgb tintBodyPixel(const std::uint8_t *pixel, const std::array<Rgb, 6> &source,
-                  const std::array<Rgb, 6> &target) {
-    for (std::size_t role = 0; role < source.size(); ++role)
-        if (std::equal(source[role].begin(), source[role].end(), pixel))
-            return target[role];
-    float best = std::numeric_limits<float>::max();
-    Rgb result{float(pixel[0]), float(pixel[1]), float(pixel[2])};
-    for (std::size_t a = 0; a < source.size(); ++a) {
-        for (std::size_t b = a + 1; b < source.size(); ++b) {
-            float dot = 0, length = 0;
-            for (int c = 0; c < 3; ++c) {
-                const float delta = source[b][c] - source[a][c];
-                dot += (pixel[c] - source[a][c]) * delta;
-                length += delta * delta;
+void composite(std::span<std::uint8_t> rgba, const DecodedRasterImage &image, std::size_t tile,
+               const std::array<unsigned, 3> &color, std::size_t tintTile = atlas::tileCount) {
+    for (std::size_t row = 0; row < atlas::tileSize; ++row) {
+        const auto *source = tileRow(image, tile, row);
+        const auto *tint = tintTile == atlas::tileCount ? nullptr : tileRow(image, tintTile, row);
+        auto *dest = rgba.data() + row * atlas::tileSize * 4;
+        for (std::size_t col = 0; col < atlas::tileSize; ++col, source += 4, dest += 4) {
+            const unsigned alpha = source[3];
+            if (!alpha)
+                continue;
+            const unsigned weight = tint ? tint[col * 4] : 0;
+            const unsigned behind = dest[3] * (255 - alpha);
+            const unsigned front = alpha * 255;
+            const unsigned total = front + behind;
+            for (std::size_t channel = 0; channel < color.size(); ++channel) {
+                const unsigned ink =
+                    std::min(255u, source[channel] + (weight * color[channel] + 127) / 255);
+                dest[channel] = static_cast<std::uint8_t>(
+                    behind ? (ink * front + dest[channel] * behind + total / 2) / total : ink);
             }
-            const float mix = std::clamp(dot / length, 0.f, 1.f);
-            float distance = 0;
-            Rgb correction{};
-            for (int c = 0; c < 3; ++c) {
-                const float original = std::lerp(source[a][c], source[b][c], mix);
-                distance += (pixel[c] - original) * (pixel[c] - original);
-                correction[c] = std::lerp(target[a][c], target[b][c], mix) - original;
-            }
-            if (distance < best) {
-                best = distance;
-                for (int c = 0; c < 3; ++c)
-                    result[c] = std::clamp(pixel[c] + correction[c], 0.f, 255.f);
-            }
+            dest[3] = static_cast<std::uint8_t>((total + 127) / 255);
         }
     }
-    return result;
 }
 
 const DecodedRasterImage &foundryAtlasImage() {
@@ -117,10 +92,9 @@ const DecodedRasterImage &foundryAtlasImage() {
     }();
     return image;
 }
-} // namespace
 
-std::array<std::size_t, 4> foundryAvatarLayers(std::string_view nick, std::string_view mapping) {
-    constexpr std::string_view prefix = "foundry-concept-1:";
+Traits avatarTraits(std::string_view nick, std::string_view mapping) {
+    constexpr std::string_view prefix = "short-fuse-club-1:";
     // Reserve once; the ASCII prefix is unchanged by every supported IRC casemapping.
     std::string seed;
     seed.reserve(prefix.size() + nick.size());
@@ -143,13 +117,10 @@ std::array<std::size_t, 4> foundryAvatarLayers(std::string_view nick, std::strin
     }
     std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
     SHA256(reinterpret_cast<const unsigned char *>(seed.data()), seed.size(), digest.data());
-    const std::size_t body = digest[0] % 4, palette = digest[1] % 6;
-    const std::size_t fuse = digest[2] % 4, spark = digest[3] % 3;
-    const std::size_t accessory = digest[4] % 5, mark = digest[5] % 4;
-    return {atlas::fuseOffset + fuse * 3 + spark, atlas::bodyOffset + body * 6 + palette,
-            atlas::accessoryOffset + accessory * 6 + palette,
-            atlas::markOffset + (accessory == 1 ? 4 : 0) + mark};
+    return {digest[0] % atlas::bodyKinds, digest[1] % atlas::faceKinds,
+            digest[2] % atlas::gearKinds};
 }
+} // namespace
 
 float foundryAvatarBodyCenterY(std::string_view nick, std::string_view mapping) {
     static const auto centers = [] {
@@ -159,22 +130,22 @@ float foundryAvatarBodyCenterY(std::string_view nick, std::string_view mapping) 
         if (image.pixels.empty())
             return result;
         for (size_t body = 0; body < result.size(); ++body) {
-            const auto tile = atlas::bodyOffset + body;
-            const auto x = tile % atlas::columns * atlas::tileSize;
-            const auto y = tile / atlas::columns * atlas::tileSize;
             size_t top = atlas::tileSize, bottom = 0;
-            for (size_t row = 0; row < atlas::tileSize; ++row)
+            for (size_t row = 0; row < atlas::tileSize; ++row) {
+                const auto *source = tileRow(image, atlas::bodyOffset + body, row);
                 for (size_t col = 0; col < atlas::tileSize; ++col)
-                    if (image.pixels[((y + row) * atlas::width + x + col) * 4 + 3] >= 128) {
+                    if (source[col * 4 + 3] >= 128) {
                         top = std::min(top, row);
                         bottom = std::max(bottom, row + 1);
+                        break;
                     }
+            }
             if (top < bottom)
                 result[body] = float(top + bottom) / (2 * atlas::tileSize);
         }
         return result;
     }();
-    return centers[foundryAvatarLayers(nick, mapping)[1] - atlas::bodyOffset];
+    return centers[avatarTraits(nick, mapping).body];
 }
 
 bool composeFoundryAvatar(std::span<std::uint8_t> rgba, std::string_view nick,
@@ -185,32 +156,18 @@ bool composeFoundryAvatar(std::span<std::uint8_t> rgba, std::string_view nick,
     if (atlasImage.pixels.empty())
         return false;
     std::fill(rgba.begin(), rgba.end(), 0);
-    const auto layers = foundryAvatarLayers(nick, mapping);
-    const auto sourceRoles = bodyRoles((layers[1] - atlas::bodyOffset) % 6);
-    const auto targetRoles = tintedRoles(sourceRoles, bodyColor);
-    for (const auto tile : layers) {
-        const auto x = (tile % atlas::columns) * atlas::tileSize;
-        const auto y = (tile / atlas::columns) * atlas::tileSize;
-        for (std::size_t row = 0; row < atlas::tileSize; ++row) {
-            const auto *source = atlasImage.pixels.data() + ((y + row) * atlas::width + x) * 4;
-            auto *dest = rgba.data() + row * atlas::tileSize * 4;
-            for (std::size_t col = 0; col < atlas::tileSize; ++col, source += 4, dest += 4) {
-                const unsigned alpha = source[3], inverse = 255 - alpha;
-                const unsigned outAlpha = alpha * 255 + dest[3] * inverse;
-                if (!outAlpha)
-                    continue;
-                const auto rgb = alpha && tile == layers[1]
-                                     ? tintBodyPixel(source, sourceRoles, targetRoles)
-                                     : Rgb{float(source[0]), float(source[1]), float(source[2])};
-                for (int channel = 0; channel < 3; ++channel)
-                    dest[channel] = static_cast<std::uint8_t>(
-                        (std::lround(rgb[channel]) * alpha * 255 +
-                         dest[channel] * dest[3] * inverse + outAlpha / 2) /
-                        outAlpha);
-                dest[3] = static_cast<std::uint8_t>((outAlpha + 127) / 255);
-            }
-        }
-    }
+    const auto [body, face, gear] = avatarTraits(nick, mapping);
+    const auto toByte = [](float value) {
+        return static_cast<unsigned>(std::lround(255 * std::clamp(value, 0.f, 1.f)));
+    };
+    const std::array color{toByte(bodyColor.r), toByte(bodyColor.g), toByte(bodyColor.b)};
+    composite(rgba, atlasImage, atlas::fuseOffset + body, color);
+    if (gear)
+        composite(rgba, atlasImage, atlas::backGearOffset + body * atlas::gearKinds + gear, color);
+    composite(rgba, atlasImage, atlas::bodyOffset + body, color, atlas::tintOffset + body);
+    if (gear)
+        composite(rgba, atlasImage, atlas::frontGearOffset + body * atlas::gearKinds + gear, color);
+    composite(rgba, atlasImage, atlas::faceOffset + body * atlas::faceKinds + face, color);
     return true;
 }
 

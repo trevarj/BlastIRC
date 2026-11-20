@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <render/core/color.h>
@@ -12,9 +11,6 @@ class Renderer;
 
 namespace blast {
 
-// Tile indices in drawing order: fuse, body, accessory, mark.
-std::array<std::size_t, 4> foundryAvatarLayers(std::string_view nick,
-                                               std::string_view mapping = "rfc1459");
 // Visible body midpoint as a fraction of tile height, excluding the separate fuse layer.
 float foundryAvatarBodyCenterY(std::string_view nick, std::string_view mapping = "rfc1459");
 // Writes exactly one atlas-sized straight-alpha RGBA tile. No renderer/GPU cache.

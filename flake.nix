@@ -185,7 +185,10 @@
       };
       devShells.${system} = {
         icon-studio = pkgs.mkShellNoCC {
-          packages = [ (pkgs.python3.withPackages (ps: [ ps.pillow ])) ];
+          packages = [
+            (pkgs.python3.withPackages (ps: [ ps.pillow ]))
+            pkgs.librsvg
+          ];
         };
         default = pkgs.mkShell {
           packages =

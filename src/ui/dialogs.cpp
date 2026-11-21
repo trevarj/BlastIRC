@@ -1957,30 +1957,28 @@ struct Dialogs::Impl {
         label(*motion, "Effects Off pauses motion and sound; Reduced motion pauses animations "
                        "only, and both keep your saved preferences.");
         auto *sending = section("effects.sending", "Sending");
-        static constexpr const char *movements[] = {"None", "Flight", "Rise",
-                                                    "Pop",  "Slide",  "Drift"};
-        select(*sending, "Sending movement", {std::begin(movements), std::end(movements)},
-               movements[std::clamp(int(model.settings.sendMotion), 0, 5)],
-               [this](std::size_t index, std::string_view) {
-                   if (index < std::size(movements))
-                       model.settings.sendMotion = SendMotion(index);
-               });
-        static constexpr const char *reveals[] = {"None", "Fade", "Pixels"};
+        static constexpr const char *movements[] = {"None", "Flight", "Rise", "Pop", "Slide"};
+        select(
+            *sending, "Sending movement", {std::begin(movements), std::end(movements)},
+            movements[std::clamp(int(model.settings.sendMotion), 0, int(std::size(movements)) - 1)],
+            [this](std::size_t index, std::string_view) {
+                if (index < std::size(movements))
+                    model.settings.sendMotion = SendMotion(index);
+            });
+        static constexpr const char *reveals[] = {"None", "Fade"};
         select(*sending, "Sending reveal", {std::begin(reveals), std::end(reveals)},
-               reveals[std::clamp(int(model.settings.sendReveal), 0, 2)],
+               reveals[std::clamp(int(model.settings.sendReveal), 0, int(std::size(reveals)) - 1)],
                [this](std::size_t index, std::string_view) {
                    if (index < std::size(reveals))
                        model.settings.sendReveal = SendReveal(index);
                });
-        label(*sending, "Movement changes how a bubble arrives and reveal fades or uncovers its "
-                        "text; choose None for either to use only the other.");
+        label(*sending, "Movement changes how a sent message arrives. Fade is optional and "
+                        "can be used with or without movement.");
         auto *incoming = section("effects.receiving", "Receiving");
         static constexpr SendMotion incomingValues[] = {SendMotion::None, SendMotion::Rise,
-                                                        SendMotion::Pop, SendMotion::Slide,
-                                                        SendMotion::Drift};
-        static constexpr const char *incomingNames[] = {
-            "None", "Rise · upward", "Pop · grow into place", "Slide · from the side",
-            "Drift · gentle settling"};
+                                                        SendMotion::Pop, SendMotion::Slide};
+        static constexpr const char *incomingNames[] = {"None", "Rise · upward", "Pop · short zoom",
+                                                        "Slide · from the side"};
         std::size_t incomingIndex = 0;
         for (std::size_t i = 0; i < std::size(incomingValues); ++i)
             if (model.settings.incomingMotion == incomingValues[i])
@@ -1990,17 +1988,19 @@ struct Dialogs::Impl {
                    if (index < std::size(incomingValues))
                        model.settings.incomingMotion = incomingValues[index];
                });
-        static constexpr const char *incomingReveals[] = {"None", "Fade · opacity",
-                                                          "Pixels · uncover in blocks"};
+        static constexpr const char *incomingReveals[] = {"None", "Fade · opacity"};
         select(*incoming, "Incoming reveal",
                {std::begin(incomingReveals), std::end(incomingReveals)},
-               incomingReveals[std::clamp(int(model.settings.incomingReveal), 0, 2)],
+               incomingReveals[std::clamp(int(model.settings.incomingReveal), 0,
+                                          int(std::size(incomingReveals)) - 1)],
                [this](std::size_t index, std::string_view) {
                    if (index < std::size(incomingReveals))
                        model.settings.incomingReveal = SendReveal(index);
                });
         slider(*incoming, "Incoming duration (100–2000 ms)", model.settings.incomingDurationMs, 100,
                2000, 10, [this](float value) { model.settings.incomingDurationMs = value; });
+        label(*incoming, "Pop zooms into place without bouncing. Fade is optional and can "
+                         "be used with or without movement.");
         static constexpr const char *mentionNames[] = {
             "Off",          "Neon mention",    "Breathing glow", "Luminous outline",
             "Text shimmer", "Accent underline"};

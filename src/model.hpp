@@ -17,8 +17,8 @@ using std::set;
 using std::string;
 using std::vector;
 enum class FxLevel { Off, Subtle, Full };
-enum class SendMotion { None, Flight, Rise, Pop, Slide, Drift };
-enum class SendReveal { None, Fade, Pixels };
+enum class SendMotion { None, Flight, Rise, Pop, Slide };
+enum class SendReveal { None, Fade };
 enum class MentionEffect {
     Off,
     NeonMention,
@@ -76,10 +76,10 @@ struct Settings {
     UploadConfig uploads;
     FxLevel fx = FxLevel::Subtle;
     SendMotion sendMotion = SendMotion::Flight;
-    SendReveal sendReveal = SendReveal::Pixels;
-    SendMotion incomingMotion = SendMotion::None;
-    SendReveal incomingReveal = SendReveal::Fade;
-    float incomingDurationMs = 550.f;
+    SendReveal sendReveal = SendReveal::None;
+    SendMotion incomingMotion = SendMotion::Pop;
+    SendReveal incomingReveal = SendReveal::None;
+    float incomingDurationMs = 280.f;
     MentionEffect mentionEffect = MentionEffect::Off;
     float mentionStrength = .6f, mentionSpeed = 1.f;
     bool mentionOutlineBreathing = false, mentionUnderlineGlint = false;

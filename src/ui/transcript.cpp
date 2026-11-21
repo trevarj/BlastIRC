@@ -984,10 +984,7 @@ struct TranscriptView::Impl {
         Node *mentionHalo = nullptr;
         Node *content = nullptr, *decorations = nullptr, *body = nullptr, *rowClip = nullptr;
         MediaPreviewCard *preview = nullptr;
-        PixelRevealNode *reveal = nullptr;
         RenderProxyNode *flight = nullptr;
-        PixelRevealNode *flightReveal = nullptr;
-        Node *flightGroup = nullptr;
         struct BodyText {
             TextNode *node;
             std::optional<Color> color;
@@ -4389,15 +4386,8 @@ struct TranscriptView::Impl {
         slot.roleRects.clear();
         slot.reactions.clear();
         stopFlight(slot);
-        if (slot.reveal)
-            slot.reveal->setReveal(1);
-        if (slot.reveal)
-            slot.reveal->setScale(1);
-        if (slot.reveal)
-            slot.reveal->setSource(nullptr);
         if (slot.rowClip)
             slot.area->removeChild(slot.rowClip);
-        slot.reveal = nullptr;
         if (slot.decorations)
             slot.area->removeChild(slot.decorations);
         const float top = (row.day ? g.day : 0) + (row.unread ? g.unread : 0) +
@@ -4421,12 +4411,6 @@ struct TranscriptView::Impl {
         // Traditional entrances stay inside their stable row and the scroller viewport.
         slot.area->setClipChildren(false);
         slot.rowClip->addChild(std::move(content));
-        if (!slot.reveal) {
-            auto reveal = std::make_unique<PixelRevealNode>();
-            slot.reveal = reveal.get();
-            slot.rowClip->addChild(std::move(reveal));
-        }
-        slot.reveal->setSource(slot.content);
         const float gap = g.rowGap(entry.presence, row.grouped);
         const float padding = notice ? g.activityPadding() : g.padding(entry.presence);
         const float avatarLane = g.avatarLane(entry.presence);
@@ -5164,22 +5148,12 @@ struct TranscriptView::Impl {
     }
 
     void stopFlight(Slot &slot, bool restoreHitTesting = true) {
-        if (slot.flightReveal) {
-            slot.flightReveal->setSource(nullptr);
-            slot.flightGroup->removeChild(slot.flightReveal);
-            slot.flightReveal = nullptr;
-        }
         if (slot.flight) {
             slot.flight->setSource(nullptr);
-            slot.flightGroup->removeChild(slot.flight);
+            motionHost->removeChild(slot.flight);
             slot.flight = nullptr;
-        }
-        if (slot.flightGroup) {
-            motionHost->removeChild(slot.flightGroup);
-            slot.flightGroup = nullptr;
-        }
-        if (slot.content)
             slot.content->setOpacity(1);
+        }
         if (restoreHitTesting && !slot.area->hitTestVisible()) {
             slot.area->setHitTestVisible(true);
             slot.area->setExcludeSubtreeFromTabOrder(false);
@@ -5192,14 +5166,11 @@ struct TranscriptView::Impl {
         if (cache && slot.buffer == active && slot.index < cache->rows.size() &&
             cache->rows[slot.index].focusIdentity == slot.focusIdentity)
             cache->rows[slot.index].entranceStarted = -1;
-        if (slot.content)
+        if (slot.content) {
             slot.content->setPosition(0, 0);
-        if (slot.content)
             slot.content->setScale(1);
-        if (slot.reveal)
-            slot.reveal->setReveal(1);
-        if (slot.reveal)
-            slot.reveal->setScale(1);
+            slot.content->setOpacity(1);
+        }
     }
     void cancelMention(Slot &slot) {
         for (auto &text : slot.text) {
@@ -5325,36 +5296,13 @@ struct TranscriptView::Impl {
                 model.settings.incomingDurationMs);
             if (!entrance.active)
                 row.entranceStarted = -1;
-            const float lane = !row.grouped && g.avatars ? g.avatarLane(false) : 0;
-            LayoutRect revealBounds =
-                g.bubbles ? LayoutRect{slot.material->x() - (entry.own ? 0 : lane), 0,
-                                       slot.material->width() + lane, slot.content->height()}
-                          : LayoutRect{slot.material->x(), slot.material->y(),
-                                       slot.material->width(), slot.material->height()};
-            if (outline && slot.mentionPaint) {
-                const float left = std::min(revealBounds.x, slot.mentionPaint->x());
-                const float top = std::min(revealBounds.y, slot.mentionPaint->y());
-                const float right = std::max(revealBounds.x + revealBounds.width,
-                                             slot.mentionPaint->x() + slot.mentionPaint->width());
-                const float bottom = std::max(revealBounds.y + revealBounds.height,
-                                              slot.mentionPaint->y() + slot.mentionPaint->height());
-                revealBounds = {left, top, right - left, bottom - top};
-            }
             if (entrance.active && entry.own && g.bubbles) {
-                slot.reveal->setReveal(1);
                 slot.content->setPosition(entrance.x, entrance.y);
+                slot.content->setOpacity(0);
                 if (!slot.flight) {
-                    auto group = std::make_unique<Node>();
-                    group->setHitTestVisible(false);
-                    group->setParticipatesInLayout(false);
-                    slot.flightGroup = group.get();
-                    motionHost->addChild(std::move(group));
                     auto flight = std::make_unique<RenderProxyNode>(slot.content);
                     slot.flight = flight.get();
-                    slot.flightGroup->addChild(std::move(flight));
-                    auto reveal = std::make_unique<PixelRevealNode>(slot.flight);
-                    slot.flightReveal = reveal.get();
-                    slot.flightGroup->addChild(std::move(reveal));
+                    motionHost->addChild(std::move(flight));
                     slot.area->setHitTestVisible(false);
                     if (dispatcher)
                         dispatcher->syncPointerHover();
@@ -5362,37 +5310,27 @@ struct TranscriptView::Impl {
                 float sceneX, sceneY, hostX, hostY;
                 Node::mapToScene(slot.content, 0, 0, sceneX, sceneY);
                 Node::mapFromScene(motionHost, sceneX, sceneY, hostX, hostY);
-                slot.flightGroup->setPosition(hostX, hostY);
-                slot.flightGroup->setTransformOrigin(
-                    slot.material->x() + slot.material->width() * .5f,
-                    slot.material->y() + slot.material->height() * .5f);
-                slot.flightGroup->setScale(entrance.scale);
-                slot.flight->setPosition(0, 0);
+                slot.flight->setPosition(hostX, hostY);
+                slot.flight->setTransformOrigin(slot.material->x() + slot.material->width() * .5f,
+                                                slot.material->y() + slot.material->height() * .5f);
+                slot.flight->setScale(entrance.scale);
                 slot.flight->setSize(slot.content->width(), slot.content->height());
-                slot.content->setOpacity(0);
-                slot.flightReveal->setRevealBounds(revealBounds);
-                slot.flightReveal->setReveal(entrance.reveal, opacity,
-                                             model.settings.sendReveal == SendReveal::Pixels);
+                slot.flight->setOpacity(opacity * entrance.reveal);
             } else {
                 stopFlight(slot, g.bubbles || !entrance.active);
                 slot.content->setPosition(entrance.x, entrance.y);
-                slot.content->setTransformOrigin(slot.material->x() + slot.material->width() * .5f,
-                                                 (g.bubbles ? 0 : slot.material->y()) +
-                                                     slot.material->height() * .5f);
-                const bool pixels =
-                    (entry.own ? model.settings.sendReveal : model.settings.incomingReveal) ==
-                    SendReveal::Pixels;
-                // Proxies retain their source scale. During native pixel reveal,
-                // scale partitions and proxied paint together only at the reveal parent.
-                const bool pixelTransform =
-                    !g.bubbles && pixels && entrance.active && entrance.reveal < 1;
-                slot.content->setScale(pixelTransform ? 1 : entrance.scale);
-                slot.reveal->setRevealBounds(revealBounds);
-                slot.reveal->setReveal(entrance.reveal, opacity, pixels);
+                float originX = slot.material->x() + slot.material->width() * .5f;
+                if (entrance.active && !g.bubbles && !entry.own &&
+                    model.settings.incomingMotion == SendMotion::Pop) {
+                    // Scale from the reading start, not the center of a wide history row.
+                    const auto *nick = slot.nicks.empty() ? nullptr : slot.nicks.front().first;
+                    originX = nick ? nick->parent()->x() + nick->x() : slot.material->x();
+                }
+                slot.content->setTransformOrigin(originX, slot.material->y() +
+                                                              slot.material->height() * .5f);
+                slot.content->setScale(entrance.scale);
+                slot.content->setOpacity(opacity * entrance.reveal);
                 if (!g.bubbles) {
-                    slot.reveal->setTransformOrigin(slot.content->transformOriginX(),
-                                                    slot.content->transformOriginY());
-                    slot.reveal->setScale(pixelTransform ? entrance.scale : 1);
                     if (slot.area->hitTestVisible() == entrance.active) {
                         slot.area->setHitTestVisible(!entrance.active);
                         if (dispatcher)

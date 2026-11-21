@@ -45,7 +45,7 @@ struct MessageEntrance {
     bool active = false;
 };
 // Independent native transforms and reveal clocks; a row stays live until both settle.
-inline constexpr double outgoingDuration = .70, incomingDuration = .55, sendRevealDuration = .45;
+inline constexpr double outgoingDuration = .44, incomingDuration = .28, sendRevealDuration = .45;
 inline double messageMotionDuration(SendMotion motion) {
     switch (motion) {
     case SendMotion::Flight:
@@ -56,8 +56,6 @@ inline double messageMotionDuration(SendMotion motion) {
         return .32;
     case SendMotion::Slide:
         return .55;
-    case SendMotion::Drift:
-        return .70;
     case SendMotion::None:
         return 0;
     }
@@ -70,10 +68,10 @@ inline double messageIncomingDuration(float milliseconds) {
 inline MessageEntrance messageEntrance(double age, bool own, float originX, float originY,
                                        float destinationX, float destinationY, bool enabled,
                                        SendMotion motion = SendMotion::Flight,
-                                       SendReveal reveal = SendReveal::Pixels,
-                                       SendMotion incomingMotion = SendMotion::None,
-                                       SendReveal incomingReveal = SendReveal::Fade,
-                                       float incomingDurationMs = 550.f) {
+                                       SendReveal reveal = SendReveal::None,
+                                       SendMotion incomingMotion = SendMotion::Pop,
+                                       SendReveal incomingReveal = SendReveal::None,
+                                       float incomingDurationMs = float(incomingDuration * 1000)) {
     if (!enabled || !std::isfinite(age) || age < 0)
         return {};
     if (!own) {
@@ -110,24 +108,15 @@ inline MessageEntrance messageEntrance(double age, bool own, float originX, floa
             result.y = 18 * (1 - cubicOut(t));
             break;
         case SendMotion::Pop:
-            result.scale = .92f + .08f * backOut(t);
+            result.scale = own ? .92f + .08f * backOut(t) : .94f + .06f * cubicOut(t);
             break;
         case SendMotion::Slide:
             result.x = 24 * (1 - smooth(t));
-            break;
-        case SendMotion::Drift:
-            result.x = 18 * (1 - smooth(t));
-            result.y = 12 * (1 - cubicOut(t));
             break;
         case SendMotion::None:
             break;
         }
     }
     return result;
-}
-inline float messageBlockOpacity(float reveal, unsigned block) {
-    // A fixed permutation, not per-frame randomness: blocks cannot flicker back off.
-    const float rank = float((block * 37U) & 63U) / 64.f;
-    return std::clamp((reveal * 1.2f - rank) / .2f, 0.f, 1.f);
 }
 } // namespace blast::fx

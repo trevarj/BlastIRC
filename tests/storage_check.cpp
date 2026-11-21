@@ -14,6 +14,7 @@
 #include <regex>
 #include <sqlite3.h>
 #include <sys/stat.h>
+#include <toml++/toml.hpp>
 #include <unistd.h>
 
 using namespace blast;
@@ -2615,10 +2616,10 @@ int main() {
             assert(expected.settings.bindings.at("conversation-back") == "C-o" &&
                    expected.settings.bindings.at("conversation-forward") == "C-i");
             assert(expected.settings.sendMotion == SendMotion::Flight &&
-                   expected.settings.sendReveal == SendReveal::Pixels);
-            assert(expected.settings.incomingMotion == SendMotion::None &&
-                   expected.settings.incomingReveal == SendReveal::Fade &&
-                   expected.settings.incomingDurationMs == 550.f &&
+                   expected.settings.sendReveal == SendReveal::None);
+            assert(expected.settings.incomingMotion == SendMotion::Pop &&
+                   expected.settings.incomingReveal == SendReveal::None &&
+                   expected.settings.incomingDurationMs == 280.f &&
                    expected.settings.foolDisplay == FoolDisplay::Minimized &&
                    !expected.settings.foolUnread && expected.settings.messageWrapColumns == 80);
             assert(expected.settings.linkPreviews == PreviewMode::Click &&
@@ -2643,6 +2644,7 @@ int main() {
             storage.load(unfinished);
             assert(unfinished.firstRun && unfinished.settings.peopleMode == SidebarMode::Hidden);
             assert(unfinished.settings.fx == FxLevel::Subtle && unfinished.settings.sound);
+            presentation(unfinished.settings, expected.settings);
             expected.firstRun = false; // The wizard has now been completed explicitly.
             expected.identities[0].password = "secret ' \\\"\npassword";
             expected.identities[0].certificate = "/tmp/client.pem";
@@ -2662,8 +2664,8 @@ int main() {
             s.messageScale = 1.6f;
             s.sendMotion = SendMotion::Rise;
             s.sendReveal = SendReveal::Fade;
-            s.incomingMotion = SendMotion::Drift;
-            s.incomingReveal = SendReveal::Pixels;
+            s.incomingMotion = SendMotion::Slide;
+            s.incomingReveal = SendReveal::Fade;
             s.incomingDurationMs = 1250.f;
             s.foolDisplay = FoolDisplay::Blurred;
             s.foolUnread = true;
@@ -3093,7 +3095,7 @@ int main() {
                    legacy.settings.bindings.at("jump-channel") == "M-j" &&
                    legacy.settings.bindings.at("user-command") == "M-F12");
             assert(legacy.settings.sendMotion == SendMotion::Flight &&
-                   legacy.settings.sendReveal == SendReveal::Pixels);
+                   legacy.settings.sendReveal == SendReveal::None);
             assert(legacy.settings.fx == FxLevel::Full && legacy.settings.sound);
             assert(legacy.settings.mentionEffect == MentionEffect::Off);
             assert(legacy.settings.cursorShape == "line" && legacy.settings.cursorEffect == "off" &&
@@ -3126,7 +3128,7 @@ int main() {
                 assert(legacy.settings.peopleMode == SidebarMode::Hidden &&
                        legacy.settings.workspace == expected.settings.workspace);
                 assert(legacy.settings.sendMotion == SendMotion::Flight &&
-                       legacy.settings.sendReveal == SendReveal::Pixels);
+                       legacy.settings.sendReveal == SendReveal::None);
                 assert(legacy.settings.messageLayouts == expected.settings.messageLayouts &&
                        legacy.settings.uiFont == "Legacy UI font" &&
                        legacy.settings.messageFont == "Legacy message font");
@@ -3191,12 +3193,9 @@ int main() {
                                                    {"flight", SendMotion::Flight},
                                                    {"rise", SendMotion::Rise},
                                                    {"pop", SendMotion::Pop},
-                                                   {"slide", SendMotion::Slide},
-                                                   {"drift", SendMotion::Drift}}) {
-            for (const auto &[revealToken, reveal] :
-                 vector<std::pair<string, SendReveal>>{{"none", SendReveal::None},
-                                                       {"fade", SendReveal::Fade},
-                                                       {"pixels", SendReveal::Pixels}}) {
+                                                   {"slide", SendMotion::Slide}}) {
+            for (const auto &[revealToken, reveal] : vector<std::pair<string, SendReveal>>{
+                     {"none", SendReveal::None}, {"fade", SendReveal::Fade}}) {
                 {
                     std::ofstream output(config / "settings.toml");
                     output << "[appearance]\nsend_motion = '" << motionToken << "'\nsend_reveal = '"
@@ -3214,6 +3213,34 @@ int main() {
                 assert(contents(config / "config.toml") == originalConfig);
             }
         }
+        // Removed effects are accepted on load, then saved as canonical values in both directions.
+        {
+            const auto file = config / "settings.toml";
+            const string source = "[appearance]\nsend_motion = 'drift'\nsend_reveal = 'pixels'\n"
+                                  "incoming_motion = 'drift'\nincoming_reveal = 'pixels'\n";
+            {
+                std::ofstream output(file);
+                output << source;
+            }
+            Storage storage;
+            Model migrated;
+            storage.load(migrated);
+            assert(contents(file) == source);
+            assert(migrated.settings.sendMotion == SendMotion::Rise &&
+                   migrated.settings.sendReveal == SendReveal::None &&
+                   migrated.settings.incomingMotion == SendMotion::Rise &&
+                   migrated.settings.incomingReveal == SendReveal::None);
+            storage.save(migrated);
+            const auto saved = toml::parse_file(file.string());
+            assert(saved["appearance"]["send_motion"].value<string>() == "rise" &&
+                   saved["appearance"]["send_reveal"].value<string>() == "none" &&
+                   saved["appearance"]["incoming_motion"].value<string>() == "rise" &&
+                   saved["appearance"]["incoming_reveal"].value<string>() == "none");
+            Model reopened;
+            storage.load(reopened);
+            presentation(reopened.settings, migrated.settings);
+            assert(contents(config / "config.toml") == originalConfig);
+        }
         for (const auto &[token, effect] : vector<std::pair<string, MentionEffect>>{
                  {"off", MentionEffect::Off},
                  {"neon_mention", MentionEffect::NeonMention},
@@ -3228,7 +3255,7 @@ int main() {
                 output << "[appearance]\nmention_effect = '" << token
                        << "'\n"
                           "send_motion = 'slide'\nsend_reveal = 'none'\n"
-                          "incoming_motion = 'pop'\nincoming_reveal = 'pixels'\n"
+                          "incoming_motion = 'pop'\nincoming_reveal = 'fade'\n"
                           "incoming_duration_ms = 1250\n";
                 output << "mention_strength = 0.75\nmention_speed = 1.5\n"
                           "mention_outline_breathing = true\nmention_underline_glint = true\n";
@@ -3240,7 +3267,7 @@ int main() {
                    configured.settings.sendMotion == SendMotion::Slide &&
                    configured.settings.sendReveal == SendReveal::None &&
                    configured.settings.incomingMotion == SendMotion::Pop &&
-                   configured.settings.incomingReveal == SendReveal::Pixels &&
+                   configured.settings.incomingReveal == SendReveal::Fade &&
                    configured.settings.incomingDurationMs == 1250.f);
             assert(configured.settings.mentionStrength == .75f &&
                    configured.settings.mentionSpeed == 1.5f &&
@@ -3256,8 +3283,10 @@ int main() {
             assert(contents(config / "config.toml") == originalConfig);
         }
         // Either field may be absent without changing the explicitly configured other field.
-        for (const string source :
-             {"[appearance]\nsend_motion = 'none'\n", "[appearance]\nsend_reveal = 'none'\n"}) {
+        for (bool motionOnly : {true, false}) {
+            const string source =
+                motionOnly ? "[appearance]\nsend_motion = 'none'\nincoming_motion = 'none'\n"
+                           : "[appearance]\nsend_reveal = 'fade'\nincoming_reveal = 'fade'\n";
             {
                 std::ofstream output(config / "settings.toml");
                 output << source;
@@ -3265,15 +3294,14 @@ int main() {
             Storage storage;
             Model actual;
             storage.load(actual);
-            assert(actual.settings.sendMotion == (source.find("send_motion") != string::npos
-                                                      ? SendMotion::None
-                                                      : SendMotion::Flight));
-            assert(actual.settings.sendReveal == (source.find("send_reveal") != string::npos
-                                                      ? SendReveal::None
-                                                      : SendReveal::Pixels));
-            assert(actual.settings.incomingMotion == SendMotion::None &&
-                   actual.settings.incomingReveal == SendReveal::Fade &&
-                   actual.settings.incomingDurationMs == 550.f &&
+            const auto reveal = motionOnly ? SendReveal::None : SendReveal::Fade;
+            assert(actual.settings.sendMotion ==
+                       (motionOnly ? SendMotion::None : SendMotion::Flight) &&
+                   actual.settings.incomingMotion ==
+                       (motionOnly ? SendMotion::None : SendMotion::Pop));
+            assert(actual.settings.sendReveal == reveal &&
+                   actual.settings.incomingReveal == reveal);
+            assert(actual.settings.incomingDurationMs == 280.f &&
                    actual.settings.foolDisplay == FoolDisplay::Minimized &&
                    !actual.settings.foolUnread && actual.settings.messageWrapColumns == 80);
             assert(contents(config / "settings.toml") == source);
@@ -3298,8 +3326,8 @@ int main() {
             }
         // New absent fields preserve defaults; all supported policies round-trip independently.
         for (int style = 0; style < 4; ++style) {
-            for (const auto motion : {SendMotion::None, SendMotion::Rise, SendMotion::Pop,
-                                      SendMotion::Slide, SendMotion::Drift}) {
+            for (const auto motion :
+                 {SendMotion::None, SendMotion::Rise, SendMotion::Pop, SendMotion::Slide}) {
                 Model configured = legacy;
                 auto &s = configured.settings;
                 s.linkPreviews = PreviewMode(style % 3);
@@ -3313,7 +3341,7 @@ int main() {
                 s.foolUnread = style % 2 != 0;
                 s.messageWrapColumns = style == 0 ? 0 : style == 3 ? 1000 : 80;
                 s.incomingMotion = motion;
-                s.incomingReveal = SendReveal(style % 3);
+                s.incomingReveal = SendReveal(style % 2);
                 s.incomingDurationMs = style == 0 ? 100.f : style == 3 ? 2000.f : 550.f;
                 s.messageScale = style == 0 ? .7f : style == 3 ? 2.f : 1.3f;
                 Storage storage;

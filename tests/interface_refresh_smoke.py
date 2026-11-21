@@ -1758,9 +1758,9 @@ def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=Fal
     edits = [
         (1, 'select', ('off', 'subtle', 'full').index(fx), 'appearance', 'fx'),
         (2, 'toggle', reduced, 'appearance', 'reduced_motion'),
-        (5, 'select', ('none', 'rise', 'pop', 'slide', 'drift').index(motion),
+        (5, 'select', ('none', 'rise', 'pop', 'slide').index(motion),
          'appearance', 'incoming_motion'),
-        (6, 'select', ('none', 'fade', 'pixels').index(reveal), 'appearance', 'incoming_reveal'),
+        (6, 'select', ('none', 'fade').index(reveal), 'appearance', 'incoming_reveal'),
         (7, 'slider', (100, 10, 2000), 'appearance', 'incoming_duration_ms')]
     if mention is not None:
         edits.append((8, 'select', ('off', 'neon_mention', 'breathing_glow', 'luminous_outline',
@@ -3231,16 +3231,17 @@ def run_typing_bubble(ctx):
 def run_incoming(ctx):
     """Sample real row frames during live delivery, not before/after unrelated UI."""
     defaults = tomllib.loads(Path(ctx['preferences']).read_text())['appearance']
+    assert (defaults['send_motion'], defaults['send_reveal']) == ('flight', 'none'), defaults
     assert (defaults['incoming_motion'], defaults['incoming_reveal'],
-            defaults['incoming_duration_ms']) == ('none', 'fade', 550), defaults
+            defaults['incoming_duration_ms']) == ('pop', 'none', 280), defaults
     _policy_focus(ctx, ctx['query_id'])
     _policy_chat(ctx, fools=[])
     # Each independent movement and reveal is exercised; capture begins before
     # durable storage waits so a fast machine cannot miss the whole timeline.
     cases = [('none', 'none', 'full', False)]
-    cases += [(motion, 'none', 'full', False) for motion in ('rise', 'pop', 'slide', 'drift')]
-    cases += [('none', reveal, 'full', False) for reveal in ('fade', 'pixels')]
-    cases += [('slide', 'pixels', 'off', False), ('slide', 'pixels', 'full', True)]
+    cases += [(motion, 'none', 'full', False) for motion in ('rise', 'pop', 'slide')]
+    cases += [('none', 'fade', 'full', False),
+              ('slide', 'fade', 'off', False), ('slide', 'fade', 'full', True)]
     evidence = []
     for index, (motion, reveal, fx, reduced) in enumerate(cases):
         _policy_effects(ctx, motion=motion, reveal=reveal, fx=fx, reduced=reduced)
@@ -3268,9 +3269,12 @@ def run_incoming(ctx):
         enabled = fx != 'off' and not reduced and (motion != 'none' or reveal != 'none')
         if enabled:
             assert len(set(observed)) >= 3, ('Configured incoming effect did not animate real row', motion, reveal)
-            if motion in ('slide', 'drift', 'rise'):
+            if motion in ('slide', 'rise'):
                 assert any(marker != settled for _, _, marker in visible), (
                     'Incoming movement did not move native marker geometry', motion, visible[0][2], settled)
+            if motion == 'pop':
+                assert any(marker[2] - marker[0] < settled[2] - settled[0] for _, _, marker in visible), (
+                    'Incoming Pop did not scale the opaque message into place', visible[0][2], settled)
         else:
             # Permit the first root paint to settle, but not an animation tail.
             stable = [_policy_crop(image, box) for stamp, image, _ in visible if stamp >= first + .15]
@@ -3287,7 +3291,7 @@ def run_incoming(ctx):
     # prove fool suppression rather than trivially testing an invisible row.
     _policy_chat(ctx, fools=[ctx['query_target']])
     _policy_appearance(ctx, fool='dimmed')
-    _policy_effects(ctx, motion='slide', reveal='pixels')
+    _policy_effects(ctx, motion='slide', reveal='fade')
     gui.move_pointer(ctx['window'], 5, 5)
     started = time.monotonic()
     _policy_send(ctx, 'MutedMotionProbe café retained fool', durable=False)

@@ -368,10 +368,8 @@ string sendMotionName(SendMotion value) {
         return "pop";
     case SendMotion::Slide:
         return "slide";
-    case SendMotion::Drift:
-        return "drift";
     }
-    invalid("appearance.send_motion", "none, flight, rise, pop, slide, or drift");
+    invalid("appearance.send_motion", "none, flight, rise, pop, or slide");
 }
 string sendRevealName(SendReveal value) {
     switch (value) {
@@ -379,24 +377,25 @@ string sendRevealName(SendReveal value) {
         return "none";
     case SendReveal::Fade:
         return "fade";
-    case SendReveal::Pixels:
-        return "pixels";
     }
-    invalid("appearance.send_reveal", "none, fade, or pixels");
+    invalid("appearance.send_reveal", "none or fade");
 }
 SendMotion motionValue(const string &token, const char *key, bool incoming = false) {
+    if (token == "drift")
+        return SendMotion::Rise;
     for (auto motion : {SendMotion::None, SendMotion::Flight, SendMotion::Rise, SendMotion::Pop,
-                        SendMotion::Slide, SendMotion::Drift})
+                        SendMotion::Slide})
         if (token == sendMotionName(motion) && (!incoming || motion != SendMotion::Flight))
             return motion;
-    invalid(key, incoming ? "none, rise, pop, slide, or drift"
-                          : "none, flight, rise, pop, slide, or drift");
+    invalid(key, incoming ? "none, rise, pop, or slide" : "none, flight, rise, pop, or slide");
 }
 SendReveal revealValue(const string &token, const char *key) {
-    for (auto reveal : {SendReveal::None, SendReveal::Fade, SendReveal::Pixels})
+    if (token == "pixels")
+        return SendReveal::None;
+    for (auto reveal : {SendReveal::None, SendReveal::Fade})
         if (token == sendRevealName(reveal))
             return reveal;
-    invalid(key, "none, fade, or pixels");
+    invalid(key, "none or fade");
 }
 string mentionEffectName(MentionEffect value) {
     switch (value) {

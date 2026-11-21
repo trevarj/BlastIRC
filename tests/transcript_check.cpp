@@ -7558,7 +7558,6 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         assert(rowClip->clipChildren() == (layout != blast::MessageLayout::Bubbles));
         near(rowClip->width(), grouped.row.width());
         near(rowClip->height(), grouped.row.height());
-        assert(find<blast::PixelRevealNode>(*rowClip));
         Node *halo = nullptr;
         for (const auto &child : grouped.row.children())
             if (child.get() != rowClip && child->visible())
@@ -7676,7 +7675,6 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
         assert(moving.content.x() > 0);
         assert(movingClip && movingClip->parent() == &moving.row);
         assert(movingClip->clipChildren() == (layout != blast::MessageLayout::Bubbles));
-        assert(find<blast::PixelRevealNode>(*movingClip));
         near(movingClip->x(), 0);
         near(movingClip->y(), 0);
         near(movingClip->width(), moving.row.width());
@@ -7689,44 +7687,29 @@ void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
                 if (const auto *rect = find<RectNode>(*child); rect && rect->style().outerShadow)
                     assert(!child->visible());
         model.settings.incomingMotion = blast::SendMotion::None;
-        model.settings.incomingReveal = blast::SendReveal::Pixels;
-        auto pixelArrival = buffer.messages.back();
-        pixelArrival.id = "pixel-mention";
-        pixelArrival.text = "PixelMention Me";
-        pixelArrival.arrival = model.now;
-        buffer.messages.push_back(std::move(pixelArrival));
+        model.settings.incomingReveal = blast::SendReveal::Fade;
+        auto fadeArrival = buffer.messages.back();
+        fadeArrival.id = "fading-mention";
+        fadeArrival.text = "FadingMention Me";
+        fadeArrival.arrival = model.now;
+        buffer.messages.push_back(std::move(fadeArrival));
         ++buffer.messagesRevision;
         arrange();
         model.now += .1;
         arrange();
-        const auto pixel = body(view, "PixelMention");
-        auto *reveal = find<blast::PixelRevealNode>(pixel.row);
-        assert(reveal && reveal->visible() && !reveal->children().empty());
-        near(pixel.content.opacity(), 0);
-        const RectNode *pixelOutline = nullptr;
-        for (const auto &child : pixel.content.children())
+        const auto fading = body(view, "FadingMention");
+        near(fading.content.x(), 0);
+        near(fading.content.y(), 0);
+        near(fading.content.scaleX(), 1);
+        near(fading.content.opacity(), .1f / .9f);
+        const RectNode *fadeOutline = nullptr;
+        for (const auto &child : fading.content.children())
             if (const auto *rect = dynamic_cast<RectNode *>(child.get());
                 rect && rect->visible() && rect->style().borderWidth > 0 && rect->zIndex() >= 0)
-                pixelOutline = rect;
-        const auto *pixelSurface = find<blast::MaterialNode>(pixel.content);
-        assert(pixelOutline && pixelSurface);
-        assert(pixelOutline->x() < pixelSurface->x() && pixelOutline->y() < pixelSurface->y());
-        float left = std::numeric_limits<float>::infinity(), top = left;
-        float right = -left, bottom = -left;
-        for (const auto &tile : reveal->children()) {
-            if (!tile->visible())
-                continue;
-            const auto *clip = tile->pixelPartitionClip();
-            assert(clip);
-            float x1, y1, x2, y2;
-            Node::mapToScene(tile.get(), clip->left, clip->top, x1, y1);
-            Node::mapToScene(tile.get(), clip->right, clip->bottom, x2, y2);
-            left = std::min(left, x1);
-            top = std::min(top, y1);
-            right = std::max(right, x2);
-            bottom = std::max(bottom, y2);
-        }
-        containedBounds(sceneBounds(*pixelOutline), {left, top, right - left, bottom - top});
+                fadeOutline = rect;
+        assert(fadeOutline);
+        containedBounds(sceneBounds(*fadeOutline), sceneBounds(fading.row));
+        containedBounds(ancestorPaintClip(*fadeOutline), nativeHistoryClip(view));
     }
 }
 
@@ -7744,6 +7727,8 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         model.settings.reducedMotion = false;
         model.settings.fx = blast::FxLevel::Full;
         model.settings.incomingMotion = blast::SendMotion::Slide;
+        model.settings.incomingDurationMs = 900;
+        model.settings.sendReveal = model.settings.incomingReveal = blast::SendReveal::Fade;
         blast::Theme theme;
         theme.update(model);
         auto &buffer = model.buffers["entrance"];
@@ -7802,6 +7787,8 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         }
         model.now += .3;
         arrange();
+        if (traditional && own)
+            near(body(view, message.text).content.opacity(), .52f * (.3f / .45f));
         date = plainText(view, "Undated history");
         float stillX, stillY;
         Node::absolutePosition(date, stillX, stillY);
@@ -7883,54 +7870,51 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
         }
         assert(model.actions.empty());
         view.setMotionHost(nullptr);
-        if (traditional) {
-            // Pixels share the native Pop transform, without a composer host or flight proxy.
+        if (traditional || !own) {
+            // Pop uses the native content transform and does not need a composer host.
             model.settings.sendMotion = model.settings.incomingMotion = blast::SendMotion::Pop;
-            model.settings.sendReveal = model.settings.incomingReveal = blast::SendReveal::Pixels;
-            model.settings.incomingDurationMs = 800;
+            model.settings.sendReveal = model.settings.incomingReveal = blast::SendReveal::None;
+            model.settings.incomingDurationMs = 280;
             model.now += 1;
-            message.id = message.label = "traditional-pop";
-            message.text = "TraditionalPop";
+            if (traditional && !own)
+                message.nick = "PopPeer";
+            message.id = message.label = "native-pop";
+            message.text = "NativePop";
             message.pending = false;
             message.arrival = model.now;
             buffer.messages.push_back(message);
             arrange();
             const auto pop = body(view, message.text);
-            near(pop.content.scaleX(), 1);
-            near(pop.content.scaleY(), 1);
-            auto *reveal = find<blast::PixelRevealNode>(pop.row);
-            assert(reveal && reveal->visible() && !reveal->children().empty());
-            near(reveal->scaleX(), .92f);
-            near(reveal->scaleY(), .92f);
-            // Native proxy rendering removes source translation, NOT source scale.
-            // The partition parent is the sole scaling level for actual proxied paint.
-            for (const auto &tile : reveal->children()) {
-                auto *proxy = find<RenderProxyNode>(*tile);
-                assert(proxy && proxy->source() == &pop.content);
-                near(tile->scaleX(), 1);
-                near(proxy->scaleX(), 1);
-                near(reveal->scaleX() * tile->scaleX() * proxy->scaleX() *
-                         proxy->source()->scaleX(),
-                     .92f);
-                near(reveal->scaleY() * tile->scaleY() * proxy->scaleY() *
-                         proxy->source()->scaleY(),
-                     .92f);
+            const float initialScale = own ? .92f : .94f;
+            near(pop.content.scaleX(), initialScale);
+            near(pop.content.scaleY(), initialScale);
+            near(pop.content.opacity(), 1);
+            assert(pop.row.hitTestVisible() == !traditional && motionHost.children().empty());
+            const auto *material = find<blast::MaterialNode>(pop.content);
+            assert(material);
+            float originX = material->x() + material->width() * .5f;
+            if (traditional && !own) {
+                const auto *nickname = plainText(pop.content, message.nick);
+                assert(nickname);
+                const auto *label = dynamic_cast<const Label *>(nickname->parent());
+                assert(label && label->parent()->parent() == &pop.content);
+                originX = label->parent()->x() + label->x();
             }
-            near(reveal->transformOriginY(), pop.content.transformOriginY());
-            assert(!pop.row.hitTestVisible() && motionHost.children().empty());
+            near(pop.content.transformOriginX(), originX);
+            near(pop.content.transformOriginY(), material->y() + material->height() * .5f);
             model.now += .15;
             arrange();
             const auto movingPop = body(view, message.text);
-            auto *movingReveal = find<blast::PixelRevealNode>(movingPop.row);
-            assert(movingReveal->scaleX() != .92f);
-            near(movingPop.content.scaleX(), 1);
+            assert(movingPop.content.scaleX() > initialScale);
+            if (!own)
+                assert(movingPop.content.scaleX() < 1);
+            near(movingPop.content.opacity(), 1);
             model.now += 1;
             arrange();
             const auto settledPop = body(view, message.text);
             near(settledPop.content.scaleX(), 1);
             near(settledPop.content.opacity(), 1);
-            assert(settledPop.row.hitTestVisible() &&
-                   !find<blast::PixelRevealNode>(settledPop.row)->visible());
+            assert(settledPop.row.hitTestVisible());
             message.id = message.label = "traditional-history";
             message.text = "TraditionalHistory";
             message.history = true;
@@ -7948,14 +7932,18 @@ void messageEntranceLifecycle(TranscriptTestRenderer &renderer) {
 }
 
 void independentSendEffects(TranscriptTestRenderer &renderer) {
-    for (const bool pixels : {false, true}) {
+    using blast::SendMotion, blast::SendReveal;
+    for (const auto &[motion, reveal] : {std::pair{SendMotion::Flight, SendReveal::None},
+                                         std::pair{SendMotion::Flight, SendReveal::Fade},
+                                         std::pair{SendMotion::Pop, SendReveal::Fade},
+                                         std::pair{SendMotion::None, SendReveal::None}}) {
         blast::Model model;
         model.now = 20;
         model.settings.avatars = false;
         model.settings.fx = blast::FxLevel::Full;
         model.settings.reducedMotion = false;
-        model.settings.sendMotion = pixels ? blast::SendMotion::Pop : blast::SendMotion::Flight;
-        model.settings.sendReveal = pixels ? blast::SendReveal::Pixels : blast::SendReveal::Fade;
+        model.settings.sendMotion = motion;
+        model.settings.sendReveal = reveal;
         blast::Theme theme;
         theme.update(model);
         auto &buffer = model.buffers["independent-send"];
@@ -7964,10 +7952,16 @@ void independentSendEffects(TranscriptTestRenderer &renderer) {
         blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
         Clipboard clipboard;
         Node motionHost;
+        motionHost.setPosition(7, 11);
         motionHost.setSize(800, 700);
+        motionHost.setClipChildren(true);
         blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
         view.setMotionHost(&motionHost);
-        view.setComposerOrigin(367, 340);
+        Input composer;
+        composer.arrange(renderer, {17, 340, 700, 40});
+        const auto input = sceneBounds(composer);
+        const float originX = input.x + input.width * .5f, originY = input.y;
+        view.setComposerOrigin(originX, originY);
         const auto arrange = [&] {
             view.sync();
             view.arrange(renderer, {17, 23, 700, 300});
@@ -7981,36 +7975,65 @@ void independentSendEffects(TranscriptTestRenderer &renderer) {
         message.arrival = model.now;
         buffer.messages.push_back(message);
         arrange();
-        model.now += pixels ? .4 : .5;
-        arrange();
-        const auto rendered = body(view, message.text);
-        assert(motionHost.children().size() == 1);
-        auto &group = *motionHost.children().front();
-        auto *reveal = find<blast::PixelRevealNode>(group);
-        assert(reveal);
-        Node *proxy = nullptr;
-        for (const auto &child : group.children())
-            if (child.get() != reveal)
-                proxy = child.get();
-        assert(proxy);
-        if (pixels) {
-            near(rendered.content.x(), 0);
-            near(rendered.content.y(), 0);
-            near(group.scaleX(), 1);
-            near(group.scaleY(), 1);
-            assert(!reveal->children().empty());
-        } else {
-            assert(std::hypot(rendered.content.x(), rendered.content.y()) > .02f);
-            near(proxy->opacity(), 1);
-            assert(reveal->children().empty());
+        if (motion != SendMotion::None) {
+            struct Sample {
+                float x, y, scaleX, scaleY;
+            };
+            const auto inspect = [&](float opacity) -> Sample {
+                const auto rendered = body(view, message.text);
+                assert(motionHost.children().size() == 1);
+                auto *proxy = find<RenderProxyNode>(motionHost);
+                assert(proxy && proxy->source() == &rendered.content && !proxy->hitTestVisible());
+                assert(proxy->children().empty() && !proxy->pixelPartitionClip());
+                const auto noPartitions = [](auto &&self, const Node &node) -> void {
+                    assert(!node.pixelPartitionClip());
+                    for (const auto &child : node.children())
+                        self(self, *child);
+                };
+                noPartitions(noPartitions, rendered.content);
+                near(rendered.content.opacity(), 0);
+                assert(!rendered.row.hitTestVisible());
+                near(proxy->opacity(), opacity);
+                const auto *surface = bubbleSurface(rendered);
+                assert(surface);
+                near(proxy->transformOriginX(), surface->x() + surface->width() * .5f);
+                near(proxy->transformOriginY(), surface->y() + surface->height() * .5f);
+                float centerX, centerY;
+                Node::mapToScene(&motionHost, proxy->x() + proxy->transformOriginX(),
+                                 proxy->y() + proxy->transformOriginY(), centerX, centerY);
+                return {centerX, centerY, proxy->scaleX(), proxy->scaleY()};
+            };
+            const auto start = inspect(reveal == SendReveal::Fade ? 0.f : 1.f);
+            if (motion == SendMotion::Flight) {
+                near(start.x, originX);
+                near(start.y, originY);
+                near(start.scaleX, 1);
+                near(start.scaleY, 1);
+            } else {
+                near(start.scaleX, .92f);
+                near(start.scaleY, .92f);
+            }
+            model.now += .15;
+            arrange();
+            const auto moving = inspect(reveal == SendReveal::Fade ? 1.f / 3.f : 1.f);
+            if (motion == SendMotion::Flight) {
+                assert(moving.y < start.y);
+            } else {
+                near(moving.x, start.x);
+                near(moving.y, start.y);
+                model.now += .25;
+                arrange();
+                near(inspect(.4f / .45f).scaleX, 1); // Fade outlasts Pop.
+            }
+            model.now = 20.46;
+            arrange();
         }
-        model.now += 2;
-        arrange();
         assert(motionHost.children().empty());
         const auto restored = body(view, message.text);
         near(restored.content.x(), 0);
         near(restored.content.y(), 0);
         near(restored.content.opacity(), 1);
+        assert(restored.row.hitTestVisible());
         assert(model.actions.empty());
         view.setMotionHost(nullptr);
     }

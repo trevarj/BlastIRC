@@ -3382,8 +3382,8 @@ def probe_settings_categories(proc, window, preferences, config, database_path, 
                     # Independent native selectors: exercise each offered value,
                     # not a Cartesian product of complete messaging workflows.
                     for field, stop, choices in (
-                            ("send_motion", 3, ("none", "flight", "rise", "pop")),
-                            ("send_reveal", 4, ("none", "fade", "pixels"))):
+                            ("send_motion", 3, ("none", "flight", "rise", "pop", "slide")),
+                            ("send_reveal", 4, ("none", "fade"))):
                         original = baseline["appearance"][field]
                         for choice in (*choices, original):
                             framed_keys(window, *(["Tab"] * stop))

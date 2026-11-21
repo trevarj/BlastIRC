@@ -153,10 +153,10 @@ int main() {
         assert(veil(i * .001f) + .00001f >= veil((i - 1) * .001f));
     for (int i = 1301; i <= 3300; ++i)
         assert(veil(i * .001f) <= veil((i - 1) * .001f) + .00001f);
-    // One slow, continuous composer-to-slot flight; interruption settles immediately.
+    // Flight is opaque from the composer to the destination; cancellation settles immediately.
     const auto start = messageEntrance(0, true, 100, 500, 300, 100, true);
     const auto middle = messageEntrance(outgoingDuration / 2, true, 100, 500, 300, 100, true);
-    assert(start.active && start.x == -200 && start.y == 400 && start.reveal == 0);
+    assert(start.active && start.x == -200 && start.y == 400 && start.reveal == 1);
     assert(middle.active && std::abs(middle.x + 100) < .001f && std::abs(middle.y - 200) < .001f);
     for (bool own : {false, true}) {
         const double duration = own ? outgoingDuration : incomingDuration;
@@ -168,19 +168,25 @@ int main() {
         const auto disabled = messageEntrance(.1, own, 100, 500, 300, 100, false);
         assert(!disabled.active && disabled.reveal == 1 && disabled.x == 0 && disabled.y == 0);
     }
-    const auto incoming = messageEntrance(incomingDuration / 2, false, 100, 500, 300, 100, true);
-    assert(incoming.active && incoming.x == 0 && incoming.y == 0 && incoming.reveal > 0 &&
-           incoming.reveal < 1);
-    // Reveal can finish before flight, and motion before reveal, without an early retirement.
-    const auto flying =
-        messageEntrance(.5, true, 100, 500, 300, 100, true, SendMotion::Flight, SendReveal::Fade);
-    assert(flying.active && flying.reveal == 1 && flying.y > 0);
+    float previousScale = .94f;
+    for (int step = 0; step <= 20; ++step) {
+        const auto pop =
+            messageEntrance(incomingDuration * (step / 20.), false, 100, 500, 300, 100, true);
+        assert(pop.x == 0 && pop.y == 0 && pop.reveal == 1);
+        assert(pop.active == (step < 20) && pop.scale >= previousScale && pop.scale <= 1);
+        if (step == 0)
+            assert(pop.scale == .94f);
+        if (step == 10)
+            assert(pop.scale > .98f);
+        previousScale = pop.scale;
+    }
+    assert(previousScale == 1);
     const auto revealing =
-        messageEntrance(.4, true, 100, 500, 300, 100, true, SendMotion::Pop, SendReveal::Pixels);
+        messageEntrance(.4, true, 100, 500, 300, 100, true, SendMotion::Pop, SendReveal::Fade);
     assert(revealing.active && revealing.scale == 1 && revealing.reveal < 1);
     for (auto motion : {SendMotion::None, SendMotion::Flight, SendMotion::Rise, SendMotion::Pop,
-                        SendMotion::Slide, SendMotion::Drift})
-        for (auto reveal : {SendReveal::None, SendReveal::Fade, SendReveal::Pixels}) {
+                        SendMotion::Slide})
+        for (auto reveal : {SendReveal::None, SendReveal::Fade}) {
             const double lifetime = std::max(messageMotionDuration(motion),
                                              reveal == SendReveal::None ? 0 : sendRevealDuration);
             const auto sample = messageEntrance(.1, true, 100, 500, 300, 100, true, motion, reveal);
@@ -195,8 +201,6 @@ int main() {
                 assert(sample.x == 0 && sample.y == 0 && sample.scale > .92f);
             if (motion == SendMotion::Slide)
                 assert(sample.x > 0 && sample.x < 24 && sample.y == 0 && sample.scale == 1);
-            if (motion == SendMotion::Drift)
-                assert(sample.x > 0 && sample.x < 18 && sample.y > 0 && sample.y < 12);
             const auto settled =
                 messageEntrance(lifetime, true, 100, 500, 300, 100, true, motion, reveal);
             assert(!settled.active && settled.x == 0 && settled.y == 0 && settled.scale == 1 &&
@@ -206,8 +210,8 @@ int main() {
             assert(!disabled.active && disabled.scale == 1 && disabled.reveal == 1);
             const auto received =
                 messageEntrance(.1, false, 100, 500, 300, 100, true, motion, reveal);
-            assert(received.active && received.x == 0 && received.y == 0 && received.scale == 1 &&
-                   received.reveal == float(.1 / incomingDuration));
+            assert(received.active && received.x == 0 && received.y == 0 && received.scale < 1 &&
+                   received.reveal == 1);
         }
     for (double age :
          {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
@@ -220,14 +224,13 @@ int main() {
                value.reveal == 1);
     };
     // Incoming choices are independent of the composer choices and of each other.
-    for (auto motion : {SendMotion::None, SendMotion::Rise, SendMotion::Pop, SendMotion::Slide,
-                        SendMotion::Drift})
-        for (auto reveal : {SendReveal::None, SendReveal::Fade, SendReveal::Pixels}) {
+    for (auto motion : {SendMotion::None, SendMotion::Rise, SendMotion::Pop, SendMotion::Slide})
+        for (auto reveal : {SendReveal::None, SendReveal::Fade}) {
             for (float milliseconds : {100.f, 550.f, 2000.f}) {
                 const double duration = messageIncomingDuration(milliseconds);
                 const auto sample =
                     messageEntrance(duration / 2, false, 0, 0, 0, 0, true, SendMotion::Flight,
-                                    SendReveal::Pixels, motion, reveal, milliseconds);
+                                    SendReveal::Fade, motion, reveal, milliseconds);
                 const auto alternate =
                     messageEntrance(duration / 2, false, 999, -999, 42, 24, true, SendMotion::None,
                                     SendReveal::None, motion, reveal, milliseconds);
@@ -241,12 +244,10 @@ int main() {
                 if (motion == SendMotion::Rise)
                     assert(sample.x == 0 && sample.y > 0 && sample.y < 18 && sample.scale == 1);
                 if (motion == SendMotion::Pop)
-                    assert(sample.x == 0 && sample.y == 0 && sample.scale > 1 &&
-                           sample.scale < 1.02f);
+                    assert(sample.x == 0 && sample.y == 0 && sample.scale > .98f &&
+                           sample.scale < 1);
                 if (motion == SendMotion::Slide)
                     assert(sample.x == 12 && sample.y == 0 && sample.scale == 1);
-                if (motion == SendMotion::Drift)
-                    assert(sample.x == 9 && sample.y > 0 && sample.y < 12);
                 const auto opaque =
                     messageEntrance(duration / 2, false, 0, 0, 0, 0, true, SendMotion::None,
                                     SendReveal::None, motion, SendReveal::None, milliseconds);
@@ -273,7 +274,7 @@ int main() {
         }
     // Incoming Flight is never a composer flight, even for a malformed stored enum.
     assertSettled(messageEntrance(0, false, 100, 500, 300, 100, true, SendMotion::Flight,
-                                  SendReveal::Pixels, SendMotion::Flight, SendReveal::None));
+                                  SendReveal::Fade, SendMotion::Flight, SendReveal::None));
     assert(messageIncomingDuration(-100) == .1 && messageIncomingDuration(0) == .1);
     assert(messageIncomingDuration(10000) == 2);
     for (float invalid :
@@ -291,16 +292,6 @@ int main() {
     const auto extreme = messageEntrance(0, true, std::numeric_limits<float>::max(), 0,
                                          -std::numeric_limits<float>::max(), 0, true);
     assert(std::isfinite(extreme.x) && std::isfinite(extreme.y));
-    // Block reveal is monotonic, spatially staggered and fully sharp at completion.
-    bool staggered = false;
-    for (unsigned block = 0; block < 64; ++block) {
-        assert(messageBlockOpacity(0, block) == 0 && messageBlockOpacity(1, block) == 1);
-        for (int step = 1; step <= 100; ++step)
-            assert(messageBlockOpacity(step / 100.f, block) >=
-                   messageBlockOpacity((step - 1) / 100.f, block));
-        staggered |= messageBlockOpacity(.5f, block) != messageBlockOpacity(.5f, 0);
-    }
-    assert(staggered);
 #ifdef BLASTIRC_FX_INTEGRATION
     effectsIntegrationCheck();
 #endif

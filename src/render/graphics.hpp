@@ -29,25 +29,6 @@ class MaterialNode : public CustomDrawNode {
     std::unique_ptr<Impl> impl;
 };
 
-// Reveal the actual retained row, including text/emoji, with opacity or disjoint clip tiles.
-// The source must be a sibling, remain alive, and stay visible. No texture snapshot.
-class PixelRevealNode final : public Node {
-  public:
-    explicit PixelRevealNode(Node *source = nullptr);
-    ~PixelRevealNode() override;
-    void setSource(Node *);
-    void setRevealBounds(const LayoutRect &);
-    // Call after sizing/positioning the source; pixels=false fades its ordinary paint.
-    void setReveal(float progress, float opacity = 1, bool pixels = true);
-
-  private:
-    Node *source = nullptr;
-    LayoutRect bounds{};
-    float progress = 1;
-    void layoutTiles();
-    void clearTiles();
-};
-
 // Native SVG decoding; the Image child owns its renderer-bound texture.
 class LucideIcon : public Node {
   public:

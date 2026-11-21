@@ -1667,9 +1667,17 @@ void runSettingsCheck() {
     category(3);
     auto *movement = named<Select>(dialogs, "Sending movement");
     auto *reveal = named<Select>(dialogs, "Sending reveal");
+    auto *incomingMovement = named<Select>(dialogs, "Incoming movement");
+    auto *incomingReveal = named<Select>(dialogs, "Incoming reveal");
+    auto *incomingDuration = named<Slider>(dialogs, "Incoming duration (100–2000 ms)");
+    assert(movement->selectedText() == "Flight" && reveal->selectedText() == "None" &&
+           model.settings.sendMotion == SendMotion::Flight &&
+           model.settings.sendReveal == SendReveal::None);
+    assert(incomingMovement->selectedText() == "Pop · short zoom" &&
+           incomingReveal->selectedText() == "None" && incomingDuration->value() == 280.f);
     constexpr std::array movements{SendMotion::None, SendMotion::Flight, SendMotion::Rise,
-                                   SendMotion::Pop,  SendMotion::Slide,  SendMotion::Drift};
-    constexpr std::array reveals{SendReveal::None, SendReveal::Fade, SendReveal::Pixels};
+                                   SendMotion::Pop, SendMotion::Slide};
+    constexpr std::array reveals{SendReveal::None, SendReveal::Fade};
     // Both controls remain independent across every combination.
     for (std::size_t motion = 0; motion < movements.size(); ++motion) {
         movement->setSelectedIndex(motion);
@@ -1679,22 +1687,22 @@ void runSettingsCheck() {
                    model.settings.sendReveal == reveals[effect]);
         }
     }
-    assert(model.settings.incomingMotion == SendMotion::None &&
-           model.settings.incomingReveal == SendReveal::Fade &&
-           model.settings.incomingDurationMs == 550.f);
+    assert(model.settings.incomingMotion == SendMotion::Pop &&
+           model.settings.incomingReveal == SendReveal::None &&
+           model.settings.incomingDurationMs == 280.f);
     constexpr std::array incomingMotions{SendMotion::None, SendMotion::Rise, SendMotion::Pop,
-                                         SendMotion::Slide, SendMotion::Drift};
+                                         SendMotion::Slide};
     for (std::size_t motion = 0; motion < incomingMotions.size(); ++motion) {
-        named<Select>(dialogs, "Incoming movement")->setSelectedIndex(motion);
+        incomingMovement->setSelectedIndex(motion);
         for (std::size_t effect = 0; effect < reveals.size(); ++effect) {
-            named<Select>(dialogs, "Incoming reveal")->setSelectedIndex(effect);
+            incomingReveal->setSelectedIndex(effect);
             assert(model.settings.incomingMotion == incomingMotions[motion] &&
                    model.settings.incomingReveal == reveals[effect]);
-            assert(model.settings.sendMotion == SendMotion::Drift &&
-                   model.settings.sendReveal == SendReveal::Pixels);
+            assert(model.settings.sendMotion == SendMotion::Slide &&
+                   model.settings.sendReveal == SendReveal::Fade);
         }
     }
-    named<Slider>(dialogs, "Incoming duration (100–2000 ms)")->setValue(900);
+    incomingDuration->setValue(900);
     assert(model.settings.incomingDurationMs == 900);
     auto *mention = named<Select>(dialogs, "Mention effect");
     auto *strength = named<Slider>(dialogs, "Mention strength (0–100%)");
@@ -1727,6 +1735,11 @@ void runSettingsCheck() {
     named<Slider>(dialogs, "Overlay shake")->setValue(.5);
     sync();
     assert(model.settings.fx == FxLevel::Off && model.settings.reducedMotion);
+    assert(model.settings.sendMotion == SendMotion::Slide &&
+           model.settings.sendReveal == SendReveal::Fade &&
+           model.settings.incomingMotion == SendMotion::Slide &&
+           model.settings.incomingReveal == SendReveal::Fade &&
+           model.settings.incomingDurationMs == 900);
     assert(model.settings.gravity == 150 && model.settings.drag == 2 &&
            model.settings.shake == .5f);
     assert(model.settings.sound && model.settings.cursorEffect == "trail" &&

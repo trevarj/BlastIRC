@@ -1,5 +1,4 @@
 #include "graphics.hpp"
-#include "../fx/tween.hpp"
 #include "../theme/theme.hpp"
 #include "../ui/presentation.hpp"
 #include <GLES2/gl2.h>
@@ -302,79 +301,6 @@ void MaterialNode::draw(RenderBackend &backend, const CustomDrawContext &incomin
              withAlpha(themeColor(p.hovered ? "tertiary" : "outline_variant"),
                        p.hovered ? .35f : .3f),
              radius, scale);
-    }
-}
-
-PixelRevealNode::PixelRevealNode(Node *value) : source(value) {
-    setParticipatesInLayout(false);
-    setHitTestVisible(false);
-    setExcludeSubtreeFromTabOrder(true);
-}
-PixelRevealNode::~PixelRevealNode() = default;
-void PixelRevealNode::clearTiles() {
-    while (!children().empty())
-        removeChild(children().back().get());
-}
-void PixelRevealNode::setSource(Node *value) {
-    if (source == value)
-        return;
-    clearTiles();
-    source = value;
-}
-void PixelRevealNode::setRevealBounds(const LayoutRect &value) { bounds = value; }
-void PixelRevealNode::setReveal(float progress, float opacity, bool pixels) {
-    if (!source)
-        return;
-    progress = std::isfinite(progress) ? std::clamp(progress, 0.f, 1.f) : 1.f;
-    this->progress = progress;
-    if (!pixels || progress >= 1 || source->width() <= 0 || source->height() <= 0) {
-        source->setOpacity(opacity * (pixels ? 1.f : progress));
-        clearTiles();
-        setVisible(false);
-        return;
-    }
-    // ponytail: at most 64 disjoint clipped subtree traversals per entering row;
-    // completed rows use their ordinary sharp tree without proxies.
-    if (children().empty())
-        for (unsigned i = 0; i < 64; ++i) {
-            auto tile = std::make_unique<Node>();
-            tile->setParticipatesInLayout(false);
-            tile->setHitTestVisible(false);
-            tile->setClipChildren(true);
-            tile->addChild(std::make_unique<RenderProxyNode>(source));
-            addChild(std::move(tile));
-        }
-    source->setOpacity(0);
-    setVisible(true);
-    setOpacity(opacity);
-    setPosition(source->x(), source->y());
-    setSize(source->width(), source->height());
-    layoutTiles();
-}
-void PixelRevealNode::layoutTiles() {
-    const LayoutRect area =
-        bounds.width > 0 && bounds.height > 0 ? bounds : LayoutRect{0, 0, width(), height()};
-    const unsigned columns = static_cast<unsigned>(
-        std::clamp(std::round(std::sqrt(64.f * area.width / area.height)), 1.f, 64.f));
-    const unsigned rows = std::max(1U, 64U / columns);
-    std::array<float, 65> xEdges{}, yEdges{};
-    for (unsigned i = 0; i <= columns; ++i)
-        xEdges[i] = area.x + float(i) * area.width / columns;
-    for (unsigned i = 0; i <= rows; ++i)
-        yEdges[i] = area.y + float(i) * area.height / rows;
-    for (unsigned i = 0; i < children().size(); ++i) {
-        auto &tile = *children()[i];
-        tile.setVisible(i < columns * rows);
-        if (i >= columns * rows)
-            continue;
-        // Every mask has the SAME world matrix and reuses identical shared edges;
-        // native draw-time integer scissors cannot overlap at fractional translations.
-        tile.setPosition(0, 0);
-        tile.setSize(width(), height());
-        tile.setPixelPartitionClip(xEdges[i % columns], yEdges[i / columns],
-                                   xEdges[i % columns + 1], yEdges[i / columns + 1]);
-        tile.setOpacity(fx::messageBlockOpacity(progress, i));
-        tile.children().front()->setPosition(0, 0);
     }
 }
 

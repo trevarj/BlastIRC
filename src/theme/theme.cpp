@@ -205,19 +205,36 @@ Color themeMentionBackground(bool hovered) {
     if (cachedRevision != themeRevision()) {
         const auto base = withAlpha(themeColor("surface_container_high"), 1);
         const auto accent = withAlpha(themeColor("tertiary_container"), 1);
-        const auto body = themeForegroundColor("on_surface");
-        const auto metadata = themeForegroundColor("on_surface_variant");
-        const float bodyMinimum = std::min(4.5f, contrastRatio(base, body));
-        const float metadataMinimum = std::min(4.5f, contrastRatio(base, metadata));
+        const auto conversation = themeConversationBackdrop();
+        const auto composite = [conversation](Color fill) {
+            return lerpColor(conversation, fill, themeSurfaceAlpha());
+        };
+        const auto backdrop = composite(base);
+        const auto body = pairedForeground(backdrop, themeForegroundColor("on_surface"));
+        const auto metadata =
+            pairedForeground(backdrop, themeForegroundColor("on_surface_variant"));
+        const auto readable = [&](Color candidate, Color ink) {
+            // Bound every intermediate tint, not just the two endpoints.
+            const float luminance = relativeLuminance(ink);
+            const bool light = luminance > relativeLuminance(backdrop);
+            const auto edge = [light](float a, float b) {
+                return light ? std::max(a, b) : std::min(a, b);
+            };
+            const Color worst = {edge(backdrop.r, candidate.r), edge(backdrop.g, candidate.g),
+                                 edge(backdrop.b, candidate.b), 1};
+            const float limit = relativeLuminance(worst) + .05f;
+            return light ? luminance + .05f >= 4.5f * limit
+                         : limit >= 4.5f * (luminance + .05f);
+        };
         for (int state = 0; state < 2; ++state) {
             float low = 0, high = state ? .575f : .5f;
             backgrounds[state] = base;
-            // Retain the strongest readable tint, without worsening an authored low-contrast base.
+            // Keep the strongest readable tint over the actual conversation surface.
             for (int step = 0; step < 16; ++step) {
                 const float amount = step ? (low + high) * .5f : high;
                 const auto candidate = lerpColor(base, accent, amount);
-                if (contrastRatio(candidate, body) >= bodyMinimum &&
-                    contrastRatio(candidate, metadata) >= metadataMinimum) {
+                const auto painted = composite(candidate);
+                if (readable(painted, body) && readable(painted, metadata)) {
                     backgrounds[state] = candidate;
                     low = amount;
                     if (step == 0)

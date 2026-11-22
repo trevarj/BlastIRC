@@ -155,8 +155,8 @@ class CpuGlyphDrawSink final : public RenderBackend {
     int maxTextureSize() override { return 2048; }
     void setScissor(RenderScissor) override { std::abort(); }
     void disableScissor() override { std::abort(); }
-    void drawRect(float, float, float, float, const RoundedRectStyle &, const Mat3 &) override {
-        std::abort();
+    void drawRect(float, float, float, float, const RoundedRectStyle &style, const Mat3 &) override {
+        lastRectFill = style.fill;
     }
     void drawImage(const RenderImageDraw &) override { std::abort(); }
     void drawGlyph(const RenderGlyphDraw &draw) override { lastGlyph = draw; }
@@ -168,6 +168,7 @@ class CpuGlyphDrawSink final : public RenderBackend {
     void drawFramebufferBlur(TextureId, uint32_t, uint32_t, float, float, float) override {
         std::abort();
     }
+    Color lastRectFill{};
     TextureManager &textureManager() override { return textures; }
     RenderGlyphDraw lastGlyph{};
 
@@ -270,6 +271,10 @@ class TranscriptTestRenderer final : public Renderer {
     Color lastGlyphTint() const {
         assert(backend.lastGlyph.tinted);
         return backend.lastGlyph.tint;
+    }
+    Color materialFill(const blast::MaterialNode &material) {
+        material.draw(backend, {.width = material.width(), .height = material.height()});
+        return backend.lastRectFill;
     }
     CpuTextureUploadSink textures;
 
@@ -7061,661 +7066,235 @@ void visitSeparator(TranscriptTestRenderer &renderer) {
 }
 
 void persistentMentionStyles(TranscriptTestRenderer &renderer) {
-    for (const auto layout :
-         {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc, blast::MessageLayout::Stacked})
-        for (const auto effect :
-             {blast::MentionEffect::NeonMention, blast::MentionEffect::BreathingGlow,
-              blast::MentionEffect::LuminousOutline, blast::MentionEffect::TextShimmer,
-              blast::MentionEffect::AccentUnderline}) {
-            blast::Model model;
-            model.now = 100;
-            model.settings.timestamps = model.settings.avatars = false;
-            model.settings.reducedMotion = false;
-            model.settings.fx = blast::FxLevel::Full;
-            model.settings.incomingMotion = blast::SendMotion::None;
-            model.settings.incomingReveal = blast::SendReveal::None;
-            model.settings.mentionEffect = effect;
-            model.settings.mentionStrength = .6f;
-            model.settings.foolDisplay = blast::FoolDisplay::Shown;
-            model.settings.presence = blast::PresenceMode::All;
-            blast::Theme theme;
-            theme.update(model);
-            auto &buffer = model.buffers["persistent-mention"];
-            buffer.id = buffer.target = "persistent-mention";
-            buffer.kind = "channel";
-            buffer.server = "network";
-            buffer.muted = true;
-            model.networks[buffer.server].nick = "CurrentMe";
-            model.settings.messageLayouts[buffer.id] = layout;
-            buffer.nicks = {{.name = "Other", .account = {}, .prefix = {}}};
-            blast::Message message;
-            message.id = "persistent-history";
-            message.nick = "Peer";
-            message.text = "PersistentBody Old\x02Me\x02 Other https://example.org/OldMe "
-                           "\x03"
-                           "04,02\x1f"
-                           "ColoredBody😀\x1f\x0f";
-            message.mention = message.history = true;
-            message.mentionNick = "OldMe";
-            message.arrival = 1;
-            buffer.messages.push_back(message);
-            const auto before = buffer;
-            blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
-            Clipboard clipboard;
-            InputDispatcher dispatcher;
-            blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
-            view.setReadEligible(false);
-            view.setWindowActive(true);
-            dispatcher.setSceneRoot(&view);
-            view.setInputDispatcher(dispatcher);
-            LayoutRect viewport{17, 23, 900, 600};
-            const auto arrange = [&] {
-                view.sync();
-                view.arrange(renderer, viewport);
-            };
-            const auto roots = [&](const Body &rendered) {
-                std::vector<Node *> result;
-                for (const auto &area : rendered.body.children())
-                    if (dynamic_cast<InputArea *>(area.get()))
-                        for (const auto &child : area->children())
-                            if (!dynamic_cast<TextNode *>(child.get()) &&
-                                !dynamic_cast<RectNode *>(child.get()))
-                                result.push_back(child.get());
-                for (Node *container : {&rendered.content, static_cast<Node *>(&rendered.row)})
-                    for (const auto &child : container->children()) {
-                        if (child.get() == rendered.content.parent())
-                            continue;
-                        if (auto *rect = dynamic_cast<RectNode *>(child.get());
-                            rect && rect->style().borderWidth > 0 && rect->zIndex() >= 0)
-                            result.push_back(rect);
-                        else if (child.get() != &rendered.body &&
-                                 !dynamic_cast<InputArea *>(child.get()) &&
-                                 !dynamic_cast<blast::MaterialNode *>(child.get())) {
-                            const auto halo = [&](auto &&self, Node &node) -> bool {
-                                if (const auto *rect = dynamic_cast<RectNode *>(&node);
-                                    rect && rect->style().outerShadow)
-                                    return true;
-                                for (const auto &nested : node.children())
-                                    if (self(self, *nested))
-                                        return true;
-                                return false;
-                            };
-                            if (halo(halo, *child))
-                                result.push_back(child.get());
-                        }
-                    }
-                return result;
-            };
-            const auto signature = [&](const Body &rendered) {
-                std::vector<float> result;
-                const auto visit = [&](auto &&self, Node &node, float opacity) -> void {
-                    if (!node.visible() || (opacity *= node.opacity()) <= 0)
-                        return;
-                    result.insert(result.end(), {opacity, node.x(), node.y(), node.width(),
-                                                 node.height(), node.foregroundBlurRadius()});
-                    if (const auto *clip = node.pixelPartitionClip())
-                        result.insert(result.end(),
-                                      {clip->left, clip->top, clip->right, clip->bottom});
-                    if (auto *rect = dynamic_cast<RectNode *>(&node))
-                        result.insert(result.end(), {rect->style().fill.a, rect->style().border.a});
-                    for (const auto &child : node.children())
-                        self(self, *child, opacity);
-                };
-                for (auto *root : roots(rendered))
-                    visit(visit, *root, 1);
-                return result;
-            };
-            const auto decorated = [&] { return !signature(body(view, "PersistentBody")).empty(); };
-            const auto backdrop = [&](const Body &rendered) {
-                // The persistent body tint is distinct from ordinary hovered
-                // or activity surfaces, which may also paint behind the text.
-                const auto ordinaryFill = blast::themeSurfaceColor("surface_container_high");
-                for (const auto &child : rendered.content.children())
-                    if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                        rect && rect->visible() && rect->zIndex() < 0 &&
-                        rect->width() >= rendered.fragment.width() &&
-                        rect->height() >= rendered.fragment.height() &&
-                        ((rect->style().borderWidth > 0 && rect->style().border.a > 0) ||
-                         (rect->style().fill.a > 0 && rect->style().fill != ordinaryFill)))
-                        return true;
-                return false;
-            };
-            const auto originals = [&] {
-                std::vector<std::tuple<std::string, Color, float>> result;
-                for (const auto &area : body(view, "PersistentBody").body.children())
-                    if (dynamic_cast<InputArea *>(area.get()))
-                        for (const auto &child : area->children())
-                            if (auto *text = dynamic_cast<TextNode *>(child.get()))
-                                result.emplace_back(text->text(), text->color(), text->opacity());
-                return result;
-            };
-            arrange();
-            assert(decorated() && backdrop(body(view, "PersistentBody")));
-            const auto sortedChildren = [&](auto &&self, const Node &node) -> void {
-                int previous = std::numeric_limits<int>::min();
-                for (const auto &child : node.children()) {
-                    assert(child->zIndex() >= previous);
-                    previous = child->zIndex();
-                    self(self, *child);
-                }
-            };
-            sortedChildren(sortedChildren, body(view, "PersistentBody").row);
-            const auto originalInk = originals();
-            const auto height = body(view, "PersistentBody").row.height();
-            rail(body(view, "PersistentBody"), {});
-            if (effect != blast::MentionEffect::LuminousOutline) {
-                int splitFragments = 0;
-                for (const auto &area : body(view, "PersistentBody").body.children())
-                    if (dynamic_cast<InputArea *>(area.get())) {
-                        TextNode *base = nullptr;
-                        for (const auto &child : area->children())
-                            if (auto *text = dynamic_cast<TextNode *>(child.get()))
-                                base = text;
-                        if (!base)
-                            continue;
-                        const auto text = decodedMarkup(base->text());
-                        bool active = false;
-                        for (const auto &child : area->children())
-                            if (!dynamic_cast<TextNode *>(child.get()) &&
-                                !dynamic_cast<RectNode *>(child.get()) && child->visible() &&
-                                child->opacity() > 0)
-                                active = true;
-                        if (text == "Old" || text == "Me") {
-                            assert(active);
-                            ++splitFragments;
-                            if (effect == blast::MentionEffect::NeonMention ||
-                                effect == blast::MentionEffect::BreathingGlow)
-                                for (const auto &child : area->children())
-                                    if (child->visible() && !dynamic_cast<TextNode *>(child.get()))
-                                        for (const auto &blur : child->children())
-                                            if (blur->foregroundBlurRadius() > 0) {
-                                                assert(blur->width() > base->width());
-                                                assert(blur->height() > base->height());
-                                                const auto *ink = find<TextNode>(*blur);
-                                                assert(ink);
-                                                const auto a = nativeTextInk(renderer, *base);
-                                                const auto b = nativeTextInk(renderer, *ink);
-                                                near(a.x, b.x);
-                                                near(a.y, b.y);
-                                                near(a.width, b.width);
-                                                near(a.height, b.height);
-                                            }
-                        } else
-                            assert(!active);
-                    }
-                assert(splitFragments == 2);
-            } else {
-                auto rendered = body(view, "PersistentBody");
-                const auto *surface = find<blast::MaterialNode>(rendered.content);
-                const RectNode *dense = nullptr;
-                if (layout != blast::MessageLayout::Bubbles)
-                    for (const auto &child : rendered.content.children())
-                        if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                            rect && rect->visible() && rect->zIndex() < 0 &&
-                            rect->style().fill.a > 0 && rect->style().borderWidth == 0 &&
-                            rect->width() > 0 && rect->height() >= surface->height())
-                            dense = rect;
-                assert(layout == blast::MessageLayout::Bubbles || dense);
-                // The persistent backdrop extends outside the selection;
-                // optional outline/halo geometry still surrounds that selection.
-                const float backdropInset = dense ? surface->x() - dense->x() : 0;
-                assert(backdropInset >= 0);
-                const float outlinedBodyWidth =
-                    dense ? dense->width() - 2 * backdropInset : surface->width();
-                bool outline = false, halo = false;
-                for (auto *root : roots(rendered)) {
-                    if (auto *rect = dynamic_cast<RectNode *>(root); rect && rect->visible()) {
-                        assert(rect->style().fill.a == 0);
-                        near(rect->style().borderWidth, blast::themeScale());
-                        near(rect->x(), surface->x() - 12 * blast::themeScale());
-                        near(rect->y(), surface->y() - 8 * blast::themeScale());
-                        near(rect->width(), outlinedBodyWidth + 24 * blast::themeScale());
-                        near(rect->height(), surface->height() + 16 * blast::themeScale());
-                        containedBounds(sceneBounds(*rect), sceneBounds(rendered.row));
-                        containedBounds(sceneBounds(*rect), nativeHistoryClip(view));
-                        outline = true;
-                    } else if (root->visible()) {
-                        const auto *shadow = find<RectNode>(*root);
-                        assert(shadow && shadow->style().outerShadow);
-                        const auto shadowBounds = sceneBounds(*shadow);
-                        float surfaceX, surfaceY;
-                        Node::mapToScene(surface, 0, 0, surfaceX, surfaceY);
-                        near(shadowBounds.x, surfaceX - 12 * blast::themeScale());
-                        near(shadowBounds.y, surfaceY - 8 * blast::themeScale());
-                        near(shadowBounds.width, outlinedBodyWidth + 24 * blast::themeScale());
-                        near(shadowBounds.height, surface->height() + 16 * blast::themeScale());
-                        containedBounds(sceneBounds(*root), sceneBounds(rendered.row));
-                        containedBounds(sceneBounds(*root), nativeHistoryClip(view));
-                        assert(root->zIndex() < rendered.content.parent()->zIndex());
-                        bool beforeClip = false;
-                        for (const auto &sibling : rendered.row.children()) {
-                            if (sibling.get() == rendered.content.parent()) {
-                                assert(beforeClip);
-                                break;
-                            }
-                            beforeClip |= sibling.get() == root;
-                        }
-                        halo = true;
-                    }
-                }
-                assert(outline && halo);
-            }
-            model.now = 10000;
-            pane.following = false;
-            view.setWindowActive(false);
-            arrange();
-            assert(decorated() && originals() == originalInk);
-            near(body(view, "PersistentBody").row.height(), height);
-            auto &other = model.buffers["other-buffer"];
-            other.id = other.target = "other-buffer";
-            other.kind = "channel";
-            pane.buffer = other.id;
-            arrange();
-            pane.buffer = buffer.id;
-            arrange();
-            assert(decorated());
-            model.settings.reducedMotion = true;
-            arrange();
-            const auto steady = signature(body(view, "PersistentBody"));
-            model.now += .71;
-            arrange();
-            assert(!steady.empty() && signature(body(view, "PersistentBody")) == steady);
-            model.settings.mentionStrength = .2f;
-            arrange();
-            const auto weak = signature(body(view, "PersistentBody"));
-            model.settings.mentionStrength = .9f;
-            arrange();
-            assert(!weak.empty() && signature(body(view, "PersistentBody")) != weak);
-            assert(signature(body(view, "PersistentBody")).front() > weak.front());
-            model.settings.mentionStrength = 0;
-            arrange();
-            assert(!decorated() && backdrop(body(view, "PersistentBody")));
-            model.settings.mentionStrength = .6f;
-            model.settings.fx = blast::FxLevel::Off;
-            arrange();
-            assert(!decorated() && backdrop(body(view, "PersistentBody")) &&
-                   originals() == originalInk);
-            model.settings.fx = blast::FxLevel::Full;
-            model.settings.mentionEffect = blast::MentionEffect::Off;
-            arrange();
-            assert(!decorated() && backdrop(body(view, "PersistentBody")));
-            model.settings.mentionEffect = effect;
-            model.settings.reducedMotion = false;
-            view.setWindowActive(true);
-            arrange();
-            const auto normal = signature(body(view, "PersistentBody"));
-            model.now += .41;
-            arrange();
-            const bool animated = effect == blast::MentionEffect::BreathingGlow ||
-                                  effect == blast::MentionEffect::TextShimmer;
-            assert((signature(body(view, "PersistentBody")) != normal) == animated);
-            if (animated) {
-                model.settings.mentionSpeed = .25f;
-                arrange();
-                const auto slow = signature(body(view, "PersistentBody"));
-                model.settings.mentionSpeed = 2;
-                arrange();
-                assert(signature(body(view, "PersistentBody")) != slow);
-            }
-            if (effect == blast::MentionEffect::LuminousOutline ||
-                effect == blast::MentionEffect::AccentUnderline) {
-                model.settings.mentionOutlineBreathing = true;
-                model.settings.mentionUnderlineGlint = true;
-                arrange();
-                const auto variant = signature(body(view, "PersistentBody"));
-                model.now += .43;
-                arrange();
-                assert(signature(body(view, "PersistentBody")) != variant);
-                model.settings.reducedMotion = true;
-                arrange();
-                const auto reducedVariant = signature(body(view, "PersistentBody"));
-                model.now += .43;
-                arrange();
-                assert(signature(body(view, "PersistentBody")) == reducedVariant);
-            }
-            model.settings.reducedMotion = false;
-            arrange();
-            renderer.paintText(body(view, "PersistentBody").content);
-            const auto warmedUploads = renderer.textures.uploads;
-            for (const double delta : {.02, .04, .06}) {
-                model.now += delta;
-                arrange();
-                renderer.paintText(body(view, "PersistentBody").content);
-                assert(renderer.textures.uploads == warmedUploads);
-                assert(originals() == originalInk);
-            }
-            dispatcher.setFocus(&body(view, "PersistentBody").row);
-            assert(view.textSelectionCommand("set-mark"));
-            assert(view.textSelectionCommand("end-of-line"));
-            arrange();
-            assert(view.copySelection());
-            assert(clipboard.clipboardText() ==
-                   "PersistentBody OldMe Other https://example.org/OldMe ColoredBody😀");
-            assert(originals() == originalInk);
-            view.clearTextSelection();
-            dispatcher.setFocus(nullptr);
-            arrange();
-            assert(decorated());
-            unchanged(buffer, before);
-            for (int exclusion = 0; exclusion < 8; ++exclusion) {
-                buffer.messages.front() = message;
-                model.settings.fools.clear();
-                if (exclusion == 0)
-                    buffer.messages.front().own = true;
-                if (exclusion == 1)
-                    buffer.messages.front().pending = true;
-                if (exclusion == 2)
-                    buffer.messages.front().deleted = true;
-                if (exclusion == 3)
-                    buffer.messages.front().mention = false;
-                if (exclusion == 4)
-                    buffer.messages.front().presence = true;
-                if (exclusion == 5)
-                    model.settings.fools.insert(message.nick);
-                if (exclusion == 6)
-                    buffer.messages.front().mentionNick.clear();
-                if (exclusion == 7) {
-                    buffer.messages.front().mentionNick.clear();
-                    buffer.messages.front().text = "PersistentBody Other notCurrentMe "
-                                                   "https://example.org/CurrentMe";
-                }
-                ++buffer.messagesRevision;
-                arrange();
-                const auto token = exclusion == 2 ? "Message deleted" : "PersistentBody";
-                const bool legacyOutline =
-                    effect == blast::MentionEffect::LuminousOutline && exclusion >= 6;
-                assert(signature(body(view, token)).empty() != legacyOutline);
-                assert(backdrop(body(view, token)) == (exclusion >= 6));
-            }
-            model.settings.fools.clear();
-            buffer.messages.front() = message;
-            buffer.messages.front().mentionNick.clear();
-            buffer.messages.front().text = "PersistentBody CurrentMe Other";
-            ++buffer.messagesRevision;
-            arrange();
-            assert(decorated());
-            model.networks[buffer.server].nick = "NextMe";
-            arrange();
-            assert(decorated() == (effect == blast::MentionEffect::LuminousOutline));
-            buffer.messages.front() = message;
-            ++buffer.messagesRevision;
-            arrange();
-            assert(decorated());
-            for (const auto policy : {blast::FoolDisplay::Blurred, blast::FoolDisplay::Dimmed,
-                                      blast::FoolDisplay::Shown}) {
-                model.settings.fools.insert(message.nick);
-                model.settings.foolDisplay = policy;
-                arrange();
-                assert(!decorated() && !backdrop(body(view, "PersistentBody")));
-            }
-            model.settings.fools.clear();
-            arrange();
-            assert(decorated());
-            for (int i = 0; i < 80; ++i) {
-                blast::Message filler;
-                filler.id = filler.text = "UnrelatedRow" + std::to_string(i);
-                filler.nick = "Unrelated";
-                buffer.messages.push_back(std::move(filler));
-            }
-            ++buffer.messagesRevision;
-            arrange();
-            view.scrollToBoundary(true);
-            arrange();
-            assert(!bodyText(view, "PersistentBody"));
-            renderer.paintText(view);
-            const auto offscreenUploads = renderer.textures.uploads;
-            model.now += .23;
-            arrange();
-            renderer.paintText(view);
-            assert(renderer.textures.uploads == offscreenUploads);
-            view.scrollToBoundary(false);
-            arrange();
-            assert(decorated());
-            const auto retained = buffer;
-            for (const std::string kind : {"search", "mentions"}) {
-                auto &synthetic = model.buffers["synthetic-" + kind];
-                synthetic.id = "synthetic-" + kind;
-                synthetic.target = buffer.target;
-                synthetic.kind = kind;
-                auto aggregate = message;
-                aggregate.id = "aggregate-" + kind;
-                aggregate.sourceBuffer = buffer.id;
-                aggregate.sourceId = message.id;
-                aggregate.sourceServer = buffer.server;
-                aggregate.sourceTarget = buffer.target;
-                synthetic.messages.push_back(std::move(aggregate));
-                model.mentionSources[buffer.id] = retained;
-                pane.buffer = synthetic.id;
-                arrange();
-                assert(!decorated() && !backdrop(body(view, "PersistentBody")));
-            }
-            dispatcher.setSceneRoot(nullptr);
-        }
-}
-
-void persistentMentionRowClipping(TranscriptTestRenderer &renderer) {
-    for (const auto &[layout, width, scale] :
+    const auto contrast = [](Color a, Color b) {
+        const float x = relativeLuminance(a) + .05f, y = relativeLuminance(b) + .05f;
+        return std::max(x, y) / std::min(x, y);
+    };
+    for (const auto &[layout, width, zoom] :
          {std::tuple{blast::MessageLayout::Bubbles, 900.f, 1.f},
           std::tuple{blast::MessageLayout::Bubbles, 320.f, 1.5f},
           std::tuple{blast::MessageLayout::Irc, 900.f, 1.f},
-          std::tuple{blast::MessageLayout::Irc, 320.f, 1.5f},
-          std::tuple{blast::MessageLayout::Stacked, 900.f, 1.f},
-          std::tuple{blast::MessageLayout::Stacked, 320.f, 1.5f}}) {
+          std::tuple{blast::MessageLayout::Stacked, 900.f, 1.5f}}) {
         blast::Model model;
         model.now = 100;
-        model.settings.scale = scale;
-        model.settings.timestamps = model.settings.avatars = false;
-        model.settings.reducedMotion = false;
-        model.settings.fx = blast::FxLevel::Full;
+        model.settings.scale = zoom;
+        model.settings.timestamps = model.settings.avatars = true;
+        model.settings.transparency = true;
+        model.settings.opacity = .63f;
         model.settings.incomingMotion = blast::SendMotion::None;
         model.settings.incomingReveal = blast::SendReveal::None;
-        model.settings.mentionEffect = blast::MentionEffect::LuminousOutline;
+        model.settings.mentionStyle = blast::MentionStyle::Highlight;
+        model.settings.mentionArrival = true;
+        model.settings.fx = blast::FxLevel::Full;
         blast::Theme theme;
         theme.update(model);
-        auto &buffer = model.buffers["grouped-mention-clipping"];
-        buffer.id = buffer.target = "grouped-mention-clipping";
+        auto &buffer = model.buffers["mention-style"];
+        buffer.id = buffer.target = "mention-style";
         buffer.kind = "channel";
+        buffer.server = "network";
+        model.networks[buffer.server].nick = "OldMe";
         model.settings.messageLayouts[buffer.id] = layout;
-        for (const char *token : {"AdjacentBefore", "GroupedOutline", "AdjacentAfter"}) {
-            blast::Message entry;
-            entry.id = token;
-            entry.text = std::string(token) + " Me with enough text to wrap in a narrow viewport";
-            entry.nick = "Peer";
-            entry.timestamp = 1700000000;
-            entry.history = true;
-            entry.mention = std::string_view(token) == "GroupedOutline";
-            entry.mentionNick = entry.mention ? "Me" : "";
-            buffer.messages.push_back(std::move(entry));
-        }
+        blast::Message adjacent;
+        adjacent.id = adjacent.text = "Adjacent";
+        adjacent.nick = "Peer";
+        adjacent.timestamp = 1700000000;
+        adjacent.time = "13:42";
+        adjacent.history = true;
+        auto message = adjacent;
+        message.id = "history";
+        message.text = "Mentioned Old\x02Me\x02 OldMeToo https://example.org/OldMe "
+                       "\x03"
+                       "04,02\x1f"
+                       "ColoredBody😀\x1f\x0f";
+        message.mention = true;
+        message.mentionNick = "OldMe";
+        buffer.messages = {adjacent, message};
+        const auto before = buffer;
         blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
         Clipboard clipboard;
+        InputDispatcher dispatcher;
         blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
         view.setReadEligible(false);
+        view.setWindowActive(true);
+        dispatcher.setSceneRoot(&view);
+        view.setInputDispatcher(dispatcher);
         const LayoutRect viewport{17, 23, width, 600};
         const auto arrange = [&] {
             view.sync();
             view.arrange(renderer, viewport);
         };
-        arrange();
-        const auto previous = body(view, "AdjacentBefore");
-        const auto grouped = body(view, "GroupedOutline");
-        const auto next = body(view, "AdjacentAfter");
-        const auto previousBounds = sceneBounds(previous.row);
-        const auto groupedBounds = sceneBounds(grouped.row);
-        const auto nextBounds = sceneBounds(next.row);
-        near(previousBounds.y + previousBounds.height, groupedBounds.y);
-        near(groupedBounds.y + groupedBounds.height, nextBounds.y);
-        const auto *surface = find<blast::MaterialNode>(grouped.content);
-        assert(surface);
-        assert(surface->y() >= 16 * scale);
-        const auto surfaceBounds = sceneBounds(*surface);
-        const auto bodyBounds = sceneBounds(grouped.body);
-        if (width < 400 * scale)
-            assert(grouped.body.height() > grouped.text.height());
-        const auto *nextSurface = find<blast::MaterialNode>(next.content);
-        assert(nextSurface);
-        const auto nextSurfaceBounds = sceneBounds(*nextSurface);
-        const auto nextBodyBounds = sceneBounds(next.body);
-        near(bodyBounds.x - surfaceBounds.x, nextBodyBounds.x - nextSurfaceBounds.x);
-        near(bodyBounds.y - surfaceBounds.y, nextBodyBounds.y - nextSurfaceBounds.y);
-        assert(!grouped.row.clipChildren());
-        auto *rowClip = grouped.content.parent();
-        assert(rowClip && rowClip->parent() == &grouped.row);
-        assert(rowClip->clipChildren() == (layout != blast::MessageLayout::Bubbles));
-        near(rowClip->width(), grouped.row.width());
-        near(rowClip->height(), grouped.row.height());
-        Node *halo = nullptr;
-        for (const auto &child : grouped.row.children())
-            if (child.get() != rowClip && child->visible())
-                if (const auto *rect = find<RectNode>(*child); rect && rect->style().outerShadow)
-                    halo = child.get();
-        assert(halo && halo->zIndex() < rowClip->zIndex());
-        const RectNode *outline = nullptr;
-        for (const auto &child : grouped.content.children())
-            if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                rect && rect->visible() && rect->style().borderWidth > 0 && rect->zIndex() >= 0)
-                outline = rect;
-        const auto *shadow = find<RectNode>(*halo);
-        assert(outline && shadow);
-        const auto outlineBounds = sceneBounds(*outline);
-        const auto shadowBounds = sceneBounds(*shadow);
-        near(shadowBounds.x, outlineBounds.x);
-        near(shadowBounds.y, outlineBounds.y);
-        near(shadowBounds.width, outlineBounds.width);
-        near(shadowBounds.height, outlineBounds.height);
-        near(outlineBounds.x, surfaceBounds.x - 12 * scale);
-        near(outlineBounds.y, surfaceBounds.y - 8 * scale);
-        near(outlineBounds.height, surfaceBounds.height + 16 * scale);
-        const RectNode *dense = nullptr;
-        for (const auto &child : grouped.content.children())
-            if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                rect && rect->visible() && rect->zIndex() < 0 && rect->style().fill.a > 0 &&
-                rect->style().borderWidth == 0 && !rect->style().outerShadow &&
-                rect->height() >= surface->height())
-                dense = rect;
-        assert(layout == blast::MessageLayout::Bubbles || dense);
-        const float backdropInset = dense ? surface->x() - dense->x() : 0;
-        assert(backdropInset >= 0);
-        const float outlinedBodyWidth =
-            dense ? dense->width() - 2 * backdropInset : surface->width();
-        near(outlineBounds.width, outlinedBodyWidth + 24 * scale);
-        containedBounds(outlineBounds, groupedBounds);
-        containedBounds(outlineBounds, nativeHistoryClip(view));
-        bool haloBeforeBody = false;
-        for (const auto &child : grouped.row.children()) {
-            if (child.get() == rowClip) {
-                assert(haloBeforeBody);
-                break;
+        const auto fill = [&](const Body &rendered) {
+            const auto *material = find<blast::MaterialNode>(rendered.content);
+            assert(material);
+            if (material->visible())
+                return renderer.materialFill(*material);
+            for (const auto &child : rendered.content.children())
+                if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+                    rect && rect->visible() && rect->zIndex() < 0)
+                    return rect->style().fill;
+            std::abort();
+        };
+        const auto marker = [](const Body &rendered) -> TextNode * {
+            auto *at = plainText(rendered.content, "@");
+            return at && at->visible() ? at : nullptr;
+        };
+        const auto underline = [&](const Body &rendered) {
+            std::vector<std::string> decorated;
+            for (const auto &area : rendered.body.children()) {
+                if (!dynamic_cast<InputArea *>(area.get()))
+                    continue;
+                const auto *glyph = find<TextNode>(*area);
+                assert(glyph);
+                std::vector<LayoutRect> strokes;
+                for (const auto &child : area->children())
+                    if (child->visible())
+                        for (const auto &paint : child->children())
+                            if (const auto *rect = dynamic_cast<RectNode *>(paint.get());
+                                rect && rect->visible() && rect->style().fill.a > 0) {
+                                assert(!rect->hitTestVisible() && rect->style().borderWidth == 0);
+                                strokes.push_back(sceneBounds(*rect));
+                            }
+                if (strokes.empty())
+                    continue;
+                assert(strokes.size() == 2);
+                const auto ink = nativeTextInk(renderer, *glyph);
+                assert(strokes[0].y >= ink.y + ink.height);
+                assert(strokes[1].y > strokes[0].y + strokes[0].height);
+                near(strokes[0].width, strokes[1].width);
+                near(strokes[0].height, strokes[1].height);
+                containedBounds(strokes[0], sceneBounds(*area));
+                containedBounds(strokes[1], sceneBounds(*area));
+                decorated.push_back(decodedMarkup(glyph->text()));
             }
-            haloBeforeBody |= child.get() == halo;
+            return decorated;
+        };
+        const auto sameBounds = [](LayoutRect a, LayoutRect b) {
+            near(a.x, b.x);
+            near(a.y, b.y);
+            near(a.width, b.width);
+            near(a.height, b.height);
+        };
+        arrange();
+        const auto history = [&] { return body(view, "Mentioned"); };
+        const auto steady = fill(history());
+        assert(steady != fill(body(view, "Adjacent")));
+        const auto checkInk = [&](Color painted, const Body &rendered) {
+            const auto backdrop =
+                lerpColor(blast::themeConversationBackdrop(), painted, painted.a);
+            assert(contrast(backdrop, rendered.text.color()) >= 4.49f);
+            assert(contrast(backdrop, blast::themeForegroundColor("on_surface_variant")) >=
+                   4.49f);
+        };
+        checkInk(steady, history());
+        auto *at = marker(history());
+        assert(at && !at->hitTestVisible());
+        const auto mark = nativeTextInk(renderer, *at);
+        containedBounds(mark, sceneBounds(history().row));
+        containedBounds(mark, nativeHistoryClip(view));
+        assert(mark.x + mark.width <= sceneBounds(history().body).x);
+        assert((underline(history()) == std::vector<std::string>{"Old", "Me"}));
+        assert(!marker(body(view, "Adjacent")) && underline(body(view, "Adjacent")).empty());
+        const auto historyRow = sceneBounds(history().row);
+        const auto historyBody = sceneBounds(history().body);
+        const auto historyText = nativeTextInk(renderer, history().text);
+        model.now += 1;
+        arrange();
+        assert(fill(history()) == steady);
+        model.settings.mentionStyle = blast::MentionStyle::TintOnly;
+        arrange();
+        assert(fill(history()) == steady && !marker(history()) && underline(history()).empty());
+        sameBounds(sceneBounds(history().row), historyRow);
+        sameBounds(sceneBounds(history().body), historyBody);
+        sameBounds(nativeTextInk(renderer, history().text), historyText);
+        model.settings.mentionStyle = blast::MentionStyle::Highlight;
+        model.settings.fx = blast::FxLevel::Off;
+        arrange();
+        assert(fill(history()) == steady && !marker(history()) && underline(history()).empty());
+        model.settings.fx = blast::FxLevel::Full;
+        model.settings.reducedMotion = true;
+        arrange();
+        assert(fill(history()) == steady && marker(history()) && underline(history()).size() == 2);
+        model.settings.reducedMotion = false;
+        unchanged(buffer, before);
+
+        if (width == 900) {
+            dispatcher.setFocus(&history().row);
+            assert(view.textSelectionCommand("set-mark"));
+            assert(view.textSelectionCommand("end-of-line"));
+            arrange();
+            assert(view.copySelection());
+            assert(clipboard.clipboardText() ==
+                   "Mentioned OldMe OldMeToo https://example.org/OldMe ColoredBody😀");
+            assert(marker(history()) && underline(history()).empty());
+            view.clearTextSelection();
+            dispatcher.setFocus(nullptr);
         }
-        const auto haloBounds = sceneBounds(*halo);
-        near(haloBounds.x, outlineBounds.x - 8 * scale);
-        near(haloBounds.y, outlineBounds.y - 8 * scale);
-        near(haloBounds.width, outlineBounds.width + 16 * scale);
-        near(haloBounds.height, outlineBounds.height + 16 * scale);
-        containedBounds(haloBounds, groupedBounds);
-        assert(haloBounds.y >= previousBounds.y + previousBounds.height);
-        assert(haloBounds.y + haloBounds.height <= nextBounds.y);
-        const auto haloClip = ancestorPaintClip(*halo);
-        const auto viewportClip = nativeHistoryClip(view);
-        near(haloClip.x, viewportClip.x);
-        near(haloClip.y, viewportClip.y);
-        near(haloClip.width, viewportClip.width);
-        near(haloClip.height, viewportClip.height);
-        const auto visibleHalo = intersectBounds(haloBounds, haloClip);
-        near(visibleHalo.x, haloBounds.x);
-        near(visibleHalo.y, haloBounds.y);
-        near(visibleHalo.width, haloBounds.width);
-        near(visibleHalo.height, haloBounds.height);
-        containedBounds(visibleHalo, viewportClip);
-        model.settings.mentionEffect = blast::MentionEffect::Off;
+        buffer.messages.back().mentionNick.clear();
+        ++buffer.messagesRevision;
         arrange();
-        for (const auto &[token, expected] :
-             {std::pair{"AdjacentBefore", previousBounds},
-              std::pair{"GroupedOutline", groupedBounds}, std::pair{"AdjacentAfter", nextBounds}}) {
-            const auto actual = sceneBounds(body(view, token).row);
-            near(actual.x, expected.x);
-            near(actual.y, expected.y);
-            near(actual.width, expected.width);
-            near(actual.height, expected.height);
+        assert(fill(history()) == steady && marker(history()) && underline(history()).empty());
+        buffer.messages.back().mention = false;
+        ++buffer.messagesRevision;
+        arrange();
+        assert(!marker(history()) && fill(history()) != steady);
+        sameBounds(sceneBounds(history().row), historyRow);
+        sameBounds(sceneBounds(history().body), historyBody);
+        view.scrollToBoundary(true);
+        arrange();
+
+        const auto append = [&](std::string token, double arrival) {
+            auto live = message;
+            live.id = token;
+            live.text = token + " OldMe";
+            live.history = false;
+            live.arrival = arrival;
+            buffer.messages.push_back(std::move(live));
+            arrange();
+        };
+        append("LiveMention", model.now);
+        const auto live = [&] { return body(view, "LiveMention"); };
+        const auto peak = fill(live());
+        assert(peak != steady);
+        checkInk(peak, live());
+        const auto liveRow = sceneBounds(live().row);
+        const auto liveText = nativeTextInk(renderer, live().text);
+        assert(marker(live()));
+        const auto atPeak = nativeTextInk(renderer, *marker(live()));
+        model.now += .11;
+        arrange();
+        assert(fill(live()) != peak && fill(live()) != steady);
+        sameBounds(nativeTextInk(renderer, *marker(live())), atPeak);
+        sameBounds(sceneBounds(live().row), liveRow);
+        sameBounds(nativeTextInk(renderer, live().text), liveText);
+        model.now += .111;
+        arrange();
+        assert(fill(live()) == steady);
+
+        append("StaleMention", model.now - 1);
+        assert(fill(body(view, "StaleMention")) == steady);
+        view.setWindowActive(false);
+        append("InactiveMention", model.now);
+        view.setWindowActive(true);
+        arrange();
+        assert(fill(body(view, "InactiveMention")) == steady);
+        model.settings.mentionArrival = false;
+        append("UnanimatedMention", model.now);
+        assert(fill(body(view, "UnanimatedMention")) == steady);
+        model.settings.mentionArrival = true;
+        append("RecycledMention", model.now);
+        assert(fill(body(view, "RecycledMention")) != steady);
+        for (int i = 0; i < 80; ++i) {
+            auto filler = adjacent;
+            filler.id = filler.text = "UnrelatedRow" + std::to_string(i);
+            buffer.messages.push_back(std::move(filler));
         }
-        const auto undecorated = body(view, "GroupedOutline");
-        const auto *undecoratedSurface = find<blast::MaterialNode>(undecorated.content);
-        assert(undecoratedSurface);
-        const auto undecoratedSurfaceBounds = sceneBounds(*undecoratedSurface);
-        const auto undecoratedBodyBounds = sceneBounds(undecorated.body);
-        near(undecoratedSurfaceBounds.x, surfaceBounds.x);
-        near(undecoratedSurfaceBounds.y, surfaceBounds.y);
-        near(undecoratedSurfaceBounds.width, surfaceBounds.width);
-        near(undecoratedSurfaceBounds.height, surfaceBounds.height);
-        near(undecoratedBodyBounds.x, bodyBounds.x);
-        near(undecoratedBodyBounds.y, bodyBounds.y);
-        near(undecoratedBodyBounds.width, bodyBounds.width);
-        near(undecoratedBodyBounds.height, bodyBounds.height);
-        buffer.messages[1].mention = false;
-        ++buffer.messagesRevision;
         arrange();
-        near(body(view, "AdjacentBefore").row.height(), previousBounds.height);
-        near(body(view, "AdjacentAfter").row.height(), nextBounds.height);
-        buffer.messages[1].mention = true;
-        ++buffer.messagesRevision;
-        model.settings.mentionEffect = blast::MentionEffect::LuminousOutline;
+        assert(!bodyText(view, "RecycledMention"));
+        view.scrollToBoundary(false);
         arrange();
-        model.settings.incomingMotion = blast::SendMotion::Slide;
-        model.settings.incomingDurationMs = 900;
-        auto arrival = buffer.messages.back();
-        arrival.id = "moving-mention";
-        arrival.text = "MovingMention Me";
-        arrival.mention = true;
-        arrival.mentionNick = "Me";
-        arrival.history = false;
-        arrival.arrival = model.now;
-        buffer.messages.push_back(std::move(arrival));
-        ++buffer.messagesRevision;
-        arrange();
-        model.now += .1;
-        arrange();
-        const auto moving = body(view, "MovingMention");
-        auto *movingClip = moving.content.parent();
-        assert(moving.content.x() > 0);
-        assert(movingClip && movingClip->parent() == &moving.row);
-        assert(movingClip->clipChildren() == (layout != blast::MessageLayout::Bubbles));
-        near(movingClip->x(), 0);
-        near(movingClip->y(), 0);
-        near(movingClip->width(), moving.row.width());
-        near(movingClip->height(), moving.row.height());
-        if (layout != blast::MessageLayout::Bubbles)
-            containedBounds(ancestorPaintClip(moving.text), sceneBounds(moving.row));
-        containedBounds(ancestorPaintClip(moving.text), nativeHistoryClip(view));
-        for (const auto &child : moving.row.children())
-            if (child.get() != movingClip)
-                if (const auto *rect = find<RectNode>(*child); rect && rect->style().outerShadow)
-                    assert(!child->visible());
-        model.settings.incomingMotion = blast::SendMotion::None;
-        model.settings.incomingReveal = blast::SendReveal::Fade;
-        auto fadeArrival = buffer.messages.back();
-        fadeArrival.id = "fading-mention";
-        fadeArrival.text = "FadingMention Me";
-        fadeArrival.arrival = model.now;
-        buffer.messages.push_back(std::move(fadeArrival));
-        ++buffer.messagesRevision;
-        arrange();
-        model.now += .1;
-        arrange();
-        const auto fading = body(view, "FadingMention");
-        near(fading.content.x(), 0);
-        near(fading.content.y(), 0);
-        near(fading.content.scaleX(), 1);
-        near(fading.content.opacity(), .1f / .9f);
-        const RectNode *fadeOutline = nullptr;
-        for (const auto &child : fading.content.children())
-            if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                rect && rect->visible() && rect->style().borderWidth > 0 && rect->zIndex() >= 0)
-                fadeOutline = rect;
-        assert(fadeOutline);
-        containedBounds(sceneBounds(*fadeOutline), sceneBounds(fading.row));
-        containedBounds(ancestorPaintClip(*fadeOutline), nativeHistoryClip(view));
+        assert(fill(body(view, "LiveMention")) == steady);
+        assert(fill(body(view, "RecycledMention")) == steady);
+        dispatcher.setSceneRoot(nullptr);
     }
 }
 
@@ -11498,7 +11077,6 @@ void runTranscriptCheck() {
     visitSeparator(renderer);
     messageEntranceLifecycle(renderer);
     persistentMentionStyles(renderer);
-    persistentMentionRowClipping(renderer);
     independentSendEffects(renderer);
     cappedTranscriptBodies(renderer);
     typingFooterGeometry(renderer);

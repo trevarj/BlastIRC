@@ -7,7 +7,6 @@
 #include <string_view>
 
 namespace blast {
-struct MessageSurface;
 enum class MaterialKind { Backdrop, Panel, Conversation, Message };
 
 // A retained modern surface. Children remain ordinary native controls and sharp text.
@@ -15,7 +14,7 @@ class MaterialNode : public CustomDrawNode {
   public:
     explicit MaterialNode(MaterialKind kind = MaterialKind::Panel);
     ~MaterialNode() override;
-    void setMessage(const MessageSurface &);
+    void setMessage(Color fill, bool hovered);
     void sync();
     void draw(RenderBackend &, const CustomDrawContext &) const override;
 

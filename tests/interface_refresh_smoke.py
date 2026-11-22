@@ -10,6 +10,7 @@ it proves discovery/LATEST, cached-chat/loading state, and automatic full select
 It also restarts a >200-content legacy presence-heavy cache with saved overlapping gaps,
 proving local paint while real history is held and click-free durable gap recovery.
 The jump-bottom scope proves the zero-arrival native FAB click and resumed following.
+The mention-highlight scope compares real grouped mention paint and live arrivals.
 """
 import argparse
 import json
@@ -173,7 +174,7 @@ def main():
                                  "activity-pins", "input-routing", "logo-alignment",
                                  "minimum-height", "message-links", "typing-focus", "mentions-unread",
                                  "startup-history-sync", "jump-bottom", "scrollbar", "buffer-boundaries",
-                                 "conversation-history", "soju-search-context", "mention-effects", "mention-background", "avatar-alignment",
+                                 "conversation-history", "soju-search-context", "mention-highlight", "avatar-alignment",
                                  "muted-unread", "network-sidebar"))
     options, remaining = parser.parse_known_args()
     if any(option in remaining for option in ("--probe", "--probes", "--layout-only", "--ime-only", "--raw-only")):
@@ -1753,8 +1754,8 @@ def _policy_chat(ctx, *, fools=None, receive=None):
     return _policy_settings(ctx, 2, edits)
 
 
-def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=False, mention=None,
-                    strength=None, speed=None, outline=None, glint=None):
+def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=False,
+                    mention_style=None, mention_arrival=None):
     edits = [
         (1, 'select', ('off', 'subtle', 'full').index(fx), 'appearance', 'fx'),
         (2, 'toggle', reduced, 'appearance', 'reduced_motion'),
@@ -1762,30 +1763,19 @@ def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=Fal
          'appearance', 'incoming_motion'),
         (6, 'select', ('none', 'fade').index(reveal), 'appearance', 'incoming_reveal'),
         (7, 'slider', (100, 10, 2000), 'appearance', 'incoming_duration_ms')]
-    if mention is not None:
-        edits.append((8, 'select', ('off', 'neon_mention', 'breathing_glow', 'luminous_outline',
-                                   'text_shimmer', 'accent_underline').index(mention),
-                      'appearance', 'mention_effect'))
-    if strength is not None:
-        edits.append((9, 'slider', (0, 1, strength, strength / 100),
-                      'appearance', 'mention_strength'))
-    if outline is not None:
-        assert mention == 'luminous_outline'
-        edits.append((10, 'toggle', outline, 'appearance', 'mention_outline_breathing'))
-    if glint is not None:
-        assert mention == 'accent_underline'
-        edits.append((10, 'toggle', glint, 'appearance', 'mention_underline_glint'))
-    if speed is not None:
-        stop = 11 if mention in ('luminous_outline', 'accent_underline') else 10
-        edits.append((stop, 'slider', (25, 5, speed, speed / 100),
-                      'appearance', 'mention_speed'))
+    if mention_style is not None:
+        edits.append((8, 'select', ('highlight', 'tint_only').index(mention_style),
+                      'appearance', 'mention_style'))
+    if mention_arrival is not None:
+        assert mention_style == 'highlight'
+        edits.append((9, 'toggle', mention_arrival, 'appearance', 'mention_arrival'))
     saved = _policy_settings(ctx, 3, edits)
     appearance = saved['appearance']
     assert all(appearance[k] == v for k, v in {
         'fx': fx, 'reduced_motion': reduced, 'incoming_motion': motion,
         'incoming_reveal': reveal, 'incoming_duration_ms': 2000}.items()), appearance
-    if mention is not None:
-        assert appearance['mention_effect'] == mention, appearance
+    if mention_style is not None:
+        assert appearance['mention_style'] == mention_style, appearance
     return appearance
 
 
@@ -3317,303 +3307,153 @@ def run_incoming(ctx):
                                pixels for stamp, pixels in cropped if stamp >= first_complete))}}
 
 
-def run_mention_background(ctx):
-    return run_mention_effects(ctx, background_only=True)
-
-
-def run_mention_effects(ctx, *, background_only=False):
-    """Compare retained real-wire rows against their own native Off raster."""
+def run_mention_highlight(ctx):
+    """Compare native body rasters on actual incoming messages in one conversation."""
+    w, p = ctx['window'], ctx['proc']
+    prefs, db = ctx['preferences'], ctx['database_path']
     _policy_focus(ctx, ctx['query_id'])
     _policy_chat(ctx, fools=[], receive=False)
-    gui.set_navigation(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
-                       'hidden', 'mention-effects')
-    gui.set_people(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'], 'hidden')
-    choices = ('neon_mention', 'breathing_glow', 'luminous_outline',
-               'text_shimmer', 'accent_underline')
-    evidence = []
+    gui.set_navigation(p, w, prefs, db, 'hidden', 'mention-highlight')
+    gui.set_people(p, w, prefs, db, 'hidden')
+    gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'],
+                          ctx['query_id'], 'bubbles', label='mention-highlight-layout')
+    pane = gui.read_layout(prefs)['conversation']['rect']
+    geometry = gui.window_geometry(w)
     destination = Path(ctx['destination'])
+    evidence = {}
 
-    def delta(a, b):
-        return sum(abs(x - y) for x, y in zip(a, b))
+    def configure(style='highlight', *, arrival=None, fx='full', reduced=False):
+        _policy_effects(ctx, mention_style=style, mention_arrival=arrival, fx=fx, reduced=reduced)
+        upload.focus_composer(w)
+        gui.move_pointer(w, 0, 0)
 
-    def background_sample(image, left, right):
-        # Same ordinary tail on both rows; its dominant color is body fill,
-        # not a comparison of differently rasterized nickname glyphs.
-        box = (right[2] + 3, left[1], right[2] + 45, left[3])
-        native = Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
-        patch = native.crop(box)
-        count, rgb = max(patch.getcolors(patch.width * patch.height))
-        assert count > patch.width * patch.height / 2, ('No dominant body background', box, rgb, count)
-        return {'region': box, 'rgb': rgb, 'background_pixels': count}
+    def message(index, nick):
+        colors = [(31 + index, 111, 47), (173 + index, 53, 113), (71 + index, 95, 197)]
 
-    def reanchor():
-        nonlocal left, right, region
-        left, right = _policy_wait_box(ctx, left_rgb), _policy_wait_box(ctx, right_rgb)
-        assert left[0] < right[0] and abs(left[1] - right[1]) <= 1, (
-            'Fixture own nickname wrapped; cannot compare native geometry', style, left, right)
-        layout = gui.read_layout(ctx['preferences'])
-        x, y, width, height = layout['conversation']['rect']
-        scale = layout['scale']
-        region = (round(x + 2 * scale), max(round(y), left[1] - round(42 * scale)),
-                  round(x + width - 110 * scale), min(round(y + height), left[3] + round(14 * scale)))
-        assert right[2] + 45 < region[2], ('Fixture body exceeds native sample region', region, right)
-
-    def shown_fool_reference():
-        _policy_chat(ctx, fools=[ctx['query_target']])
-        gui.command('show-fools', window=ctx['window'])
-        gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
-        _policy_effects(ctx, mention='off')
-        # Eligibility changes bubble padding; only FX changes on an unchanged
-        # policy row must preserve the marker geometry checked by capture().
-        reanchor()
-        frames, item = capture('shown-fool-off')
-        sample = background_sample(gui.native_rgb_capture(ctx['window']), left, right)
-        assert sample['rgb'] == ordinary_background['rgb'], (
-            'Shown fool retained eligible mention background', style, ordinary_background, sample)
-        item['background'] = sample
-        evidence.append(dict(style=style, **item))
-        return frames[-1]
-
-    def capture(label, seconds=.55):
-        token = f'mention-keepalive-{time.monotonic_ns()}'
-        ctx['observer'].send('PING :' + token)
-        ctx['observer'].wait(lambda command, params, prefix:
-            command == 'PONG' and params and params[-1] == token, timeout=15)
-        gui.move_pointer(ctx['window'], 0, 0)
-        time.sleep(1.5)
-        frames, stamps = [], []
-        started = time.monotonic()
-        while time.monotonic() - started < seconds:
-            image = gui.native_rgb_capture(ctx['window'])
-            for rgb, expected in ((left_rgb, left), (right_rgb, right)):
-                actual = _policy_box(ctx, rgb, image=image)
-                diagnostic = (style, label, rgb, expected, actual)
-                assert actual == expected, ('Paint-only effect moved source marker', diagnostic)
-            frames.append(_policy_crop(image, region))
-            stamps.append(time.monotonic() - started)
-            time.sleep(.10)
-        path = destination.with_name(destination.stem + f'-mention-{style}-{label}.png')
-        Image.frombytes('RGB', (image['width'], image['height']), image['pixels']).save(path)
-        assert len(frames) >= 3, ('Insufficient native samples', style, label, stamps)
-        return frames, {'label': label, 'capture': str(path), 'frames': len(frames),
-                        'sample_seconds': stamps, 'region': region,
-                        'distinct_frames': len(set(frames)),
-                        'temporal_delta': sum(delta(a, b) for a, b in zip(frames, frames[1:])) /
-                                          (stamps[-1] - stamps[0])}
-
-    def observe(label, *, animated=False, suppressed=False, sample_seconds=None, **settings):
-        appearance = _policy_effects(ctx, **settings)
-        frames, item = capture(label, sample_seconds or (4.4 if animated else .55))
-        changes = [delta(frame, baseline) for frame in frames]
-        item.update(settings={key: appearance[key] for key in (
-            'mention_effect', 'mention_strength', 'mention_speed', 'mention_outline_breathing',
-            'mention_underline_glint', 'fx', 'reduced_motion')},
-                    maximum_off_delta=max(changes), minimum_off_delta=min(changes))
-        evidence.append(dict(style=style, **item))
-        diagnostic = (style, label, item)
-        if suppressed:
-            assert max(changes) == 0, ('Suppressed decoration differs from Off', diagnostic)
-        else:
-            assert max(changes) > 24, ('Persistent decoration missing after former expiry', diagnostic)
-        if animated:
-            assert len(set(frames)) > 2 and item['temporal_delta'] > 24, (
-                'Persistent motion did not change actual retained pixels', diagnostic)
-        else:
-            assert len(set(frames)) == 1, ('Steady decoration animated', diagnostic)
-        if not suppressed:
-            reference = Image.frombytes('RGB', (region[2] - region[0], region[3] - region[1]), baseline)
-            if settings['mention'] != 'luminous_outline':
-                nickname = (left[2] + 1 - region[0], left[1] - 7 - region[1],
-                            right[0] - 1 - region[0], left[3] + 7 - region[1])
-                original_nick = reference.crop(nickname).tobytes()
-                assert max(delta(Image.frombytes('RGB', reference.size, frame).crop(nickname).tobytes(),
-                                 original_nick) for frame in frames) > 24, (
-                    'Decoration missed the actual own-nickname span', diagnostic, nickname)
-            for frame in frames:
-                rendered = Image.frombytes('RGB', reference.size, frame)
-                interior = (right[2] + 3 - region[0], left[1] + 3 - region[1],
-                            right[2] + 45 - region[0], left[3] - 3 - region[1])
-                assert rendered.crop(interior).tobytes() == reference.crop(interior).tobytes(), (
-                    'Effect tinted unrelated body/interior', diagnostic, interior)
-                if settings['mention'] != 'luminous_outline':
-                    rail = (0, left[1] - region[1], max(1, left[0] - region[0] - 12),
-                            left[3] - region[1])
-                    assert rendered.crop(rail).tobytes() == reference.crop(rail).tobytes(), (
-                        'Nickname effect painted an obsolete message rail', diagnostic, rail)
-        return frames, item
-
-    def assert_source_absent(label):
-        image = gui.native_rgb_capture(ctx['window'])
-        pane = gui.read_layout(ctx['preferences'])['conversation']['rect']
-        components = [gui.native_marker_components(image, pane, rgb)
-                      for rgb in (left_rgb, right_rgb)]
-        assert not any(components), (label, style, components)
-
-    for style_index, style in enumerate(('bubbles', 'irc', 'stacked')):
-        _policy_effects(ctx, mention='off', fx='off')
-        gui.set_message_style(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
-                              ctx['args'], ctx['destination'], ctx['query_id'], style,
-                              label='mention-effects-' + style)
-        left_rgb, right_rgb = (31, 111 + style_index * 35, 47), (173, 53, 113 + style_index * 35)
-        def swatch(rgb, text):
-            token = ''.join(f'{value:02X}' for value in rgb)
+        def swatch(color, text):
+            token = '%02X%02X%02X' % color
             return f'\x04{token},{token}{text}\x0f'
-        ordinary_left_rgb = (left_rgb[0] + 1, *left_rgb[1:])
-        ordinary_right_rgb = (right_rgb[0] + 1, *right_rgb[1:])
-        ordinary_text = (swatch(ordinary_left_rgb, 'ANCHOR') + ' ordinary ' +
-                         swatch(ordinary_right_rgb, 'BOUND') + ' unrelated body')
-        _policy_send(ctx, ordinary_text)
-        ordinary_left = _policy_wait_box(ctx, ordinary_left_rgb)
-        ordinary_right = _policy_wait_box(ctx, ordinary_right_rgb)
-        assert abs(ordinary_left[1] - ordinary_right[1]) <= 1, (
-            'Ordinary background control wrapped', style, ordinary_left, ordinary_right)
-        ordinary_background = background_sample(
-            gui.native_rgb_capture(ctx['window']), ordinary_left, ordinary_right)
-        ordinary_capture = _policy_capture(ctx, 'mention-' + style + '-ordinary-off')
-        text = (swatch(left_rgb, 'ANCHOR') + ' ' + ctx['own_nick'] + ' ' +
-                swatch(right_rgb, 'BOUND') + ' unrelated body')
-        _policy_send(ctx, text)
-        left, right = _policy_wait_box(ctx, left_rgb), _policy_wait_box(ctx, right_rgb)
-        mention_background = background_sample(gui.native_rgb_capture(ctx['window']), left, right)
-        assert mention_background['rgb'] != ordinary_background['rgb'], (
-            'Eligible mention lost its persistent body tint with effects Off',
-            style, ordinary_background, mention_background)
-        _policy_effects(ctx, mention='off', fx='full')
-        reanchor()
-        baseline_frames, off_item = capture('off')
-        assert len(set(baseline_frames)) == 1, ('Off source is not stable', style, off_item)
-        off_item['persistent_background'] = {
-            'ordinary': ordinary_background, 'mention': mention_background,
-            'ordinary_capture': str(ordinary_capture), 'fx': 'off', 'mention_effect': 'off'}
-        baseline = baseline_frames[-1]
-        evidence.append(dict(style=style, **off_item))
-        if background_only:
-            _policy_focus(ctx, ctx['channel_id'])
-            _policy_focus(ctx, ctx['query_id'])
-            frames, revisit = capture('background-revisit')
-            assert all(frame == baseline for frame in frames), (
-                'Persistent background changed after focus revisit', style, revisit)
-            evidence.append(dict(style=style, **revisit))
-            baseline = shown_fool_reference()
-            observe('shown-fool-neon', mention='neon_mention', strength=100, suppressed=True)
-            _policy_chat(ctx, fools=[])
-            continue
-        for choice in choices:
-            variant = {'outline': False} if choice == 'luminous_outline' else (
-                      {'glint': False} if choice == 'accent_underline' else {})
-            animated = choice in ('breathing_glow', 'text_shimmer')
-            observe(choice, mention=choice, strength=100, animated=animated, **variant)
-            observe(choice + '-reduced', mention=choice, strength=100, reduced=True, **variant)
-            observe(choice + '-fx-off', mention=choice, fx='off', suppressed=True)
-            observe(choice + '-zero', mention=choice, strength=0, suppressed=True)
-            _, low = observe(choice + '-low', mention=choice, strength=20, reduced=True, **variant)
-            _, high = observe(choice + '-high', mention=choice, strength=100, reduced=True, **variant)
-            assert high['maximum_off_delta'] > low['maximum_off_delta'] * 1.2, (
-                'Strength does not change actual decoration intensity', style, choice, low, high)
-            if choice in ('luminous_outline', 'accent_underline'):
-                variant = {'outline': True} if choice == 'luminous_outline' else {'glint': True}
-                observe(choice + '-variant', mention=choice, strength=100, animated=True, **variant)
-                observe(choice + '-variant-reduced', mention=choice, strength=100,
-                        reduced=True, **variant)
-            if animated or choice in ('luminous_outline', 'accent_underline'):
-                _, slow = observe(choice + '-slow', mention=choice, strength=100, speed=25,
-                                  animated=True, sample_seconds=17, **variant)
-                _, fast = observe(choice + '-fast', mention=choice, strength=100, speed=200,
-                                  animated=True, **variant)
-                assert fast['temporal_delta'] > slow['temporal_delta'] * 1.2, (
-                    'Speed does not change native animation rate', style, choice, slow, fast)
-        _policy_effects(ctx, mention='neon_mention', strength=100)
-        _policy_focus(ctx, ctx['channel_id'])
-        _policy_focus(ctx, ctx['query_id'])
-        frames, revisit = capture('revisit')
-        assert all(delta(frame, baseline) > 24 for frame in frames), (
-            'Retained mention disappeared after revisit', style, revisit)
-        evidence.append(dict(style=style, **revisit))
-        baseline = shown_fool_reference()
-        for choice in choices:
-            observe(choice + '-shown-fool', mention=choice, strength=100, suppressed=True)
-        _policy_appearance(ctx, fool='hidden')
-        gui.command('hide-fools', window=ctx['window'])
-        gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
-        assert_source_absent('Hidden fool source pixels leaked')
-        _policy_chat(ctx, fools=[])
 
-    if background_only:
-        return _refresh_return(ctx, 'mention-background', {
-            'cases': evidence, 'layouts': ['bubbles', 'irc', 'stacked'],
-            'effects_off_background': True, 'shown_fool_background_and_fx_absent': True,
-            'focus_revisit_pixels_unchanged': True,
-            'limits': ['Search/global-mentions exclusions are covered by native_transcript_check.']})
+        a, b, c = (swatch(color, text) for color, text in zip(colors, ('ANCHOR', 'BOUND', 'ENDMARK')))
+        return colors, f'{a} {nick} {b} x{ctx["own_nick"]} {c} unrelated body readable'
 
-    saved = _policy_effects(ctx, mention='accent_underline', strength=73, glint=True, speed=135)
-    gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
-    target = destination.with_name(destination.stem + '-mention-before-restart.bmp')
-    out, err = gui.finish_gui(ctx['proc'], ctx['window'], ctx['screenshot'], target, ctx['args'].size)
-    ctx['logs'].append(('mention-before-restart', out, err))
-    departed = {ctx['own_nick'], ctx['other_nick']}
-    while departed:
-        _, _, prefix = ctx['observer'].wait(lambda command, params, prefix:
-            command == 'QUIT' and prefix.split('!', 1)[0] in departed, timeout=15)
-        departed.remove(prefix.split('!', 1)[0])
-    screenshot = Path(ctx['screenshot']).with_name('mention-effects-restart.bmp')
-    proc, window = gui.launch_gui(ctx['binary'], screenshot, ctx['env'], ctx['args'].size, ctx['logs'])
-    ctx.update(proc=proc, window=window, screenshot=screenshot)
-    gui.wait_joins(ctx['observer'], ctx['channel'], (ctx['own_nick'], ctx['other_nick']))
-    _policy_focus(ctx, ctx['query_id'])
-    persisted = gui.save_preferences(proc, ctx['preferences'], window)['appearance']
-    keys = ('mention_effect', 'mention_strength', 'mention_speed',
-            'mention_outline_breathing', 'mention_underline_glint')
-    assert {key: persisted[key] for key in keys} == {key: saved[key] for key in keys}, (
-        'Native save/reload lost mention settings', saved, persisted)
-    left, right = _policy_wait_box(ctx, left_rgb), _policy_wait_box(ctx, right_rgb)
-    layout = gui.read_layout(ctx['preferences'])
-    x, y, width, height = layout['conversation']['rect']
-    scale = layout['scale']
-    region = (round(x + 2 * scale), max(round(y), left[1] - round(42 * scale)),
-              round(x + width - 110 * scale), min(round(y + height), left[3] + round(14 * scale)))
-    _policy_effects(ctx, mention='off')
-    baseline_frames, _ = capture('history-off')
-    baseline = baseline_frames[-1]
-    observe('history-reloaded', mention='accent_underline', strength=73, glint=True,
-            speed=135, animated=True)
-    for index in range(48):
-        _policy_send(ctx, f'Quiet retained visibility control row {index}', durable=False)
-    gui.wait_messages(ctx['proc'], ctx['database_path'], ctx['expected_messages'])
-    time.sleep(2)
-    assert_source_absent('Visibility control failed to move every mention offscreen')
-    pane = gui.read_layout(ctx['preferences'])['conversation']['rect']
-    quiet_region = (round(pane[0] + 2), round(pane[1] + 60 * scale),
-                    round(pane[0] + pane[2] - 110 * scale),
-                    round(gui.native_input_rectangle(ctx['window'])[1] - 12 * scale))
-    def quiet_sample():
-        trace = gui.GUI_DEBUG[ctx['window']][1]
-        offset = trace.stat().st_size
-        pixels = []
+    def marker(image, rgb):
+        items = gui.native_marker_components(image, pane, rgb)
+        return items[0]['bbox'] if len(items) == 1 and items[0]['full'] else None
+
+    def plate(image, box):
+        rgb_box = (box[2] + 3, box[1], box[2] + 45, box[3])
+        patch = Image.frombytes('RGB', (42, box[3] - box[1]), _policy_crop(image, rgb_box))
+        count, rgb = max(patch.getcolors(patch.width * patch.height))
+        assert count > patch.width * patch.height / 2, ('No dominant message backdrop', rgb_box, rgb)
+        return rgb
+
+    def save(label, image):
+        path = destination.with_name(destination.stem + '-mention-' + label + '.png')
+        Image.frombytes('RGB', (image['width'], image['height']), image['pixels']).save(path)
+        return str(path)
+
+    def observe(label, colors, action, *, animates):
+        # Sample before any SQLite or layout barrier consumes the short arrival window.
+        action()
         started = time.monotonic()
-        while time.monotonic() - started < 2.2:
-            pixels.append(_policy_crop(gui.native_rgb_capture(ctx['window']), quiet_region))
-            time.sleep(.15)
-        with trace.open('rb') as stream:
-            stream.seek(offset)
-            commits = len(re.findall(rb'wl_surface[@#]\d+\.commit\(', stream.read()))
-        assert len(set(pixels)) == 1, 'Offscreen mention animation changed visible ordinary rows'
-        return commits
-    enabled_commits = quiet_sample()
-    _policy_effects(ctx, mention='off')
-    time.sleep(2)
-    off_commits = quiet_sample()
-    assert enabled_commits <= off_commits + 2, (
-        'Offscreen mentions kept the native surface animating', enabled_commits, off_commits)
-    _policy_capture(ctx, 'mention-offscreen')
-    return _refresh_return(ctx, 'mention-effects', {
-        'cases': evidence, 'saved_reloaded_settings': {key: persisted[key] for key in keys},
-        'history_restart': True, 'hidden_fool_source_pixels_absent': True,
-        'visible_only': {'enabled_commits': enabled_commits, 'off_commits': off_commits,
-                         'region': quiet_region, 'all_source_markers_offscreen': True},
-        'motion': 'none', 'reveal': 'none',
-        'limits': ['Native raster checks observe retained row appearance and scheduling motion; '
-                   'cache allocations, glyph fragment coverage, selection/copy and precise outline '
-                   'geometry remain focused C++ regression checks.']})
+        samples = []
+        while time.monotonic() - started < .70:
+            image = gui.native_rgb_capture(w, geometry=geometry)
+            box = marker(image, colors[-1])
+            if box:
+                if not samples:
+                    first = image
+                samples.append((time.monotonic() - started, box, plate(image, box)))
+        assert len(samples) >= 3, ('Insufficient real rendered frames', label, samples)
+        assert len({box for _, box, _ in samples}) == 1, ('Mention moved body ink', label, samples)
+        fills = [rgb for _, _, rgb in samples]
+        settled = [rgb for stamp, _, rgb in samples if stamp - samples[0][0] >= .28]
+        assert len(settled) >= 2 and len(set(settled)) == 1, (
+            'Mention tint did not settle', label, samples)
+        assert (len(set(fills)) > 1) == animates, ('Unexpected mention arrival motion', label, samples)
+        evidence[label] = {'samples': samples, 'first': save(label + '-first', first),
+                           'last': save(label + '-last', image)}
+        gui.wait_messages(p, db, ctx['expected_messages'])
+        return fills[-1]
+
+    def retained(label, colors):
+        for rgb in colors:
+            _policy_wait_box(ctx, rgb)
+        image = gui.native_rgb_capture(w)
+        anchors = tuple(marker(image, rgb) for rgb in colors)
+        assert all(anchors) and len({box[1] for box in anchors}) == 1, (
+            'Message markers are incomplete or wrapped', label, anchors)
+        a, b, c = anchors
+        top, bottom = a[1] - 4, a[3] + 6
+        regions = ((round(pane[0]) + 1, top, a[0] - 1, bottom),
+                   (a[2], top, b[0], bottom), (b[2], top, c[0], bottom),
+                   (c[2] + 1, top, c[2] + 45, bottom))
+        crops = tuple(_policy_crop(image, region) for region in regions)
+        evidence[label] = {'capture': save(label, image), 'anchors': anchors, 'regions': regions,
+                           'background': plate(image, c)}
+        return anchors, crops
+
+    migrated = gui.save_preferences(p, prefs, w)['appearance']
+    assert (migrated['mention_style'], migrated['mention_arrival']) == ('tint_only', False), migrated
+    configure(arrival=True)
+    ordinary, text = message(0, 'ordinary')
+    _policy_send(ctx, text)
+    retained('ordinary', ordinary)
+    colors, text = message(1, ctx['own_nick'].swapcase())
+    fill = observe('arrival-enabled', colors, lambda: _policy_send(ctx, text, durable=False), animates=True)
+    anchors, highlight = retained('highlight', colors)
+    assert fill == evidence['highlight']['background'] != evidence['ordinary']['background'], (
+        'Mention lost its settled tint against an ordinary body', evidence)
+    b, c = anchors[1:]
+    ink = _native_word_ink(ctx, (b[2] + 2, b[1], c[0] - 2, b[3]), padding=0)
+    assert ink['contrast'] >= 4.5, ('Tint makes ordinary message ink unreadable', ink)
+    evidence['highlight']['body_ink'] = ink
+
+    configure('tint_only')
+    tint_anchors, tint = retained('tint-only', colors)
+    assert tint_anchors == anchors and tint[2:] == highlight[2:], (
+        'Mention style reflowed text, changed its tint, or decorated the non-token')
+    assert highlight[0] != tint[0] and highlight[1] != tint[1], (
+        'Highlight must add a visible leading @ and exact-nickname decoration')
+    left, top, right, bottom = evidence['highlight']['regions'][1]
+    size = (right - left, bottom - top)
+    underline = ImageChops.difference(Image.frombytes('RGB', size, highlight[1]),
+                                     Image.frombytes('RGB', size, tint[1])).getbbox()
+    evidence['highlight']['nickname_ink_delta'] = underline
+    assert underline[2] - underline[0] >= size[0] / 2 and underline[3] - underline[1] <= 5, (
+        'Exact nickname changed beyond its underline', underline)
+    assert evidence['tint-only']['background'] == fill
+
+    configure(fx='off')
+    assert retained('fx-off', colors) == (anchors, tint), 'Effects Off must fall back to Tint only'
+    configure(reduced=True)
+    assert retained('reduced-motion', colors) == (anchors, highlight), (
+        'Reduced motion must keep the static @ and nickname underline')
+    configure()
+    _policy_focus(ctx, ctx['channel_id'])
+    revisit_fill = observe('focus-revisit', colors, lambda: gui.switch_buffer(ctx['query_target']),
+                           animates=False)
+    assert revisit_fill == fill and retained('revisited-highlight', colors)[1] == highlight
+
+    configure(arrival=False)
+    assert retained('arrival-disabled-retained', colors) == (anchors, highlight), (
+        'Arrival toggle must not remove the retained @ or underline')
+    disabled, text = message(2, ctx['own_nick'])
+    assert observe('arrival-disabled', disabled, lambda: _policy_send(ctx, text, durable=False),
+                   animates=False) == fill
+    configure(reduced=True, arrival=True)
+    reduced, text = message(3, ctx['own_nick'])
+    assert observe('reduced-motion-arrival', reduced, lambda: _policy_send(ctx, text, durable=False),
+                   animates=False) == fill
+
+    _policy_chat(ctx, fools=[ctx['query_target']])
+    gui.command('show-fools', window=w)
+    gui.save_state(p, prefs, db)
+    retained('shown-fool', colors)
+    assert evidence['shown-fool']['background'] == evidence['ordinary']['background'], (
+        'A shown fool acquired the eligible mention tint', evidence['shown-fool'])
+    return _refresh_return(ctx, 'mention-highlight', evidence)
 
 
 def run_avatar_alignment(ctx):
@@ -3621,7 +3461,7 @@ def run_avatar_alignment(ctx):
     from contextlib import ExitStack
 
     _policy_focus(ctx, ctx['channel_id'])
-    _policy_effects(ctx, fx='off')  # Compatible with the pre-mention binary.
+    _policy_effects(ctx, fx='off')
     _policy_chat(ctx, fools=[], receive=False)
     gui.set_navigation(ctx['proc'], ctx['window'], ctx['preferences'], ctx['database_path'],
                        'hidden', 'avatar-alignment')

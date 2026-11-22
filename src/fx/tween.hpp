@@ -31,15 +31,6 @@ inline float smooth(float t) {
     t = std::clamp(t, 0.f, 1.f);
     return t * t * (3 - 2 * t);
 }
-inline float veil(float age) {
-    if (age < 0)
-        return 0;
-    if (age < .3f)
-        return smooth(age / .3f);
-    if (age < 1.3f)
-        return 1;
-    return 1 - smooth((age - 1.3f) / 2.f);
-}
 struct MessageEntrance {
     float x = 0, y = 0, reveal = 1, scale = 1;
     bool active = false;

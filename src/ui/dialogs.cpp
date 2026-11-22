@@ -2002,53 +2002,23 @@ struct Dialogs::Impl {
                2000, 10, [this](float value) { model.settings.incomingDurationMs = value; });
         label(*incoming, "Pop zooms into place without bouncing. Fade is optional and can "
                          "be used with or without movement.");
-        static constexpr const char *mentionNames[] = {
-            "Off",          "Neon mention",    "Breathing glow", "Luminous outline",
-            "Text shimmer", "Accent underline"};
-        auto *mention =
-            select(*incoming, "Mention effect", {std::begin(mentionNames), std::end(mentionNames)},
-                   mentionNames[std::clamp(int(model.settings.mentionEffect), 0, 5)], {});
-        auto *strength =
-            slider(*incoming, "Mention strength (0–100%)", model.settings.mentionStrength * 100, 0,
-                   100, 1, [this](float value) { model.settings.mentionStrength = value / 100; });
-        auto *outline =
-            toggle(*incoming, "Breathing outline", model.settings.mentionOutlineBreathing, {});
-        auto *glint = toggle(*incoming, "Traveling underline glint",
-                             model.settings.mentionUnderlineGlint, {});
-        auto *speed =
-            slider(*incoming, "Mention speed (25–200%)", model.settings.mentionSpeed * 100, 25, 200,
-                   5, [this](float value) { model.settings.mentionSpeed = value / 100; });
-        const auto applicable = [this, strength, outline, glint, speed] {
-            const auto effect = model.settings.mentionEffect;
-            strength->setEnabled(effect != MentionEffect::Off);
-            outline->setEnabled(effect == MentionEffect::LuminousOutline);
-            glint->setEnabled(effect == MentionEffect::AccentUnderline);
-            speed->setEnabled(
-                effect == MentionEffect::BreathingGlow || effect == MentionEffect::TextShimmer ||
-                (effect == MentionEffect::LuminousOutline &&
-                 model.settings.mentionOutlineBreathing) ||
-                (effect == MentionEffect::AccentUnderline && model.settings.mentionUnderlineGlint));
-        };
-        mention->setOnSelectionChanged([this, applicable](std::size_t index, std::string_view) {
-            if (index < std::size(mentionNames))
-                model.settings.mentionEffect = MentionEffect(index);
-            applicable();
+        const bool highlight = model.settings.mentionStyle == MentionStyle::Highlight;
+        auto *mention = select(*incoming, "Mention highlight", {"Highlight", "Tint only"},
+                               highlight ? "Highlight" : "Tint only", {});
+        auto *arrival =
+            toggle(*incoming, "Emphasize on arrival", model.settings.mentionArrival,
+                   [this](bool value) { model.settings.mentionArrival = value; });
+        arrival->setEnabled(highlight);
+        mention->setOnSelectionChanged([this, arrival](std::size_t index, std::string_view) {
+            const bool enabled = index == 0;
+            model.settings.mentionStyle = enabled ? MentionStyle::Highlight : MentionStyle::TintOnly;
+            arrival->setEnabled(enabled);
         });
-        outline->setOnChange([this, applicable](bool value) {
-            model.settings.mentionOutlineBreathing = value;
-            applicable();
-        });
-        glint->setOnChange([this, applicable](bool value) {
-            model.settings.mentionUnderlineGlint = value;
-            applicable();
-        });
-        applicable();
         label(*incoming, "Incoming movement and reveal apply only to new live messages, never "
                          "restored history or fools.");
-        label(*incoming,
-              "Mention effects persist on retained messages. Effects Off or zero "
-              "strength removes decoration; Reduced motion keeps a steady style. "
-              "Legacy mentions retain nick styling only when the matched nick is known.");
+        label(*incoming, "Highlight adds an @ and underlines your matched nickname. "
+                         "Tint only keeps the soft tint. Effects Off uses tint only; "
+                         "Reduced motion skips the arrival emphasis.");
         auto *physics = section("effects.physics", "Physics");
         auto *gravity = slider(*physics, "Gravity", model.settings.gravity, -200, 500, 1,
                                [this](float value) { model.settings.gravity = value; });

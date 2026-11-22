@@ -19,14 +19,7 @@ using std::vector;
 enum class FxLevel { Off, Subtle, Full };
 enum class SendMotion { None, Flight, Rise, Pop, Slide };
 enum class SendReveal { None, Fade };
-enum class MentionEffect {
-    Off,
-    NeonMention,
-    BreathingGlow,
-    LuminousOutline,
-    TextShimmer,
-    AccentUnderline
-};
+enum class MentionStyle { TintOnly, Highlight };
 enum class FoolDisplay { Minimized, Blurred, Dimmed, Hidden, Shown };
 enum class PreviewMode { Off, Click, Automatic };
 enum class PresenceMode { All, Smart, Hidden, Global };
@@ -80,9 +73,8 @@ struct Settings {
     SendMotion incomingMotion = SendMotion::Pop;
     SendReveal incomingReveal = SendReveal::None;
     float incomingDurationMs = 280.f;
-    MentionEffect mentionEffect = MentionEffect::Off;
-    float mentionStrength = .6f, mentionSpeed = 1.f;
-    bool mentionOutlineBreathing = false, mentionUnderlineGlint = false;
+    MentionStyle mentionStyle = MentionStyle::Highlight;
+    bool mentionArrival = true;
     FoolDisplay foolDisplay = FoolDisplay::Minimized;
     bool foolUnread = false;
     int messageWrapColumns = 80;

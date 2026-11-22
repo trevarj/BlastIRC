@@ -1,6 +1,5 @@
 #pragma once
 #include <cstdint>
-#include <string_view>
 
 class Renderer;
 
@@ -11,12 +10,6 @@ enum class MessageLayout;
 struct PresentationMetrics {
     float fontSize, padding, inset, headerHeight, rowGap, groupedGap, widthFraction, avatarSize;
     bool inlineNick;
-};
-struct MessageSurface {
-    float x = 0, y = 0, width = 0, height = 0;
-    std::string_view server, target, id;
-    bool own = false, presence = false, hovered = false, mentionHighlight = false;
-    float opacity = 1;
 };
 const PresentationMetrics &presentationMetrics();
 // Native logical height, shared by the actual window and supported-size consumers.

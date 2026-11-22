@@ -39,64 +39,49 @@ class EffectsTestAccess {
                     assert(MIX_GetTrackGain(voice.track) > 0);
                 }
         };
-        // Observe the real visual simulation consumed by the overlay, without a GL context.
-        std::vector<std::vector<float>> normal;
-        for (bool silent : {false, true}) {
+        Event mention;
+        mention.type = "mention";
+        mention.server = "synthetic";
+        mention.target = "#chat";
+        mention.id = "row";
+        model.now = 10;
+        const auto checkMention = [&](bool ding) {
             p.stop();
-            assert(playing() == 0);
-            Event event;
-            event.type = "mention";
-            event.server = "synthetic";
-            event.target = "#chat";
-            event.id = "row";
-            event.silent = silent;
-            const double start = silent ? 20 : 10;
-            model.effects.clear();
-            model.now = start;
-            effects.draw(model); // Equal zero-age first frames through the public entry.
-            model.effects = {event};
-            for (int frame = 0; frame <= 70; ++frame) {
-                model.now = start + frame * .05;
-                fxViewport(0, 0, 128, 80);
-                // Moving the real row during the bloom must move both veils identically.
-                fxAnchor("synthetic", "#chat", "row", frame < 10 ? 12 : 24, 30, 60, 12);
-                effects.draw(model);
-                model.effects.clear();
-                if (frame == 0) {
-                    if (silent)
-                        assert(playing() == 0);
-                    else
-                        expectClip("ding");
-                }
-                std::vector<float> geometry;
-                if (frame <= 65)
-                    assert(p.count == 1);
-                if (p.count) {
-                    assert(p.count == 1);
-                    const auto &particle = p.particles[0];
-                    const float x = frame < 10 ? 12 : 24;
-                    assert(particle.shape == Shape::Veil && particle.life == 3.3f);
-                    assert(std::abs(particle.age - frame * .05f) < .00001f);
-                    assert(particle.rect.min.x == x && particle.rect.min.y == 30);
-                    assert(particle.rect.max.x == x + 60 && particle.rect.max.y == 42);
-                    const auto renderedCenter = center(particle.rect);
-                    assert(renderedCenter.x == x + 30 && renderedCenter.y == 36);
-                    assert(particle.clip.min.x == 0 && particle.clip.min.y == 0);
-                    assert(particle.clip.max.x == 128 && particle.clip.max.y == 80);
-                    geometry = {particle.age,        particle.life,       particle.rect.min.x,
-                                particle.rect.min.y, particle.rect.max.x, particle.rect.max.y,
-                                particle.pos.x,      particle.pos.y};
-                }
-                if (silent)
-                    assert(geometry == normal[frame]);
-                else
-                    normal.push_back(geometry);
-                if (frame == 70)
-                    assert(p.count == 0); // Real expiry, not a permanently retained visual.
-            }
+            fxViewport(0, 0, 128, 80);
+            fxAnchor(mention.server, mention.target, mention.id, 12, 30, 60, 12);
+            model.effects = {mention};
+            ++model.now;
+            effects.draw(model);
+            assert(p.count == 0);
+            if (ding)
+                expectClip("ding");
+            else
+                assert(playing() == 0);
+        };
+        for (auto level : {FxLevel::Full, FxLevel::Subtle}) {
+            model.settings.fx = level;
+            checkMention(true);
         }
-        assert(normal[6][2] + 12 == normal[26][2]);
-        assert(normal[6][6] + 12 == normal[26][6]);
+        model.settings.mentionStyle = MentionStyle::TintOnly;
+        model.settings.mentionArrival = false;
+        checkMention(true);
+        mention.history = true;
+        checkMention(false);
+        mention.history = false;
+        model.settings.reducedMotion = true;
+        checkMention(true);
+        model.settings.reducedMotion = false;
+        model.settings.cues["mention"].enabled = false;
+        checkMention(false);
+        model.settings.cues.erase("mention");
+        model.settings.sound = false;
+        checkMention(false);
+        model.settings.sound = true;
+        model.settings.fx = FxLevel::Off;
+        checkMention(false);
+        model.settings.fx = FxLevel::Full;
+        mention.silent = true;
+        checkMention(false);
         // A muted chat does not poison a later unrelated global cue.
         Event global;
         global.type = "state";
@@ -145,14 +130,7 @@ int main() {
         assert(cubicOut(t) >= previous);
         previous = cubicOut(t);
         assert(bounceOut(t) >= 0 && bounceOut(t) <= 1.00001f);
-        assert(veil(t * 4) >= 0 && veil(t * 4) <= 1);
     }
-    assert(veil(0) == 0 && veil(.3f) == 1 && veil(1.3f) == 1 && veil(3.3f) == 0);
-    // Gentle attention has one continuous bloom and one continuous decay, no strobe.
-    for (int i = 1; i <= 300; ++i)
-        assert(veil(i * .001f) + .00001f >= veil((i - 1) * .001f));
-    for (int i = 1301; i <= 3300; ++i)
-        assert(veil(i * .001f) <= veil((i - 1) * .001f) + .00001f);
     // Flight is opaque from the composer to the destination; cancellation settles immediately.
     const auto start = messageEntrance(0, true, 100, 500, 300, 100, true);
     const auto middle = messageEntrance(outgoingDuration / 2, true, 100, 500, 300, 100, true);

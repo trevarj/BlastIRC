@@ -129,7 +129,7 @@ float random01() {
     return float(randomState & 0xffffff) / 16777215.f;
 }
 float random(float low, float high) { return low + (high - low) * random01(); }
-enum class Effect { None, Kick, Split, Mention, React, Redact, Join, Part, Disconnect };
+enum class Effect { None, Kick, Split, React, Redact, Join, Part, Disconnect };
 struct Directive {
     std::string_view event;
     Effect effect;
@@ -138,7 +138,7 @@ struct Directive {
 constexpr Directive director[] = {{"kick", Effect::Kick, "boom"},
                                   {"ban", Effect::Kick, "boom"},
                                   {"netsplit", Effect::Split, "rumble"},
-                                  {"mention", Effect::Mention, "ding"},
+                                  {"mention", Effect::None, "ding"},
                                   {"reaction", Effect::React, "pop"},
                                   {"redact", Effect::Redact, "hush"},
                                   {"join", Effect::Join, "blip"},
@@ -630,10 +630,6 @@ struct Effects::Impl {
                 shake = model.now;
             break;
         }
-        case Effect::Mention:
-            if (auto *p = add(Shape::Veil, pos, tertiary, 3.3f, 1))
-                p->rect = row;
-            break;
         case Effect::React:
             ring(pos, tertiary, full ? 30 : 18, .25f);
             if (auto *p = add(Shape::Veil, pos, tertiary, .65f, 1))
@@ -745,7 +741,7 @@ struct Effects::Impl {
             const float fade = std::sin(std::min(1.f, t / .08f) * pi * .5f) * (1 - fx::smooth(t));
             const auto tint = color(p.tint, fade * .7f * context.opacity);
             if (p.shape == Shape::Veil) {
-                const float envelope = p.life > 1 ? fx::veil(p.age) : std::sin(t * pi);
+                const float envelope = std::sin(t * pi);
                 const float pad = 8 * fx::smooth(std::min(1.f, p.age / .3f));
                 const Color c = withAlpha(p.tint, .095f * envelope * context.opacity *
                                                       (level == FxLevel::Subtle ? .55f : 1.f));
@@ -875,7 +871,7 @@ void Effects::draw(Model &model) {
             if (director[i].event == type) {
                 if (!event.silent)
                     p.sound(model.settings, director[i], i, model.now);
-                if (!model.settings.reducedMotion)
+                if (!model.settings.reducedMotion && director[i].effect != Effect::None)
                     p.event(event, director[i], model);
                 break;
             }

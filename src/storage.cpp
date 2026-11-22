@@ -397,38 +397,14 @@ SendReveal revealValue(const string &token, const char *key) {
             return reveal;
     invalid(key, "none or fade");
 }
-string mentionEffectName(MentionEffect value) {
+string mentionStyleName(MentionStyle value) {
     switch (value) {
-    case MentionEffect::Off:
-        return "off";
-    case MentionEffect::NeonMention:
-        return "neon_mention";
-    case MentionEffect::BreathingGlow:
-        return "breathing_glow";
-    case MentionEffect::LuminousOutline:
-        return "luminous_outline";
-    case MentionEffect::TextShimmer:
-        return "text_shimmer";
-    case MentionEffect::AccentUnderline:
-        return "accent_underline";
+    case MentionStyle::TintOnly:
+        return "tint_only";
+    case MentionStyle::Highlight:
+        return "highlight";
     }
-    invalid(
-        "appearance.mention_effect",
-        "off, neon_mention, breathing_glow, luminous_outline, text_shimmer, or accent_underline");
-}
-MentionEffect mentionEffectValue(const string &token) {
-    if (token == "rail_pulse")
-        return MentionEffect::BreathingGlow;
-    if (token == "border_halo")
-        return MentionEffect::LuminousOutline;
-    for (auto effect : {MentionEffect::Off, MentionEffect::NeonMention,
-                        MentionEffect::BreathingGlow, MentionEffect::LuminousOutline,
-                        MentionEffect::TextShimmer, MentionEffect::AccentUnderline})
-        if (token == mentionEffectName(effect))
-            return effect;
-    invalid(
-        "appearance.mention_effect",
-        "off, neon_mention, breathing_glow, luminous_outline, text_shimmer, or accent_underline");
+    invalid("appearance.mention_style", "tint_only or highlight");
 }
 string foolDisplayName(FoolDisplay value) {
     switch (value) {
@@ -536,6 +512,52 @@ void range(float value, float low, float high, const char *name) {
         invalid(name,
                 "a finite number in [" + std::to_string(low) + ", " + std::to_string(high) + "]");
 }
+void parseMentionPreferences(const toml::table &row, Settings &settings) {
+    const bool hasStyle = row.contains("mention_style");
+    const bool hasArrival = row.contains("mention_arrival");
+    if (hasStyle) {
+        string style;
+        exactField(row, "mention_style", style);
+        if (style == "tint_only")
+            settings.mentionStyle = MentionStyle::TintOnly;
+        else if (style == "highlight")
+            settings.mentionStyle = MentionStyle::Highlight;
+        else
+            invalid("appearance.mention_style", "tint_only or highlight");
+    }
+    exactField(row, "mention_arrival", settings.mentionArrival);
+    if (hasStyle && hasArrival)
+        return;
+
+    string effect = "off";
+    float strength = .6f, speed = 1.f;
+    bool outline = false, underline = false;
+    exactField(row, "mention_effect", effect);
+    field(row, "mention_strength", strength);
+    field(row, "mention_speed", speed);
+    exactField(row, "mention_outline_breathing", outline);
+    exactField(row, "mention_underline_glint", underline);
+    range(strength, 0, 1, "appearance.mention_strength");
+    range(speed, .25, 2, "appearance.mention_speed");
+
+    bool arrival = false;
+    if (effect == "breathing_glow" || effect == "rail_pulse" || effect == "text_shimmer")
+        arrival = true;
+    else if (effect == "luminous_outline" || effect == "border_halo")
+        arrival = outline;
+    else if (effect == "accent_underline")
+        arrival = underline;
+    else if (effect != "off" && effect != "neon_mention")
+        invalid("appearance.mention_effect",
+                "off, neon_mention, breathing_glow, luminous_outline, text_shimmer, "
+                "accent_underline, rail_pulse, or border_halo");
+
+    const bool highlight = effect != "off" && strength > 0;
+    if (!hasStyle)
+        settings.mentionStyle = highlight ? MentionStyle::Highlight : MentionStyle::TintOnly;
+    if (!hasArrival)
+        settings.mentionArrival = highlight && arrival;
+}
 float cursorValue(double value, double low, double high, float fallback) {
     return std::isfinite(value) ? static_cast<float>(std::clamp(value, low, high)) : fallback;
 }
@@ -555,9 +577,7 @@ void validate(const Settings &settings) {
     motionValue(sendMotionName(settings.incomingMotion), "appearance.incoming_motion", true);
     sendRevealName(settings.incomingReveal);
     range(settings.incomingDurationMs, 100, 2000, "appearance.incoming_duration_ms");
-    mentionEffectName(settings.mentionEffect);
-    range(settings.mentionStrength, 0, 1, "appearance.mention_strength");
-    range(settings.mentionSpeed, .25, 2, "appearance.mention_speed");
+    mentionStyleName(settings.mentionStyle);
     foolDisplayName(settings.foolDisplay);
     if (settings.messageWrapColumns < 0 || settings.messageWrapColumns > 1000)
         invalid("appearance.message_wrap_columns", "an integer from 0 through 1000");
@@ -848,13 +868,7 @@ void parseSettings(const toml::table &document, Settings &settings) {
         exactField(*row, "incoming_reveal", reveal);
         settings.incomingReveal = revealValue(reveal, "appearance.incoming_reveal");
         field(*row, "incoming_duration_ms", settings.incomingDurationMs);
-        string mention = mentionEffectName(settings.mentionEffect);
-        exactField(*row, "mention_effect", mention);
-        settings.mentionEffect = mentionEffectValue(mention);
-        field(*row, "mention_strength", settings.mentionStrength);
-        field(*row, "mention_speed", settings.mentionSpeed);
-        exactField(*row, "mention_outline_breathing", settings.mentionOutlineBreathing);
-        exactField(*row, "mention_underline_glint", settings.mentionUnderlineGlint);
+        parseMentionPreferences(*row, settings);
         string fools = foolDisplayName(settings.foolDisplay);
         exactField(*row, "fool_display", fools);
         bool foundFoolDisplay = false;
@@ -1156,11 +1170,8 @@ toml::table settingsDocument(const Settings &settings) {
                                    {"incoming_motion", sendMotionName(settings.incomingMotion)},
                                    {"incoming_reveal", sendRevealName(settings.incomingReveal)},
                                    {"incoming_duration_ms", settings.incomingDurationMs},
-                                   {"mention_effect", mentionEffectName(settings.mentionEffect)},
-                                   {"mention_strength", settings.mentionStrength},
-                                   {"mention_speed", settings.mentionSpeed},
-                                   {"mention_outline_breathing", settings.mentionOutlineBreathing},
-                                   {"mention_underline_glint", settings.mentionUnderlineGlint},
+                                   {"mention_style", mentionStyleName(settings.mentionStyle)},
+                                   {"mention_arrival", settings.mentionArrival},
                                    {"fool_display", foolDisplayName(settings.foolDisplay)},
                                    {"fool_unread", settings.foolUnread},
                                    {"message_wrap_columns", settings.messageWrapColumns},
@@ -2211,9 +2222,14 @@ void Storage::load(Model &model) {
     impl->configSafe = false;
     try {
         loaded.firstRun = !fs::exists(profiles);
+        const bool hasPreferences = fs::exists(preferences);
+        if (!loaded.firstRun || hasPreferences) {
+            loaded.settings.mentionStyle = MentionStyle::TintOnly;
+            loaded.settings.mentionArrival = false;
+        }
         if (!loaded.firstRun && ::chmod(profiles.c_str(), 0600) != 0)
             systemFail("secure configuration", profiles);
-        if (fs::exists(preferences) && ::chmod(preferences.c_str(), 0600) != 0)
+        if (hasPreferences && ::chmod(preferences.c_str(), 0600) != 0)
             systemFail("secure settings", preferences);
         if (!loaded.firstRun)
             parseProfiles(toml::parse_file(profiles.string()), loaded);
@@ -2221,7 +2237,7 @@ void Storage::load(Model &model) {
             loaded.identities.emplace_back();
             loaded.servers.emplace_back();
         }
-        if (fs::exists(preferences))
+        if (hasPreferences)
             parseSettings(toml::parse_file(preferences.string()), loaded.settings);
         validate(loaded.settings);
     } catch (const toml::parse_error &error) {

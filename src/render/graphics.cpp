@@ -1,6 +1,5 @@
 #include "graphics.hpp"
 #include "../theme/theme.hpp"
-#include "../ui/presentation.hpp"
 #include <GLES2/gl2.h>
 #include <algorithm>
 #include <array>
@@ -212,23 +211,20 @@ void rect(RenderBackend &backend, const CustomDrawContext &context, Color fill, 
 
 struct MaterialNode::Impl {
     MaterialKind kind;
-    bool own = false, presence = false, hovered = false, mentionHighlight = false;
-    float opacity = 1, radius = -1;
+    Color fill{};
+    bool hovered = false;
+    float radius = -1;
     std::uint64_t theme = 0;
     explicit Impl(MaterialKind value) : kind(value) {}
 };
 MaterialNode::MaterialNode(MaterialKind kind) : impl(std::make_unique<Impl>(kind)) {}
 MaterialNode::~MaterialNode() = default;
-void MaterialNode::setMessage(const MessageSurface &surface) {
+void MaterialNode::setMessage(Color fill, bool hovered) {
     auto &p = *impl;
-    if (p.own == surface.own && p.presence == surface.presence && p.hovered == surface.hovered &&
-        p.mentionHighlight == surface.mentionHighlight && p.opacity == surface.opacity)
+    if (p.fill == fill && p.hovered == hovered)
         return;
-    p.own = surface.own;
-    p.presence = surface.presence;
-    p.hovered = surface.hovered;
-    p.mentionHighlight = surface.mentionHighlight;
-    p.opacity = surface.opacity;
+    p.fill = fill;
+    p.hovered = hovered;
     markPaintDirty();
 }
 void MaterialNode::sync() {
@@ -266,8 +262,7 @@ void MaterialNode::doArrange(Renderer &renderer, const LayoutRect &bounds) {
 }
 void MaterialNode::draw(RenderBackend &backend, const CustomDrawContext &incoming) const {
     const auto &p = *impl;
-    auto context = incoming;
-    context.opacity *= p.opacity;
+    const auto &context = incoming;
     if (context.width <= 0 || context.height <= 0 || context.opacity <= 0)
         return;
     const float scale = themeScale();
@@ -275,10 +270,6 @@ void MaterialNode::draw(RenderBackend &backend, const CustomDrawContext &incomin
         p.kind == MaterialKind::Message
             ? std::min({themeBubbleRadius() * .75f, context.width * .5f, context.height * .5f})
             : themeCornerRadius();
-    // Routine events share the reading surface, not a conversational bubble/accent.
-    if (p.kind == MaterialKind::Message && p.presence && !p.hovered)
-        return;
-    const bool own = p.own && !p.presence;
     const auto panelBorder = [&p] {
         const bool conversation = p.kind == MaterialKind::Conversation;
         return withAlpha(themeForegroundColor(conversation ? "primary" : "outline_variant"),
@@ -290,8 +281,7 @@ void MaterialNode::draw(RenderBackend &backend, const CustomDrawContext &incomin
         rect(backend, context, themeSurfaceColor("surface_container_low"), panelBorder(), radius,
              scale);
     } else {
-        const auto fill = themeMessageBackground(own, p.presence, p.hovered, p.mentionHighlight);
-        rect(backend, context, themeSurfaceFill(fill),
+        rect(backend, context, p.fill,
              withAlpha(themeColor(p.hovered ? "tertiary" : "outline_variant"),
                        p.hovered ? .35f : .3f),
              radius, scale);

@@ -1704,28 +1704,23 @@ void runSettingsCheck() {
     }
     incomingDuration->setValue(900);
     assert(model.settings.incomingDurationMs == 900);
-    auto *mention = named<Select>(dialogs, "Mention effect");
-    auto *strength = named<Slider>(dialogs, "Mention strength (0–100%)");
-    auto *speed = named<Slider>(dialogs, "Mention speed (25–200%)");
-    auto *outline = named<Toggle>(dialogs, "Breathing outline");
-    auto *glint = named<Toggle>(dialogs, "Traveling underline glint");
-    for (std::size_t effect = 0; effect < 6; ++effect) {
-        mention->setSelectedIndex(effect);
-        assert(model.settings.mentionEffect == MentionEffect(effect));
-        assert(strength->enabled() == (effect != 0));
-        assert(outline->enabled() == (effect == 3));
-        assert(glint->enabled() == (effect == 5));
-        assert(speed->enabled() == (effect == 2 || effect == 4));
-    }
-    activate(dispatcher, *glint);
-    assert(model.settings.mentionUnderlineGlint && speed->enabled());
-    mention->setSelectedIndex(3);
-    activate(dispatcher, *outline);
-    assert(model.settings.mentionOutlineBreathing && speed->enabled());
-    strength->setValue(73);
-    speed->setValue(155);
-    assert(std::abs(model.settings.mentionStrength - .73f) < .001f &&
-           std::abs(model.settings.mentionSpeed - 1.55f) < .001f);
+    auto *mention = named<Select>(dialogs, "Mention highlight");
+    auto *arrival = named<Toggle>(dialogs, "Emphasize on arrival");
+    assert(mention && arrival && mention->selectedText() == "Highlight" && arrival->enabled() &&
+           model.settings.mentionStyle == MentionStyle::Highlight && model.settings.mentionArrival);
+    mention->setSelectedIndex(1);
+    assert(mention->selectedText() == "Tint only" &&
+           model.settings.mentionStyle == MentionStyle::TintOnly && model.settings.mentionArrival &&
+           !arrival->enabled() && !dispatcher.firstTabFocusUnder(arrival));
+    mention->setSelectedIndex(0);
+    assert(model.settings.mentionStyle == MentionStyle::Highlight && arrival->enabled());
+    activate(dispatcher, *arrival);
+    assert(!model.settings.mentionArrival);
+    assert(!find<Label>(dialogs, [](const Label &label) {
+        return label.text() == "Mention effect" || label.text() == "Mention strength (0–100%)" ||
+               label.text() == "Mention speed (25–200%)" || label.text() == "Breathing outline" ||
+               label.text() == "Traveling underline glint";
+    }));
     sliderInput(dialogs, dispatcher);
     named<Select>(dialogs, "Effects")->setSelectedIndex(0);
     assert(model.settings.fx == FxLevel::Off);
@@ -1735,6 +1730,7 @@ void runSettingsCheck() {
     named<Slider>(dialogs, "Overlay shake")->setValue(.5);
     sync();
     assert(model.settings.fx == FxLevel::Off && model.settings.reducedMotion);
+    assert(model.settings.mentionStyle == MentionStyle::Highlight && !model.settings.mentionArrival);
     assert(model.settings.sendMotion == SendMotion::Slide &&
            model.settings.sendReveal == SendReveal::Fade &&
            model.settings.incomingMotion == SendMotion::Slide &&
@@ -1873,11 +1869,8 @@ void runSettingsCheck() {
     assert(loaded.settings.incomingMotion == model.settings.incomingMotion &&
            loaded.settings.incomingReveal == model.settings.incomingReveal &&
            loaded.settings.incomingDurationMs == model.settings.incomingDurationMs &&
-           loaded.settings.mentionEffect == model.settings.mentionEffect &&
-           loaded.settings.mentionStrength == model.settings.mentionStrength &&
-           loaded.settings.mentionSpeed == model.settings.mentionSpeed &&
-           loaded.settings.mentionOutlineBreathing == model.settings.mentionOutlineBreathing &&
-           loaded.settings.mentionUnderlineGlint == model.settings.mentionUnderlineGlint &&
+           loaded.settings.mentionStyle == model.settings.mentionStyle &&
+           loaded.settings.mentionArrival == model.settings.mentionArrival &&
            loaded.settings.foolDisplay == model.settings.foolDisplay &&
            loaded.settings.foolUnread == model.settings.foolUnread &&
            loaded.settings.messageWrapColumns == model.settings.messageWrapColumns);

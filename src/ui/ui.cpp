@@ -1236,23 +1236,24 @@ struct Ui::Impl {
         const std::array<std::pair<const char *, const char *>, 4> tools = {
             {{"panel-left", "Toggle Channels"},
              {"terminal", "Execute command"},
-             {"x", "Close window"},
-             {"settings", "Settings"}}};
-        constexpr std::array controlKeys = {"topbar-navigation", "topbar-command", "topbar-close",
-                                            "topbar-settings"};
+             {"settings", "Settings"},
+             {"x", "Close window"}}};
+        constexpr std::array controlKeys = {"topbar-navigation", "topbar-command",
+                                            "topbar-settings", "topbar-close"};
         for (std::size_t i = 0; i < tools.size(); ++i) {
             auto button = std::make_unique<IconButton>(tools[i].first, tools[i].second, [this, i] {
                 if (i == 0)
                     pending.emplace_back("toggle-navigation");
                 else if (i == 1)
                     pending.emplace_back("execute-command");
-                else if (i == 2) {
+                else if (i == 2)
+                    pending.emplace_back("settings");
+                else {
                     if (window.close)
                         window.close();
                     else
                         queue(model, "quit");
-                } else
-                    pending.emplace_back("settings");
+                }
             });
             button->setTabFocusKey(controlKeys[i]);
             if (i == 0)
@@ -4193,7 +4194,7 @@ void Ui::Impl::refresh(bool panelResize) {
     updateTopbarHint(*networksButton, 2, "Toggle Networks", "toggle-networks");
     networksButton->selected(workspace.serverRailVisible);
     updateTopbarHint(*mentionsButton, 3, "Mentions — all networks", "global-mentions");
-    updateTopbarHint(*windowButtons.back(), 4, "Settings", "settings");
+    updateTopbarHint(*windowButtons[2], 4, "Settings", "settings");
     mentionsButton->selected(model.activeBuffer == GlobalMentionsBufferId);
     if (!showReadAll && readAllButton->visible())
         retirePanel(*readAllButton, applicationMenu, true);

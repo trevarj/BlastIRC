@@ -743,7 +743,7 @@ def shell_actions(layout):
     extra = extent + gap
     return {"navigation": (left + extent / 2, height / 2),
             "palette": (left + 1.5 * extent + gap, height / 2),
-            "settings": (width - outer - extent / 2, height / 2),
+            "settings": (width - outer - extra - extent / 2, height / 2),
             "application": (outer + 60 * zoom, height / 2),
             "networks": (left - (3 if unread and not folded else 2) * extra + extent / 2, height / 2),
             "mentions": (left - (2 if unread and not folded else 1) * extra + extent / 2, height / 2),

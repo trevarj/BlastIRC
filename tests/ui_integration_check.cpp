@@ -2842,12 +2842,13 @@ void titlebarGeometryCheck() {
     blast::Theme theme;
     PangoRenderer renderer;
     blast::Ui ui(model, clipboard);
-    const auto checkSettingsEdge = [&](float width, float scale) {
+    const auto checkRightmostControls = [&](float width, float scale) {
         auto *settings = areaWithKey(ui.root(), "topbar-settings");
-        assert(settings && visible(*settings));
+        auto *close = areaWithKey(ui.root(), "topbar-close");
+        assert(settings && visible(*settings) && close && visible(*close));
         assert(settings->width() >= 32 * scale && settings->height() >= 32 * scale);
-        float right = 0, y = 0;
-        Node::mapToScene(settings, settings->width(), 0, right, y);
+        assert(std::abs(close->x() - (settings->x() + settings->width()) - 8 * scale) < .1f);
+        const float right = close->x() + close->width();
         assert(right <= width && right >= width - 12 * scale);
     };
     for (const float scale : {1.f, 2.f}) {
@@ -2880,7 +2881,7 @@ void titlebarGeometryCheck() {
         InputArea *previous = nullptr;
         for (const auto key :
              {"topbar-networks", "topbar-mentions", "topbar-mark-all-read", "topbar-navigation",
-              "topbar-command", "topbar-close", "topbar-settings"}) {
+              "topbar-command", "topbar-settings", "topbar-close"}) {
             auto *button = areaWithKey(ui.root(), key);
             assert(button);
             if (!visible(*button))
@@ -2897,11 +2898,11 @@ void titlebarGeometryCheck() {
             }
             previous = button;
         }
-        checkSettingsEdge(1600, scale);
+        checkRightmostControls(1600, scale);
         const float compactWidth = 760 * scale - 1;
         ui.update(compactWidth, 1000, 1);
         ui.root().layout(renderer);
-        checkSettingsEdge(compactWidth, scale);
+        checkRightmostControls(compactWidth, scale);
     }
 }
 

@@ -38,8 +38,6 @@ static void presentation(const Settings &actual, const Settings &expected) {
     assert(actual.incomingMotion == expected.incomingMotion &&
            actual.incomingReveal == expected.incomingReveal &&
            actual.incomingDurationMs == expected.incomingDurationMs &&
-           actual.mentionStyle == expected.mentionStyle &&
-           actual.mentionArrival == expected.mentionArrival &&
            actual.foolDisplay == expected.foolDisplay && actual.foolUnread == expected.foolUnread &&
            actual.messageWrapColumns == expected.messageWrapColumns);
     assert(actual.linkPreviews == expected.linkPreviews &&
@@ -2628,8 +2626,6 @@ int main() {
             assert(!expected.settings.previewAllowLocal);
             assert(!fs::exists(config / "settings.toml")); // Loading never writes preferences.
             assert(expected.settings.fx == FxLevel::Subtle && expected.settings.sound);
-            assert(expected.settings.mentionStyle == MentionStyle::Highlight &&
-                   expected.settings.mentionArrival);
             assert(expected.settings.cursorShape == "line" &&
                    expected.settings.cursorEffect == "off" &&
                    expected.settings.cursorTrailDurationMs == 120.f &&
@@ -3070,14 +3066,7 @@ int main() {
             Model configured;
             fs::remove(config / "settings.toml");
             storage.load(configured);
-            assert(!configured.firstRun &&
-                   configured.settings.mentionStyle == MentionStyle::TintOnly &&
-                   !configured.settings.mentionArrival);
-            assert(!fs::exists(config / "settings.toml"));
-            std::ofstream(config / "settings.toml") << "schema_version = 1\n";
-            storage.load(configured);
-            assert(configured.settings.mentionStyle == MentionStyle::TintOnly &&
-                   !configured.settings.mentionArrival);
+            assert(!configured.firstRun && !fs::exists(config / "settings.toml"));
         }
         // Legacy preferences retain their effect level and acquire independent send defaults.
         {
@@ -3110,8 +3099,6 @@ int main() {
             assert(legacy.settings.sendMotion == SendMotion::Flight &&
                    legacy.settings.sendReveal == SendReveal::None);
             assert(legacy.settings.fx == FxLevel::Full && legacy.settings.sound);
-            assert(legacy.settings.mentionStyle == MentionStyle::TintOnly &&
-                   !legacy.settings.mentionArrival);
             assert(legacy.settings.cursorShape == "line" && legacy.settings.cursorEffect == "off" &&
                    legacy.settings.cursorTrailDurationMs == 120.f &&
                    legacy.settings.cursorTrailStrength == .20f);
@@ -3255,69 +3242,36 @@ int main() {
             presentation(reopened.settings, migrated.settings);
             assert(contents(config / "config.toml") == originalConfig);
         }
-        struct MentionCase {
-            const char *source;
-            MentionStyle style;
-            bool arrival;
-        };
-        using enum MentionStyle;
-        for (const auto &[source, style, arrival] : {
-                 MentionCase{"mention_effect = 'off'\n", TintOnly, false},
-                 MentionCase{"mention_effect = 'neon_mention'\n", Highlight, false},
-                 MentionCase{"mention_effect = 'breathing_glow'\nmention_strength = 0.75\n",
-                             Highlight, true},
-                 MentionCase{"mention_effect = 'text_shimmer'\n", Highlight, true},
-                 MentionCase{"mention_effect = 'luminous_outline'\nmention_underline_glint = true\n",
-                             Highlight, false},
-                 MentionCase{"mention_effect = 'luminous_outline'\nmention_outline_breathing = true\n",
-                             Highlight, true},
-                 MentionCase{"mention_effect = 'accent_underline'\nmention_outline_breathing = true\n",
-                             Highlight, false},
-                 MentionCase{"mention_effect = 'accent_underline'\nmention_underline_glint = true\n",
-                             Highlight, true},
-                 MentionCase{"mention_effect = 'rail_pulse'\nmention_speed = 1.5\n", Highlight, true},
-                 MentionCase{"mention_effect = 'border_halo'\n", Highlight, false},
-                 MentionCase{"mention_effect = 'border_halo'\nmention_outline_breathing = true\n",
-                             Highlight, true},
-                 MentionCase{"mention_effect = 'breathing_glow'\nmention_strength = 0\n", TintOnly,
-                             false},
-                 MentionCase{"mention_effect = 'off'\nmention_style = 'highlight'\n", Highlight,
-                             false},
-                 MentionCase{"mention_effect = 'text_shimmer'\nmention_arrival = false\n", Highlight,
-                             false},
-                 MentionCase{"mention_effect = 'neon_mention'\nmention_arrival = true\n", Highlight,
-                             true},
-                 MentionCase{"mention_style = 'tint_only'\nmention_arrival = true\n"
-                             "mention_effect = 'unknown'\nmention_strength = 'obsolete'\n",
-                             TintOnly, true},
-             }) {
+        for (const char *obsolete : {"mention_style = 'tint_only'\nmention_arrival = true\n",
+                                     "mention_effect = 'luminous_outline'\nmention_strength = 0.75\n"
+                                     "mention_speed = 1.5\nmention_outline_breathing = true\n"
+                                     "mention_underline_glint = false\n"}) {
+            const auto file = config / "settings.toml";
+            const string source = "[appearance]\n"
+                                  "send_motion = 'slide'\nsend_reveal = 'none'\n"
+                                  "incoming_motion = 'pop'\nincoming_reveal = 'fade'\n"
+                                  "incoming_duration_ms = 1250\n" +
+                                  string(obsolete);
             {
-                std::ofstream output(config / "settings.toml");
-                output << "[appearance]\n"
-                          "send_motion = 'slide'\nsend_reveal = 'none'\n"
-                          "incoming_motion = 'pop'\nincoming_reveal = 'fade'\n"
-                          "incoming_duration_ms = 1250\n"
-                       << source;
+                std::ofstream output(file);
+                output << source;
             }
             Storage storage;
             Model configured;
             storage.load(configured);
-            assert(configured.settings.mentionStyle == style &&
-                   configured.settings.mentionArrival == arrival &&
-                   configured.settings.sendMotion == SendMotion::Slide &&
+            assert(contents(file) == source);
+            assert(configured.settings.sendMotion == SendMotion::Slide &&
                    configured.settings.sendReveal == SendReveal::None &&
                    configured.settings.incomingMotion == SendMotion::Pop &&
                    configured.settings.incomingReveal == SendReveal::Fade &&
                    configured.settings.incomingDurationMs == 1250.f);
             storage.save(configured);
-            const auto savedMention = toml::parse_file((config / "settings.toml").string());
-            const auto appearance = savedMention["appearance"];
-            assert(appearance["mention_style"].value<string>() ==
-                       (style == Highlight ? "highlight" : "tint_only") &&
-                   appearance["mention_arrival"].value<bool>() == arrival);
-            for (const char *legacyKey : {"mention_effect", "mention_strength", "mention_speed",
-                                          "mention_outline_breathing", "mention_underline_glint"})
-                assert(!appearance[legacyKey]);
+            const auto saved = toml::parse_file(file.string());
+            const auto appearance = saved["appearance"];
+            for (const char *key : {"mention_style", "mention_arrival", "mention_effect",
+                                    "mention_strength", "mention_speed",
+                                    "mention_outline_breathing", "mention_underline_glint"})
+                assert(!appearance[key]);
             Model reopened;
             storage.load(reopened);
             presentation(reopened.settings, configured.settings);
@@ -3428,14 +3382,6 @@ int main() {
                                     "incoming_duration_ms = nan",
                                     "incoming_duration_ms = inf",
                                     "incoming_duration_ms = '550'",
-                                    "mention_strength = -0.01",
-                                    "mention_strength = 1.01",
-                                    "mention_strength = nan",
-                                    "mention_speed = 0.24",
-                                    "mention_speed = 2.01",
-                                    "mention_speed = inf",
-                                    "mention_outline_breathing = 1",
-                                    "mention_underline_glint = 'true'",
                                     "message_scale = 0.699",
                                     "message_scale = 2.001",
                                     "message_scale = nan",
@@ -3596,7 +3542,7 @@ int main() {
         for (const string diagnostic :
              {"appearance.send_motion", "appearance.send_reveal", "appearance.incoming_motion",
               "appearance.incoming_duration_ms", "appearance.fool_display",
-              "appearance.mention_style", "appearance.message_wrap_columns", "previews",
+              "appearance.message_wrap_columns", "previews",
               "previews.max_height", "previews.media_max_mib", "previews.media_max_seconds",
               "cursor.shape", "cursor.effect"}) {
             Storage storage;
@@ -3611,8 +3557,6 @@ int main() {
                 invalid.settings.incomingMotion = SendMotion::Flight;
             else if (diagnostic == "appearance.incoming_duration_ms")
                 invalid.settings.incomingDurationMs = std::numeric_limits<float>::quiet_NaN();
-            else if (diagnostic == "appearance.mention_style")
-                invalid.settings.mentionStyle = static_cast<MentionStyle>(-1);
             else if (diagnostic == "appearance.fool_display")
                 invalid.settings.foolDisplay = static_cast<FoolDisplay>(-1);
             else if (diagnostic == "appearance.message_wrap_columns")
@@ -3905,21 +3849,6 @@ int main() {
             {"[appearance]\nsend_reveal = 'Pixels'\n", "appearance.send_reveal"},
             {"[appearance]\nsend_reveal = ''\n", "appearance.send_reveal"},
             {"[appearance]\nsend_reveal = false\n", "send_reveal"},
-            {"[appearance]\nmention_effect = 'unknown'\n", "appearance.mention_effect"},
-            {"[appearance]\nmention_effect = 'Text_Shimmer'\n", "appearance.mention_effect"},
-            {"[appearance]\nmention_effect = ''\n", "appearance.mention_effect"},
-            {"[appearance]\nmention_effect = true\n", "mention_effect"},
-            {"[appearance]\nmention_effect = 1\n", "mention_effect"},
-            {"[appearance]\nmention_effect = 1.0\n", "mention_effect"},
-            {"[appearance]\nmention_effect = []\n", "mention_effect"},
-            {"[appearance]\nmention_effect = {}\n", "mention_effect"},
-            {"[appearance]\nmention_style = 'Highlight'\n", "appearance.mention_style"},
-            {"[appearance]\nmention_style = ''\n", "appearance.mention_style"},
-            {"[appearance]\nmention_style = 'off'\n", "appearance.mention_style"},
-            {"[appearance]\nmention_style = true\n", "mention_style"},
-            {"[appearance]\nmention_style = {}\n", "mention_style"},
-            {"[appearance]\nmention_arrival = 'true'\n", "mention_arrival"},
-            {"[appearance]\nmention_arrival = 1\n", "mention_arrival"},
             {"[presentation]\nirc_channels = 'Libera/#a'\n", "presentation.irc_channels"},
             {"[presentation]\nirc_channels = ['Libera/#a', false]\n", "presentation.irc_channels"},
             {"[presentation]\nmessage_layouts = []\n", "message_layouts"},

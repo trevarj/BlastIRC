@@ -330,7 +330,7 @@ struct Fragment {
     std::string text, url;
     TextFont font;
     std::array<std::optional<Color>, 2> color;
-    float x = 0, y = 0, width = 0, height = 0, baseline = 0, inkBottom = 0;
+    float x = 0, y = 0, width = 0, height = 0, baseline = 0;
     size_t linkStart = absent, displayBegin = 0, displayEnd = 0;
     MessageSelectionFragment selection;
     bool selectionReady = false;
@@ -398,8 +398,10 @@ std::vector<NickAnnotation> annotateNicksWithLinks(const Model &model, const Buf
 
 RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, float width,
                 float minimumLine, int columns, const Model &model, const Buffer &buffer,
-                const std::string &author, std::string_view matchedNick,
+                const std::string &author, std::string_view matchedNick, bool emphasizeMention,
                 const std::array<Color, 2> &backgrounds, Color normal) {
+    if (matchedNick.empty())
+        emphasizeMention = false;
     RichLayout result;
     const auto links = detectLinks(document);
     std::vector<size_t> boundaries;
@@ -419,6 +421,10 @@ RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, flo
     }
     const auto mentions =
         annotateNicksWithLinks(model, buffer, document, author, links, matchedNick);
+    const auto accent = emphasizeMention ? themeForegroundColor("primary") : Color{};
+    const auto network = emphasizeMention ? model.networks.find(buffer.server) : model.networks.end();
+    const std::string_view mapping =
+        network == model.networks.end() ? std::string_view("rfc1459") : network->second.caseMapping;
     auto pieces = [&](size_t begin, size_t end, float y, bool emit) {
         float x = 0;
         for (const auto &run : document.runs) {
@@ -429,6 +435,7 @@ RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, flo
                 font.weight = FontWeight::Bold;
             if (run.style.monospace)
                 font.family = "monospace";
+            const auto weight = font.weight;
             while (at < finish) {
                 size_t next = finish;
                 const RichLink *link = nullptr;
@@ -443,11 +450,11 @@ RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, flo
                         break;
                     }
                 }
-                std::string nick;
+                const std::string *nick = nullptr;
                 if (!link)
                     for (const auto &mention : mentions) {
                         if (mention.begin <= at && at < mention.end) {
-                            nick = mention.nick;
+                            nick = &mention.nick;
                             next = std::min(next, mention.end);
                             break;
                         }
@@ -457,6 +464,9 @@ RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, flo
                         }
                     }
                 const auto &style = run.style;
+                const bool ownMention =
+                    emphasizeMention && nick && sameNick(*nick, matchedNick, mapping);
+                font.weight = ownMention ? std::max(weight, FontWeight::SemiBold) : weight;
                 const auto display = std::string_view(document.text).substr(at, next - at);
                 auto text = markup(display, style, link != nullptr);
                 const auto metrics = renderer.measureText(text, size, font, 0, 1, TextAlign::Start,
@@ -464,10 +474,14 @@ RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, flo
                 const float cellWidth = metrics.width;
                 if (emit) {
                     std::array<std::optional<Color>, 2> ink{style.foreground, style.foreground};
-                    if (!style.foreground && !nick.empty() && !style.reverse)
+                    if (ownMention && !style.foreground && !style.reverse)
+                        for (size_t hover = 0; hover < ink.size(); ++hover)
+                            ink[hover] = themePairedForeground(
+                                style.background.value_or(backgrounds[hover]), accent);
+                    else if (!style.foreground && nick && !style.reverse)
                         for (size_t hover = 0; hover < ink.size(); ++hover)
                             ink[hover] =
-                                nickTextColor(model, nick, buffer.server,
+                                nickTextColor(model, *nick, buffer.server,
                                               style.background.value_or(backgrounds[hover]));
                     else if (!style.foreground && style.background)
                         ink.fill(themePairedForeground(*style.background, normal));
@@ -480,13 +494,12 @@ RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, flo
                                                 cellWidth,
                                                 std::max(minimumLine, metrics.bottom - metrics.top),
                                                 -metrics.top,
-                                                metrics.inkBottom,
                                                 link ? link->start : absent,
                                                 at,
                                                 next,
                                                 {},
                                                 false,
-                                                nick,
+                                                nick ? *nick : std::string{},
                                                 0,
                                                 style.background
                                                     ? markup(display, style, link != nullptr, false)
@@ -651,7 +664,7 @@ struct Geometry {
     float header = 20, footer = 14, quote = 24, reaction = 29, day = 36, unread = 30;
     float bodyLine = 0, nickLine = 0, nickHeader = 0, activityLine = 0, metadataHeader = 0;
     float verticalPadding = 0;
-    bool channel = false, inlineChannel = false;
+    bool conversation = false, channel = false, inlineChannel = false;
     bool bubbles = false, avatars = false, timestamps = false, tight = false;
     std::string key;
     bool dense() const { return !bubbles; }
@@ -694,7 +707,7 @@ struct Geometry {
         return bubbles && avatars && !presence && !tight ? (metrics.avatarSize + 10) * scale : 0;
     }
     float authorAvatarInset() const {
-        return bubbles && tight && avatars ? (metrics.avatarSize + 6) * scale : 0;
+        return bubbles && tight && avatars ? (metrics.avatarSize + 2) * scale : 0;
     }
     float compactAvatarSize(bool inlineLayout) const {
         return channel && avatars ? (inlineLayout ? 20 : 34) * scale : 0;
@@ -716,10 +729,14 @@ struct Geometry {
                : dense() ? timeGutter
                          : 0;
     }
+    float leftInset(bool presence) const {
+        return (conversation && !presence ? 12.f : metrics.inset) * scale;
+    }
+    float sideInsets(bool presence) const { return leftInset(presence) + metrics.inset * scale; }
     float bodyWidth(float width, bool presence) const {
         const float minimum = channel && !presence ? 1.f : 32.f;
         const float available =
-            std::max(minimum, width - 2 * metrics.inset * scale - avatarLane(presence));
+            std::max(minimum, width - sideInsets(presence) - avatarLane(presence));
         const float surface =
             presence
                 ? available
@@ -745,7 +762,8 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
     result.scale = themeScale();
     result.cornerRadius = Style::radiusLg * result.scale;
     result.bubbles = messageBubbles(model.settings, buffer);
-    result.channel = !result.bubbles && (buffer.kind == "channel" || buffer.kind == "query");
+    result.conversation = buffer.kind == "channel" || buffer.kind == "query";
+    result.channel = !result.bubbles && result.conversation;
     result.tight = result.bubbles && (width < 400 * result.scale || height < 180 * result.scale);
     if (result.bubbles) {
         result.metrics.padding = 12;
@@ -754,7 +772,7 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
         result.metrics.widthFraction = .90f;
     }
     if (result.tight) {
-        result.metrics.padding = 4;
+        result.metrics.padding = 2;
         result.metrics.inset = 4;
         result.metrics.headerHeight = 18;
         result.metrics.rowGap = 10;
@@ -827,7 +845,7 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
     result.day = std::max(36 * result.scale, result.header + 16 * result.scale);
     result.unread = std::max(30 * result.scale, result.header + 10 * result.scale);
     if (result.channel) {
-        const float available = std::max(1.f, width - 2 * result.metrics.inset * result.scale);
+        const float available = std::max(1.f, width - result.sideInsets(false));
         const float nickAdornment = result.compactAvatarInset(true) + 2 * result.chipPadding();
         auto actorFont = themeUiFont();
         actorFont.weight = FontWeight::Bold;
@@ -871,7 +889,6 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
         result.key += "|" + std::to_string(nick.name.size()) + ":" + nick.name;
     return result;
 }
-constexpr double mentionArrivalDuration = .22;
 Color denseBackground(const Message &entry, bool hovered) {
     return typedActivity(entry) || hovered ? themeSurfaceColor("surface_container_high")
                                            : rgba(0, 0, 0, 0);
@@ -883,8 +900,7 @@ Color rowBackdrop(const Geometry &g, const Message &entry, bool hovered) {
     if (typedActivity(entry) || !entry.presence)
         base = over(base, denseBackground(entry, hovered));
     if (bubble)
-        base = over(base,
-                    themeSurfaceFill(themeMessageBackground(entry.own, false, hovered, false)));
+        base = over(base, themeSurfaceFill(themeMessageBackground(entry.own, false, hovered)));
     return base;
 }
 
@@ -902,13 +918,12 @@ struct TranscriptView::Impl {
         float gapHeight = 0;
         size_t signature = 0;
         uint64_t revision = 0, focusIdentity = 0;
-        double entranceStarted = -1, mentionStarted = -1;
+        double entranceStarted = -1;
         bool measured = false, fragmentsReady = false, day = false, grouped = false, unread = false;
         bool unreadEligible = false;
         bool friendAuthor = false;
         bool mentionHighlight = false;
         std::array<Color, 2> backdrop, bodyInk, metadataInk;
-        std::array<Color, 2> mentionPeak, mentionFill;
         bool footerStacked = false;
         bool showClock = true;
         bool foolOpen = false;
@@ -992,14 +1007,12 @@ struct TranscriptView::Impl {
         InputArea *area = nullptr;
         MaterialNode *material = nullptr;
         RectNode *dense = nullptr, *focusRing = nullptr;
-        TextNode *mentionMarker = nullptr;
         Node *content = nullptr, *decorations = nullptr, *body = nullptr, *rowClip = nullptr;
         MediaPreviewCard *preview = nullptr;
         RenderProxyNode *flight = nullptr;
         struct BodyText {
             TextNode *node;
             std::array<std::optional<Color>, 2> color;
-            Node *underline = nullptr;
         };
         std::vector<BodyText> text;
         std::vector<RectNode *> selectionRects;
@@ -3223,9 +3236,9 @@ struct TranscriptView::Impl {
                       entry.timestamp >= buffer.messages[previous].timestamp &&
                       entry.timestamp - buffer.messages[previous].timestamp < 300;
         row.showClock = timestampVisible(row, buffer, index);
-        row.mentionHighlight = entry.mention && !entry.own && !entry.presence && !entry.pending &&
-                               !entry.deleted && buffer.kind != "mentions" &&
-                               buffer.kind != "search" && !foolish(buffer, entry);
+        row.mentionHighlight = cache->geometry.conversation && entry.mention && !entry.own &&
+                               !entry.presence && !entry.pending && !entry.deleted &&
+                               !foolish(buffer, entry);
     }
     float activityBodyWidth(const Row &row, const Message &entry, const Geometry &g,
                             float width) const {
@@ -3595,11 +3608,7 @@ struct TranscriptView::Impl {
                                      : fx::messageIncomingDuration(model.settings.incomingDurationMs)) &&
                     !foolish(buffer, entry))
                     row.entranceStarted = model.now;
-                if (windowActive && !unsettled && !selectedText && row.mentionHighlight &&
-                    model.settings.mentionStyle == MentionStyle::Highlight &&
-                    model.settings.mentionArrival && age < mentionArrivalDuration)
-                    row.mentionStarted = model.now;
-                if (row.entranceStarted >= 0 || row.mentionStarted >= 0)
+                if (row.entranceStarted >= 0)
                     c.arrivals.push_back(index);
             }
             if (observeArrivals && !entry.own && !entry.history && !entry.pending &&
@@ -3901,21 +3910,10 @@ struct TranscriptView::Impl {
             : entry.own && g.bubbles && !emote ? themeForegroundColor("on_primary_container")
                                                : themeForegroundColor("on_surface");
         const auto metadata = themeForegroundColor("on_surface_variant");
-        const auto conversation = themeConversationBackdrop();
-        const auto neutralFill = themeSurfaceColor("surface_container_high");
         for (size_t hover = 0; hover < row.backdrop.size(); ++hover) {
-            if (row.mentionHighlight) {
-                row.mentionPeak[hover] =
-                    themeSurfaceFill(themeMessageBackground(false, false, hover != 0, true));
-                row.mentionFill[hover] = lerpColor(neutralFill, row.mentionPeak[hover], .72f);
-                row.backdrop[hover] = over(conversation, row.mentionFill[hover]);
-            } else {
-                row.backdrop[hover] = rowBackdrop(g, entry, hover != 0);
-            }
-            const auto inkBase =
-                row.mentionHighlight ? over(conversation, neutralFill) : row.backdrop[hover];
-            row.bodyInk[hover] = themePairedForeground(inkBase, normal);
-            row.metadataInk[hover] = themePairedForeground(inkBase, metadata);
+            row.backdrop[hover] = rowBackdrop(g, entry, hover != 0);
+            row.bodyInk[hover] = themePairedForeground(row.backdrop[hover], normal);
+            row.metadataInk[hover] = themePairedForeground(row.backdrop[hover], metadata);
         }
         auto document = parseIrcFormatting(collapsed       ? std::string_view(row.activityLabel)
                                            : entry.deleted ? std::string_view("Message deleted")
@@ -3931,7 +3929,7 @@ struct TranscriptView::Impl {
             wrap(renderer, document, notice ? g.activityFont : g.font, bodyMax,
                  notice ? g.activityLine : g.bodyLine, model.settings.messageWrapColumns, model,
                  sourceContext(buffer, entry) ? *sourceContext(buffer, entry) : buffer, entry.nick,
-                 entry.mentionNick, row.backdrop, normal);
+                 entry.mentionNick, row.mentionHighlight, row.backdrop, normal);
         const auto previewLinks = detectLinks(document);
         row.previewUrl = previewLinks.empty() ? std::string{} : previewLinks.front().url;
         if (mediaController)
@@ -3994,7 +3992,7 @@ struct TranscriptView::Impl {
         row.reactions.clear();
         float reactionWidth = 0;
         const float reactionLimit =
-            std::max(0.f, std::min(bodyMax, c.width - 2 * metrics.inset * g.scale -
+            std::max(0.f, std::min(bodyMax, c.width - g.sideInsets(entry.presence) -
                                                 g.avatarLane(entry.presence) - 2 * padding -
                                                 row.prefixWidth));
         if (readable(buffer, index))
@@ -4366,8 +4364,6 @@ struct TranscriptView::Impl {
         const auto &g = c.geometry;
         const auto &metrics = g.metrics;
         const float friendExtent = row.friendAuthor ? 18 * g.scale : 0;
-        if (slot.buffer != active || slot.focusIdentity != row.focusIdentity)
-            cancelMentionArrival(slot);
         slot.index = index;
         slot.area->setPosition(0, float(c.header + c.heights.prefix(index) + row.gapHeight));
         slot.area->setSize(c.width, float(row.height - row.gapHeight));
@@ -4438,7 +4434,6 @@ struct TranscriptView::Impl {
         slot.statusSpinner = nullptr;
         slot.statusCheck = nullptr;
         slot.avatarBackground = nullptr;
-        slot.mentionMarker = nullptr;
         slot.roleRects.clear();
         slot.reactions.clear();
         stopFlight(slot);
@@ -4484,7 +4479,7 @@ struct TranscriptView::Impl {
             : entry.presence ? (c.width - row.surfaceWidth) * .5f
             : entry.own && g.bubbles && !entry.action
                 ? c.width - metrics.inset * g.scale - avatarLane - row.surfaceWidth
-                : metrics.inset * g.scale + avatarLane;
+                : g.leftInset(entry.presence) + avatarLane;
         const float surfaceHeight =
             float(row.height - row.gapHeight) - top - gap;
         auto material = std::make_unique<MaterialNode>(MaterialKind::Message);
@@ -4494,6 +4489,11 @@ struct TranscriptView::Impl {
         slot.material->setVisible(g.bubbles && !entry.presence && !entry.action);
         slot.material->setHitTestVisible(false);
         slot.content->addChild(std::move(material));
+        if (row.mentionHighlight)
+            rectangle(
+                *slot.content, 2 * g.scale, top, 2 * g.scale, surfaceHeight,
+                themePairedForeground(themeConversationBackdrop(), themeForegroundColor("primary")),
+                g.scale);
         auto dense = std::make_unique<RectNode>();
         slot.dense = dense.get();
         slot.dense->setPosition(surfaceX, top);
@@ -4566,7 +4566,7 @@ struct TranscriptView::Impl {
                    g.tight ? x - row.emotePrefix
                    : entry.own && !entry.action
                        ? c.width - metrics.inset * g.scale - metrics.avatarSize * g.scale
-                       : metrics.inset * g.scale,
+                       : g.leftInset(false),
                    entry.action ? top + (g.tight ? g.paddingY(false) : 0)
                                 : y + row.authorOffset +
                                       (row.authorHeight + 2 * g.chipPaddingY() -
@@ -4909,35 +4909,7 @@ struct TranscriptView::Impl {
         body->setSize(row.contentWidth, row.bodyHeight);
         body->setForegroundBlurRadius(concealedFool(buffer, index) ? 10 * g.scale : 0);
         slot.content->addChild(std::move(body));
-        if (row.mentionHighlight) {
-            auto marker = std::make_unique<TextNode>();
-            slot.mentionMarker = marker.get();
-            const float size = 8 * g.scale;
-            auto font = themeUiFont();
-            font.weight = FontWeight::Bold;
-            const auto ink = renderer.measureText("@", size, font);
-            const float markerX = std::max(0.f, surfaceX - ink.width - g.scale);
-            const float firstLine = row.lines.empty() ? g.bodyLine : row.lines.front().height;
-            marker->setText("@");
-            marker->setFontSize(size);
-            marker->setFontFamily(font.family);
-            marker->setFontFeatures(font.features);
-            marker->setFontWeight(font.weight);
-            marker->setMaxLines(1);
-            marker->setColor(themePairedForeground(themeConversationBackdrop(),
-                                                   themeForegroundColor("tertiary")));
-            marker->setPosition(markerX,
-                                row.bodyOffset + (firstLine - ink.inkTop - ink.inkBottom) * .5f);
-            marker->setSize(ink.width, ink.bottom - ink.top);
-            marker->setHitTestVisible(false);
-            slot.content->addChild(std::move(marker));
-        }
         size_t previousLink = absent;
-        const auto source = sourceContext(buffer, entry);
-        const auto network = model.networks.find(source ? source->server : buffer.server);
-        const std::string_view matchedNick = entry.mentionNick;
-        const auto mapping =
-            network == model.networks.end() ? "rfc1459" : network->second.caseMapping;
         for (const auto &fragment : row.fragments) {
             if (row.urlReplaced)
                 break;
@@ -5023,24 +4995,8 @@ struct TranscriptView::Impl {
             text->setPosition(fragment.inset, fragment.baseline);
             text->setSize(fragment.width - 2 * fragment.inset, fragment.height);
             text->setHitTestVisible(false);
-            auto &painted = slot.text.emplace_back(Slot::BodyText{text.get(), fragment.color});
+            slot.text.push_back({text.get(), fragment.color});
             area->addChild(std::move(text));
-            if (row.mentionHighlight && !matchedNick.empty() && !fragment.nick.empty() &&
-                sameNick(fragment.nick, matchedNick, mapping) && fragment.width > 0) {
-                const float top =
-                    fragment.baseline + std::max(g.scale, fragment.inkBottom + .3f * g.scale);
-                const float stroke = std::min(.75f * g.scale, (fragment.height - top) / 3);
-                if (stroke > 0) {
-                    auto underline = std::make_unique<Node>();
-                    painted.underline = underline.get();
-                    underline->setPosition(0, top);
-                    underline->setSize(fragment.width, 3 * stroke);
-                    underline->setHitTestVisible(false);
-                    rectangle(*underline, 0, 0, fragment.width, stroke, row.bodyInk[0]);
-                    rectangle(*underline, 0, 2 * stroke, fragment.width, stroke, row.bodyInk[0]);
-                    area->addChild(std::move(underline));
-                }
-            }
             slot.body->addChild(std::move(hit));
         }
         if (mediaController && row.previewHeight > 0 && readable(buffer, index)) {
@@ -5159,7 +5115,6 @@ struct TranscriptView::Impl {
         }
     }
     void cancelEntrance(Slot &slot) {
-        cancelMentionArrival(slot);
         stopFlight(slot);
         if (cache && slot.buffer == active && slot.index < cache->rows.size() &&
             cache->rows[slot.index].focusIdentity == slot.focusIdentity)
@@ -5169,12 +5124,6 @@ struct TranscriptView::Impl {
             slot.content->setScale(1);
             slot.content->setOpacity(1);
         }
-    }
-    void cancelMentionArrival(const Slot &slot) {
-        if (cache && slot.mentionMarker && slot.buffer == active)
-            if (const auto found = cache->keys.find(slot.key); found != cache->keys.end() &&
-                cache->rows[found->second].focusIdentity == slot.focusIdentity)
-                cache->rows[found->second].mentionStarted = -1;
     }
     void excludeRows() {
         for (auto &slot : slots) {
@@ -5205,12 +5154,6 @@ struct TranscriptView::Impl {
         const float bottom = viewport->y + viewport->height;
         fxViewport(left, top, right - left, bottom - top);
         const auto textRange = orderedTextRange();
-        const bool highlight = model.settings.fx != FxLevel::Off &&
-                               model.settings.mentionStyle == MentionStyle::Highlight;
-        const bool animateMention = highlight && model.settings.mentionArrival &&
-                                    !model.settings.reducedMotion && windowActive &&
-                                    !switched && pane.following && !focusRevealTarget &&
-                                    !selectedText && effectivelyVisible();
         for (auto &slot : slots) {
             if (!slot.area->visible() || slot.index >= buffer->messages.size() || !slot.material ||
                 slot.key != ui_logic::messageKey(buffer->messages[slot.index])) {
@@ -5308,47 +5251,12 @@ struct TranscriptView::Impl {
             }
             const bool hovered =
                 dispatcher ? owns(dispatcher->hoveredArea()) : slot.area->hovered();
-            const double age = model.now - row.mentionStarted;
-            float emphasis = 0;
-            if (row.mentionStarted >= 0) {
-                if (animateMention && row.mentionHighlight && !interacting && destinationVisible &&
-                    age >= 0 && age < mentionArrivalDuration) {
-                    const float remaining = 1.f - float(age / mentionArrivalDuration);
-                    emphasis = remaining * remaining;
-                } else
-                    row.mentionStarted = -1;
-            }
-            Color fill{};
-            auto backdrop = row.backdrop[hovered];
-            if (row.mentionHighlight) {
-                fill = row.mentionFill[hovered];
-                if (emphasis > 0) {
-                    fill = lerpColor(fill, row.mentionPeak[hovered], emphasis);
-                    backdrop = over(themeConversationBackdrop(), fill);
-                }
-            }
-            if (slot.mentionMarker)
-                slot.mentionMarker->setVisible(highlight);
             paintTextSelection(slot, textRange, top, bottom, hovered);
             const auto normal = row.bodyInk[hovered];
             if (slot.preview)
-                slot.preview->setBackdrop(backdrop);
-            const bool selected =
-                textRange && slot.index >= textRange->first && slot.index <= textRange->last;
-            for (size_t i = 0; i < slot.text.size(); ++i) {
-                auto &text = slot.text[i];
+                slot.preview->setBackdrop(row.backdrop[hovered]);
+            for (const auto &text : slot.text)
                 text.node->setColor(text.color[hovered].value_or(normal));
-                if (text.underline && i < row.fragments.size()) {
-                    const auto &fragment = row.fragments[i];
-                    const bool covered =
-                        selected &&
-                        (slot.index != textRange->first ||
-                         fragment.displayEnd > textRange->begin.byte) &&
-                        (slot.index != textRange->last ||
-                         fragment.displayBegin < textRange->end.byte);
-                    text.underline->setVisible(highlight && !covered);
-                }
-            }
             for (auto &[label, ink] : slot.labelInk)
                 label->setColor(ink[hovered]);
             if (slot.friendBadge)
@@ -5412,8 +5320,8 @@ struct TranscriptView::Impl {
             }
             RoundedRectStyle denseStyle{};
             const bool bubble = slot.material->visible();
-            denseStyle.fill = row.mentionHighlight ? fill : denseBackground(entry, hovered);
-            const bool highlighted = hovered || row.mentionHighlight;
+            denseStyle.fill = denseBackground(entry, hovered);
+            const bool highlighted = hovered;
             const float contentWidth =
                 g.bubbles || entry.presence ? slot.material->width() : row.selectionWidth;
             const float padding = 3 * g.scale;
@@ -5429,11 +5337,8 @@ struct TranscriptView::Impl {
             const float highlightRadius = std::min(
                 {(slot.material->visible() ? themeBubbleRadius() * .75f : g.cornerRadius) + padding,
                  highlightWidth * .5f, highlightHeight * .5f});
-            slot.dense->setVisible(row.mentionHighlight
-                                       ? !bubble
-                                       : typedActivity(entry) ||
-                                             (!entry.presence &&
-                                              (g.dense() || entry.action || highlighted)));
+            slot.dense->setVisible(typedActivity(entry) ||
+                                   (!entry.presence && (g.dense() || entry.action || highlighted)));
             slot.dense->setPosition(highlighted ? highlightX : slot.material->x(),
                                     highlighted ? highlightY : slot.material->y());
             slot.dense->setSize(highlighted ? highlightWidth : contentWidth,
@@ -5444,10 +5349,7 @@ struct TranscriptView::Impl {
             slot.dense->setStyle(denseStyle);
             if (bubble)
                 slot.material->setMessage(
-                    row.mentionHighlight
-                        ? fill
-                        : themeSurfaceFill(themeMessageBackground(entry.own, false, hovered, false)),
-                    hovered);
+                    themeSurfaceFill(themeMessageBackground(entry.own, false, hovered)), hovered);
             slot.material->sync();
             float l, t, r, b;
             Node::transformedBounds(slot.material, l, t, r, b);
@@ -5609,17 +5511,15 @@ struct TranscriptView::Impl {
                 cache->scroll = scroll->scrollOffset();
                 cache->following = pane.following;
                 cache->unseen = pane.unseen;
-                for (auto &row : cache->rows) {
-                    row.entranceStarted = row.mentionStarted = -1;
-                }
+                for (auto &row : cache->rows)
+                    row.entranceStarted = -1;
             }
             active = pane.buffer;
             cache = &caches[active];
             cache->historyDemandActive = false;
             cache->historyDemandKeys.clear();
-            for (auto &row : cache->rows) {
-                row.entranceStarted = row.mentionStarted = -1;
-            }
+            for (auto &row : cache->rows)
+                row.entranceStarted = -1;
             pane.following = cache->following;
             pane.unseen = cache->unseen;
             switched = true;
@@ -6558,7 +6458,7 @@ struct TranscriptView::Impl {
                     c.header + c.heights.prefix(index) + arrival.gapHeight + arrival.bodyOffset;
                 if (arrival.hiddenActivity || top >= c.scroll + height ||
                     top + arrival.bodyHeight <= c.scroll) {
-                    arrival.entranceStarted = arrival.mentionStarted = -1;
+                    arrival.entranceStarted = -1;
                 }
             }
         c.arrivals.clear();

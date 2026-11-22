@@ -13,9 +13,7 @@ Color themeColor(std::string_view role);
 Color themeForegroundColor(std::string_view role);
 // Preserve a foreground when readable, otherwise repair to >=4.5:1 on an opaque background.
 Color themePairedForeground(Color background, Color authored);
-// Opaque mention surface; attenuate the accent to preserve nominal body/metadata contrast.
-Color themeMentionBackground(bool hovered = false);
-Color themeMessageBackground(bool own, bool presence, bool hovered, bool mention);
+Color themeMessageBackground(bool own, bool presence, bool hovered);
 Color themeNickColor(std::uint32_t hash);
 // Background alpha is opt-in and never applied to a control's text or children.
 float themeSurfaceAlpha();

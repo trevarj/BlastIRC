@@ -10,7 +10,7 @@ it proves discovery/LATEST, cached-chat/loading state, and automatic full select
 It also restarts a >200-content legacy presence-heavy cache with saved overlapping gaps,
 proving local paint while real history is held and click-free durable gap recovery.
 The jump-bottom scope proves the zero-arrival native FAB click and resumed following.
-The mention-highlight scope compares real grouped mention paint and live arrivals.
+The mention-highlight scope measures the static conversation accent across all layouts.
 """
 import argparse
 import json
@@ -1754,8 +1754,7 @@ def _policy_chat(ctx, *, fools=None, receive=None):
     return _policy_settings(ctx, 2, edits)
 
 
-def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=False,
-                    mention_style=None, mention_arrival=None):
+def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=False):
     edits = [
         (1, 'select', ('off', 'subtle', 'full').index(fx), 'appearance', 'fx'),
         (2, 'toggle', reduced, 'appearance', 'reduced_motion'),
@@ -1763,19 +1762,11 @@ def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=Fal
          'appearance', 'incoming_motion'),
         (6, 'select', ('none', 'fade').index(reveal), 'appearance', 'incoming_reveal'),
         (7, 'slider', (100, 10, 2000), 'appearance', 'incoming_duration_ms')]
-    if mention_style is not None:
-        edits.append((8, 'select', ('highlight', 'tint_only').index(mention_style),
-                      'appearance', 'mention_style'))
-    if mention_arrival is not None:
-        assert mention_style == 'highlight'
-        edits.append((9, 'toggle', mention_arrival, 'appearance', 'mention_arrival'))
     saved = _policy_settings(ctx, 3, edits)
     appearance = saved['appearance']
     assert all(appearance[k] == v for k, v in {
         'fx': fx, 'reduced_motion': reduced, 'incoming_motion': motion,
         'incoming_reveal': reveal, 'incoming_duration_ms': 2000}.items()), appearance
-    if mention_style is not None:
-        assert appearance['mention_style'] == mention_style, appearance
     return appearance
 
 
@@ -3308,151 +3299,207 @@ def run_incoming(ctx):
 
 
 def run_mention_highlight(ctx):
-    """Compare native body rasters on actual incoming messages in one conversation."""
+    """Observe a live mention, its read state, and its adjacent ordinary row."""
     w, p = ctx['window'], ctx['proc']
     prefs, db = ctx['preferences'], ctx['database_path']
-    _policy_focus(ctx, ctx['query_id'])
+    identity, channel = ctx['channel_id'], ctx['channel']
+    _policy_focus(ctx, identity)
     _policy_chat(ctx, fools=[], receive=False)
     gui.set_navigation(p, w, prefs, db, 'hidden', 'mention-highlight')
     gui.set_people(p, w, prefs, db, 'hidden')
-    gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'],
-                          ctx['query_id'], 'bubbles', label='mention-highlight-layout')
-    pane = gui.read_layout(prefs)['conversation']['rect']
-    geometry = gui.window_geometry(w)
+    _policy_appearance(ctx, wrap=80)
     destination = Path(ctx['destination'])
     evidence = {}
 
-    def configure(style='highlight', *, arrival=None, fx='full', reduced=False):
-        _policy_effects(ctx, mention_style=style, mention_arrival=arrival, fx=fx, reduced=reduced)
+    def parking():
         upload.focus_composer(w)
         gui.move_pointer(w, 0, 0)
 
-    def message(index, nick):
-        colors = [(31 + index, 111, 47), (173 + index, 53, 113), (71 + index, 95, 197)]
+    def layout(mode):
+        gui.set_message_style(p, w, prefs, db, ctx['args'], destination, identity, mode,
+                              label='mention-layout-' + mode)
+        parking()
 
-        def swatch(color, text):
-            token = '%02X%02X%02X' % color
+    layout('bubbles')
+    _policy_effects(ctx)
+    parking()
+    pane = gui.read_layout(prefs)
+    rectangle = pane['conversation']['rect']
+    metrics = gui.pane_metrics(pane, pane['scale'])
+    # This scope uses the native fixture's fixed 1x logical geometry.
+    left = round(metrics['x'] + metrics['left']) + 2
+    geometry = gui.window_geometry(w)
+    mention_colors = ((31, 111, 47), (173, 53, 113))
+    ordinary_colors = ((71, 95, 197), (187, 119, 51))
+
+    def body(colors, nick):
+        def anchor(rgb, text):
+            token = '%02X%02X%02X' % rgb
             return f'\x04{token},{token}{text}\x0f'
+        return (f'{anchor(colors[0], "START")} {nick}, can you check whether the quieter '
+                f'mention mark is easy to see on wrapped messages? {anchor(colors[1], "FINISH")} Thanks.')
 
-        a, b, c = (swatch(color, text) for color, text in zip(colors, ('ANCHOR', 'BOUND', 'ENDMARK')))
-        return colors, f'{a} {nick} {b} x{ctx["own_nick"]} {c} unrelated body readable'
+    def anchors(image, colors):
+        boxes = []
+        for rgb in colors:
+            items = gui.native_marker_components(image, rectangle, rgb)
+            if len(items) != 1 or not items[0]['full']:
+                return None
+            boxes.append(items[0]['bbox'])
+        return boxes
 
-    def marker(image, rgb):
-        items = gui.native_marker_components(image, pane, rgb)
-        return items[0]['bbox'] if len(items) == 1 and items[0]['full'] else None
-
-    def plate(image, box):
-        rgb_box = (box[2] + 3, box[1], box[2] + 45, box[3])
-        patch = Image.frombytes('RGB', (42, box[3] - box[1]), _policy_crop(image, rgb_box))
+    def plate(raster, box):
+        # The marker is followed by more body, so its right edge is inside
+        # the material even on the last line. Text sparsely covers this strip.
+        patch = raster.crop((box[2], box[1], box[2] + 18, box[3]))
         count, rgb = max(patch.getcolors(patch.width * patch.height))
-        assert count > patch.width * patch.height / 2, ('No dominant message backdrop', rgb_box, rgb)
+        assert count > patch.width * patch.height / 2, ('No ordinary body plate', box, rgb)
         return rgb
 
-    def save(label, image):
+    def rail(raster, first, last):
+        accent = raster.getpixel((left, first[1]))
+        gutter = raster.getpixel((left + 2, first[1]))
+        assert accent != gutter, ('No mention line at the transcript edge', first, accent)
+        if ctx['args'].palette is None:
+            assert max(abs(a - b) for a, b in zip(accent, (168, 199, 250))) <= 1, accent
+
+        def luminance(rgb):
+            linear = [v / 3294.6 if v <= 10 else ((v / 255 + .055) / 1.055) ** 2.4 for v in rgb]
+            return sum(v * weight for v, weight in zip(linear, (.2126, .7152, .0722)))
+
+        levels = sorted((luminance(accent), luminance(gutter)))
+        ratio = (levels[1] + .05) / (levels[0] + .05)
+        assert ratio >= 4.5, ('Insufficient rail contrast', accent, gutter, ratio)
+        top, bottom = first[1], first[1] + 1
+        while top > 0 and raster.getpixel((left, top - 1)) == accent:
+            top -= 1
+        while bottom < raster.height and raster.getpixel((left, bottom)) == accent:
+            bottom += 1
+        assert first[3] <= last[1] < last[3] <= bottom, ('Rail misses wrapped ink', first, last, top, bottom)
+        for y in range(top, bottom):
+            assert all(raster.getpixel((x, y)) == accent for x in (left, left + 1)), (
+                'Rail is not a solid two-pixel line', y)
+            assert raster.getpixel((left - 1, y)) == gutter, ('Rail extends left', y)
+            assert all(raster.getpixel((x, y)) == gutter for x in range(left + 2, left + 10)), (
+                'Rail lacks its eight-pixel gap before content', y)
+        return (left, top, left + 2, bottom), accent, gutter, ratio
+
+    def frame(*, paired=False, marked=True):
+        image = gui.native_rgb_capture(w, geometry=geometry)
+        mention = anchors(image, mention_colors)
+        ordinary = anchors(image, ordinary_colors) if paired else None
+        if not mention or (paired and not ordinary):
+            return None
+        raster = Image.frombytes('RGB', (image['width'], image['height']), image['pixels'])
+        first, last = mention
+        result = {'mention': mention, 'body_rgb': plate(raster, last)}
+        if marked:
+            box, accent, gutter, ratio = rail(raster, first, last)
+            result.update(line_box=box, line_rgb=accent, gutter_rgb=gutter, contrast=ratio,
+                          line_above_ink=first[1] - box[1], line_below_ink=box[3] - last[3])
+        else:
+            gutter = raster.getpixel((left + 2, first[1]))
+            assert all(raster.getpixel((x, y)) == gutter
+                       for y in range(first[1], last[3]) for x in (left, left + 1)), (
+                'A shown fool still has a mention mark', mention)
+        if paired:
+            a, b = ordinary
+            assert a[3] <= b[1], ('Ordinary reference must also wrap', ordinary)
+            assert first[0] == a[0], ('The marked and ordinary rows do not share a content lane',
+                                      mention, ordinary)
+            # The subpixel cap can occupy the first row after the opaque core.
+            assert box[3] < a[1] and all(
+                raster.getpixel((x, y)) == gutter
+                for y in range(box[3] + 1, b[3]) for x in (left, left + 1)), (
+                    'The mention rail leaks into the following ordinary row', box, ordinary)
+            assert plate(raster, b) == result['body_rgb'], (
+                'Mention still tints its body', mention, ordinary)
+            result['ordinary'] = ordinary
+        return result, raster
+
+    def signature(result):
+        return tuple(result[key] for key in
+                     ('line_rgb', 'body_rgb', 'line_above_ink', 'line_below_ink'))
+
+    def retained(label, *, paired=False, marked=True):
+        result, raster = gui.SESSION.until(
+            'real mention body and accent in ' + label, lambda: frame(paired=paired, marked=marked))
         path = destination.with_name(destination.stem + '-mention-' + label + '.png')
-        Image.frombytes('RGB', (image['width'], image['height']), image['pixels']).save(path)
-        return str(path)
+        raster.save(path)
+        evidence[label] = dict(result, capture=str(path))
+        return result
 
-    def observe(label, colors, action, *, animates):
-        # Sample before any SQLite or layout barrier consumes the short arrival window.
-        action()
-        started = time.monotonic()
-        samples = []
-        while time.monotonic() - started < .70:
-            image = gui.native_rgb_capture(w, geometry=geometry)
-            box = marker(image, colors[-1])
-            if box:
-                if not samples:
-                    first = image
-                samples.append((time.monotonic() - started, box, plate(image, box)))
-        assert len(samples) >= 3, ('Insufficient real rendered frames', label, samples)
-        assert len({box for _, box, _ in samples}) == 1, ('Mention moved body ink', label, samples)
-        fills = [rgb for _, _, rgb in samples]
-        settled = [rgb for stamp, _, rgb in samples if stamp - samples[0][0] >= .28]
-        assert len(settled) >= 2 and len(set(settled)) == 1, (
-            'Mention tint did not settle', label, samples)
-        assert (len(set(fills)) > 1) == animates, ('Unexpected mention arrival motion', label, samples)
-        evidence[label] = {'samples': samples, 'first': save(label + '-first', first),
-                           'last': save(label + '-last', image)}
+    # Break the observer's earlier author group, so the wrapped mention has
+    # a real header in bubbles and two-line. The observer's next row is ordinary.
+    guest = 'nativeharper'
+    with gui.fixtures.BootstrapClient(
+            dict(ctx['lab'].endpoints['direct'], nick=guest, username=guest),
+            ctx['lab'].ca_file, authenticate=False) as client:
+        client.send('JOIN ' + channel)
+        gui.receive_until(ctx['observer'], 'JOIN', [channel], guest, redact=ctx['lab']._redact)
+        intro = 'The conversation should stay easy to scan.'
+        client.send(f'PRIVMSG {channel} :{intro}')
+        ctx['expected_messages'].extend(ctx['channel_messages'](intro, guest))
         gui.wait_messages(p, db, ctx['expected_messages'])
-        return fills[-1]
 
-    def retained(label, colors):
-        for rgb in colors:
-            _policy_wait_box(ctx, rgb)
-        image = gui.native_rgb_capture(w)
-        anchors = tuple(marker(image, rgb) for rgb in colors)
-        assert all(anchors) and len({box[1] for box in anchors}) == 1, (
-            'Message markers are incomplete or wrapped', label, anchors)
-        a, b, c = anchors
-        top, bottom = a[1] - 4, a[3] + 6
-        regions = ((round(pane[0]) + 1, top, a[0] - 1, bottom),
-                   (a[2], top, b[0], bottom), (b[2], top, c[0], bottom),
-                   (c[2] + 1, top, c[2] + 45, bottom))
-        crops = tuple(_policy_crop(image, region) for region in regions)
-        evidence[label] = {'capture': save(label, image), 'anchors': anchors, 'regions': regions,
-                           'background': plate(image, c)}
-        return anchors, crops
+        text = body(mention_colors, ctx['own_nick'].swapcase())
+        _policy_send(ctx, text, target=channel, durable=False)
+        started, samples = time.monotonic(), []
+        while time.monotonic() - started < .70:
+            captured = frame()
+            if captured:
+                samples.append(signature(captured[0]))
+        assert len(samples) >= 3 and len(set(samples)) == 1, (
+            'Mention pixels changed after first visible arrival with incoming motion disabled', samples)
+        gui.wait_messages(p, db, ctx['expected_messages'])
+        read = gui.wait_read_marker(p, db, identity)
+        assert read[3] == text, ('The settled mention must already be read', read)
+        evidence['live'] = {'frames': len(samples), 'signature': samples[0], 'read_marker': read}
+        ordinary = body(ordinary_colors, 'Harper')
+        _policy_send(ctx, ordinary, target=channel)
+        assert gui.wait_read_marker(p, db, identity)[3] == ordinary
+        bubbles = retained('bubbles', paired=True)
+        assert signature(bubbles) == samples[0] and bubbles['line_above_ink'] >= 14, bubbles
 
-    migrated = gui.save_preferences(p, prefs, w)['appearance']
-    assert (migrated['mention_style'], migrated['mention_arrival']) == ('tint_only', False), migrated
-    configure(arrival=True)
-    ordinary, text = message(0, 'ordinary')
-    _policy_send(ctx, text)
-    retained('ordinary', ordinary)
-    colors, text = message(1, ctx['own_nick'].swapcase())
-    fill = observe('arrival-enabled', colors, lambda: _policy_send(ctx, text, durable=False), animates=True)
-    anchors, highlight = retained('highlight', colors)
-    assert fill == evidence['highlight']['background'] != evidence['ordinary']['background'], (
-        'Mention lost its settled tint against an ordinary body', evidence)
-    b, c = anchors[1:]
-    ink = _native_word_ink(ctx, (b[2] + 2, b[1], c[0] - 2, b[3]), padding=0)
-    assert ink['contrast'] >= 4.5, ('Tint makes ordinary message ink unreadable', ink)
-    evidence['highlight']['body_ink'] = ink
+        _policy_focus(ctx, ctx['other_channel_id'])
+        _policy_focus(ctx, identity)
+        parking()
+        assert signature(retained('bubbles-revisited', paired=True)) == signature(bubbles)
+        _policy_effects(ctx, reduced=True)
+        parking()
+        assert signature(retained('bubbles-reduced-motion', paired=True)) == signature(bubbles)
+        _policy_effects(ctx, fx='off')
+        parking()
+        assert signature(retained('bubbles-effects-off', paired=True)) == signature(bubbles)
 
-    configure('tint_only')
-    tint_anchors, tint = retained('tint-only', colors)
-    assert tint_anchors == anchors and tint[2:] == highlight[2:], (
-        'Mention style reflowed text, changed its tint, or decorated the non-token')
-    assert highlight[0] != tint[0] and highlight[1] != tint[1], (
-        'Highlight must add a visible leading @ and exact-nickname decoration')
-    left, top, right, bottom = evidence['highlight']['regions'][1]
-    size = (right - left, bottom - top)
-    underline = ImageChops.difference(Image.frombytes('RGB', size, highlight[1]),
-                                     Image.frombytes('RGB', size, tint[1])).getbbox()
-    evidence['highlight']['nickname_ink_delta'] = underline
-    assert underline[2] - underline[0] >= size[0] / 2 and underline[3] - underline[1] <= 5, (
-        'Exact nickname changed beyond its underline', underline)
-    assert evidence['tint-only']['background'] == fill
+        layout('irc')
+        adaptive = retained('traditional-adaptive-effects-off', paired=True)
+        layout('stacked')
+        stacked = retained('traditional-two-line-effects-off', paired=True)
+        assert adaptive['mention'][0][0] > stacked['mention'][0][0] + 30, (adaptive, stacked)
+        assert stacked['line_above_ink'] >= adaptive['line_above_ink'] + 8, (adaptive, stacked)
 
-    configure(fx='off')
-    assert retained('fx-off', colors) == (anchors, tint), 'Effects Off must fall back to Tint only'
-    configure(reduced=True)
-    assert retained('reduced-motion', colors) == (anchors, highlight), (
-        'Reduced motion must keep the static @ and nickname underline')
-    configure()
-    _policy_focus(ctx, ctx['channel_id'])
-    revisit_fill = observe('focus-revisit', colors, lambda: gui.switch_buffer(ctx['query_target']),
-                           animates=False)
-    assert revisit_fill == fill and retained('revisited-highlight', colors)[1] == highlight
+        _policy_chat(ctx, fools=[ctx['query_target']])
+        gui.command('show-fools', window=w)
+        gui.save_state(p, prefs, db)
+        parking()
+        retained('shown-fool', marked=False)
 
-    configure(arrival=False)
-    assert retained('arrival-disabled-retained', colors) == (anchors, highlight), (
-        'Arrival toggle must not remove the retained @ or underline')
-    disabled, text = message(2, ctx['own_nick'])
-    assert observe('arrival-disabled', disabled, lambda: _policy_send(ctx, text, durable=False),
-                   animates=False) == fill
-    configure(reduced=True, arrival=True)
-    reduced, text = message(3, ctx['own_nick'])
-    assert observe('reduced-motion-arrival', reduced, lambda: _policy_send(ctx, text, durable=False),
-                   animates=False) == fill
-
-    _policy_chat(ctx, fools=[ctx['query_target']])
-    gui.command('show-fools', window=w)
-    gui.save_state(p, prefs, db)
-    retained('shown-fool', colors)
-    assert evidence['shown-fool']['background'] == evidence['ordinary']['background'], (
-        'A shown fool acquired the eligible mention tint', evidence['shown-fool'])
+    # Keep the comparison captures free of raster test swatches.
+    _policy_chat(ctx, fools=[])
+    query = ctx['query_id']
+    _policy_send(ctx, f'{ctx["own_nick"]}, could you move the desk lamp a little? '
+                      'The reflection in the window makes it hard to read from across the room.')
+    _policy_focus(ctx, query)
+    ordinary = 'There should still be plenty of daylight by the window.'
+    _policy_send(ctx, ordinary)
+    assert gui.wait_read_marker(p, db, query)[3] == ordinary
+    evidence['showcase'] = {}
+    for mode, label in (('bubbles', 'bubbles'), ('irc', 'traditional-adaptive'),
+                        ('stacked', 'traditional-two-line')):
+        label = 'mention-showcase-' + label
+        gui.set_message_style(p, w, prefs, db, ctx['args'], destination, query, mode, label=label)
+        evidence['showcase'][mode] = str(destination.with_name(destination.stem + '-' + label + '.png'))
     return _refresh_return(ctx, 'mention-highlight', evidence)
 
 

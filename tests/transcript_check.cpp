@@ -774,7 +774,7 @@ void presenceGeometry(TranscriptTestRenderer &renderer, const Body &b) {
         if (const auto *rect = dynamic_cast<RectNode *>(child.get()))
             assert(!rect->visible() || rect->style().fill.a == 0);
 }
-void rail(const Body &b, std::string_view role) {
+void rail(const Body &b, bool expected = false) {
     int count = 0;
     const auto *surface = find<blast::MaterialNode>(b.content);
     assert(surface);
@@ -784,13 +784,15 @@ void rail(const Body &b, std::string_view role) {
             rect->width() >= b.text.fontSize() || rect->height() <= rect->width())
             continue;
         ++count;
-        assert(!role.empty());
-        assert(rect->style().fill == blast::themeForegroundColor(role));
-        near(rect->x(), surface->x());
+        assert(expected && !rect->hitTestVisible());
+        assert(rect->style().fill ==
+               blast::themePairedForeground(blast::themeConversationBackdrop(),
+                                            blast::themeForegroundColor("primary")));
+        assert(surface->x() - rect->x() - rect->width() >= 8 * blast::themeScale());
         near(rect->y(), surface->y());
         near(rect->height(), surface->height());
     }
-    assert(count == (role.empty() ? 0 : 1));
+    assert(count == (expected ? 1 : 0));
 }
 
 struct BodyBounds {
@@ -975,14 +977,14 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 assert(padding > 0);
                 near(chipBounds.width, nick->maxWidth() + 2 * padding);
                 assert(!plainText(rendered.content, "YOU") && !plainText(rendered.content, "Sent"));
-                rail(rendered, {});
+                rail(rendered);
             }
             if (stacked)
                 assert(hy + hit->height() <= bounds(rendered).top + .02f);
             else
                 near(baseline(*nick), baseline(rendered.text));
         }
-        rail(body(view, "DecorationBody2", true), {});
+        rail(body(view, "DecorationBody2", true), true);
     };
     for (const char *style : {"monogram", "sprite"}) {
         model.settings.avatarStyle = style;
@@ -6584,9 +6586,9 @@ void check(TranscriptTestRenderer &renderer, float zoom, bool traditional) {
     assert(own.row.parent() == mention.row.parent());
     near(mention.row.y() - own.row.y(), own.row.height());
     near(conversation.row.y() - mention.row.y(), mention.row.height());
-    rail(own, {});
-    rail(mention, {});
-    rail(conversation, {});
+    rail(own);
+    rail(mention);
+    rail(conversation);
     assert(!plainText(own.content, "Me") && !plainText(mention.content, "Me"));
     InputDispatcher dispatcher;
     dispatcher.setSceneRoot(&view);
@@ -7065,11 +7067,7 @@ void visitSeparator(TranscriptTestRenderer &renderer) {
     assert(plainText(body(emptyView, "NewlyMutedUnread").row, "New since your last visit"));
 }
 
-void persistentMentionStyles(TranscriptTestRenderer &renderer) {
-    const auto contrast = [](Color a, Color b) {
-        const float x = relativeLuminance(a) + .05f, y = relativeLuminance(b) + .05f;
-        return std::max(x, y) / std::min(x, y);
-    };
+void persistentMentions(TranscriptTestRenderer &renderer) {
     for (const auto &[layout, width, zoom] :
          {std::tuple{blast::MessageLayout::Bubbles, 900.f, 1.f},
           std::tuple{blast::MessageLayout::Bubbles, 320.f, 1.5f},
@@ -7083,9 +7081,7 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
         model.settings.opacity = .63f;
         model.settings.incomingMotion = blast::SendMotion::None;
         model.settings.incomingReveal = blast::SendReveal::None;
-        model.settings.mentionStyle = blast::MentionStyle::Highlight;
-        model.settings.mentionArrival = true;
-        model.settings.fx = blast::FxLevel::Full;
+        model.settings.fx = blast::FxLevel::Off;
         blast::Theme theme;
         theme.update(model);
         auto &buffer = model.buffers["mention-style"];
@@ -7102,10 +7098,9 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
         adjacent.history = true;
         auto message = adjacent;
         message.id = "history";
-        message.text = "Mentioned Old\x02Me\x02 OldMeToo https://example.org/OldMe "
+        message.text = "Mentioned OldMe oldme \x1dOldMeToo\x1d https://example.org/OldMe "
                        "\x03"
-                       "04,02\x1f"
-                       "ColoredBody😀\x1f\x0f";
+                       "04\x1dOLDME\x0f\nMore text on the next line";
         message.mention = true;
         message.mentionNick = "OldMe";
         buffer.messages = {adjacent, message};
@@ -7123,98 +7118,65 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
             view.sync();
             view.arrange(renderer, viewport);
         };
-        const auto fill = [&](const Body &rendered) {
-            const auto *material = find<blast::MaterialNode>(rendered.content);
+        const auto surface = [](const Body &rendered) -> blast::MaterialNode & {
+            auto *material = find<blast::MaterialNode>(rendered.content);
             assert(material);
-            if (material->visible())
-                return renderer.materialFill(*material);
-            for (const auto &child : rendered.content.children())
-                if (const auto *rect = dynamic_cast<RectNode *>(child.get());
-                    rect && rect->visible() && rect->zIndex() < 0)
-                    return rect->style().fill;
+            return *material;
+        };
+        const auto ink = [](const Body &rendered, std::string_view word) -> TextNode & {
+            for (const auto &child : rendered.body.children())
+                if (dynamic_cast<InputArea *>(child.get()))
+                    if (auto *text = find<TextNode>(*child);
+                        text && decodedMarkup(text->text()) == word)
+                        return *text;
+            std::fprintf(stderr, "Missing exact mention fragment '%.*s'\n", int(word.size()),
+                         word.data());
             std::abort();
         };
-        const auto marker = [](const Body &rendered) -> TextNode * {
-            auto *at = plainText(rendered.content, "@");
-            return at && at->visible() ? at : nullptr;
-        };
-        const auto underline = [&](const Body &rendered) {
-            std::vector<std::string> decorated;
-            for (const auto &area : rendered.body.children()) {
-                if (!dynamic_cast<InputArea *>(area.get()))
-                    continue;
-                const auto *glyph = find<TextNode>(*area);
-                assert(glyph);
-                std::vector<LayoutRect> strokes;
-                for (const auto &child : area->children())
-                    if (child->visible())
-                        for (const auto &paint : child->children())
-                            if (const auto *rect = dynamic_cast<RectNode *>(paint.get());
-                                rect && rect->visible() && rect->style().fill.a > 0) {
-                                assert(!rect->hitTestVisible() && rect->style().borderWidth == 0);
-                                strokes.push_back(sceneBounds(*rect));
-                            }
-                if (strokes.empty())
-                    continue;
-                assert(strokes.size() == 2);
-                const auto ink = nativeTextInk(renderer, *glyph);
-                assert(strokes[0].y >= ink.y + ink.height);
-                assert(strokes[1].y > strokes[0].y + strokes[0].height);
-                near(strokes[0].width, strokes[1].width);
-                near(strokes[0].height, strokes[1].height);
-                containedBounds(strokes[0], sceneBounds(*area));
-                containedBounds(strokes[1], sceneBounds(*area));
-                decorated.push_back(decodedMarkup(glyph->text()));
-            }
-            return decorated;
-        };
-        const auto sameBounds = [](LayoutRect a, LayoutRect b) {
-            near(a.x, b.x);
-            near(a.y, b.y);
-            near(a.width, b.width);
-            near(a.height, b.height);
+        const auto marker = [&](const Body &rendered) -> const RectNode * {
+            for (const auto &child : rendered.content.children())
+                if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+                    rect && rect->visible() && rect->width() == 2 * zoom &&
+                    rect->x() < surface(rendered).x())
+                    return rect;
+            return nullptr;
         };
         arrange();
         const auto history = [&] { return body(view, "Mentioned"); };
-        const auto steady = fill(history());
-        assert(steady != fill(body(view, "Adjacent")));
-        const auto checkInk = [&](Color painted, const Body &rendered) {
-            const auto backdrop =
-                lerpColor(blast::themeConversationBackdrop(), painted, painted.a);
-            assert(contrast(backdrop, rendered.text.color()) >= 4.49f);
-            assert(contrast(backdrop, blast::themeForegroundColor("on_surface_variant")) >=
-                   4.49f);
+        const auto adjacentRow = [&] { return body(view, "Adjacent"); };
+        const auto contrastSafeAccent = [&](Color backdrop) {
+            return blast::themePairedForeground(backdrop, blast::themeForegroundColor("primary"));
         };
-        checkInk(steady, history());
-        auto *at = marker(history());
-        assert(at && !at->hitTestVisible());
-        const auto mark = nativeTextInk(renderer, *at);
-        containedBounds(mark, sceneBounds(history().row));
-        containedBounds(mark, nativeHistoryClip(view));
-        assert(mark.x + mark.width <= sceneBounds(history().body).x);
-        assert((underline(history()) == std::vector<std::string>{"Old", "Me"}));
-        assert(!marker(body(view, "Adjacent")) && underline(body(view, "Adjacent")).empty());
-        const auto historyRow = sceneBounds(history().row);
-        const auto historyBody = sceneBounds(history().body);
-        const auto historyText = nativeTextInk(renderer, history().text);
-        model.now += 1;
-        arrange();
-        assert(fill(history()) == steady);
-        model.settings.mentionStyle = blast::MentionStyle::TintOnly;
-        arrange();
-        assert(fill(history()) == steady && !marker(history()) && underline(history()).empty());
-        sameBounds(sceneBounds(history().row), historyRow);
-        sameBounds(sceneBounds(history().body), historyBody);
-        sameBounds(nativeTextInk(renderer, history().text), historyText);
-        model.settings.mentionStyle = blast::MentionStyle::Highlight;
-        model.settings.fx = blast::FxLevel::Off;
-        arrange();
-        assert(fill(history()) == steady && !marker(history()) && underline(history()).empty());
-        model.settings.fx = blast::FxLevel::Full;
-        model.settings.reducedMotion = true;
-        arrange();
-        assert(fill(history()) == steady && marker(history()) && underline(history()).size() == 2);
-        model.settings.reducedMotion = false;
+        const auto *line = marker(history());
+        assert(line && !line->hitTestVisible() && !marker(adjacentRow()));
+        const auto mark = sceneBounds(*line);
+        const auto frame = sceneBounds(surface(history()));
+        near(mark.y, frame.y);
+        near(mark.height, frame.height);
+        assert(frame.x - (mark.x + mark.width) >= 8 * zoom);
+        assert(mark.height > 2 * nativeTextInk(renderer, history().text).height);
+        assert(line->style().fill == contrastSafeAccent(blast::themeConversationBackdrop()));
+        const auto backdrop = blast::themeConversationBackdrop();
+        auto bodyBackdrop = backdrop;
+        if (layout == blast::MessageLayout::Bubbles) {
+            const auto fill = renderer.materialFill(surface(history()));
+            assert(fill == renderer.materialFill(surface(adjacentRow())));
+            bodyBackdrop = lerpColor(backdrop, fill, fill.a);
+        }
+        for (const auto word : {"OldMe", "oldme"}) {
+            const auto &text = ink(history(), word);
+            assert(text.fontWeight() == FontWeight::SemiBold);
+            assert(text.color() == contrastSafeAccent(bodyBackdrop));
+        }
+        const auto &explicitColor = ink(history(), "OLDME");
+        assert(explicitColor.fontWeight() == FontWeight::SemiBold);
+        assert(explicitColor.color() == rgbHex(blast::ircPalette[4]));
+        assert(explicitColor.text().find("italic") != std::string::npos);
+        assert(ink(history(), "OldMeToo").fontWeight() == blast::themeMessageFont().weight);
+        if (width == 900)
+            assert(ink(history(), "https://example.org/OldMe").fontWeight() ==
+                   blast::themeMessageFont().weight);
+        assert(!plainText(history().content, "@"));
         unchanged(buffer, before);
 
         if (width == 900) {
@@ -7224,76 +7186,21 @@ void persistentMentionStyles(TranscriptTestRenderer &renderer) {
             arrange();
             assert(view.copySelection());
             assert(clipboard.clipboardText() ==
-                   "Mentioned OldMe OldMeToo https://example.org/OldMe ColoredBody😀");
-            assert(marker(history()) && underline(history()).empty());
+                   "Mentioned OldMe oldme OldMeToo https://example.org/OldMe OLDME");
+            assert(marker(history()));
             view.clearTextSelection();
             dispatcher.setFocus(nullptr);
         }
         buffer.messages.back().mentionNick.clear();
         ++buffer.messagesRevision;
         arrange();
-        assert(fill(history()) == steady && marker(history()) && underline(history()).empty());
+        assert(marker(history()));
+        assert(ink(history(), "OldMe").fontWeight() == blast::themeMessageFont().weight);
         buffer.messages.back().mention = false;
         ++buffer.messagesRevision;
         arrange();
-        assert(!marker(history()) && fill(history()) != steady);
-        sameBounds(sceneBounds(history().row), historyRow);
-        sameBounds(sceneBounds(history().body), historyBody);
-        view.scrollToBoundary(true);
-        arrange();
-
-        const auto append = [&](std::string token, double arrival) {
-            auto live = message;
-            live.id = token;
-            live.text = token + " OldMe";
-            live.history = false;
-            live.arrival = arrival;
-            buffer.messages.push_back(std::move(live));
-            arrange();
-        };
-        append("LiveMention", model.now);
-        const auto live = [&] { return body(view, "LiveMention"); };
-        const auto peak = fill(live());
-        assert(peak != steady);
-        checkInk(peak, live());
-        const auto liveRow = sceneBounds(live().row);
-        const auto liveText = nativeTextInk(renderer, live().text);
-        assert(marker(live()));
-        const auto atPeak = nativeTextInk(renderer, *marker(live()));
-        model.now += .11;
-        arrange();
-        assert(fill(live()) != peak && fill(live()) != steady);
-        sameBounds(nativeTextInk(renderer, *marker(live())), atPeak);
-        sameBounds(sceneBounds(live().row), liveRow);
-        sameBounds(nativeTextInk(renderer, live().text), liveText);
-        model.now += .111;
-        arrange();
-        assert(fill(live()) == steady);
-
-        append("StaleMention", model.now - 1);
-        assert(fill(body(view, "StaleMention")) == steady);
-        view.setWindowActive(false);
-        append("InactiveMention", model.now);
-        view.setWindowActive(true);
-        arrange();
-        assert(fill(body(view, "InactiveMention")) == steady);
-        model.settings.mentionArrival = false;
-        append("UnanimatedMention", model.now);
-        assert(fill(body(view, "UnanimatedMention")) == steady);
-        model.settings.mentionArrival = true;
-        append("RecycledMention", model.now);
-        assert(fill(body(view, "RecycledMention")) != steady);
-        for (int i = 0; i < 80; ++i) {
-            auto filler = adjacent;
-            filler.id = filler.text = "UnrelatedRow" + std::to_string(i);
-            buffer.messages.push_back(std::move(filler));
-        }
-        arrange();
-        assert(!bodyText(view, "RecycledMention"));
-        view.scrollToBoundary(false);
-        arrange();
-        assert(fill(body(view, "LiveMention")) == steady);
-        assert(fill(body(view, "RecycledMention")) == steady);
+        assert(!marker(history()));
+        near(sceneBounds(surface(history())).x, frame.x);
         dispatcher.setSceneRoot(nullptr);
     }
 }
@@ -8575,6 +8482,7 @@ void sourceMentionConsumers(TranscriptTestRenderer &renderer) {
     assert(!plainText(view, source.server + " / " + source.target));
     const auto rendered = body(view, "SourcePrivate");
     assert(!bubbleSurface(rendered)); // Dense aggregate rows have no forced mention fill.
+    rail(rendered);
     for (const auto &child : rendered.content.children())
         if (const auto *rect = dynamic_cast<RectNode *>(child.get()); rect && rect->visible())
             assert(rect->style().fill != blast::themeForegroundColor("tertiary"));
@@ -11076,7 +10984,7 @@ void runTranscriptCheck() {
     inkCenteredMarkupShadows(renderer);
     visitSeparator(renderer);
     messageEntranceLifecycle(renderer);
-    persistentMentionStyles(renderer);
+    persistentMentions(renderer);
     independentSendEffects(renderer);
     cappedTranscriptBodies(renderer);
     typingFooterGeometry(renderer);

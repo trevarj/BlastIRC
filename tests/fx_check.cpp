@@ -62,9 +62,6 @@ class EffectsTestAccess {
             model.settings.fx = level;
             checkMention(true);
         }
-        model.settings.mentionStyle = MentionStyle::TintOnly;
-        model.settings.mentionArrival = false;
-        checkMention(true);
         mention.history = true;
         checkMention(false);
         mention.history = false;

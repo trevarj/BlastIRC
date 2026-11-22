@@ -1704,20 +1704,9 @@ void runSettingsCheck() {
     }
     incomingDuration->setValue(900);
     assert(model.settings.incomingDurationMs == 900);
-    auto *mention = named<Select>(dialogs, "Mention highlight");
-    auto *arrival = named<Toggle>(dialogs, "Emphasize on arrival");
-    assert(mention && arrival && mention->selectedText() == "Highlight" && arrival->enabled() &&
-           model.settings.mentionStyle == MentionStyle::Highlight && model.settings.mentionArrival);
-    mention->setSelectedIndex(1);
-    assert(mention->selectedText() == "Tint only" &&
-           model.settings.mentionStyle == MentionStyle::TintOnly && model.settings.mentionArrival &&
-           !arrival->enabled() && !dispatcher.firstTabFocusUnder(arrival));
-    mention->setSelectedIndex(0);
-    assert(model.settings.mentionStyle == MentionStyle::Highlight && arrival->enabled());
-    activate(dispatcher, *arrival);
-    assert(!model.settings.mentionArrival);
     assert(!find<Label>(dialogs, [](const Label &label) {
-        return label.text() == "Mention effect" || label.text() == "Mention strength (0–100%)" ||
+        return label.text() == "Mention highlight" || label.text() == "Emphasize on arrival" ||
+               label.text() == "Mention effect" || label.text() == "Mention strength (0–100%)" ||
                label.text() == "Mention speed (25–200%)" || label.text() == "Breathing outline" ||
                label.text() == "Traveling underline glint";
     }));
@@ -1730,7 +1719,6 @@ void runSettingsCheck() {
     named<Slider>(dialogs, "Overlay shake")->setValue(.5);
     sync();
     assert(model.settings.fx == FxLevel::Off && model.settings.reducedMotion);
-    assert(model.settings.mentionStyle == MentionStyle::Highlight && !model.settings.mentionArrival);
     assert(model.settings.sendMotion == SendMotion::Slide &&
            model.settings.sendReveal == SendReveal::Fade &&
            model.settings.incomingMotion == SendMotion::Slide &&
@@ -1869,8 +1857,6 @@ void runSettingsCheck() {
     assert(loaded.settings.incomingMotion == model.settings.incomingMotion &&
            loaded.settings.incomingReveal == model.settings.incomingReveal &&
            loaded.settings.incomingDurationMs == model.settings.incomingDurationMs &&
-           loaded.settings.mentionStyle == model.settings.mentionStyle &&
-           loaded.settings.mentionArrival == model.settings.mentionArrival &&
            loaded.settings.foolDisplay == model.settings.foolDisplay &&
            loaded.settings.foolUnread == model.settings.foolUnread &&
            loaded.settings.messageWrapColumns == model.settings.messageWrapColumns);

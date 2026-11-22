@@ -2011,23 +2011,8 @@ struct Dialogs::Impl {
                2000, 10, [this](float value) { model.settings.incomingDurationMs = value; });
         label(*incoming, "Pop zooms into place without bouncing. Fade is optional and can "
                          "be used with or without movement.");
-        const bool highlight = model.settings.mentionStyle == MentionStyle::Highlight;
-        auto *mention = select(*incoming, "Mention highlight", {"Highlight", "Tint only"},
-                               highlight ? "Highlight" : "Tint only", {});
-        auto *arrival =
-            toggle(*incoming, "Emphasize on arrival", model.settings.mentionArrival,
-                   [this](bool value) { model.settings.mentionArrival = value; });
-        arrival->setEnabled(highlight);
-        mention->setOnSelectionChanged([this, arrival](std::size_t index, std::string_view) {
-            const bool enabled = index == 0;
-            model.settings.mentionStyle = enabled ? MentionStyle::Highlight : MentionStyle::TintOnly;
-            arrival->setEnabled(enabled);
-        });
         label(*incoming, "Incoming movement and reveal apply only to new live messages, never "
                          "restored history or fools.");
-        label(*incoming, "Highlight adds an @ and underlines your matched nickname. "
-                         "Tint only keeps the soft tint. Effects Off uses tint only; "
-                         "Reduced motion skips the arrival emphasis.");
         auto *physics = section("effects.physics", "Physics");
         auto *gravity = slider(*physics, "Gravity", model.settings.gravity, -200, 500, 1,
                                [this](float value) { model.settings.gravity = value; });

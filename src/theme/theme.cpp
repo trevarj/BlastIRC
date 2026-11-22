@@ -199,57 +199,7 @@ Color themeForegroundColor(std::string_view role) { return withAlpha(themeColor(
 Color themePairedForeground(Color background, Color authored) {
     return pairedForeground(background, authored);
 }
-Color themeMentionBackground(bool hovered) {
-    static std::uint64_t cachedRevision = ~std::uint64_t{0};
-    static Color backgrounds[2];
-    if (cachedRevision != themeRevision()) {
-        const auto base = withAlpha(themeColor("surface_container_high"), 1);
-        const auto accent = withAlpha(themeColor("tertiary_container"), 1);
-        const auto conversation = themeConversationBackdrop();
-        const auto composite = [conversation](Color fill) {
-            return lerpColor(conversation, fill, themeSurfaceAlpha());
-        };
-        const auto backdrop = composite(base);
-        const auto body = pairedForeground(backdrop, themeForegroundColor("on_surface"));
-        const auto metadata =
-            pairedForeground(backdrop, themeForegroundColor("on_surface_variant"));
-        const auto readable = [&](Color candidate, Color ink) {
-            // Bound every intermediate tint, not just the two endpoints.
-            const float luminance = relativeLuminance(ink);
-            const bool light = luminance > relativeLuminance(backdrop);
-            const auto edge = [light](float a, float b) {
-                return light ? std::max(a, b) : std::min(a, b);
-            };
-            const Color worst = {edge(backdrop.r, candidate.r), edge(backdrop.g, candidate.g),
-                                 edge(backdrop.b, candidate.b), 1};
-            const float limit = relativeLuminance(worst) + .05f;
-            return light ? luminance + .05f >= 4.5f * limit
-                         : limit >= 4.5f * (luminance + .05f);
-        };
-        for (int state = 0; state < 2; ++state) {
-            float low = 0, high = state ? .575f : .5f;
-            backgrounds[state] = base;
-            // Keep the strongest readable tint over the actual conversation surface.
-            for (int step = 0; step < 16; ++step) {
-                const float amount = step ? (low + high) * .5f : high;
-                const auto candidate = lerpColor(base, accent, amount);
-                const auto painted = composite(candidate);
-                if (readable(painted, body) && readable(painted, metadata)) {
-                    backgrounds[state] = candidate;
-                    low = amount;
-                    if (step == 0)
-                        break;
-                } else
-                    high = amount;
-            }
-        }
-        cachedRevision = themeRevision();
-    }
-    return backgrounds[hovered ? 1 : 0];
-}
-Color themeMessageBackground(bool own, bool presence, bool hovered, bool mention) {
-    if (mention)
-        return themeMentionBackground(hovered);
+Color themeMessageBackground(bool own, bool presence, bool hovered) {
     const auto fill = themeForegroundColor(presence ? "surface_container_low"
                                            : own    ? "primary_container"
                                                     : "surface_container_high");

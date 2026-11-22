@@ -98,6 +98,7 @@ inline const auto &bindingCommands() {
             {"message-style:irc", {"Use traditional IRC rows", "", Other}},
             {"message-style:bubbles", {"Use message bubbles", "", Other}},
             {"message-style:stacked", {"Use stacked IRC rows", "", Other}},
+            {"message-style:default", {"Use global message layout", "", Other}},
             {"presence:global", {"Use global presence mode", "", Other}},
             {"presence:all", {"Show all presence events", "", Other}},
             {"presence:smart", {"Use smart presence filtering", "", Other}},

@@ -97,6 +97,7 @@ struct Settings {
     map<string, Cue> cues;
     map<string, string> bindings, nickColors, workspace;
     set<string> friends, fools;
+    MessageLayout defaultMessageLayout = MessageLayout::Bubbles;
     map<string, MessageLayout> messageLayouts;
     vector<string> pinnedBuffers; // Full buffer IDs, newest pin first.
     map<string, PresenceMode> channelPresence;

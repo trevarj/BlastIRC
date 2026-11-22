@@ -4522,9 +4522,11 @@ void queuedPaneCommandCheck(bool rename) {
                            std::pair{"Traditional IRC", Intent::Style},
                            std::pair{"Traditional · two-line", Intent::Style},
                            std::pair{"Message bubbles", Intent::Style},
+                           std::pair{"Use global default", Intent::Style},
                            std::pair{"Hidden", Intent::Presence},
                            std::pair{"Close buffer", Intent::Close}};
     auto model = edgeModel();
+    model.settings.defaultMessageLayout = MessageLayout::Stacked;
     Clipboard clipboard;
     Theme theme;
     theme.update(model);
@@ -4560,15 +4562,15 @@ void queuedPaneCommandCheck(bool rename) {
         const auto display = std::find_if(
             menu.request.menu.begin(), menu.request.menu.end(),
             [](const ContextMenuEntry &entry) { return entry.label == "Message display"; });
-        assert(display != menu.request.menu.end() && display->children.size() == 3);
+        assert(display != menu.request.menu.end() && display->children.size() == 4);
         const auto selected = model.settings.messageLayouts.find(origin);
-        const auto layout = selected == model.settings.messageLayouts.end() ? MessageLayout::Bubbles
-                                                                            : selected->second;
         const std::array expected{MessageLayout::Bubbles, MessageLayout::Irc,
                                   MessageLayout::Stacked};
+        const auto override = selected != model.settings.messageLayouts.end();
         for (std::size_t i = 0; i < expected.size(); ++i)
-            assert(display->children[i].radio &&
-                   display->children[i].toggleState == (layout == expected[i] ? 1 : 0));
+            assert(display->children[i].radio && display->children[i].toggleState ==
+                                                     (override && selected->second == expected[i]));
+        assert(display->children.back().radio && display->children.back().toggleState == !override);
         const auto firstAction = model.actions.size();
         menu.select(label);
         if (rename && intent == Intent::History) {
@@ -4594,12 +4596,15 @@ void queuedPaneCommandCheck(bool rename) {
             targeted("read");
             break;
         case Intent::Style:
-            if (std::string_view(label) == "Message bubbles")
+            if (std::string_view(label) == "Use global default")
                 assert(!model.settings.messageLayouts.contains(origin));
-            else
-                assert(model.settings.messageLayouts.at(origin) ==
-                       (std::string_view(label) == "Traditional IRC" ? MessageLayout::Irc
-                                                                     : MessageLayout::Stacked));
+            else {
+                const auto expectedLayout =
+                    std::string_view(label) == "Traditional IRC"          ? MessageLayout::Irc
+                    : std::string_view(label) == "Traditional · two-line" ? MessageLayout::Stacked
+                                                                          : MessageLayout::Bubbles;
+                assert(model.settings.messageLayouts.at(origin) == expectedLayout);
+            }
             assert(!model.settings.messageLayouts.contains(edgeBuffers[1]));
             break;
         case Intent::Presence:

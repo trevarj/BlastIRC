@@ -3298,20 +3298,24 @@ void Ui::Impl::paneMenu(std::uint64_t id, Node &anchor, bool includeHiddenTools,
                 menuLeaf(commands, buffer.archived ? "Unarchive" : "Archive",
                          buffer.archived ? "archive-off" : "archive",
                          prefix + (buffer.archived ? "unarchive-buffer" : "archive-buffer")));
-            const auto layout = messageLayout(model.settings, buffer);
+            const auto &layouts = model.settings.messageLayouts;
+            const auto selected = layouts.find(buffer.id);
             ContextMenuEntry display{};
             display.label = "Message display";
             display.icon = "layout-list";
-            display.children.reserve(3);
-            display.children.push_back(menuRadio(commands, "Message bubbles", "messages",
-                                                 prefix + "message-style:bubbles",
-                                                 layout == MessageLayout::Bubbles));
-            display.children.push_back(menuRadio(commands, "Traditional IRC", "list",
-                                                 prefix + "message-style:irc",
-                                                 layout == MessageLayout::Irc));
-            display.children.push_back(menuRadio(commands, "Traditional · two-line", "layout-list",
-                                                 prefix + "message-style:stacked",
-                                                 layout == MessageLayout::Stacked));
+            display.children.reserve(4);
+            display.children.push_back(
+                menuRadio(commands, "Message bubbles", "messages", prefix + "message-style:bubbles",
+                          selected != layouts.end() && selected->second == MessageLayout::Bubbles));
+            display.children.push_back(
+                menuRadio(commands, "Traditional IRC", "list", prefix + "message-style:irc",
+                          selected != layouts.end() && selected->second == MessageLayout::Irc));
+            display.children.push_back(menuRadio(
+                commands, "Traditional · two-line", "layout-list", prefix + "message-style:stacked",
+                selected != layouts.end() && selected->second == MessageLayout::Stacked));
+            display.children.push_back(menuRadio(commands, "Use global default", "settings",
+                                                 prefix + "message-style:default",
+                                                 selected == layouts.end()));
             entries.push_back(std::move(display));
         }
         ContextMenuEntry history{};
@@ -3875,16 +3879,21 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
             queue(model, "close_buffer", model.activeBuffer);
     } else if (command == "quit")
         queue(model, "quit");
-    else if (command == "message-style:irc" || command == "message-style:bubbles" ||
-             command == "message-style:stacked") {
+    else if (command.starts_with("message-style:")) {
         const auto buffer = model.buffers.find(model.activeBuffer);
         if (buffer != model.buffers.end() &&
             (buffer->second.kind == "channel" || buffer->second.kind == "query")) {
-            if (command == "message-style:bubbles")
-                model.settings.messageLayouts.erase(buffer->first);
+            auto &layouts = model.settings.messageLayouts;
+            if (command == "message-style:default")
+                layouts.erase(buffer->first);
+            else if (command == "message-style:bubbles")
+                layouts[buffer->first] = MessageLayout::Bubbles;
+            else if (command == "message-style:irc")
+                layouts[buffer->first] = MessageLayout::Irc;
+            else if (command == "message-style:stacked")
+                layouts[buffer->first] = MessageLayout::Stacked;
             else
-                model.settings.messageLayouts[buffer->first] =
-                    command == "message-style:irc" ? MessageLayout::Irc : MessageLayout::Stacked;
+                return;
             queue(model, "save");
         }
     } else if (command.starts_with("presence:")) {

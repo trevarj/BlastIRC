@@ -3358,18 +3358,24 @@ void Application::command(Buffer &b, const string &input) {
     if (name == "MESSAGESTYLE") {
         const auto style = lower(args);
         if ((b.kind != "channel" && b.kind != "query") ||
-            (!style.empty() && style != "irc" && style != "bubbles" && style != "stacked")) {
-            report("Usage: /messagestyle [bubbles|irc|stacked] (in a conversation)", b.server,
-                   b.id);
+            (!style.empty() && style != "default" && style != "irc" && style != "bubbles" &&
+             style != "stacked")) {
+            report("Usage: /messagestyle [default|bubbles|irc|stacked] (in a conversation)",
+                   b.server, b.id);
             return;
         }
         auto &layouts = model.settings.messageLayouts;
         const auto current = layouts.find(b.id);
-        if (style == "bubbles" || (style.empty() && current != layouts.end() &&
-                                   current->second != MessageLayout::Bubbles))
+        const auto layout =
+            current == layouts.end() ? model.settings.defaultMessageLayout : current->second;
+        if (style == "default")
             layouts.erase(b.id);
+        else if (style == "stacked")
+            layouts[b.id] = MessageLayout::Stacked;
+        else if (style == "irc" || (style.empty() && layout == MessageLayout::Bubbles))
+            layouts[b.id] = MessageLayout::Irc;
         else
-            layouts[b.id] = style == "stacked" ? MessageLayout::Stacked : MessageLayout::Irc;
+            layouts[b.id] = MessageLayout::Bubbles;
         save();
         return;
     }

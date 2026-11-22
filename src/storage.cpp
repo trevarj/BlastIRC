@@ -20,10 +20,12 @@
 #include <sqlite3.h>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <sys/stat.h>
 #include <toml++/toml.hpp>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <unistd.h>
 
 namespace blast {
@@ -435,6 +437,25 @@ void previewModeField(const toml::table &row, const char *key, PreviewMode &valu
         }
     invalid("previews." + string(key), "off, click, or automatic");
 }
+constexpr std::pair<MessageLayout, const char *> messageLayoutTokens[] = {
+    {MessageLayout::Bubbles, "bubbles"},
+    {MessageLayout::Irc, "irc"},
+    {MessageLayout::Stacked, "stacked"},
+};
+MessageLayout messageLayoutValue(const toml::node &node, const char *key,
+                                 std::string_view suffix = {}) {
+    if (const auto token = node.value<std::string_view>())
+        for (const auto &[layout, name] : messageLayoutTokens)
+            if (*token == name)
+                return layout;
+    invalid(string(key).append(suffix), "bubbles, irc, or stacked");
+}
+const char *messageLayoutName(MessageLayout value, const char *key, std::string_view suffix = {}) {
+    for (const auto &[layout, token] : messageLayoutTokens)
+        if (value == layout)
+            return token;
+    invalid(string(key).append(suffix), "a valid message layout");
+}
 Settings defaults() {
     Settings settings;
     for (const char *cue :
@@ -799,18 +820,14 @@ void parseSettings(const toml::table &document, Settings &settings) {
         exactField(*row, "allow_local", settings.previewAllowLocal);
     }
     if (const auto *row = table(document, "presentation")) {
+        if (const auto *layout = row->get("message_layout"))
+            settings.defaultMessageLayout =
+                messageLayoutValue(*layout, "presentation.message_layout");
         if (row->contains("message_layouts")) {
             const auto *layouts = table(*row, "message_layouts");
-            for (const auto &[name, value] : *layouts) {
-                const auto token = value.value<string>();
-                const string key = "presentation.message_layouts." + string(name.str());
-                if (!token || (*token != "bubbles" && *token != "irc" && *token != "stacked"))
-                    invalid(key, "bubbles, irc, or stacked");
-                settings.messageLayouts[string(name.str())] = *token == "irc" ? MessageLayout::Irc
-                                                              : *token == "stacked"
-                                                                  ? MessageLayout::Stacked
-                                                                  : MessageLayout::Bubbles;
-            }
+            for (const auto &[name, value] : *layouts)
+                settings.messageLayouts[string(name.str())] =
+                    messageLayoutValue(value, "presentation.message_layouts.", name.str());
         } else if (const auto *channels = row->get("irc_channels")) {
             for (const auto &id : stringArray(*channels, "presentation.irc_channels"))
                 settings.messageLayouts[id] = MessageLayout::Irc;
@@ -1019,21 +1036,9 @@ toml::table settingsDocument(const Settings &settings) {
         channels.insert(name, presenceName(mode));
     for (const auto &[name, shown] : settings.bufferFools)
         bufferFools.insert(name, shown);
-    for (const auto &[name, layout] : settings.messageLayouts) {
-        switch (layout) {
-        case MessageLayout::Bubbles:
-            messageLayouts.insert(name, "bubbles");
-            break;
-        case MessageLayout::Irc:
-            messageLayouts.insert(name, "irc");
-            break;
-        case MessageLayout::Stacked:
-            messageLayouts.insert(name, "stacked");
-            break;
-        default:
-            invalid("presentation.message_layouts." + name, "a valid message layout");
-        }
-    }
+    for (const auto &[name, layout] : settings.messageLayouts)
+        messageLayouts.insert(name,
+                              messageLayoutName(layout, "presentation.message_layouts.", name));
     auto bindings = mapping(settings.bindings);
     for (const char *obsolete : {"style-modern", "style-glass", "style-hacker"})
         bindings.erase(obsolete);
@@ -1085,8 +1090,11 @@ toml::table settingsDocument(const Settings &settings) {
                                  {"media_max_mib", settings.previewMediaMaxMiB},
                                  {"allow_local", settings.previewAllowLocal},
                                  {"media_max_seconds", settings.previewMediaMaxSeconds}}},
-        {"presentation", toml::table{{"message_layouts", std::move(messageLayouts)},
-                                     {"pinned_buffers", array(settings.pinnedBuffers)}}},
+        {"presentation",
+         toml::table{{"message_layout", messageLayoutName(settings.defaultMessageLayout,
+                                                          "presentation.message_layout")},
+                     {"message_layouts", std::move(messageLayouts)},
+                     {"pinned_buffers", array(settings.pinnedBuffers)}}},
         {"composer", toml::table{{"spellcheck", settings.spellcheck},
                                  {"spellcheck_language", settings.spellcheckLanguage},
                                  {"word_prediction", settings.wordPrediction}}},

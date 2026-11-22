@@ -7499,16 +7499,16 @@ struct ApplicationRegression {
         app.storage_.load(preferenceReload);
         assert(preferenceReload.settings.messageLayouts == app.model.settings.messageLayouts);
         app.command(room, "/messagestyle bubbles");
-        assert(app.model.settings.messageLayouts.empty());
+        assert(app.model.settings.messageLayouts.at(room.id) == MessageLayout::Bubbles);
         app.command(room, "/messagestyle");
         assert(app.model.settings.messageLayouts.at(room.id) == MessageLayout::Irc);
         app.command(room, "/messagestyle");
-        assert(app.model.settings.messageLayouts.empty());
+        assert(app.model.settings.messageLayouts.at(room.id) == MessageLayout::Bubbles);
         app.command(room, "/messagestyle stacked");
         assert(app.model.settings.messageLayouts.at(room.id) == MessageLayout::Stacked);
         app.storage_.load(preferenceReload);
         assert(preferenceReload.settings.messageLayouts == app.model.settings.messageLayouts);
-        app.command(room, "/messagestyle");
+        app.command(room, "/messagestyle default");
         assert(app.model.settings.messageLayouts.empty());
         app.command(room, "/messagestyle stacked");
         app.command(room, "/messagestyle invalid");
@@ -7683,7 +7683,7 @@ struct ApplicationRegression {
         auto &reopened = app.buffer("test", closingTarget, "query");
         assert(reopened.id == closingId &&
                app.model.settings.messageLayouts.at(reopened.id) == MessageLayout::Irc);
-        app.command(reopened, "/messagestyle bubbles");
+        app.command(reopened, "/messagestyle default");
         app.storage_.load(preferenceReload);
         assert(!preferenceReload.settings.messageLayouts.contains(closingId) &&
                preferenceReload.settings.messageLayouts.at(destinationId) ==

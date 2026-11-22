@@ -1696,7 +1696,17 @@ struct Dialogs::Impl {
               "strength tune the animation, while Effects Off or Reduced motion pauses it.");
         button(*cursor, "Try in conversation", [this] { dismiss(); });
         auto *messages = section("appearance.messages", "Messages");
-        label(*messages, "Conversation menus can switch grouped bubbles to traditional IRC rows.");
+        static constexpr const char *layoutNames[] = {"Message bubbles", "Traditional IRC",
+                                                      "Traditional · two-line"};
+        select(*messages, "Default message layout",
+               {std::begin(layoutNames), std::end(layoutNames)},
+               layoutNames[std::clamp(int(model.settings.defaultMessageLayout), 0, 2)],
+               [this](std::size_t index, std::string_view) {
+                   if (index < std::size(layoutNames))
+                       model.settings.defaultMessageLayout = MessageLayout(index);
+               });
+        label(*messages, "Conversation menus can override the default for individual channels "
+                         "and direct messages.");
         toggle(*messages, "Show timestamps", model.settings.timestamps,
                [this](bool value) { model.settings.timestamps = value; });
         toggle(*messages, "Show avatars", model.settings.avatars,

@@ -30,6 +30,7 @@ static void mode(const fs::path &file, unsigned expected) {
 }
 static void presentation(const Settings &actual, const Settings &expected) {
     assert(actual.sendMotion == expected.sendMotion && actual.sendReveal == expected.sendReveal &&
+           actual.defaultMessageLayout == expected.defaultMessageLayout &&
            actual.messageLayouts == expected.messageLayouts && actual.uiFont == expected.uiFont &&
            actual.messageFont == expected.messageFont);
     assert(actual.scale == expected.scale && actual.messageScale == expected.messageScale);
@@ -2697,6 +2698,7 @@ int main() {
             s.friends = {"alice", "bob"};
             s.fools = {"mallory"};
             s.channelPresence["Libera/#a"] = PresenceMode::All;
+            s.defaultMessageLayout = MessageLayout::Stacked;
             s.messageLayouts = {{"Libera/#a", MessageLayout::Irc},
                                 {"Other/#a", MessageLayout::Irc}};
             s.pinnedBuffers = {"Other/#a", "Libera/#a"};
@@ -3091,6 +3093,7 @@ int main() {
             storage.load(legacy);
             assert(!legacy.firstRun && legacy.settings.opacity == .5f);
             assert(!legacy.settings.transparency && legacy.settings.messageLayouts.empty());
+            assert(legacy.settings.defaultMessageLayout == MessageLayout::Bubbles);
             assert(legacy.settings.scale == 1.f && legacy.settings.messageScale == 1.f);
             assert(!legacy.settings.bindings.contains("split-below") &&
                    !legacy.settings.bindings.contains("close-pane") &&
@@ -3135,6 +3138,7 @@ int main() {
                        legacy.settings.workspace == expected.settings.workspace);
                 assert(legacy.settings.sendMotion == SendMotion::Flight &&
                        legacy.settings.sendReveal == SendReveal::None);
+                assert(legacy.settings.defaultMessageLayout == MessageLayout::Bubbles);
                 assert(legacy.settings.messageLayouts == expected.settings.messageLayouts &&
                        legacy.settings.uiFont == "Legacy UI font" &&
                        legacy.settings.messageFont == "Legacy message font");
@@ -3170,17 +3174,22 @@ int main() {
             }
         }
         // Canonical layouts take precedence over legacy input and round-trip all three tokens.
-        {
-            std::ofstream output(config / "settings.toml");
-            output << "[presentation]\nirc_channels = ['legacy/ignored']\n"
-                      "[presentation.message_layouts]\n"
-                      "'Libera/#a' = 'stacked'\n'Other/#a' = 'irc'\n'Explicit/#b' = 'bubbles'\n";
-        }
-        {
+        for (const auto &[token, layout] :
+             {std::pair{"bubbles", MessageLayout::Bubbles}, std::pair{"irc", MessageLayout::Irc},
+              std::pair{"stacked", MessageLayout::Stacked}}) {
+            {
+                std::ofstream output(config / "settings.toml");
+                output
+                    << "[presentation]\nmessage_layout = '" << token
+                    << "'\nirc_channels = ['legacy/ignored']\n"
+                       "[presentation.message_layouts]\n"
+                       "'Libera/#a' = 'stacked'\n'Other/#a' = 'irc'\n'Explicit/#b' = 'bubbles'\n";
+            }
             Storage storage;
             Model layouts;
             storage.load(layouts);
-            assert(layouts.settings.messageLayouts.size() == 3 &&
+            assert(layouts.settings.defaultMessageLayout == layout &&
+                   layouts.settings.messageLayouts.size() == 3 &&
                    layouts.settings.messageLayouts.at("Libera/#a") == MessageLayout::Stacked &&
                    layouts.settings.messageLayouts.at("Other/#a") == MessageLayout::Irc &&
                    layouts.settings.messageLayouts.at("Explicit/#b") == MessageLayout::Bubbles &&
@@ -3189,9 +3198,11 @@ int main() {
             const auto saved = contents(config / "settings.toml");
             assert(saved.find("irc_channels") == string::npos &&
                    saved.find("message_layouts") != string::npos);
+            assert(toml::parse(saved)["presentation"]["message_layout"].value<string>() == token);
             Model reopened;
             storage.load(reopened);
-            assert(reopened.settings.messageLayouts == layouts.settings.messageLayouts);
+            assert(reopened.settings.defaultMessageLayout == layout &&
+                   reopened.settings.messageLayouts == layouts.settings.messageLayouts);
         }
         // Every motion/reveal pairing is independently decoded and survives save/restart.
         for (const auto &[motionToken, motion] :
@@ -3856,6 +3867,10 @@ int main() {
             {"[appearance]\nsend_reveal = false\n", "send_reveal"},
             {"[presentation]\nirc_channels = 'Libera/#a'\n", "presentation.irc_channels"},
             {"[presentation]\nirc_channels = ['Libera/#a', false]\n", "presentation.irc_channels"},
+            {"[presentation]\nmessage_layout = false\n", "presentation.message_layout"},
+            {"[presentation]\nmessage_layout = 'IRC'\n", "presentation.message_layout"},
+            {"[presentation]\nmessage_layout = ''\n", "presentation.message_layout"},
+            {"[presentation]\nmessage_layout = 'other'\n", "presentation.message_layout"},
             {"[presentation]\nmessage_layouts = []\n", "message_layouts"},
             {"[presentation.message_layouts]\n'a' = false\n", "presentation.message_layouts.a"},
             {"[presentation.message_layouts]\n'a' = 'IRC'\n", "presentation.message_layouts.a"},

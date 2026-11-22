@@ -1475,6 +1475,15 @@ void runSettingsCheck() {
     assert(availability->text().find(model.settings.spellcheckLanguage) != std::string_view::npos);
     missingLanguage->setSelectedIndex(0);
     assert(model.settings.spellcheckLanguage == "auto");
+    auto *defaultLayout = named<Select>(dialogs, "Default message layout");
+    assert(defaultLayout->selectedText() == "Message bubbles" &&
+           model.settings.defaultMessageLayout == MessageLayout::Bubbles);
+    defaultLayout->setSelectedIndex(1);
+    assert(defaultLayout->selectedText() == "Traditional IRC" &&
+           model.settings.defaultMessageLayout == MessageLayout::Irc);
+    defaultLayout->setSelectedIndex(2);
+    assert(defaultLayout->selectedText() == "Traditional · two-line" &&
+           model.settings.defaultMessageLayout == MessageLayout::Stacked);
     assert(model.settings.foolDisplay == FoolDisplay::Minimized && !model.settings.foolUnread &&
            model.settings.messageWrapColumns == 80);
     for (int style = 0; style < 4; ++style) {
@@ -1601,6 +1610,8 @@ void runSettingsCheck() {
            model.settings.messageFont == "monospace");
     assert(named<Select>(dialogs, "UI font weight")->selectedText() == "400" &&
            named<Select>(dialogs, "Message font weight")->selectedText() == "600");
+    assert(named<Select>(dialogs, "Default message layout")->selectedText() ==
+           "Traditional · two-line");
 
     category(1);
     auto *record = keyed(dialogs, "blastirc.settings.record.complete");
@@ -1891,6 +1902,7 @@ void runSettingsCheck() {
     Model loaded;
     app.storage().load(loaded);
     assert(loaded.settings.wordPrediction && model.settings.wordPrediction);
+    assert(loaded.settings.defaultMessageLayout == MessageLayout::Stacked);
     assert(fileText(preferences).find("word_prediction = true") != std::string::npos);
     assert(loaded.settings.cursorShape == "box" && loaded.settings.cursorEffect == "trail" &&
            loaded.settings.cursorTrailDurationMs == 222 &&

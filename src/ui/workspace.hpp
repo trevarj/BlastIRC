@@ -38,6 +38,7 @@ class Workspace {
     void focus(std::uint64_t id);
     std::optional<std::uint64_t> navigateHistory(bool forward);
     std::optional<std::uint64_t> navigateActivity();
+    std::uint64_t lastViewed(const std::string &buffer) const;
     void reconcile();
     void remapBuffer(std::string_view oldId, std::string_view newId);
     void persist();
@@ -51,6 +52,8 @@ class Workspace {
     std::map<std::uint64_t, SavedPane> saved_;
     std::string publishedActive_, serialized_;
     std::optional<float> serverRailWidth_, channelSidebarWidth_, compactChannelSidebarWidth_;
+    std::map<std::string, std::uint64_t> lastViewed_;
+    std::uint64_t viewSequence_ = 0;
     std::vector<std::string> history_;
     std::size_t historyCursor_ = 0;
     bool suppressHistory_ = true;

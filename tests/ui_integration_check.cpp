@@ -10401,6 +10401,81 @@ void conversationHistoryNativeCheck() {
     dispatcher.setSceneRoot(nullptr);
 }
 
+void conversationFinderOrderNativeCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    constexpr std::array targets{"#review-archive", "dailyreviewlog", "re-view", "review"};
+    for (std::size_t i = 0; i < targets.size(); ++i)
+        model.buffers.at(edgeBuffers[i]).target = targets[i];
+    auto &channel = model.buffers.at(edgeBuffers[0]);
+    channel.kind = "channel";
+    channel.joined = true;
+    auto &search = model.buffers["test/$finder"];
+    search.id = "test/$finder";
+    search.server = "test";
+    search.kind = "search";
+    search.target = "Unrelated finder result";
+
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    ui.execute("buffer:" + std::string(edgeBuffers[1]));
+    frame();
+    assert(model.activeBuffer == edgeBuffers[1]);
+
+    // Traffic after navigation must neither reshuffle visits nor put unvisited chats first.
+    constexpr std::array timestamps{20, 10, 40, 30};
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+        auto &buffer = model.buffers.at(edgeBuffers[i]);
+        auto &message = buffer.messages.emplace_back();
+        message.id = buffer.id + "-activity";
+        message.nick = "Peer";
+        message.text = "New traffic";
+        message.timestamp = timestamps[i];
+        recordChatActivity(buffer, message);
+    }
+    hostKey(ui, dispatcher, XKB_KEY_x, KeyMod::Ctrl, 'x');
+    hostKey(ui, dispatcher, XKB_KEY_b, 0, 'b');
+    frame();
+    auto *query = dispatcher.focusedArea()
+                      ? dynamic_cast<Input *>(dispatcher.focusedArea()->textInputClient())
+                      : nullptr;
+    assert(query && visibleLabelContaining(*query, "Find a conversation…"));
+    auto &picker = *query->parent();
+    const auto assertOrder = [&](bool filtered) {
+        Label *previous = nullptr;
+        for (int i : {1, 0, 2, 3}) {
+            auto *row = visibleLabelContaining(picker, std::string(targets[i]) + "  ·  ");
+            assert(row && (!previous || pointerPoint(*row)[1] > pointerPoint(*previous)[1]));
+            previous = row;
+        }
+        auto *utility = visibleLabelContaining(picker, search.target + "  ·  ");
+        assert(filtered ? !utility
+                        : utility && pointerPoint(*utility)[1] > pointerPoint(*previous)[1]);
+    };
+    assertOrder(false);
+    // "review" has a stronger fuzzy score than the viewed chats and "re-view".
+    for (char ch : std::string_view("review"))
+        hostKey(ui, dispatcher, ch, 0, ch);
+    frame();
+    assert(query->value() == "review");
+    assertOrder(true);
+
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
 void conversationHistorySelectionCheck(bool flushAdmission) {
     using namespace blast;
     const std::string configHome = std::getenv("XDG_CONFIG_HOME");
@@ -10973,6 +11048,7 @@ void runUiIntegrationCheck() {
     cycleSpellingBindingsCheck();
     nextActivityNativeCheck();
     conversationHistoryNativeCheck();
+    conversationFinderOrderNativeCheck();
     conversationHistorySelectionCheck(false);
     conversationHistorySelectionCheck(true);
     conversationHistoryOwnershipCheck();

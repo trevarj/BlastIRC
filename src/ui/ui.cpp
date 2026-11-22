@@ -3001,6 +3001,8 @@ void Ui::Impl::rebuildMatches(std::string_view preferred) {
     struct Match {
         int score;
         std::string id, label;
+        const Buffer *chat = nullptr;
+        std::uint64_t viewRank = 0;
     };
     std::vector<Match> found;
     if (commandMode) {
@@ -3015,25 +3017,34 @@ void Ui::Impl::rebuildMatches(std::string_view preferred) {
                 found.push_back(
                     {score, name, commandLabel(model, command.label, name) + "    [" + name + "]"});
         }
+        std::stable_sort(found.begin(), found.end(),
+                         [](const Match &a, const Match &b) { return a.score > b.score; });
     } else {
         paletteSources.clear();
         for (const auto &[id, buffer] : model.buffers) {
             const auto caption = serverDisplayName(model, buffer.server);
             paletteSources.push_back({id, buffer.target, std::string(caption)});
-            const auto label = buffer.kind == "server"
-                                   ? std::string(caption)
-                                   : buffer.target + "  ·  " + std::string(caption);
+            auto label = buffer.kind == "server" ? std::string(caption)
+                                                 : buffer.target + "  ·  " + std::string(caption);
             int score = ui_logic::fuzzy(query, label);
             // Keep the existing target + routing-key search without exposing
             // technical keys in the displayed result.
             if (score <= -100000)
                 score = ui_logic::fuzzy(query, buffer.target + "  ·  " + buffer.server);
-            if (score > -100000)
-                found.push_back({score, id, label});
+            if (score > -100000) {
+                const bool chat = buffer.kind == "channel" || buffer.kind == "query";
+                found.push_back({score, id, std::move(label), chat ? &buffer : nullptr,
+                                 chat ? workspace.lastViewed(id) : 0});
+            }
         }
+        std::ranges::sort(found, [](const Match &a, const Match &b) {
+            if (bool(a.chat) != bool(b.chat))
+                return a.chat != nullptr;
+            if (a.viewRank != b.viewRank)
+                return a.viewRank > b.viewRank;
+            return a.chat ? chatActivityBefore(*a.chat, *b.chat) : a.id < b.id;
+        });
     }
-    std::stable_sort(found.begin(), found.end(),
-                     [](const Match &a, const Match &b) { return a.score > b.score; });
     matches.clear();
     for (auto &item : found)
         matches.emplace_back(std::move(item.id), std::move(item.label));

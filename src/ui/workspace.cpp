@@ -147,13 +147,19 @@ void Workspace::publish() {
     const auto &buffer = panes.at(focused).buffer;
     if (model_.activeBuffer != buffer)
         model_.activeBuffer = buffer;
-    if (publishedActive_ != buffer) {
+    if (publishedActive_ != buffer || (!viewSequence_ && !buffer.empty())) {
         if (activityOrigin_ && !advancingActivity_) {
             activityOrigin_.reset();
             activityPending_.clear();
         }
         publishedActive_ = buffer;
+        if (!buffer.empty())
+            lastViewed_[buffer] = ++viewSequence_;
     }
+}
+Id Workspace::lastViewed(const std::string &buffer) const {
+    const auto found = lastViewed_.find(buffer);
+    return found != lastViewed_.end() ? found->second : 0;
 }
 Id Workspace::open(std::string_view buffer) {
     for (const auto &[id, pane] : panes)
@@ -281,6 +287,11 @@ std::optional<Id> Workspace::navigateActivity() {
     return std::nullopt;
 }
 void Workspace::remapNavigation(const std::string &oldId, const std::string &newId) {
+    if (const auto old = lastViewed_.find(oldId); old != lastViewed_.end()) {
+        auto &rank = lastViewed_[newId];
+        rank = std::max(rank, old->second);
+        lastViewed_.erase(old);
+    }
     if (activityOrigin_ && *activityOrigin_ == oldId)
         *activityOrigin_ = newId;
     std::size_t count = 0;

@@ -3284,9 +3284,10 @@ struct ApplicationRegression {
                restored.buffers.at(room.id).draft == room.draft &&
                restored.buffers.at(room.id).readMarker == marker &&
                restored.activeBuffer == utility.id);
+        app.model.settings.workspace.erase("visible_buffers");
         incoming.id = "muted-archived-arrival";
         app.reduce(incoming);
-        assert(room.archived && room.unread == 2);
+        assert(room.archived && room.unread == 2 && app.model.status.empty());
         app.action({"mute_buffer", room.id, "off", {}});
         assert(room.archived && !room.muted);
         incoming.history = true;
@@ -3330,6 +3331,10 @@ struct ApplicationRegression {
         app.storage_.load(restored);
         assert(!restored.buffers.at(room.id).archived && !restored.buffers.at(room.id).muted &&
                app.storage_.history(room.id, 20).size() == room.messages.size());
+        assert(app.model.status == "New message in #room");
+        auto &sameTarget = app.buffer("chat-controls-other", room.target);
+        app.action({"mute_buffer", sameTarget.id, "on", {}});
+        assert(sameTarget.muted && app.model.status == "New message in #room");
 
         // Queued origin IDs survive a rename; losing an origin must never target selection.
         app.model.actions = {{"mute_buffer", room.id, "on", {}},
@@ -3339,6 +3344,18 @@ struct ApplicationRegression {
         app.dispatchActions();
         auto &renamed = app.buffer("chat-controls", "#renamed");
         assert(renamed.muted && renamed.archived && renamed.joined && !other.muted);
+        assert(app.model.status.empty());
+
+        app.action({"mute_buffer", sameTarget.id, "off", {}});
+        auto parallel = incoming;
+        parallel.server = sameTarget.server;
+        parallel.id = "parallel-arrival";
+        app.reduce(parallel);
+        assert(app.model.status == "New message in #room");
+        app.model.status = "Unrelated status feedback";
+        app.action({"mute_buffer", sameTarget.id, "on", {}});
+        assert(sameTarget.muted && app.model.status == "Unrelated status feedback");
+
         other.archived = false;
         other.muted = false;
         app.renameBuffer(renamed.id, other.target);

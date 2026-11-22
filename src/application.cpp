@@ -20,6 +20,8 @@
 namespace blast {
 using namespace application_detail;
 namespace {
+constexpr char activityStatusPrefix[] = "New message in ";
+
 int64_t epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -675,6 +677,10 @@ void Application::renameBuffer(string oldId, string target) {
         b.target = target;
         b.title = target;
     }
+    if (activityStatusBuffer_ == oldId)
+        activityStatusBuffer_ = id;
+    if (dest->second.muted)
+        clearActivityStatus(id);
     if (savingAllowed_)
         storage_.loadHistoryState(dest->second);
     remapHistory();
@@ -1035,7 +1041,15 @@ void Application::stopClient(string server) {
         failSends(failed, "Connection closed before the send reached pending history");
     }
 }
+void Application::clearActivityStatus(const string &buffer) {
+    if (activityStatusBuffer_ != buffer)
+        return;
+    activityStatusBuffer_.clear();
+    if (model.status.starts_with(activityStatusPrefix))
+        model.status.clear();
+}
 void Application::report(const string &text, const string &server, const string &origin) {
+    activityStatusBuffer_.clear();
     model.status = text;
     string name = server;
     if (name.empty() && !model.servers.empty())
@@ -1814,9 +1828,10 @@ void Application::receive(Event e) {
         notification.type = "notify";
         model.effects.push_back(std::move(notification));
     }
-    if (!foolish && !e.history && b.unread > previousUnread && !visible(b)) {
+    if (!b.muted && !foolish && !e.history && b.unread > previousUnread && !visible(b)) {
         // Badges are drawn by the UI; hidden conversations never create overlay FX/sounds.
-        model.status = "New message in " + b.target;
+        model.status = activityStatusPrefix + b.target;
+        activityStatusBuffer_ = b.id;
     }
 }
 void Application::groupPresence(Event e, bool joins, bool explicitBatch) {
@@ -3718,7 +3733,10 @@ void Application::action(const Action &a) {
             flag = previous;
             model.activeBuffer = previousActive;
             report(error.what(), chat.server);
+            return;
         }
+        if (a.type == "mute_buffer" && chat.muted)
+            clearActivityStatus(chat.id);
         return;
     }
     if (a.type == "soju-remove-account") {

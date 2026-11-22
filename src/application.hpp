@@ -112,6 +112,7 @@ class Application {
     map<string, string> caseMapping_, channelTypes_, historyReferences_;
     set<string> historyClassificationSettled_;
     map<string, std::deque<int64_t>> activity_;
+    string activityStatusBuffer_;
     map<string, vector<Nick>> namesCache_;
     map<string, PresenceGroup> presenceGroups_;
     map<string, Pending> pending_;
@@ -196,6 +197,7 @@ class Application {
                bool confirmed = false);
     void captureHistoryRow(const Buffer &, Message &);
     void repairChatActivity(Buffer &);
+    void clearActivityStatus(const string &buffer);
     void report(const string &, const string &server = "", const string &origin = "");
     void restoreDraft(Buffer &, const string &, bool distinctSubmission = false);
     bool failSends(const Event &, const string &);

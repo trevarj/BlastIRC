@@ -3104,9 +3104,10 @@ void initialHistoryConsumerCheck() {
     buffer.initialHistorySync = HistorySyncState::Loading;
     frame();
     assert(visible(*remaining) && remaining->text().find("2") != std::string::npos);
-    const auto tooltipContent = remaining->tooltipContent();
-    const auto *tooltip = std::get_if<std::string>(&tooltipContent);
-    assert(tooltip && *tooltip == remaining->text());
+    auto *history = areaWithKey(*line, "status-history");
+    assert(history &&
+           areaWithTooltip(*line, remaining->text() + "\nShow queued and loading conversations") ==
+               history);
     buffer.initialHistorySync = background.initialHistorySync = HistorySyncState::Idle;
     frame();
     assert(!visible(*remaining) && !status());
@@ -3300,6 +3301,96 @@ void statusDetailsCheck() {
     assert(model.status == snapshot);
     hostKey(ui, dispatcher, XKB_KEY_Escape);
     frame();
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
+void statusActionsCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    model.networks.at("test").state = "Ready";
+    model.servers.front().alias = "Local alias";
+    model.buffers.at(edgeBuffers[1]).initialHistorySync = HistorySyncState::Queued;
+    model.buffers.at(edgeBuffers[2]).initialHistorySync = HistorySyncState::Loading;
+    model.buffers.at(edgeBuffers[2]).muted = true;
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    MenuHost menu;
+    Ui ui(model, clipboard);
+    ui.root().setPopupContext(&menu);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1400, 900, 1);
+        ui.root().layout(renderer);
+    };
+    const auto control = [&](std::string_view key) {
+        auto *area = areaWithKey(ui.root(), key);
+        assert(area && visible(*area));
+        return area;
+    };
+    frame();
+    auto *nick = control("status-nick");
+    click(dispatcher, *nick);
+    frame();
+    auto *composer = inputWithText(ui.root(), "/nick ");
+    assert(composer && dispatcher.focusedArea() == composer->inputArea());
+    assert(composer->cursorPosition() == 6 && model.buffers.at(edgeBuffers[0]).draft == "/nick ");
+    ui.execute("undo");
+    frame();
+    assert(model.buffers.at(edgeBuffers[0]).draft == edgeDrafts[0]);
+    dispatcher.setFocus(nick);
+    const InputArea::KeyData enter{.sym = XKB_KEY_Return, .pressed = true};
+    assert(ui.handleKey(enter));
+    frame();
+    assert(ui.handleKey(enter));
+    assert(ui.handleKey({.sym = XKB_KEY_Return, .pressed = false}));
+    assert(model.buffers.at(edgeBuffers[0]).draft == "/nick ");
+    ui.execute("undo");
+    frame();
+    assert(model.buffers.at(edgeBuffers[0]).draft == edgeDrafts[0]);
+
+    model.status = "Retained feedback";
+    nativeKey(ui, dispatcher, 'x', KeyMod::Ctrl);
+    frame();
+    dispatcher.setFocus(control("status-chord"));
+    nativeKey(ui, dispatcher, XKB_KEY_space);
+    frame();
+    auto *chord = areaWithKey(ui.root(), "status-chord");
+    assert(chord && !visible(*chord) && model.status == "Retained feedback");
+    assert(model.buffers.at(edgeBuffers[0]).draft == edgeDrafts[0]);
+
+    click(dispatcher, *control("status-network"));
+    frame();
+    auto *dialogs = visibleNode<Dialogs>(ui.root());
+    assert(dialogs && dialogs->settingsOpen() && inputWithText(*dialogs, "example.invalid"));
+    hostKey(ui, dispatcher, XKB_KEY_Escape);
+    frame();
+
+    click(dispatcher, *control("status-connection"));
+    assert(menu.open);
+    menu.select("Reconnect");
+    frame();
+    assert(std::any_of(model.actions.begin(), model.actions.end(), [](const auto &action) {
+        return action.type == "connect" && action.text == "test";
+    }));
+    click(dispatcher, *control("status-connection"));
+    assert(menu.open);
+    menu.select("Open server log");
+    frame();
+    assert(std::any_of(model.actions.begin(), model.actions.end(), [](const auto &action) {
+        return action.type == "open-server-log" && action.buffer == "test";
+    }));
+
+    click(dispatcher, *control("status-history"));
+    assert(menu.open && menu.request.menu.size() == 1);
+    menu.select("Local alias/DM second — Queued");
+    frame();
+    assert(model.activeBuffer == edgeBuffers[1]);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -10801,6 +10892,7 @@ void runUiIntegrationCheck() {
     statusIdentityCheck();
     initialHistoryConsumerCheck();
     statusDetailsCheck();
+    statusActionsCheck();
     topbarReadAllCheck();
     serverLogConsumerCheck();
     queuedServerLogPaletteCheck();

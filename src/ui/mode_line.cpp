@@ -34,9 +34,9 @@ Label *lineLabel(Node &parent) {
     label->setBaselineMode(LabelBaselineMode::TextFixedHeight);
     return label;
 }
-void text(Label &label, std::string_view value) {
-    if (label.setText(value))
-        label.setTooltip(std::string(value));
+bool historyEligible(const Buffer &chat) {
+    return (chat.kind == "channel" || chat.kind == "query") && !chat.archived && !chat.muted &&
+           chat.initialHistorySync != HistorySyncState::Idle;
 }
 void style(Label &label, const TextFont &font, float scale, Color ink) {
     if (label.font().family != font.family)
@@ -72,6 +72,14 @@ std::string overflowCaption(size_t count) {
 bool activateKey(const InputArea::KeyData &key) {
     return key.pressed && !key.preedit && key.modifiers == 0 && KeySymbol::isEnterOrSpace(key.sym);
 }
+ContextMenuEntry menuEntry(size_t value, std::string label, std::string_view icon = {}) {
+    ContextMenuEntry entry;
+    entry.label = std::move(label);
+    entry.icon = icon;
+    entry.value = value;
+    entry.ellipsize = TextEllipsize::Middle;
+    return entry;
+}
 } // namespace
 
 struct ModeLine::Impl {
@@ -100,98 +108,207 @@ struct ModeLine::Impl {
         Label *marker, *suffix;
         std::string id;
     };
+    struct Scope {
+        std::string_view buffer, server;
+        const Buffer *chat;
+        const Network *network;
+        const ServerConfig *profile;
+
+        bool mentions() const { return chat && chat->kind == "mentions"; }
+        bool writable() const {
+            return chat &&
+                   (chat->kind == "channel" || chat->kind == "query" || chat->kind == "server");
+        }
+        std::string_view state() const {
+            return mentions()                           ? "Read only"
+                   : network && !network->state.empty() ? std::string_view(network->state)
+                                                        : "Disconnected";
+        }
+        uint64_t session() const { return network ? network->sessionGeneration : 0; }
+    };
+    struct HistoryRow {
+        std::string id, name, target;
+        HistorySyncState state;
+        bool query;
+    };
+    using HistoryRows = std::vector<HistoryRow>;
 
     Node &owner;
     Model &model;
     std::function<void(std::string)> execute;
     std::function<void(Node &)> retire;
-    std::array<Label *, GroupCount> right;
+    std::array<Button, GroupCount> controls;
+    std::array<std::string_view, GroupCount> hints;
     std::array<Glyph *, GroupCount> icons;
     ActivityMap activity;
     std::vector<const ActivityMap::value_type *> ordered;
     std::vector<Slot> slots;
     std::vector<std::array<float, 2>> measuredChips;
     Button overflow;
-    Button feedbackButton;
-    Box *feedbackTip;
-    Label *feedbackTipText;
-    Timer feedbackHover;
+    Box *tip;
+    Label *tipText;
+    Timer hoverTimer;
+    std::optional<Group> hoverGroup;
     size_t firstOmitted = 0, historyRemaining = 0;
     decltype(Settings::fools) fools;
     bool foolUnread = false, visible = false, allowed = true, layoutReady = false;
     bool healthy = false, failureFeedback = false;
     float scale = 1;
     Color activityInk{}, mentionInk{}, focusInk{};
+    std::string shownBuffer, shownServer, shownState;
+    uint64_t shownSession = 0;
+    bool shownProfile = false, shownWritable = false;
 
     std::shared_ptr<int> alive = std::make_shared<int>(0);
     uint64_t popupGeneration = 0;
-    bool popupOpen = false;
+    Button *popupButton = nullptr;
     std::array<int, 4> popupAnchor{};
+    std::shared_ptr<const HistoryRows> popupHistory;
 
     Impl(Node &owner, Model &model, std::function<void(std::string)> execute,
          std::function<void(Node &)> retire)
-        : owner(owner), model(model), execute(std::move(execute)), retire(std::move(retire)),
-          overflow(makeButton()), feedbackButton(makeButton()) {
+        : owner(owner), model(model), execute(std::move(execute)), retire(std::move(retire)) {
         constexpr std::array names{"history", "info-circle", "keyboard",
                                    "user",    "server",      "plug-connected-x"};
-        for (size_t i = 0; i < right.size(); ++i) {
-            auto &parent = i == Feedback ? *feedbackButton.area : owner;
-            icons[i] = child<Glyph>(parent);
+        constexpr std::array keys{"status-history", "status-feedback", "status-chord",
+                                  "status-nick",    "status-network",  "status-connection"};
+        for (size_t i = controls.size(); i-- > 0;) {
+            const auto group = static_cast<Group>(i);
+            auto &button = controls[i] = makeButton();
+            auto *area = button.area;
+            icons[i] = child<Glyph>(*area);
             icons[i]->setGlyph(names[i]);
             icons[i]->setHitTestVisible(false);
-            right[i] = i == Feedback ? feedbackButton.title : lineLabel(owner);
+            button.title->setHitTestVisible(false);
+            area->setTabFocusKey(keys[i]);
+            area->setOnEnter([this, group](const InputArea::PointerData &) { startHover(group); });
+            area->setOnLeave([this, group] {
+                updateFocus(controls[group]);
+                if (hoverGroup == group)
+                    hideTip();
+            });
+            area->setOnPress([this](const InputArea::PointerData &) { hideTip(); });
+            area->setOnClick([this, group](const InputArea::PointerData &pointer) {
+                activateGroup(group, pointer.serial);
+            });
+            area->setOnKeyDown([this, group](const InputArea::KeyData &key) {
+                if (activateKey(key))
+                    activateGroup(group, std::nullopt);
+            });
         }
-        right[Feedback]->setHitTestVisible(false);
-        feedbackTip = child<Box>(owner);
-        feedbackTip->setHitTestVisible(false);
-        feedbackTip->setVisible(false);
-        feedbackTipText = child<Label>(*feedbackTip);
-        feedbackTipText->setUseMarkup(false);
-        feedbackTipText->setMaxLines(3);
-        feedbackButton.area->setOnEnter([this](const InputArea::PointerData &) {
-            feedbackButton.focus->setVisible(allowed);
-            if (allowed)
-                feedbackHover.start(std::chrono::milliseconds(400), [this] {
-                    if (allowed && feedbackButton.area->visible() &&
-                        feedbackButton.area->hovered()) {
-                        feedbackTip->setVisible(true);
-                        this->owner.markLayoutDirty();
-                    }
-                });
-        });
-        feedbackButton.area->setOnLeave([this] {
-            feedbackButton.focus->setVisible(allowed && feedbackButton.area->focused());
-            hideFeedbackTip();
-        });
-        feedbackButton.area->setOnPress(
-            [this](const InputArea::PointerData &) { hideFeedbackTip(); });
-        feedbackButton.area->setTabFocusKey("status-feedback");
-        const auto openFeedback = [this] {
-            hideFeedbackTip();
-            if (allowed && feedbackButton.area->visible() && !right[Feedback]->text().empty())
-                this->execute("status-details:" + std::string(right[Feedback]->text()));
-        };
-        feedbackButton.area->setOnClick(
-            [openFeedback](const InputArea::PointerData &) { openFeedback(); });
-        feedbackButton.area->setOnKeyDown([openFeedback](const InputArea::KeyData &key) {
-            if (activateKey(key))
-                openFeedback();
-        });
+        controls[Nick].area->setFocusOnPointerPress(false);
+        controls[Chord].area->setFocusOnPointerPress(false);
+        tip = child<Box>(owner);
+        tip->setHitTestVisible(false);
+        tip->setVisible(false);
+        tipText = child<Label>(*tip);
+        tipText->setUseMarkup(false);
+        tipText->setMaxLines(3);
+        overflow = makeButton();
         overflow.area->setTabFocusKey("status-activity-overflow");
         overflow.area->setOnClick(
-            [this](const InputArea::PointerData &pointer) { openPopup(pointer.serial); });
+            [this](const InputArea::PointerData &pointer) { openOverflow(pointer.serial); });
         overflow.area->setOnKeyDown([this](const InputArea::KeyData &key) {
             if (activateKey(key))
-                openPopup(std::nullopt);
+                openOverflow(std::nullopt);
         });
     }
     ~Impl() {
         alive.reset();
         closePopup();
     }
-    void hideFeedbackTip() {
-        feedbackHover.stop();
-        feedbackTip->setVisible(false);
+    void hideTip() {
+        hoverTimer.stop();
+        hoverGroup.reset();
+        tip->setVisible(false);
+    }
+    void startHover(Group group) {
+        hideTip();
+        auto &button = controls[group];
+        updateFocus(button);
+        if (!allowed || popupButton || !button.area->enabled())
+            return;
+        hoverGroup = group;
+        hoverTimer.start(std::chrono::milliseconds(400), [this, group] {
+            const auto &area = *controls[group].area;
+            if (allowed && !popupButton && hoverGroup == group && area.visible() &&
+                area.enabled() && area.hovered()) {
+                updateTipText(group);
+                tip->setVisible(true);
+                owner.markLayoutDirty();
+            }
+        });
+    }
+    void updateFocus(const Button &button) const {
+        const auto &area = *button.area;
+        button.focus->setFill(focusInk);
+        button.focus->setVisible(allowed && area.enabled() && (area.focused() || area.hovered()));
+    }
+    std::string_view caption(Group group) const { return controls[group].title->text(); }
+    void updateTipText(Group group) {
+        const auto hint = hints[group];
+        const auto value = caption(group);
+        std::string content;
+        content.reserve(hint.size() + 1 + value.size());
+        content.append(hint).append("\n").append(value);
+        tipText->setText(content);
+    }
+    void setControl(Group group, std::string_view value, std::string_view hint) {
+        auto &button = controls[group];
+        auto &area = *button.area;
+        if (button.title->setText(value) || hints[group] != hint) {
+            if (popupButton == &button)
+                closePopup();
+            hints[group] = hint;
+            if (area.pressed())
+                retire(area);
+            std::string tooltip;
+            if (!value.empty()) {
+                tooltip.reserve(value.size() + 1 + hint.size());
+                tooltip.append(value).append("\n").append(hint);
+            }
+            area.setTooltip(std::move(tooltip));
+            if (hoverGroup == group && tip->visible())
+                updateTipText(group);
+        }
+    }
+    Scope scope() const {
+        const auto found = model.buffers.find(model.activeBuffer);
+        const auto *chat = found == model.buffers.end() ? nullptr : &found->second;
+        auto network = model.networks.end();
+        if (chat && chat->kind != "mentions")
+            network = model.networks.find(chat->server);
+        else if (!chat && !model.networks.empty())
+            network = model.networks.begin();
+        const std::string_view server = chat ? std::string_view(chat->server)
+                                        : network != model.networks.end() ? network->first
+                                                                          : std::string_view{};
+        const auto profile =
+            std::find_if(model.servers.begin(), model.servers.end(),
+                         [&](const auto &config) { return config.name == server; });
+        return {model.activeBuffer, server, chat,
+                network == model.networks.end() ? nullptr : &network->second,
+                profile == model.servers.end() ? nullptr : &*profile};
+    }
+    bool matchesScope(const Scope &current) const {
+        return shownBuffer == current.buffer && shownServer == current.server &&
+               shownState == current.state() && shownSession == current.session() &&
+               shownProfile == bool(current.profile) && shownWritable == current.writable();
+    }
+    void setScope(const Scope &current) {
+        if (matchesScope(current))
+            return;
+        if (popupButton == &controls[State])
+            closePopup();
+        for (const auto group : {Nick, NetworkName, State})
+            if (controls[group].area->pressed())
+                retire(*controls[group].area);
+        shownBuffer = current.buffer;
+        shownServer = current.server;
+        shownState = current.state();
+        shownSession = current.session();
+        shownProfile = bool(current.profile);
+        shownWritable = current.writable();
     }
     Button makeButton() {
         auto *area = static_cast<InputArea *>(
@@ -204,15 +321,13 @@ struct ModeLine::Impl {
         auto *focus = child<Box>(*area);
         focus->setHitTestVisible(false);
         focus->setVisible(false);
-        const auto rule = [this, area, focus] {
-            focus->setFill(focusInk);
-            focus->setVisible(area->enabled() && (area->focused() || area->hovered()));
-        };
+        const Button button{area, lineLabel(*area), focus};
+        const auto rule = [this, button] { updateFocus(button); };
         area->setOnFocusGain(rule);
         area->setOnFocusLoss(rule);
         area->setOnEnter([rule](const InputArea::PointerData &) { rule(); });
         area->setOnLeave(rule);
-        return {area, lineLabel(*area), focus};
+        return button;
     }
     void moveButton(Button &button, float x, float width, float height) {
         auto &area = *button.area;
@@ -235,7 +350,7 @@ struct ModeLine::Impl {
         if (button.area->enabled() && !enabled && button.area->visible())
             retire(*button.area);
         button.area->setEnabled(enabled);
-        button.focus->setVisible(enabled && (button.area->focused() || button.area->hovered()));
+        updateFocus(button);
     }
     const Buffer *eligibleBuffer(const std::string &id) const {
         const auto found = model.buffers.find(id);
@@ -263,27 +378,31 @@ struct ModeLine::Impl {
         style(*button.title, font, scale, activityInk);
         button.focus->setFill(focusInk);
     }
-    std::array<int, 4> anchor() const {
+    static std::array<int, 4> anchor(const Button &button) {
         float left, top, rightEdge, bottom;
-        Node::transformedBounds(overflow.area, left, top, rightEdge, bottom);
+        Node::transformedBounds(button.area, left, top, rightEdge, bottom);
         return {static_cast<int>(std::round(left)), static_cast<int>(std::round(top)),
                 std::max(1, static_cast<int>(std::round(rightEdge - left))),
                 std::max(1, static_cast<int>(std::round(bottom - top)))};
     }
     void closePopup() {
         ++popupGeneration;
-        if (std::exchange(popupOpen, false))
+        popupHistory.reset();
+        if (std::exchange(popupButton, nullptr))
             if (auto *context = owner.popupContext())
                 context->closeSelectDropdown();
     }
-    void openPopup(std::optional<uint32_t> inputSerial) {
-        auto *context = overflow.area->popupContext();
-        if (!context || popupOpen || !layoutReady || !allowed || !overflow.area->visible() ||
-            firstOmitted >= ordered.size())
+    void openPopup(Button &button, std::optional<uint32_t> inputSerial,
+                   std::vector<ContextMenuEntry> entries, std::function<void(size_t)> select,
+                   std::shared_ptr<const HistoryRows> history = {}) {
+        auto *context = button.area->popupContext();
+        if (!context || popupButton || !allowed || !button.area->visible() || entries.empty())
             return;
 
         SelectPopupContext::DropdownRequest request;
-        popupAnchor = anchor();
+        hideTip();
+        const auto origin = anchor(button);
+        popupAnchor = origin;
         request.anchorX = popupAnchor[0];
         request.anchorY = popupAnchor[1];
         request.anchorWidth = popupAnchor[2];
@@ -294,45 +413,187 @@ struct ModeLine::Impl {
         request.fontSize = 14 * scale;
         request.font = themeUiFont();
         request.maxVisibleOptions = 12;
-        const size_t omitted = ordered.size() - firstOmitted;
-        std::vector<std::string> ids;
-        ids.reserve(omitted);
-        request.menu.reserve(omitted);
-        for (size_t i = firstOmitted; i < ordered.size(); ++i) {
-            const auto &[id, entry] = *ordered[i];
-            ContextMenuEntry item;
-            item.label = entry.caption;
-            item.value = ids.size();
-            item.ellipsize = TextEllipsize::Middle;
-            request.menu.push_back(std::move(item));
-            ids.push_back(id);
-        }
+        request.menu = std::move(entries);
         const auto generation = ++popupGeneration;
         const std::weak_ptr<int> guard = alive;
-        popupOpen = true;
+        popupButton = &button;
+        popupHistory = std::move(history);
         context->openSelectDropdown(
-            request, {[this, guard, generation, ids = std::move(ids)](size_t index) {
+            request, {[this, guard, generation, button = &button, origin,
+                       select = std::move(select)](size_t index) {
                           if (guard.expired() || generation != popupGeneration)
                               return;
-                          popupOpen = false;
+                          popupButton = nullptr;
+                          popupHistory.reset();
                           ++popupGeneration;
-                          if (!layoutReady || !allowed || !overflow.area->visible() ||
-                              anchor() != popupAnchor || index >= ids.size() ||
-                              index >= ordered.size() - firstOmitted)
-                              return;
-                          const auto &[id, entry] = *ordered[firstOmitted + index];
-                          const auto *chat = eligibleBuffer(ids[index]);
-                          if (id == ids[index] && chat && chat->unread == entry.count &&
-                              chat->target == entry.target &&
-                              (chat->kind == "query") == entry.query &&
-                              activityNetwork(model, *chat) == entry.name &&
-                              ui_logic::hasUnreadMention(model, *chat) == entry.mentioned)
-                              execute("buffer:" + id);
+                          if (allowed && button->area->visible() && anchor(*button) == origin)
+                              select(index);
                       },
                       [this, guard, generation] {
-                          if (!guard.expired() && generation == popupGeneration)
-                              popupOpen = false;
+                          if (!guard.expired() && generation == popupGeneration) {
+                              popupButton = nullptr;
+                              popupHistory.reset();
+                          }
                       }});
+        if (!context->isSelectDropdownOpen() && popupButton == &button)
+            closePopup();
+    }
+    void openOverflow(std::optional<uint32_t> inputSerial) {
+        if (!layoutReady || !allowed || popupButton || !overflow.area->visible() ||
+            firstOmitted >= ordered.size())
+            return;
+        const size_t omitted = ordered.size() - firstOmitted;
+        std::vector<ContextMenuEntry> entries;
+        std::vector<std::string> ids;
+        ids.reserve(omitted);
+        entries.reserve(omitted);
+        for (size_t i = firstOmitted; i < ordered.size(); ++i) {
+            const auto &[id, entry] = *ordered[i];
+            entries.push_back(menuEntry(ids.size(), entry.caption));
+            ids.push_back(id);
+        }
+        openPopup(
+            overflow, inputSerial, std::move(entries), [this, ids = std::move(ids)](size_t index) {
+                if (!layoutReady || index >= ids.size() || firstOmitted + index >= ordered.size())
+                    return;
+                const auto &[id, entry] = *ordered[firstOmitted + index];
+                const auto *chat = eligibleBuffer(ids[index]);
+                if (id == ids[index] && chat && chat->unread == entry.count &&
+                    chat->target == entry.target && (chat->kind == "query") == entry.query &&
+                    activityNetwork(model, *chat) == entry.name &&
+                    ui_logic::hasUnreadMention(model, *chat) == entry.mentioned)
+                    execute("buffer:" + id);
+            });
+    }
+    bool matchesHistory(std::string_view id, const Buffer &chat, const HistoryRow &row) const {
+        return id == row.id && historyEligible(chat) && chat.initialHistorySync == row.state &&
+               chat.target == row.target && (chat.kind == "query") == row.query &&
+               activityNetwork(model, chat) == row.name;
+    }
+    void syncHistory() {
+        size_t count = 0;
+        bool changed = false;
+        for (const auto &[id, chat] : model.buffers) {
+            if (!historyEligible(chat))
+                continue;
+            if (popupHistory && !changed)
+                changed = count >= popupHistory->size() ||
+                          !matchesHistory(id, chat, (*popupHistory)[count]);
+            ++count;
+        }
+        if (popupHistory && (changed || count != popupHistory->size()))
+            closePopup();
+        if (count != historyRemaining) {
+            historyRemaining = count;
+            setControl(History, count ? "History: " + std::to_string(count) + " remaining" : "",
+                       "Show queued and loading conversations");
+        }
+    }
+    void openHistory(std::optional<uint32_t> inputSerial) {
+        auto rows = std::make_shared<HistoryRows>();
+        rows->reserve(historyRemaining);
+        std::vector<ContextMenuEntry> entries;
+        entries.reserve(historyRemaining);
+        for (const auto &[id, chat] : model.buffers) {
+            if (!historyEligible(chat))
+                continue;
+            const auto name = activityNetwork(model, chat);
+            const bool query = chat.kind == "query";
+            const bool loading = chat.initialHistorySync == HistorySyncState::Loading;
+            std::string label(name);
+            label.append(query ? "/DM " : "/").append(chat.target);
+            label.append(loading ? " — Loading" : " — Queued");
+            entries.push_back(
+                menuEntry(rows->size(), std::move(label), loading ? "loader" : "clock"));
+            rows->push_back({id, std::string(name), chat.target, chat.initialHistorySync, query});
+        }
+        openPopup(
+            controls[History], inputSerial, std::move(entries),
+            [this, rows](size_t index) {
+                if (index >= rows->size())
+                    return;
+                const auto &row = (*rows)[index];
+                const auto chat = model.buffers.find(row.id);
+                if (chat != model.buffers.end() && matchesHistory(chat->first, chat->second, row))
+                    execute("buffer:" + row.id);
+            },
+            rows);
+    }
+    void openConnection(const Scope &current, std::optional<uint32_t> inputSerial) {
+        if (current.mentions()) {
+            execute("status-details:Global Mentions is read only and has no single network "
+                    "connection.");
+            return;
+        }
+        if (!current.profile) {
+            execute(current.server.empty()
+                        ? "status-details:No network profile is selected."
+                        : "status-details:The network " + std::string(current.server) +
+                              " no longer has a configured profile.");
+            return;
+        }
+        const auto state = current.state();
+        const bool connected = state != "Disconnected" && state != "Failed";
+        std::vector<ContextMenuEntry> entries;
+        entries.reserve(connected ? 3 : 2);
+        entries.push_back(
+            menuEntry(0, connected ? "Reconnect" : "Connect", connected ? "refresh" : "plug"));
+        if (connected)
+            entries.push_back(menuEntry(1, "Disconnect", "plug-off"));
+        entries.push_back(menuEntry(2, "Open server log", "terminal"));
+        openPopup(controls[State], inputSerial, std::move(entries),
+                  [this, connected, server = std::string(current.server),
+                   buffer = std::string(current.buffer), state = std::string(state),
+                   session = current.session()](size_t index) {
+                      const auto latest = scope();
+                      if (!latest.profile || latest.mentions() || latest.server != server ||
+                          latest.buffer != buffer || latest.state() != state ||
+                          latest.session() != session)
+                          return;
+                      if (index == 0)
+                          execute("status-connect:" + server);
+                      else if (index == 1 && connected)
+                          execute("status-disconnect:" + server);
+                      else if (index == 2)
+                          execute("open-server-log:" + server);
+                  });
+    }
+    void activateGroup(Group group, std::optional<uint32_t> inputSerial) {
+        hideTip();
+        if (!allowed || popupButton || !controls[group].area->visible() || caption(group).empty())
+            return;
+        switch (group) {
+        case History:
+            openHistory(inputSerial);
+            return;
+        case Feedback:
+            execute("status-details:" + std::string(caption(Feedback)));
+            return;
+        case Chord:
+            execute("status-cancel-chord");
+            return;
+        default:
+            break;
+        }
+        const auto current = scope();
+        if (!matchesScope(current))
+            return;
+        if (group == NetworkName) {
+            execute(current.mentions() || !current.profile ? "status-network:"
+                                                           : "status-network:" + shownServer);
+        } else if (group == State) {
+            openConnection(current, inputSerial);
+        } else if (current.mentions()) {
+            execute("switch-buffer");
+        } else if (!current.writable()) {
+            execute("status-details:Open a writable conversation on this network to change your "
+                    "nickname.");
+        } else if (!current.profile || current.server.empty()) {
+            execute("status-details:This conversation has no configured network profile for "
+                    "changing your nickname.");
+        } else {
+            execute("status-nick:" + shownBuffer);
+        }
     }
 };
 
@@ -351,35 +612,29 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     if (p.scale != userScale || p.visible != ledgerVisible || p.allowed != allowActivityMenu) {
         p.layoutReady = false;
         p.closePopup();
+        p.hideTip();
+        if (!allowActivityMenu)
+            for (const auto &button : p.controls)
+                if (button.area->pressed() || button.area->hovered())
+                    p.retire(*button.area);
         p.scale = userScale;
         p.visible = ledgerVisible;
         p.allowed = allowActivityMenu;
         markLayoutDirty();
     }
     const auto &model = p.model;
-    const auto buffer = model.buffers.find(model.activeBuffer);
-    const bool mentions = buffer != model.buffers.end() && buffer->second.kind == "mentions";
-    auto network = model.networks.end();
-    if (buffer != model.buffers.end() && !mentions)
-        network = model.networks.find(buffer->second.server);
-    else if (buffer == model.buffers.end() && !model.networks.empty())
-        network = model.networks.begin();
-    const Network *net = network == model.networks.end() ? nullptr : &network->second;
-    const std::string_view serverName = buffer != model.buffers.end()
-                                            ? std::string_view(buffer->second.server)
-                                        : net ? std::string_view(network->first)
-                                              : std::string_view{};
-    const auto config = std::find_if(model.servers.begin(), model.servers.end(),
-                                     [&](const auto &server) { return server.name == serverName; });
+    const auto current = p.scope();
+    p.setScope(current);
+    const bool mentions = current.mentions();
+    const auto *net = current.network;
+    const auto *config = current.profile;
     const std::string_view name =
-        mentions ? std::string_view{"All networks"} : serverDisplayName(model, serverName);
-    const std::string_view state = mentions                     ? "Read only"
-                                   : net && !net->state.empty() ? std::string_view(net->state)
-                                                                : "Disconnected";
+        mentions ? std::string_view{"All networks"} : serverDisplayName(model, current.server);
+    const auto state = current.state();
     std::string_view nick = mentions                       ? std::string_view{"Mentions"}
                             : net && net->state == "Ready" ? std::string_view(net->nick)
                                                            : std::string_view{};
-    if (!mentions && nick.empty() && config != model.servers.end())
+    if (!mentions && nick.empty() && config)
         if (const auto identity =
                 std::find_if(model.identities.begin(), model.identities.end(),
                              [&](const auto &entry) { return entry.name == config->identity; });
@@ -395,35 +650,23 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
         (connectionError ||
          !(feedback.starts_with("New message in ") || feedback == "All buffers marked as read" ||
            (feedback.contains(" · ") && feedback.contains('\n'))));
-    text(*p.right[Nick], nick);
-    text(*p.right[NetworkName], name);
-    text(*p.right[State], p.healthy ? "Connected" : state == "Ready" ? "Failed" : state);
-    if (p.right[Feedback]->setText(feedback)) {
-        if (p.feedbackButton.area->pressed())
-            p.retire(*p.feedbackButton.area);
-        p.feedbackButton.area->setTooltip(
-            feedback.empty() ? std::string{} : std::string(feedback) + "\nOpen status details");
-        p.feedbackTipText->setText(
-            feedback.empty() ? std::string{} : "Open status details\n" + std::string(feedback));
-    }
-    p.feedbackButton.area->setHitTestVisible(allowActivityMenu && !feedback.empty());
-    p.enableButton(p.feedbackButton, !feedback.empty());
-    if (!allowActivityMenu || feedback.empty()) {
-        p.feedbackButton.focus->setVisible(false);
-        p.hideFeedbackTip();
-    }
-    text(*p.right[Chord], keyHint);
+    p.setControl(Nick, nick,
+                 mentions ? "Switch conversation"
+                 : current.writable() && config && !current.server.empty()
+                     ? "Prefill /nick in the composer"
+                     : "Open status details");
+    p.setControl(NetworkName, name,
+                 !mentions && config ? "Open network settings" : "Manage networks");
+    p.setControl(State,
+                 p.healthy          ? "Connected"
+                 : state == "Ready" ? "Failed"
+                                    : state,
+                 !mentions && config ? "Show connection actions" : "Open status details");
+    p.setControl(Feedback, feedback, "Open status details");
+    p.setControl(Chord, keyHint, "Cancel pending key chord");
     p.icons[State]->setGlyph(mentions ? "at" : p.healthy ? "plug" : "plug-connected-x");
     p.icons[Feedback]->setGlyph(p.failureFeedback ? "alert-circle" : "info-circle");
-    const auto historyRemaining = static_cast<size_t>(
-        std::count_if(model.buffers.begin(), model.buffers.end(), [](const auto &entry) {
-            return entry.second.initialHistorySync != HistorySyncState::Idle;
-        }));
-    if (p.historyRemaining != historyRemaining) {
-        p.historyRemaining = historyRemaining;
-        text(*p.right[History],
-             historyRemaining ? "History: " + std::to_string(historyRemaining) + " remaining" : "");
-    }
+    p.syncHistory();
     const auto &font = themeUiFont();
     const auto backdrop = themeForegroundColor("background");
     const auto ink = [backdrop](std::string_view role) {
@@ -432,17 +675,20 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     p.activityInk = ink("primary");
     p.mentionInk = ink("error");
     p.focusInk = ink("secondary");
-    p.feedbackButton.focus->setFill(p.focusInk);
     const auto contextualInk = ink("on_surface_variant");
     const auto contextInk = ink("on_surface");
-    for (size_t i = 0; i < p.right.size(); ++i) {
+    for (size_t i = 0; i < p.controls.size(); ++i) {
+        auto &button = p.controls[i];
+        const bool hasCaption = !button.title->text().empty();
+        button.area->setHitTestVisible(allowActivityMenu && hasCaption);
+        p.enableButton(button, hasCaption);
         const auto color = i == State ? (state == "Failed" || connectionError ? p.mentionInk
                                          : p.healthy                          ? p.activityInk
                                                                               : p.focusInk)
                            : i == Feedback && p.failureFeedback ? p.mentionInk
                            : i == Chord || i == Nick            ? contextInk
                                                                 : contextualInk;
-        style(*p.right[i], font, p.scale, color);
+        style(*button.title, font, p.scale, color);
         p.icons[i]->setColor(color);
         p.icons[i]->setGlyphSize(14 * p.scale);
     }
@@ -513,7 +759,8 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     }
     if (presentationChanged) {
         p.layoutReady = false;
-        p.closePopup();
+        if (p.popupButton == &p.overflow)
+            p.closePopup();
         if (p.overflow.area->pressed())
             p.retire(*p.overflow.area);
         p.ordered.clear();
@@ -555,7 +802,7 @@ void ModeLine::doLayout(Renderer &renderer) {
     const float iconPrefix = std::round(14 * p.scale) + std::ceil(4 * p.scale);
     std::array<float, GroupCount> ideal{}, used{}, labelWidths{}, iconWidths{};
     for (size_t i = 0; i < ideal.size(); ++i)
-        ideal[i] = measure(p.right[i]->text());
+        ideal[i] = measure(p.controls[i].title->text());
     ideal[Nick] = std::min(ideal[Nick], std::ceil(140 * p.scale));
     ideal[NetworkName] = std::min(ideal[NetworkName], std::ceil(200 * p.scale));
     const size_t count = p.visible && height() > 0 ? p.ordered.size() : 0;
@@ -668,8 +915,9 @@ void ModeLine::doLayout(Renderer &renderer) {
     const auto overflowLabel = omitted ? overflowCaption(omitted) : std::string{};
     const float overflowText = measure(overflowLabel);
     const bool showOverflow = omitted && overflowText <= remaining;
-    if (p.firstOmitted != shown || (p.popupOpen && !showOverflow)) {
-        p.closePopup();
+    if (p.firstOmitted != shown) {
+        if (p.popupButton == &p.overflow)
+            p.closePopup();
         if (p.overflow.area->pressed())
             p.retire(*p.overflow.area);
     }
@@ -682,8 +930,6 @@ void ModeLine::doLayout(Renderer &renderer) {
         placeLabel(*p.overflow.title, renderer, (overflowSize - overflowText) / 2, overflowText,
                    height());
         remaining -= overflowSize;
-        if (p.popupOpen && p.anchor() != p.popupAnchor)
-            p.closePopup();
     } else {
         p.hideButton(p.overflow);
     }
@@ -696,41 +942,50 @@ void ModeLine::doLayout(Renderer &renderer) {
     take(History, remaining);
     x = width() - padding;
     for (size_t i = used.size(); i-- > 0;) {
-        if (i == Feedback) {
-            if (labelWidths[i] > 0)
-                p.moveButton(p.feedbackButton, x - labelWidths[i] - iconWidths[i],
-                             labelWidths[i] + iconWidths[i], height());
-            else {
-                p.hideButton(p.feedbackButton);
-                p.hideFeedbackTip();
-            }
+        auto &button = p.controls[i];
+        const auto group = static_cast<Impl::Group>(i);
+        if (labelWidths[i] <= 0 || height() <= 0) {
+            p.hideButton(button);
+            if (p.hoverGroup == group)
+                p.hideTip();
+            x -= used[i];
+            continue;
         }
-        const float labelX = i == Feedback ? iconWidths[i] : x - labelWidths[i];
-        placeLabel(*p.right[i], renderer, labelX, labelWidths[i], height());
+        const float buttonWidth = labelWidths[i] + iconWidths[i];
+        p.moveButton(button, x - buttonWidth, buttonWidth, height());
+        placeLabel(*button.title, renderer, iconWidths[i], labelWidths[i], height());
         auto &icon = *p.icons[i];
         icon.setVisible(iconWidths[i] > 0);
         if (icon.visible()) {
             icon.measure(renderer);
-            icon.setPosition(labelX - iconWidths[i], (height() - icon.height()) / 2);
+            icon.setPosition(0, (height() - icon.height()) / 2);
         }
         x -= used[i];
     }
-    if (p.feedbackTip->visible() && width() > 20 * p.scale) {
+    if (p.popupButton &&
+        (!p.popupButton->area->visible() || p.anchor(*p.popupButton) != p.popupAnchor))
+        p.closePopup();
+    if (p.hoverGroup && p.tip->visible()) {
+        if (width() <= 20 * p.scale) {
+            p.hideTip();
+            return;
+        }
+        const auto group = *p.hoverGroup;
         const float inset = 8 * p.scale;
         const auto fill = themeForegroundColor("surface_container_high");
-        p.feedbackTip->setFill(fill);
-        p.feedbackTip->setBorder(themeForegroundColor("outline_variant"), 1.f);
-        p.feedbackTip->setRadius(inset);
-        auto &label = *p.feedbackTipText;
+        p.tip->setFill(fill);
+        p.tip->setBorder(themeForegroundColor("outline_variant"), 1.f);
+        p.tip->setRadius(inset);
+        auto &label = *p.tipText;
         style(label, font, p.scale,
               themePairedForeground(fill, themeForegroundColor("on_surface")));
         label.setMaxWidth(std::min(width(), 420 * p.scale) - 2 * inset);
         label.measure(renderer);
         label.setPosition(inset, inset);
-        p.feedbackTip->setSize(label.width() + 2 * inset, label.height() + 2 * inset);
-        p.feedbackTip->setPosition(std::clamp(p.feedbackButton.area->x(), 0.f,
-                                              std::max(0.f, width() - p.feedbackTip->width())),
-                                   -p.feedbackTip->height() - 4 * p.scale);
+        p.tip->setSize(label.width() + 2 * inset, label.height() + 2 * inset);
+        p.tip->setPosition(
+            std::clamp(p.controls[group].area->x(), 0.f, std::max(0.f, width() - p.tip->width())),
+            -p.tip->height() - 4 * p.scale);
     }
 }
 } // namespace blast

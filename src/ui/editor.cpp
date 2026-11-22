@@ -993,6 +993,23 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
     }
     auto view = std::find_if(views.begin(), views.end(),
                              [&](const Composer *v) { return v->pane.id == pane.id; });
+    if (op == "prefill-nick") {
+        if (!composerWritable(model, pane.buffer) || view == views.end())
+            return true;
+        auto &composer = **view;
+        if (composer.input->composing() || !composer.paste.empty()) {
+            model.status = "Finish composition or paste review before changing your nickname.";
+            return true;
+        }
+        auto &d = draft(pane.buffer);
+        recover(pane.buffer, d);
+        ui_logic::Editor edit;
+        edit.text = "/nick ";
+        edit.cursor = edit.anchor = edit.text.size();
+        apply(pane.buffer, d, std::move(edit), pane.id);
+        pane.focusComposer = true;
+        return true;
+    }
     if (op == "cycle-spelling") {
         if (view != views.end())
             (*view)->cycleSpelling();

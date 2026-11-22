@@ -1487,6 +1487,7 @@ struct Ui::Impl {
     bool messageCommand(std::string_view command);
     void showReactionPicker(TranscriptMessageTarget target);
     void finishReactionPicker(std::string glyph = {});
+    bool statusControlsAvailable() const;
     void run(std::string command, std::optional<InputArea::PointerData> pointer = {});
     void drainPending();
     void focus(std::uint64_t id, bool focusComposer = true);
@@ -3691,13 +3692,47 @@ void Ui::Impl::dismissTopic(bool restoreFocus) {
         dispatcher->restoreTabFocus(std::move(topicFocus));
 }
 
+bool Ui::Impl::statusControlsAvailable() const {
+    return !paletteOpen && !jumpOpen && !reactionTarget && !dialogs->active() && !topicSource &&
+           uploadStage == UploadStage::Closed && !media->active();
+}
+
 void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> pointer) {
     if (command.empty())
         return;
-    if (command.starts_with("status-details:")) {
-        if (!paletteOpen && !jumpOpen && !reactionTarget && !dialogs->active() && !topicSource &&
-            uploadStage == UploadStage::Closed && !media->active())
-            dialogs->open(command);
+    if (command.starts_with("status-")) {
+        if (!statusControlsAvailable())
+            return;
+        const std::string_view route(command);
+        if (route == "status-cancel-chord") {
+            chord.clear();
+            if (dispatcher && dispatcher->focusedArea() &&
+                dispatcher->focusedArea()->tabFocusKey() == "status-chord")
+                focus(workspace.focused);
+        } else if (route.starts_with("status-details:")) {
+            dialogs->open(route);
+        } else if (route.starts_with("status-nick:")) {
+            const auto origin = route.substr(std::string_view("status-nick:").size());
+            if (auto pane = workspace.panes.find(workspace.focused);
+                pane != workspace.panes.end() && pane->second.buffer == origin &&
+                model.activeBuffer == origin)
+                editors.execute("prefill-nick", pane->second);
+        } else {
+            const auto separator = route.find(':');
+            if (separator == std::string_view::npos)
+                return;
+            const auto action = route.substr(0, separator);
+            const auto server = route.substr(separator + 1);
+            if (action == "status-network" && server.empty()) {
+                dialogs->open("networks");
+            } else if (std::any_of(model.servers.begin(), model.servers.end(),
+                                   [&](const auto &profile) { return profile.name == server; })) {
+                if (action == "status-network")
+                    dialogs->open("server:" + std::string(server));
+                else if (action == "status-connect" || action == "status-disconnect")
+                    queue(model, std::string(action.substr(7)), {}, std::string(server));
+            }
+        }
         return;
     }
     for (const auto &[id, view] : views)
@@ -4418,9 +4453,7 @@ void Ui::Impl::refresh(bool panelResize) {
         closeUploadMenu();
     restoreJumpFocus(false);
     syncUploadPanel();
-    modeLine->sync(scale, navigationMode, chord,
-                   !paletteOpen && !jumpOpen && !reactionTarget && !dialogs->active() &&
-                       !topicSource && uploadStage == UploadStage::Closed && !media->active());
+    modeLine->sync(scale, navigationMode, chord, statusControlsAvailable());
     place(*modeLine, outer, height - statusHeight, std::max(0.f, width - 2 * outer), statusHeight);
     if (windowActive)
         repairFocus();
@@ -4791,6 +4824,11 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
             return consume();
         }
         return false;
+    }
+    if (area && statusControlsAvailable() && !event.preedit && !event.modifiers &&
+        KeySymbol::isEnterOrSpace(event.sym) && withinNode(area, modeLine)) {
+        area->dispatchKey(event.sym, event.utf32, event.modifiers, event.pressed, event.preedit);
+        return consume();
     }
     if (!dialogs->active())
         if (const auto view = views.find(workspace.focused);

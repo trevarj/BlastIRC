@@ -612,9 +612,15 @@ void captionConsumers(Certificate &certificate, const std::string &body) {
         if (id == 1) {
             auto *image = previewImage(*view);
             assert(image && image->visible() && image->hasImage());
-            assert(view->height() == 128 && view->measure(renderer, 400, 1) == 128);
+            assert(image->width() == 320 && image->height() == 120);
+            assert(view->height() == view->measure(renderer, 400, 1));
             assert(!visibleLabelWithText(*view, url));
-            assert(!visibleLabelWithText(*view, "Real image page title"));
+            auto *site = visibleLabelWithText(*view, server.endpoint.substr(8));
+            auto *title = visibleLabelWithText(*view, "Real image page title");
+            auto *action = firstArea(*view);
+            assert(site && title && action && site->y() >= image->height());
+            assert(title->y() >= site->y() + site->height());
+            assert(title->y() + title->height() <= action->height());
         }
     }
     root.removeChild(view);
@@ -633,15 +639,18 @@ void htmlThumbnailConsumers(Certificate &certificate, const std::string &body) {
     assert(PreviewService::raster(
         {reinterpret_cast<const std::uint8_t *>(undecodable.data()), undecodable.size()}));
     for (const std::string_view scenario : {"missing", "pending", "denied", "failed", "undecodable",
-                                            "upload", "valid", "suffix", "click"}) {
+                                            "upload", "valid", "untitled", "suffix", "click"}) {
         const bool missing = scenario == "missing";
         const bool pending = scenario == "pending";
         const bool denied = scenario == "denied";
         const bool click = scenario == "click";
         const bool invalid = scenario == "undecodable";
-        const bool valid = scenario == "valid" || scenario == "suffix";
+        const bool untitled = scenario == "untitled";
+        const bool valid = scenario == "valid" || scenario == "suffix" || untitled;
         const bool upload = scenario == "upload";
         Server server(certificate, [&](std::string_view path) {
+            if (untitled && path == "/page")
+                return Reply{"<meta property='og:image' content='/thumb.png'>"};
             if (path == "/page" || path == "/page.png")
                 return Reply{missing ? "<title>No thumbnail</title>"
                                      : "<title>Thumbnail page</title>"
@@ -704,6 +713,8 @@ void htmlThumbnailConsumers(Certificate &certificate, const std::string &body) {
             assert(view->visible() && image && image->visible() && image->hasImage());
             assert(image->sourceWidth() == 1 && image->sourceHeight() == 1);
             assert(!visibleLabelWithText(*view, url) && !controller.replacesUrl(17));
+            assert(visibleLabelWithText(*view, server.endpoint.substr(8)));
+            assert(bool(visibleLabelWithText(*view, "Thumbnail page")) == !untitled);
         } else if (upload) {
             assert(controller.ready(17) && controller.error(17).empty());
             assert(view->measure(renderer, 400, 1) > 0); // CPU pixels alone are insufficient.

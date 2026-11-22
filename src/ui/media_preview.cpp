@@ -90,15 +90,15 @@ std::string hostOf(std::string_view url) {
     auto host = url.substr(start + 3);
     return std::string(host.substr(0, host.find_first_of("/?#")));
 }
-void labelStyle(Label &label, float scale) {
+void labelStyle(Label &label, float size, int lines = 1, std::string_view role = "on_surface") {
     const auto &font = themeUiFont();
     label.setUseMarkup(false);
-    label.setMaxLines(1);
+    label.setMaxLines(lines);
     label.setFontFamily(font.family);
     label.setFontFeatures(font.features);
     label.setFontWeight(font.weight);
-    label.setFontSize(13 * scale);
-    label.setColor(themeForegroundColor("on_surface"));
+    label.setFontSize(size);
+    label.setColor(themeForegroundColor(role));
 }
 std::optional<DecodedRasterImage> readRaster(const PreviewAsset &asset, int target) {
     if (!asset.bytes || asset.bytes > 32ULL * 1024 * 1024)
@@ -274,7 +274,7 @@ struct MediaPreviewController::Impl {
             background->setRadius(themeCornerRadius());
             const float pad = std::min(12 * scale, w / 8), inner = std::max(0.f, w - 2 * pad);
             for (auto *label : {title, status}) {
-                labelStyle(*label, scale);
+                labelStyle(*label, Style::fontSizeCaption * scale);
                 label->setMaxWidth(inner);
             }
             title->setPosition(pad, pad);
@@ -367,7 +367,7 @@ struct MediaPreviewController::Impl {
     InputDispatcher::TabFocusSnapshot returnFocus;
     PreviewService service;
     MediaPlayer player;
-    Label captionMeasure;
+    Label captionMeasure, siteMeasure;
     std::map<std::uint64_t, Entry> entries;
     std::map<std::uint64_t, std::uint64_t> tickets;
     std::function<void()> changed;
@@ -385,16 +385,27 @@ struct MediaPreviewController::Impl {
         overlay = view.get();
         host.addChild(std::move(view));
     }
-    static void prepareCaption(Label &label, const Entry &entry, float width, float scale) {
-        labelStyle(label, scale);
-        label.setMaxWidth(std::max(1.f, std::min(width, 320 * scale) - 16 * scale));
-        const bool page = entry.kind == PreviewKind::Link || !entry.imageUrl.empty();
-        label.setText(page || entry.title.empty() ? entry.original : entry.title);
-    }
-    float captionHeight(Renderer &renderer, const Entry &entry, float width, float scale) {
-        prepareCaption(captionMeasure, entry, width, scale);
-        captionMeasure.measure(renderer);
-        return std::max(24 * scale, captionMeasure.height() + 8 * scale);
+    static float prepareCaption(Renderer &renderer, Label &caption, Label &site, const Entry &entry,
+                                float width, float scale) {
+        const float inner = std::max(1.f, width - 16 * scale);
+        labelStyle(caption, Style::fontSizeCaption * scale, entry.confirmedLink ? 2 : 1);
+        caption.setMaxWidth(inner);
+        caption.setText(entry.title.empty() ? (entry.confirmedLink ? entry.host : entry.original)
+                                            : entry.title);
+        float siteHeight = 0;
+        if (entry.confirmedLink) {
+            const bool showSite = !entry.title.empty() && entry.title != entry.host;
+            site.setVisible(showSite);
+            if (showSite) {
+                labelStyle(site, Style::fontSizeMini * scale, 1, "on_surface_variant");
+                site.setMaxWidth(inner);
+                site.setText(entry.host);
+                site.measure(renderer);
+                siteHeight = site.height() + 2 * scale;
+            }
+        }
+        caption.measure(renderer);
+        return std::max(24 * scale, siteHeight + caption.height() + 8 * scale);
     }
     Policy currentPolicy() const {
         const auto &s = model.settings;
@@ -776,7 +787,7 @@ void MediaPreviewController::bind(std::uint64_t id, std::string_view url, bool r
     entry.original = std::string(url);
     entry.origin = *normalized;
     entry.url = *normalized;
-    entry.host = hostOf(entry.url);
+    entry.host = hostOf(entry.origin);
     entry.kind = urlKind(entry.url);
     entry.automaticAllowed = automaticAllowed;
     s.request(id, entry, false);
@@ -811,7 +822,10 @@ float MediaPreviewController::measure(Renderer &renderer, std::uint64_t id, floa
     const float limit = std::clamp(s.model.settings.previewMaxHeight, 64, 240) * scale;
     const float desired =
         raster.width && raster.height ? thumbWidth * raster.height / raster.width : 96 * scale;
-    const float caption = replacesUrl(id) ? s.captionHeight(renderer, it->second, width, scale) : 0;
+    const float caption =
+        entry.confirmedLink || replacesUrl(id)
+            ? s.prepareCaption(renderer, s.captionMeasure, s.siteMeasure, entry, thumbWidth, scale)
+            : 0;
     return std::clamp(desired, std::min(64 * scale, limit), limit) + caption + 8 * scale;
 }
 bool MediaPreviewController::openUrl(std::string_view url, std::uint64_t messageId) {
@@ -1050,9 +1064,9 @@ struct MediaPreviewCard::Impl {
             else if (key.sym == XKB_KEY_Return || key.sym == XKB_KEY_space)
                 activate();
         });
-        status = child<Label>(owner);
+        status = child<Label>(*thumbnailAction);
         status->setHitTestVisible(false);
-        caption = child<Label>(owner);
+        caption = child<Label>(*thumbnailAction);
         caption->setHitTestVisible(false);
         auto icon = std::make_unique<LucideIcon>("link");
         typeIcon = icon.get();
@@ -1182,15 +1196,22 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
     auto &entry = it->second;
     const float scale = s.scale;
     const bool replacing = s.controller.replacesUrl(s.id);
-    const float captionHeight =
-        replacing ? controller.captionHeight(renderer, entry, width(), scale) : 0;
-    const float h = std::max(0.f, height() - 8 * scale - captionHeight);
+    const bool web = entry.confirmedLink;
     const float w = std::min(width(), 320 * scale);
+    const float captionHeight =
+        web || replacing
+            ? controller.prepareCaption(renderer, *s.caption, *s.status, entry, w, scale)
+            : 0;
+    const float h = std::max(0.f, height() - 8 * scale - captionHeight);
     s.visibleAsset->asset = entry.asset;
     entry.lastUse = ++controller.clock;
     s.background->setSize(w, h + captionHeight);
     s.background->setFill(themeSurfaceColor("surface_container"));
-    s.background->setRadius(Style::radiusLg * themeScale());
+    const float radius = Style::radiusLg * themeScale();
+    s.background->setRadius(radius);
+    s.image->setFit(web ? ImageFit::Cover : ImageFit::Contain);
+    // Native Image rounds uniformly; the card surface shows through its two inner corners.
+    s.image->setRadius(web ? radius : 0);
     if (entry.asset && entry.kind == PreviewKind::Image && s.shownRevision != entry.assetRevision) {
         s.image->clear(renderer);
         const bool loaded =
@@ -1209,6 +1230,8 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
                 setSize(width(), 0);
                 setVisible(false);
                 setHitTestVisible(false);
+                s.shownRevision = entry.assetRevision;
+                return;
             }
         }
         s.shownRevision = entry.assetRevision;
@@ -1220,8 +1243,16 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
     s.image->setSize(w, h);
     s.thumbnailAction->setPosition(0, 0);
     s.thumbnailAction->setSize(w, h + captionHeight);
-    labelStyle(*s.status, scale);
-    s.status->setMaxLines(4);
+    s.caption->setVisible(web || replacing);
+    if (web) {
+        s.typeIcon->setVisible(false);
+        s.status->setPosition(8 * scale, h + 4 * scale);
+        const float siteHeight = s.status->visible() ? s.status->height() + 2 * scale : 0;
+        s.caption->setPosition(8 * scale, h + 4 * scale + siteHeight);
+        Node::doLayout(renderer);
+        return;
+    }
+    labelStyle(*s.status, Style::fontSizeCaption * scale, 4);
     s.status->setMaxWidth(std::max(0.f, w - 16 * scale));
     s.status->setPosition(8 * scale, 8 * scale);
     const bool contentTile = !thumb && replacing;
@@ -1244,9 +1275,7 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
                                  ? "Web page · Thumbnail disabled"
                                  : "Web page · Load thumbnail")
                           : "Load preview");
-    controller.prepareCaption(*s.caption, entry, width(), scale);
     s.caption->setPosition(8 * scale, h + 4 * scale);
-    s.caption->setVisible(replacing);
     Node::doLayout(renderer);
 }
 } // namespace blast

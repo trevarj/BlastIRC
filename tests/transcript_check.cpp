@@ -10316,6 +10316,9 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
             const auto bodyBefore = sceneBounds(rendered.body);
             dispatcher.pointerMotion(before.x + 1, surfaceBefore.y + surfaceBefore.height * .5f, 1);
             assert(dispatcher.hoveredArea() == &rendered.row);
+            dispatcher.pointerMotion(bodyBefore.x + 2, bodyBefore.y + bodyBefore.height * .25f, 2);
+            assert(dispatcher.hoveredArea() &&
+                   dispatcher.hoveredArea()->parent() == &rendered.body);
             dispatcher.setFocus(&rendered.row);
             view.arrange(renderer, viewport);
             RectNode *ring = nullptr;

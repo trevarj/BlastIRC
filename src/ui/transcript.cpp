@@ -5345,7 +5345,8 @@ struct TranscriptView::Impl {
                     slot.mentionHalo->setOpacity(outlineStrength * .8f * opacity);
             }
             paintTextSelection(slot, textRange, top, bottom);
-            const bool hovered = slot.area->hovered();
+            const bool hovered =
+                dispatcher ? owns(dispatcher->hoveredArea()) : slot.area->hovered();
             const Color normal = entry.deleted || entry.presence
                                      ? themeForegroundColor("on_surface_variant")
                                  : entry.own && g.bubbles && !entry.action

@@ -31,7 +31,7 @@ Label *lineLabel(Node &parent) {
     label->setUseMarkup(false);
     label->setMaxLines(1);
     label->setEllipsize(TextEllipsize::End);
-    label->setBaselineMode(LabelBaselineMode::TextFixedHeight);
+    label->setBaselineMode(LabelBaselineMode::InkCentered);
     return label;
 }
 bool historyEligible(const Buffer &chat) {

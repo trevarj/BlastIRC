@@ -4412,7 +4412,9 @@ void Ui::Impl::refresh(bool panelResize) {
         closeUploadMenu();
     restoreJumpFocus(false);
     syncUploadPanel();
-    modeLine->sync(scale, navigationMode, chord);
+    modeLine->sync(scale, navigationMode, chord,
+                   !paletteOpen && !jumpOpen && !reactionTarget && !dialogs->active() &&
+                       !topicSource && uploadStage == UploadStage::Closed && !media->active());
     place(*modeLine, outer, height - statusHeight, std::max(0.f, width - 2 * outer), statusHeight);
     if (windowActive)
         repairFocus();

@@ -453,7 +453,7 @@ int main(int argc, char **argv) {
             if (!ui.handleKey(key, event.key))
                 input.keyEvent(event.sym, event.utf32, event.modifiers, event.pressed,
                                event.preedit);
-            if (event.pressed && !event.preedit && KeySymbol::isEnter(event.sym) &&
+            if (event.pressed && !event.preedit && KeySymbol::isEnterOrSpace(event.sym) &&
                 dropdown.isSelectDropdownOpen())
                 popupOpeningKey = event.key;
         });

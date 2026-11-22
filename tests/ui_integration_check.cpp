@@ -26,6 +26,7 @@
 #include <fstream>
 #include <functional>
 #include <glib.h>
+#include <initializer_list>
 #include <iterator>
 #include <optional>
 #include <render/animation/animation_manager.h>
@@ -3174,7 +3175,9 @@ void statusIdentityCheck() {
         line.layout(renderer);
     };
     frame();
-    assert(visibleLabelContaining(line, "CurrentLocal"));
+    assert(visibleLabelContaining(line, "CurrentLocal") && visibleLabelContaining(line, "test") &&
+           visibleLabelContaining(line, "Connected"));
+    assert(!visibleLabelContaining(line, model.buffers.at(edgeBuffers[0]).target));
     assert(!visibleLabelContaining(line, "ConfiguredLocal"));
     network.nick = "RenamedLocal";
     assert(!areaWithKey(line, "status-mark-all-read"));
@@ -7876,13 +7879,14 @@ void hiddenUnreadStatusCheck(
     model = edgeModel();
     model.settings.workspace["native_navigation_mode"] = "hidden";
     model.servers[0].alias = "Local";
+    model.identities[0].nick = "Me";
     model.networks["test"].state = "Ready";
     ServerConfig remote;
-    remote.name = "other";
+    remote.name = "zremote";
     remote.alias = "Remote";
     model.servers.push_back(remote);
-    model.networks["other"].state = "Ready";
-    model.networks["other"].nick = "OtherMe";
+    model.networks["zremote"].state = "Ready";
+    model.networks["zremote"].nick = "OtherMe";
     const auto add = [&](std::string server, std::string target, std::string kind) {
         const auto id = server + "/" + target;
         auto &buffer = model.buffers[id];
@@ -7892,8 +7896,9 @@ void hiddenUnreadStatusCheck(
         buffer.kind = std::move(kind);
         return id;
     };
-    const auto normal = add("test", "#same", "channel");
-    const auto mention = add("other", "#same", "channel");
+    const auto normal = add("test", "#ops", "channel");
+    const auto mention = add("zremote", "#ops", "channel");
+    const auto dm = add("test", "ada", "query");
     const auto archived = add("test", "#archived", "channel");
     const auto fools = add("test", "#fools", "channel");
     const auto system = add("test", "*server*", "server");
@@ -7917,6 +7922,8 @@ void hiddenUnreadStatusCheck(
     incoming(normal, true, false, true);
     incoming(normal, false, true, true);
     assert(model.buffers.at(normal).unread == 1);
+    for (int i = 0; i < 11; ++i)
+        incoming(normal);
     const auto oldMention = incoming(mention, false, false, true);
     model.buffers.at(mention).readMarker = "local:" + oldMention;
     model.buffers.at(mention).unread = 0;
@@ -7924,8 +7931,8 @@ void hiddenUnreadStatusCheck(
     incoming(archived);
     model.buffers.at(archived).archived = true;
     incoming(system);
-    incoming(edgeBuffers[1]);
-    incoming(edgeBuffers[1]);
+    incoming(dm);
+    incoming(dm);
     model.settings.fools.insert("FOOL");
     incoming(fools);
     incoming(fools, false, false, true, "fool");
@@ -7935,10 +7942,12 @@ void hiddenUnreadStatusCheck(
     theme.update(model);
     InputDispatcher dispatcher;
     PangoRenderer renderer;
+    MenuHost menu;
     Ui ui(model, clipboard);
     dispatcher.setSceneRoot(&ui.root());
     ui.setInputDispatcher(dispatcher);
     ui.setWindowActive(false);
+    ui.root().setPopupContext(&menu);
     float width = 2000;
     const auto frame = [&] {
         ui.update(width, 900, 1);
@@ -7948,97 +7957,217 @@ void hiddenUnreadStatusCheck(
     auto *line = visibleNode<ModeLine>(ui.root());
     assert(line && visibleCount<Sidebar>(ui.root()) == 0);
     const auto segment = [&](std::string_view name) { return visibleLabelContaining(*line, name); };
-    auto *local = segment("Local/#same");
-    auto *other = segment("Remote/#same");
-    auto *fool = segment("Local/#fools");
-    assert(local && other && fool && local != other);
-    assert(local->text().find(std::to_string(model.buffers.at(normal).unread)) !=
-           std::string_view::npos);
-    assert(other->text().front() != '@' && fool->text().front() != '@');
-    assert(!segment("#archived") && !segment("*server*"));
-    auto *query = segment("Local/second");
-    assert(query && query->text() == "Local/second: 2");
-    click(dispatcher, *query);
-    frame();
-    assert(model.activeBuffer == edgeBuffers[1]);
-    model.buffers.at(edgeBuffers[1]).unread = 0;
-    frame();
-    assert(!segment("Local/second"));
-    const auto normalColor = other->color();
-    const auto normalWeight = other->font().weight;
+    const auto activity = [&](const std::string &id) -> InputArea * {
+        auto *area = areaWithKey(*line, "buffer:" + id);
+        return area && visible(*area) ? area : nullptr;
+    };
+    const auto fits = [&](const Label *label) {
+        return label && label->width() + .5f >=
+                            renderer
+                                .measureText(label->text(), label->fontSize(), label->font(), 0, 1,
+                                             TextAlign::Start, TextEllipsize::End, false)
+                                .width;
+    };
+    const auto counted = [&](const std::string &id, std::string_view caption, int count) {
+        auto *area = activity(id);
+        assert(area && areaWithTooltip(*area, caption) == area);
+        const auto suffix = ": " + std::to_string(count);
+        auto *label = visibleLabelContaining(*area, suffix);
+        assert(label && label->text() == suffix && fits(label));
+        assert(label->x() >= 0 && label->x() + label->width() <= area->width() + .5f);
+        return area;
+    };
+    const auto marker = [&](const std::string &id) -> Label * {
+        auto *area = activity(id);
+        return area ? visibleLabelContaining(*area, "@") : nullptr;
+    };
+    counted(normal, "Local/#ops: 12", 12);
+    auto *other = counted(mention, "Remote/#ops: 1", 1);
+    counted(fools, "Local/#fools: 1", 1);
+    counted(dm, "Local/DM ada: 2", 2);
+    assert(!marker(mention) && !marker(fools));
+    assert(!activity(archived) && !activity(system));
+    assert(fits(segment("Connected")) && fits(labelWithText(*line, "Me")) &&
+           fits(labelWithText(*line, "Local")));
+    assert(!segment(model.buffers.at(edgeBuffers[0]).target));
+    const auto normalColor = visibleLabelContaining(*other, "Remote/#ops")->color();
+    const auto normalWeight = visibleLabelContaining(*other, "Remote/#ops")->font().weight;
+    for (int i = 0; i < 5; ++i)
+        incoming(mention);
     const auto newestMention = incoming(mention, false, false, true);
     frame();
-    other = segment("Remote/#same");
-    assert(other && other->text().front() == '@');
-    assert(other->color() != normalColor && other->font().weight > normalWeight);
-    assert(other->text().find(std::to_string(model.buffers.at(mention).unread)) !=
-           std::string_view::npos);
+    other = counted(mention, "@Remote/#ops: 7", 7);
+    const auto *at = marker(mention);
+    assert(at && at->text() == "@" && fits(at));
+    assert(at->color() != normalColor && at->font().weight > normalWeight);
     click(dispatcher, *other);
     frame();
     assert(model.activeBuffer == mention);
-    click(dispatcher, *segment("Local/#same"));
+    click(dispatcher, *activity(normal));
     frame();
     assert(model.activeBuffer == normal);
     ui.execute("buffer:" + std::string(edgeBuffers[0]));
     frame();
-    // No new controls, and stable arrivals retain the native text nodes.
-    const auto childCount = line->children().size();
+    const auto overflowControl = [&]() -> InputArea * {
+        auto *area = areaWithKey(*line, "status-activity-overflow");
+        return area && visible(*area) ? area : nullptr;
+    };
+    assert(!overflowControl() && !areaWithKey(*line, "status-mark-all-read"));
+    assert(pointerPoint(*activity(mention))[0] < pointerPoint(*labelWithText(*line, "Me"))[0]);
+    // Find a width that has room for one activity chip and the overflow control.
+    float overflowOnlyWidth = 0;
+    for (width = 64; width <= 600; width += 4) {
+        frame();
+        if (overflowControl() && !activity(mention) && !activity(normal) && !activity(dm) &&
+            !activity(fools))
+            overflowOnlyWidth = width;
+        if (overflowControl() && activity(mention) && !activity(normal) && !activity(dm) &&
+            !activity(fools))
+            break;
+    }
+    auto *overflow = overflowControl();
+    assert(width <= 600 && overflow && fits(visibleLabelContaining(*overflow, "+3 chats")));
+    counted(mention, "@Remote/#ops: 7", 7);
+    assert(fits(marker(mention)));
+    const auto omitted = [&](std::initializer_list<std::string_view> expected) {
+        assert(menu.open && overflowControl());
+        const auto point = pointerPoint(*overflowControl());
+        assert(menu.request.anchorX <= point[0] && menu.request.anchorY <= point[1]);
+        assert(menu.request.anchorX + menu.request.anchorWidth + 1 >= point[0] &&
+               menu.request.anchorY + menu.request.anchorHeight + 1 >= point[1]);
+        assert(menu.request.options.empty());
+        std::vector<std::string_view> captions;
+        for (const auto &entry : menu.request.menu) {
+            assert(entry.enabled && !entry.header && !entry.separator && entry.children.empty());
+            captions.push_back(entry.label);
+        }
+        assert(std::is_permutation(captions.begin(), captions.end(), expected.begin(),
+                                   expected.end()));
+    };
+    const auto omittedOrdinary = [&] {
+        omitted({"Local/#ops: 12", "Local/#fools: 1", "Local/DM ada: 2"});
+    };
+    const auto select = [&](std::string_view caption) {
+        // Native dismissal precedes the selection callback.
+        if (menu.callbacks.onDismiss)
+            menu.callbacks.onDismiss();
+        menu.select(caption);
+    };
+    click(dispatcher, *overflow);
+    omittedOrdinary();
+    select("Local/DM ada: 2");
     frame();
-    assert(segment("Local/#same") == local && line->children().size() == childCount);
-    assert(!areaWithKey(*line, "status-mark-all-read"));
+    assert(model.activeBuffer == dm);
+    const auto backToOrigin = [&] {
+        ui.execute("buffer:" + std::string(edgeBuffers[0]));
+        frame();
+    };
+    backToOrigin();
+    const auto openByKey = [&](std::uint32_t key) {
+        auto *area = overflowControl();
+        assert(area);
+        dispatcher.setFocus(area);
+        nativeKey(ui, dispatcher, key);
+        omittedOrdinary();
+    };
+    openByKey(XKB_KEY_Return);
+    select("Local/#ops: 12");
+    frame();
+    assert(model.activeBuffer == normal);
+    backToOrigin();
+    openByKey(XKB_KEY_space);
+    model.buffers.at(normal).unread = 0;
+    select("Local/#ops: 12");
+    assert(model.activeBuffer == edgeBuffers[0]);
+    model.buffers.at(normal).unread = 12;
+    openByKey(XKB_KEY_Return);
+    model.buffers.at(dm).muted = true;
+    select("Local/DM ada: 2");
+    assert(model.activeBuffer == edgeBuffers[0] && model.buffers.at(dm).unread == 2);
+    model.buffers.at(dm).muted = false;
+    openByKey(XKB_KEY_Return);
+    const auto stale = menu.callbacks.onSelect;
+    const auto staleValue =
+        std::find_if(menu.request.menu.begin(), menu.request.menu.end(),
+                     [](const ContextMenuEntry &entry) { return entry.label == "Local/DM ada: 2"; })
+            ->value;
     ui.execute("toggle-navigation");
     frame();
-    assert(visibleCount<Sidebar>(ui.root()) == 1 && !segment("Local/#same"));
+    assert(!menu.open && !overflowControl() && !activity(mention) &&
+           dispatcher.focusedArea() != overflow);
+    ui.execute("toggle-navigation");
+    frame();
+    assert(!overflowControl() && !activity(mention));
+    ui.execute("toggle-navigation");
+    frame();
+    assert(overflowControl() && activity(mention));
+    stale(staleValue);
+    assert(model.activeBuffer == edgeBuffers[0]);
+    openByKey(XKB_KEY_Return);
+    ui.execute("jump-channel");
+    frame();
+    assert(!menu.open && !overflowControl() && !activity(mention));
+    nativeKey(ui, dispatcher, XKB_KEY_Escape);
+    frame();
+    assert(overflowControl() && activity(mention));
+    assert(overflowOnlyWidth > 0);
+    width = overflowOnlyWidth;
+    frame();
+    assert(overflowControl() && !activity(mention) &&
+           fits(visibleLabelContaining(*overflowControl(), "+4 chats")));
+    click(dispatcher, *overflowControl());
+    omitted({"@Remote/#ops: 7", "Local/#ops: 12", "Local/#fools: 1", "Local/DM ada: 2"});
+    width = 2000;
+    frame();
+    assert(!menu.open && !overflowControl() && activity(dm));
+    ui.execute("toggle-navigation");
+    frame();
+    assert(visibleCount<Sidebar>(ui.root()) == 1 && !activity(normal));
     ui.execute("toggle-navigation");
     frame();
     auto *sidebar = visibleNode<Sidebar>(ui.root());
-    assert(sidebar && sidebar->width() == 56 && !segment("Local/#same"));
+    assert(sidebar && sidebar->width() == 56 && !activity(normal));
     ui.execute("toggle-navigation");
     frame();
-    assert(visibleCount<Sidebar>(ui.root()) == 0 && segment("Local/#same"));
+    assert(visibleCount<Sidebar>(ui.root()) == 0 && activity(normal));
     ui.execute("jump-channel");
     frame();
     auto *jump = areaWithKey(ui.root(), "channel-jump");
     sidebar = visibleNode<Sidebar>(ui.root());
     assert(jump && visible(*jump) && sidebar && sidebar->width() == 56);
-    assert(!segment("Local/#same") && !segment("Remote/#same"));
+    assert(!activity(normal) && !activity(mention));
     nativeKey(ui, dispatcher, XKB_KEY_Escape);
     frame();
-    assert(visibleCount<Sidebar>(ui.root()) == 0 && segment("Remote/#same"));
+    assert(visibleCount<Sidebar>(ui.root()) == 0 && activity(mention));
     // A retained mention at/before the read marker cannot accent newer ordinary unread.
     model.buffers.at(mention).readMarker = "local:" + newestMention;
     model.buffers.at(mention).unread = 0;
     incoming(mention);
     frame();
-    other = segment("Remote/#same");
-    assert(other && other->text().front() != '@' && other->color() == normalColor);
+    counted(mention, "Remote/#ops: 1", 1);
+    assert(!marker(mention));
     model.buffers.at(mention).unread = 0;
     frame();
-    assert(!segment("Remote/#same"));
+    assert(!activity(mention));
     // Let Core include fools, then verify the same retained mention classifier.
     model.settings.foolUnread = true;
     incoming(fools, false, false, true, "fool");
     frame();
-    fool = segment("Local/#fools");
-    assert(fool && fool->text().front() == '@' && model.buffers.at(fools).unread == 3);
+    assert(marker(fools) && model.buffers.at(fools).unread == 3);
     // Eligibility changes invalidate style without an unread/message revision.
     model.settings.foolUnread = false;
     frame();
-    fool = segment("Local/#fools");
-    assert(fool && fool->text().front() != '@' && model.buffers.at(fools).unread == 3);
+    assert(!marker(fools) && model.buffers.at(fools).unread == 3);
     model.settings.fools.clear();
     frame();
-    fool = segment("Local/#fools");
-    assert(fool && fool->text().front() == '@');
+    assert(marker(fools));
     model.settings.fools = {"FOOL", "{FOOL}"};
     incoming(fools, false, false, true, "[fool]");
     frame();
-    fool = segment("Local/#fools");
-    assert(fool && fool->text().front() != '@');
+    assert(!marker(fools));
     model.networks["test"].caseMapping = "ascii";
     frame();
-    fool = segment("Local/#fools");
-    assert(fool && fool->text().front() == '@');
+    assert(marker(fools));
     ui.execute("toggle-navigation");
     frame();
     sidebar = visibleNode<Sidebar>(ui.root());
@@ -8056,11 +8185,49 @@ void hiddenUnreadStatusCheck(
     ui.execute("toggle-navigation");
     ui.execute("toggle-navigation");
     frame();
+    const auto identityFits = [&] {
+        return fits(labelWithText(*line, "Me")) && fits(labelWithText(*line, "Local"));
+    };
+    auto &network = model.networks.at("test");
+    auto &history = model.buffers.at(edgeBuffers[2]).initialHistorySync;
     model.status = "Connection feedback";
+    history = HistorySyncState::Queued;
     width = 720;
     frame();
-    assert(visibleLabelContaining(*line, model.status));
-    assert(visibleLabelContaining(*line, "Me") && visibleLabelContaining(*line, "Connected"));
+    assert(fits(segment(model.status)) && fits(segment("History: 1 remaining")));
+    auto *healthy = segment("Connected");
+    assert(fits(healthy) && identityFits());
+    const auto healthyInk = healthy->color();
+    assert(!segment(model.buffers.at(edgeBuffers[0]).target));
+    model.status = std::string(160, 'W');
+    width = 400;
+    nativeKey(ui, dispatcher, 'x', KeyMod::Ctrl);
+    frame();
+    assert(identityFits() && fits(segment("c-x")) && !fits(segment(model.status)));
+    network.state = "Failed";
+    network.error = "TLS certificate rejected";
+    frame();
+    auto *failed = segment("Failed");
+    assert(fits(failed) && failed->color() != healthyInk);
+    assert(fits(segment(network.error)) && fits(segment("c-x")) && identityFits());
+    assert(!fits(segment("History: 1 remaining")));
+    network.error.clear();
+    for (const auto state : {"Reconnecting", "Disconnected"}) {
+        network.state = state;
+        frame();
+        assert(fits(segment(state)) && fits(segment("c-x")) && identityFits());
+    }
+    network.state = "Ready";
+    nativeKey(ui, dispatcher, 'g', KeyMod::Ctrl);
+    frame();
+    assert(!segment("c-x"));
+    history = HistorySyncState::Idle;
+    for (width = 220; width >= 80; width -= 4) {
+        frame();
+        if (identityFits() && !fits(segment("Connected")))
+            break;
+    }
+    assert(width >= 80 && identityFits() && !fits(segment("Connected")));
     for (const auto &child : line->children())
         if (visible(*child))
             assert(child->x() >= 0 && child->x() + child->width() <= line->width() + .5f);
@@ -8070,28 +8237,25 @@ void hiddenUnreadStatusCheck(
         buffer.unread = 0;
     model.buffers.at(mention).unread = 1;
     frame();
-    auto *retained = areaWithKey(*line, "buffer:" + mention);
-    assert(retained && visible(*retained));
+    auto *retained = activity(mention);
+    assert(retained);
     const auto retainedPoint = pointerPoint(*retained);
     model.buffers.at(mention).unread = 0;
     model.buffers.at(normal).unread = 1;
     frame();
-    assert(areaWithKey(*line, "buffer:" + normal) == retained);
-    click(dispatcher, *retained);
+    auto *local = activity(normal);
+    assert(local && !activity(mention));
+    click(dispatcher, *local);
     frame();
     assert(model.activeBuffer == normal);
-    ui.execute("buffer:" + mention);
-    frame();
-    dispatcher.setFocus(retained);
-    nativeKey(ui, dispatcher, XKB_KEY_Return);
-    frame();
-    assert(model.activeBuffer == normal);
-    ui.execute("buffer:" + mention);
-    frame();
-    dispatcher.setFocus(retained);
-    nativeKey(ui, dispatcher, XKB_KEY_space);
-    frame();
-    assert(model.activeBuffer == normal);
+    for (const auto key : {XKB_KEY_Return, XKB_KEY_space}) {
+        ui.execute("buffer:" + mention);
+        frame();
+        dispatcher.setFocus(activity(normal));
+        nativeKey(ui, dispatcher, key);
+        frame();
+        assert(model.activeBuffer == normal);
+    }
     const auto clickPoint = [&](const std::array<float, 2> &point) {
         dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 1001, 10010, false);
         dispatcher.pointerButton(point[0], point[1], BTN_LEFT, false, 1002, 10020, false);
@@ -8100,82 +8264,62 @@ void hiddenUnreadStatusCheck(
     ui.execute("buffer:" + mention);
     ui.execute("toggle-navigation");
     frame();
-    assert(!visible(*retained));
+    assert(!activity(normal) && !activity(mention));
     clickPoint(retainedPoint);
     assert(model.activeBuffer == mention);
     ui.execute("toggle-navigation");
     ui.execute("toggle-navigation");
     frame();
-    assert(visible(*retained));
+    assert(activity(normal));
     model.buffers.at(mention).unread = 1;
     frame();
-    auto *overflow = areaWithKey(*line, "buffer:" + normal);
-    assert(overflow && visible(*overflow));
-    const auto overflowPoint = pointerPoint(*overflow);
-    ui.execute("buffer:" + std::string(edgeBuffers[0]));
+    const auto clippedPoint = pointerPoint(*activity(normal));
+    backToOrigin();
     width = 80;
     frame();
-    assert(!visible(*overflow));
-    clickPoint(overflowPoint);
+    assert(!activity(normal));
+    clickPoint(clippedPoint);
     assert(model.activeBuffer == edgeBuffers[0]);
+    if (menu.open)
+        menu.closeSelectDropdown();
     width = 2000;
     frame();
-    // Retire an in-flight interaction before compaction retargets the first slot.
+    // A count change preserves a live press; retiring the chat cancels it before release.
     ui.setWindowActive(true);
     for (const bool touch : {false, true}) {
-        auto *first = areaWithKey(*line, "buffer:" + mention);
-        assert(first && visible(*first));
-        const auto point = pointerPoint(*first);
-        const auto marker = model.buffers.at(mention).readMarker;
-        dispatcher.setFocus(first);
+        auto *pressed = activity(normal);
+        assert(pressed);
+        const auto point = pointerPoint(*pressed);
+        const auto readMarker = model.buffers.at(normal).readMarker;
+        dispatcher.setFocus(pressed);
         ui.beginPointerInteraction(point[0], point[1]);
         assert(!ui.handlePointerButton(BTN_LEFT, true, point[0], point[1], touch));
         dispatcher.pointerButton(point[0], point[1], BTN_LEFT, true, 1101, 11010, touch);
-        model.buffers.at(mention).unread = 2;
+        model.buffers.at(normal).unread = 2;
         frame();
-        assert(dispatcher.focusedArea() == first);
-        assert(dispatcher.capturedArea() == first || dispatcher.pendingTouchPressArea() == first);
-        model.buffers.at(mention).unread = 1;
-        model.buffers.at(mention).muted = true;
+        assert(dispatcher.focusedArea() == pressed);
+        assert(dispatcher.capturedArea() == pressed ||
+               dispatcher.pendingTouchPressArea() == pressed);
+        model.buffers.at(normal).unread = 1;
+        model.buffers.at(normal).muted = true;
         frame();
-        assert(areaWithKey(*line, "buffer:" + normal) == first && visible(*first));
-        assert(dispatcher.focusedArea() != first && !dispatcher.pointerCaptured() &&
-               dispatcher.pendingTouchPressArea() != first);
+        assert(!activity(normal) && activity(mention));
+        assert(dispatcher.focusedArea() != pressed && !dispatcher.pointerCaptured() &&
+               dispatcher.pendingTouchPressArea() != pressed);
         assert(ui.handlePointerButton(BTN_LEFT, false, point[0], point[1], touch));
         frame();
         assert(model.activeBuffer == edgeBuffers[0]);
-        assert(model.buffers.at(mention).unread == 1 &&
-               model.buffers.at(mention).readMarker == marker &&
-               model.buffers.at(normal).unread == 1);
-        model.buffers.at(mention).muted = false;
+        assert(model.buffers.at(normal).unread == 1 &&
+               model.buffers.at(normal).readMarker == readMarker &&
+               model.buffers.at(mention).unread == 1);
+        model.buffers.at(normal).muted = false;
         frame();
-        assert(segment("Remote/#same") && segment("Local/#same"));
+        assert(activity(mention) && activity(normal));
     }
-    // Muting retires a real summary control without consuming either buffer's unread state.
-    const auto marker = model.buffers.at(normal).readMarker;
-    ui.setWindowActive(true);
-    dispatcher.setFocus(overflow);
-    model.buffers.at(normal).muted = true;
-    frame();
-    assert(!segment("Local/#same") && segment("Remote/#same"));
-    assert(!visible(*overflow) && dispatcher.firstTabFocusUnder(overflow) == nullptr);
-    assert(dispatcher.focusedArea() != overflow);
-    assert(model.buffers.at(normal).unread == 1 && model.buffers.at(normal).readMarker == marker &&
-           model.buffers.at(mention).unread == 1);
-    clickPoint(overflowPoint);
-    assert(model.activeBuffer == edgeBuffers[0]);
-    dispatcher.setFocus(overflow);
-    nativeKey(ui, dispatcher, XKB_KEY_Return);
-    frame();
-    assert(model.activeBuffer == edgeBuffers[0]);
-    model.buffers.at(normal).muted = false;
-    frame();
-    assert(segment("Local/#same") && segment("Remote/#same") && visible(*overflow));
-    assert(model.buffers.at(normal).unread == 1 && model.buffers.at(normal).readMarker == marker);
     model.buffers.at(normal).unread = 0;
     model.buffers.at(mention).unread = 0;
     frame();
-    assert(!visible(*retained) && !visible(*overflow));
+    assert(!activity(normal) && !activity(mention) && !overflowControl());
     clickPoint(retainedPoint);
     assert(model.activeBuffer == edgeBuffers[0]);
     dispatcher.setFocus(nullptr);

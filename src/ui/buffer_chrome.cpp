@@ -29,7 +29,7 @@ void place(Node &node, float x, float y, float width, float height) {
     node.setSize(std::max(0.f, width), std::max(0.f, height));
 }
 float hitExtent(float scale) { return std::max(32.f, 32 * scale); }
-void labelStyle(Label &label, float size, std::string_view role) {
+void labelStyle(Label &label, float size, Color ink) {
     if (label.font().family != themeUiFont().family)
         label.setFontFamily(themeUiFont().family);
     if (label.font().features != themeUiFont().features)
@@ -37,7 +37,7 @@ void labelStyle(Label &label, float size, std::string_view role) {
     if (label.font().weight != themeUiFont().weight)
         label.setFontWeight(themeUiFont().weight);
     label.setFontSize(size);
-    label.setColor(themeForegroundColor(role));
+    label.setColor(ink);
     label.setBaselineMode(LabelBaselineMode::TextFixedHeight);
 }
 void placeLabel(Label &label, Renderer &renderer, float x, float y, float width, float height) {
@@ -67,8 +67,9 @@ class ChromeButton final : public InputArea {
         setOnFocusGain([this] { style(); });
         setOnFocusLoss([this] { style(); });
     }
-    void sync(float scale, bool selected = false) {
+    void sync(float scale, Color backdrop, bool selected = false) {
         scale_ = scale;
+        backdrop_ = backdrop;
         selected_ = selected;
         style();
     }
@@ -91,23 +92,25 @@ class ChromeButton final : public InputArea {
     void style() {
         const bool primary = selected_ || pressed();
         const bool hover = hovered() && !primary;
-        background_->setFill(primary ? themeSurfaceColor("primary_container")
-                             : hover ? themeSurfaceColor("hover")
-                                     : Color{0, 0, 0, 0});
+        const auto fill = primary ? themeSurfaceColor("primary_container")
+                          : hover ? themeSurfaceColor("hover")
+                                  : Color{0, 0, 0, 0};
+        background_->setFill(fill);
         background_->setRadius(themeCornerRadius());
         if (focused())
             background_->setBorder(themeForegroundColor("secondary"), std::max(1.f, scale_));
         else
             background_->clearBorder();
+        const auto role = hover ? "on_hover" : primary ? "on_primary_container" : "on_surface";
         icon_->setColor(
-            hover ? themeForegroundColor("on_hover")
-                  : themeForegroundColor(primary ? "on_primary_container" : "on_surface"));
+            themePairedForeground(lerpColor(backdrop_, fill, fill.a), themeForegroundColor(role)));
     }
     Box *background_;
     LucideIcon *icon_;
     std::function<void(Node &, std::optional<PointerData>)> activate_;
     std::string hint_;
     float scale_ = 1;
+    Color backdrop_{};
     bool selected_ = false;
 };
 } // namespace
@@ -249,7 +252,10 @@ struct BufferTitleLine::Impl {
         const bool loadingHistory = historySync == HistorySyncState::Loading;
         historySpinner->setVisible(loadingHistory);
         historyIcon->setVisible(!loadingHistory);
-        historyIcon->setColor(themeForegroundColor("on_surface_variant"));
+        const auto backdrop = themeConversationBackdrop();
+        const auto statusInk =
+            themePairedForeground(backdrop, themeForegroundColor("on_surface_variant"));
+        historyIcon->setColor(statusInk);
         historyIcon->setGlyphSize(12 * scale);
         bool paneVisible = true;
         for (const Node *node = &owner; node && paneVisible; node = node->parent())
@@ -259,9 +265,9 @@ struct BufferTitleLine::Impl {
             historySpinner->start();
         else
             historySpinner->stop();
-        historySpinner->setColor(themeForegroundColor("on_surface_variant"));
+        historySpinner->setColor(statusInk);
         historySpinner->setSpinnerSize(12 * scale);
-        labelStyle(*historyStatus, 11 * scale, "on_surface_variant");
+        labelStyle(*historyStatus, 11 * scale, statusInk);
         const bool nextChannel = buffer && buffer->kind == "channel";
         const bool serverLog = buffer && buffer->kind == "server";
         const bool changedSource =
@@ -324,17 +330,24 @@ struct BufferTitleLine::Impl {
             identity->setVisible(false);
             avatarImage->setVisible(false);
         }
-        labelStyle(*avatarInitials, 13 * scale, "on_surface_variant");
+        const auto chipFill = themeSurfaceColor("surface_container_high");
+        const auto chipBackdrop = lerpColor(backdrop, chipFill, chipFill.a);
+        const auto chipInk =
+            themePairedForeground(chipBackdrop, themeForegroundColor("on_surface_variant"));
+        labelStyle(*avatarInitials, 13 * scale, chipInk);
         avatarInitials->setFontWeight(FontWeight::SemiBold);
-        avatarBackground->setFill(themeSurfaceColor("surface_container_high"));
+        avatarBackground->setFill(chipFill);
         avatarBackground->setRadius(themeCornerRadius());
-        labelStyle(*title, 14 * scale, active ? "on_surface" : "on_surface_variant");
-        labelStyle(*network, 11 * scale, "on_surface_variant");
-        networkChip->setFill(themeSurfaceColor("surface_container_high"));
+        const auto titleInk =
+            active ? themePairedForeground(backdrop, themeForegroundColor("on_surface"))
+                   : statusInk;
+        labelStyle(*title, 14 * scale, titleInk);
+        labelStyle(*network, 11 * scale, chipInk);
+        networkChip->setFill(chipFill);
         networkChip->setRadius(themeCornerRadius());
         for (std::size_t i = 0; i < tools.size(); ++i)
-            tools[i]->sync(scale, i == 0 && peopleEffective != SidebarMode::Hidden);
-        topic->sync(scale);
+            tools[i]->sync(scale, backdrop, i == 0 && peopleEffective != SidebarMode::Hidden);
+        topic->sync(scale, backdrop);
         const bool hintsChanged =
             bindings != model.settings.bindings || changedIdentity || !tools[0]->hasTooltip();
         if (hintsChanged) {
@@ -628,15 +641,18 @@ struct TopicPopover::Impl {
                          std::max(margin, owner.height() - h - margin)),
               w, h);
         place(*background, 0, 0, w, h);
-        background->setFill(themeSurfaceColor("surface_container_high"));
+        const auto fill = themeSurfaceColor("surface_container_high");
+        background->setFill(fill);
+        const auto backdrop = lerpColor(themeConversationBackdrop(), fill, fill.a);
         background->setBorder(themeForegroundColor("outline_variant"), scale);
         background->setRadius(themeCornerRadius());
         const float pad = std::min(12 * scale, w / 8);
         const float extent = hitExtent(scale);
-        labelStyle(*title, 14 * scale, "on_surface");
+        labelStyle(*title, 14 * scale,
+                   themePairedForeground(backdrop, themeForegroundColor("on_surface")));
         title->setPosition(pad, pad);
         title->setMaxWidth(std::max(0.f, w - 3 * pad - extent));
-        close->sync(scale);
+        close->sync(scale, backdrop);
         place(*close, std::max(0.f, w - pad - extent), pad, extent, extent);
         const auto &font = themeUiFont();
         if (appliedFamily != font.family) {

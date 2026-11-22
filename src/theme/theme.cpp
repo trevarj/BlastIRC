@@ -111,7 +111,7 @@ Color pairedForeground(Color background, Color authored) {
         return authored;
     // Preserve imported accent plates and prefer a readable color from the same palette.
     for (const auto role : {"on_surface", "inverse_on_surface", "scrim", "shadow"}) {
-        const auto candidate = themeColor(role);
+        const auto candidate = authored.a == 1.f ? themeForegroundColor(role) : themeColor(role);
         if (contrast(candidate) >= minimumContrast)
             return candidate;
     }
@@ -121,24 +121,27 @@ Color pairedForeground(Color background, Color authored) {
 void publishPalette() {
     const auto color = themeForegroundColor;
     const auto fill = [](std::string_view role) { return themeSurfaceColor(role); };
+    const auto on = [](std::string_view background, std::string_view foreground) {
+        return pairedForeground(themeForegroundColor(background), themeForegroundColor(foreground));
+    };
     setResolvedThemeLight(relativeLuminance(color("surface")) > .179f);
     setPalette(::Palette{
         .primary = color("primary"),
         .onPrimary = withAlpha(pairedForeground(color("primary"), themeColor("on_primary")), 1.f),
         .primaryContainer = fill("primary_container"),
-        .onPrimaryContainer = color("on_primary_container"),
+        .onPrimaryContainer = on("primary_container", "on_primary_container"),
         .secondary = color("secondary"),
-        .onSecondary = color("on_secondary"),
+        .onSecondary = on("secondary", "on_secondary"),
         .secondaryContainer = fill("secondary_container"),
-        .onSecondaryContainer = color("on_secondary_container"),
+        .onSecondaryContainer = on("secondary_container", "on_secondary_container"),
         .tertiary = color("tertiary"),
-        .onTertiary = color("on_tertiary"),
+        .onTertiary = on("tertiary", "on_tertiary"),
         .tertiaryContainer = fill("tertiary_container"),
-        .onTertiaryContainer = color("on_tertiary_container"),
+        .onTertiaryContainer = on("tertiary_container", "on_tertiary_container"),
         .error = color("error"),
         .onError = withAlpha(pairedForeground(color("error"), themeColor("on_error")), 1.f),
         .errorContainer = fill("error_container"),
-        .onErrorContainer = color("on_error_container"),
+        .onErrorContainer = on("error_container", "on_error_container"),
         .surface = fill("surface"),
         .onSurface = color("on_surface"),
         .onSurfaceVariant = color("on_surface_variant"),
@@ -150,7 +153,7 @@ void publishPalette() {
         .shadow = color("shadow"),
         .scrim = color("scrim"),
         .hover = fill("hover"),
-        .onHover = color("on_hover"),
+        .onHover = on("hover", "on_hover"),
     });
 }
 
@@ -227,9 +230,27 @@ Color themeMentionBackground(bool hovered) {
     }
     return backgrounds[hovered ? 1 : 0];
 }
+Color themeMessageBackground(bool own, bool presence, bool hovered, bool mention) {
+    if (mention)
+        return themeMentionBackground(hovered);
+    const auto fill = themeForegroundColor(presence ? "surface_container_low"
+                                           : own    ? "primary_container"
+                                                    : "surface_container_high");
+    return hovered ? lerpColor(fill, themeForegroundColor("tertiary_container"), .15f) : fill;
+}
 float themeSurfaceAlpha() { return surfaceAlpha; }
 Color themeSurfaceFill(Color color) { return withAlpha(color, surfaceAlpha); }
 Color themeSurfaceColor(std::string_view role) { return themeSurfaceFill(themeColor(role)); }
+Color themeConversationBackdrop() {
+    const auto panel = themeSurfaceColor("surface_container_low");
+    return withAlpha(lerpColor(themeForegroundColor("background"), panel, panel.a), 1.f);
+}
+Color themeSelectionPlate(Color background, Color fill) {
+    const auto selected = withAlpha(lerpColor(background, fill, fill.a), 1.f);
+    if (contrastRatio(background, selected) >= 1.3f)
+        return selected;
+    return withAlpha(lerpColor(background, readableTextColorForBackground(background), .4f), 1.f);
+}
 Color themeNickColor(std::uint32_t hash) {
     static constexpr const char *hues[] = {
         "terminal_normal_red",  "terminal_normal_green",   "terminal_normal_yellow",

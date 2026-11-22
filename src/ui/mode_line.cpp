@@ -138,6 +138,7 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     p.groups[2].icon->setGlyph(mentions ? "at" : healthy ? "plug" : "plug-connected-x");
     p.groups[3].icon->setGlyph(p.error ? "alert-circle" : "info-circle");
     const auto &font = themeUiFont();
+    const auto backdrop = themeForegroundColor("background");
     for (size_t i = 0; i < p.groups.size(); ++i) {
         auto &g = p.groups[i];
         for (auto *label : {g.label, g.separator}) {
@@ -155,8 +156,9 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                           : i == 3 && p.error ? "error"
                           : i == 4            ? "on_surface"
                                               : "on_surface_variant";
-        g.label->setColor(themeForegroundColor(role));
-        g.icon->setColor(themeForegroundColor(role));
+        const auto ink = themePairedForeground(backdrop, themeForegroundColor(role));
+        g.label->setColor(ink);
+        g.icon->setColor(ink);
         g.icon->setGlyphSize(14 * p.scale);
         g.separator->setColor(themeForegroundColor("outline_variant"));
     }
@@ -246,7 +248,8 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                 label.setFontFeatures(font.features);
             label.setFontSize(12 * p.scale);
             label.setFontWeight(mentioned ? FontWeight::Bold : font.weight);
-            label.setColor(themeForegroundColor(mentioned ? "error" : "primary"));
+            label.setColor(themePairedForeground(
+                backdrop, themeForegroundColor(mentioned ? "error" : "primary")));
         }
     }
     for (size_t i = p.unreadCount; i < p.unread.size(); ++i) {

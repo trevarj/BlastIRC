@@ -237,43 +237,56 @@ class Row final : public InputArea {
         style.radius = themeCornerRadius();
         style.borderWidth = primary || focused() ? zoom : 0.f;
         background->setStyle(style);
+        const auto panel =
+            nickTitle ? themeConversationBackdrop() : themeForegroundColor("background");
+        const auto rowBackdrop = lerpColor(panel, style.fill, style.fill.a);
+        const auto nickInk = [this](Color backdrop) {
+            return titleOverride
+                       ? titleColor
+                       : withAlpha(themePairedForeground(backdrop, withAlpha(titleColor, 1.f)),
+                                   titleColor.a);
+        };
+        const auto rowInk = [rowBackdrop](std::string_view role) {
+            return themePairedForeground(rowBackdrop, themeForegroundColor(role));
+        };
         if (avatarBackground && showAvatar) {
             RoundedRectStyle avatarStyle{};
             avatarStyle.fill =
                 themeSurfaceColor(primary ? "surface_container_highest" : "surface_container_high");
             avatarStyle.radius = themeCornerRadius();
             avatarBackground->setStyle(avatarStyle);
-            avatarInitials->setColor(primary       ? themeForegroundColor("on_primary_container")
-                                     : customTitle ? titleColor
-                                                   : themeForegroundColor("on_surface_variant"));
+            const auto avatarBackdrop =
+                lerpColor(rowBackdrop, avatarStyle.fill, avatarStyle.fill.a);
+            avatarInitials->setColor(
+                !primary && nickTitle
+                    ? nickInk(avatarBackdrop)
+                    : themePairedForeground(avatarBackdrop,
+                                            themeForegroundColor(primary ? "on_primary_container"
+                                                                         : "on_surface_variant")));
             RoundedRectStyle draftStyle{};
             draftStyle.fill = themeForegroundColor("tertiary_container");
             draftStyle.radius = std::min(themeCornerRadius(), 8 * zoom);
             draftBackground->setStyle(draftStyle);
             draftBackground->setVisible(draft);
         }
-        title->setColor(primary       ? themeForegroundColor("on_primary_container")
-                        : hover       ? themeForegroundColor("on_hover")
-                        : customTitle ? titleColor
-                                      : themeForegroundColor("on_surface"));
-        subtitle->setColor(hover ? themeForegroundColor("on_hover")
-                                 : themeForegroundColor(primary ? "on_primary_container"
-                                                        : error ? "error"
-                                                        : draft ? "tertiary"
-                                                                : "on_surface_variant"));
+        title->setColor(!primary && !hover && nickTitle ? nickInk(rowBackdrop)
+                                                        : rowInk(primary ? "on_primary_container"
+                                                                 : hover ? "on_hover"
+                                                                         : "on_surface"));
+        subtitle->setColor(rowInk(hover     ? "on_hover"
+                                  : primary ? "on_primary_container"
+                                  : error   ? "error"
+                                  : draft   ? "tertiary"
+                                            : "on_surface_variant"));
         const bool mutedBadge = unreadCountBadge && muted;
         const Color mutedBadgeFill =
             mutedBadge ? themeForegroundColor("surface_container_highest") : clear;
-        badge->setColor(
-            mutedBadge        ? withAlpha(themePairedForeground(
-                                       mutedBadgeFill, themeForegroundColor("on_surface_variant")),
-                                          1.f)
-            : badgeBackground ? (mentioned ? ::palette.onError : ::palette.onPrimary)
-                              : themeForegroundColor(hover       ? "on_hover"
-                                                     : mentioned ? "error"
-                                                     : primary   ? "on_primary_container"
-                                                                 : "primary"));
-        if (badgeBackground) {
+        if (!badgeBackground) {
+            badge->setColor(rowInk(hover       ? "on_hover"
+                                   : mentioned ? "error"
+                                   : primary   ? "on_primary_container"
+                                               : "primary"));
+        } else {
             RoundedRectStyle badgeStyle{};
             badgeStyle.fill = mutedBadge ? mutedBadgeFill
                               : unreadCountBadge
@@ -281,24 +294,39 @@ class Row final : public InputArea {
                                   : themeSurfaceColor(mentioned ? "error" : "primary");
             badgeStyle.radius = 4 * zoom;
             badgeBackground->setStyle(badgeStyle);
+            if (mutedBadge)
+                badge->setColor(
+                    withAlpha(themePairedForeground(mutedBadgeFill,
+                                                    themeForegroundColor("on_surface_variant")),
+                              1.f));
+            else if (unreadCountBadge)
+                badge->setColor(mentioned ? ::palette.onError : ::palette.onPrimary);
+            else
+                badge->setColor(themePairedForeground(
+                    lerpColor(rowBackdrop, badgeStyle.fill, badgeStyle.fill.a),
+                    themeForegroundColor(mentioned ? "on_error" : "on_primary")));
         }
-        for (auto *indicator : {mutedIcon, pinIcon, friendIcon})
-            if (indicator)
-                indicator->setColor(themeForegroundColor(primary ? "on_primary_container"
-                                                         : hover ? "on_hover"
-                                                                 : "on_surface_variant"));
+        if (mutedIcon) {
+            const auto ink = rowInk(primary ? "on_primary_container"
+                                    : hover ? "on_hover"
+                                            : "on_surface_variant");
+            for (auto *indicator : {mutedIcon, pinIcon, friendIcon})
+                indicator->setColor(ink);
+        }
         if (icon) {
             icon->setVisible(!showAvatar || draft);
-            icon->setColor(showAvatar && draft ? themeForegroundColor("on_tertiary_container")
-                           : hover             ? themeForegroundColor("on_hover")
-                                   : themeForegroundColor(primary ? "on_primary_container"
-                                                          : draft ? "tertiary"
+            icon->setColor(showAvatar && draft ? themePairedForeground(
+                                                     themeForegroundColor("tertiary_container"),
+                                                     themeForegroundColor("on_tertiary_container"))
+                                               : rowInk(hover     ? "on_hover"
+                                                        : primary ? "on_primary_container"
+                                                        : draft   ? "tertiary"
                                                                   : "on_surface_variant"));
         }
     }
 
     std::string key, context, preview, scratch;
-    bool matched = true, draft = false, error = false, customTitle = false;
+    bool matched = true, draft = false, error = false, nickTitle = false, titleOverride = false;
     bool inlineSubtitle = false, emphasized = false, monospace = false;
     bool avatarOnly = false, avatarLaneVisible = true, mentioned = false;
     bool unreadCountBadge = false;
@@ -697,10 +725,11 @@ class Avatar final : public InputArea {
     }
 
     void sync(std::string_view caption, std::string_view path, const Network *network,
-              bool selected, float scale, bool account = false, bool collapsed = false,
-              bool hiddenSelected = false, int unread = 0, bool mentioned = false,
-              std::string_view childStatus = {}, bool childError = false) {
+              Color backdrop, bool selected, float scale, bool account = false,
+              bool collapsed = false, bool hiddenSelected = false, int unread = 0,
+              bool mentioned = false, std::string_view childStatus = {}, bool childError = false) {
         zoom = scale;
+        backdrop_ = backdrop;
         setFocusOnPointerPress(!account);
         active = selected;
         activeChild = hiddenSelected;
@@ -822,12 +851,13 @@ class Avatar final : public InputArea {
         marker.fill = themeForegroundColor("primary");
         marker.radius = 1.5f * zoom;
         selectionMarker->setStyle(marker);
-        initials->setColor(highlight   ? themeForegroundColor("on_primary_container")
-                           : hovered() ? themeForegroundColor("on_hover")
-                                       : themeForegroundColor("on_surface"));
-        alias->setColor(themeForegroundColor(hiddenError ? "error"
-                                             : active    ? "primary"
-                                                         : "on_surface_variant"));
+        const auto initialsBackdrop = lerpColor(backdrop_, style.fill, style.fill.a);
+        initials->setColor(themePairedForeground(
+            initialsBackdrop, themeForegroundColor(highlight   ? "on_primary_container"
+                                                   : hovered() ? "on_hover"
+                                                               : "on_surface")));
+        const auto aliasRole = hiddenError ? "error" : active ? "primary" : "on_surface_variant";
+        alias->setColor(themePairedForeground(backdrop_, themeForegroundColor(aliasRole)));
         RoundedRectStyle status{};
         status.fill = dotColor;
         status.border = themeForegroundColor("surface");
@@ -851,7 +881,7 @@ class Avatar final : public InputArea {
     NativeAvatarLabelPlacement initialsPlacement;
     float zoom = 1, loadedScale = 0;
     bool active = false, activeChild = false, unreadMention = false, hiddenError = false;
-    Color dotColor{};
+    Color dotColor{}, backdrop_{};
 };
 
 std::string folded(std::string_view text) {
@@ -868,13 +898,14 @@ int prefixRank(std::string_view prefix) {
     return 5;
 }
 
-Color memberColor(const Model &model, const std::string &name, std::uint32_t hash) {
-    if (auto color = model.settings.nickColors.find(name);
-        color != model.settings.nickColors.end()) {
-        Color parsed;
-        if (tryParseHexColor(color->second, parsed))
-            return parsed;
-    }
+Color memberColor(const Model &model, const std::string &name, std::uint32_t hash,
+                  bool &overridden) {
+    Color parsed;
+    const auto color = model.settings.nickColors.find(name);
+    overridden =
+        color != model.settings.nickColors.end() && tryParseHexColor(color->second, parsed);
+    if (overridden)
+        return parsed;
     if (model.settings.nickPalette == "THEME")
         return withAlpha(themeNickColor(hash), 1.f);
     const bool classic = model.settings.nickPalette == "CLASSIC";
@@ -969,8 +1000,9 @@ struct ServerRail::Impl {
         const float itemHeight = inner + avatarRowExtra * scale;
         float y = 0;
         std::size_t childIndex = 0;
+        const auto railBackdrop = themeForegroundColor("background");
         const auto place = [&](Entry &item, std::string_view caption, std::string_view avatar,
-                               bool collapsed = false, bool hiddenSelected = false,
+                               Color backdrop, bool collapsed = false, bool hiddenSelected = false,
                                int aggregateUnread = -1, bool aggregateMention = false,
                                std::string_view childStatus = {}, bool childError = false) {
             if (item.placed == epoch)
@@ -981,8 +1013,8 @@ struct ServerRail::Impl {
             node.setExcludeSubtreeFromTabOrder(false);
             const auto network = model.networks.find(node.key);
             node.sync(caption, avatar, network == model.networks.end() ? nullptr : &network->second,
-                      node.key == selected, scale, item.account, collapsed, hiddenSelected,
-                      aggregateUnread < 0 ? item.unread : aggregateUnread,
+                      backdrop, node.key == selected, scale, item.account, collapsed,
+                      hiddenSelected, aggregateUnread < 0 ? item.unread : aggregateUnread,
                       aggregateUnread < 0 ? item.mentioned : aggregateMention, childStatus,
                       childError);
             if (canvas->children()[childIndex].get() != &node) {
@@ -1001,9 +1033,9 @@ struct ServerRail::Impl {
                        return parent.sojuAccount && parent.name == config.sojuParent;
                    });
         };
-        const auto placeProfile = [&](const ServerConfig &config) {
-            place(entry(config.name), serverDisplayName(model, config.name), config.avatar, false,
-                  false, -1, false,
+        const auto placeProfile = [&](const ServerConfig &config, Color backdrop) {
+            place(entry(config.name), serverDisplayName(model, config.name), config.avatar,
+                  backdrop, false, false, -1, false,
                   !config.sojuParent.empty() && !config.sojuEnabled
                       ? "\nLocally disabled; remote upstream network is unchanged"
                       : "");
@@ -1013,7 +1045,7 @@ struct ServerRail::Impl {
                 continue;
             auto &item = entry(config.name);
             if (!config.sojuAccount) {
-                placeProfile(config);
+                placeProfile(config, railBackdrop);
                 continue;
             }
             const auto fold = model.settings.workspace.find("soju-group:" + config.name);
@@ -1055,8 +1087,10 @@ struct ServerRail::Impl {
             item.capsule->setVisible(true);
             const float groupTop = y;
             y += 3 * scale;
-            place(item, serverDisplayName(model, config.name), config.avatar, collapsed,
-                  collapsed && hiddenSelected, collapsed ? aggregateUnread : item.unread,
+            const auto capsuleBackdrop =
+                lerpColor(railBackdrop, capsuleStyle.fill, capsuleStyle.fill.a);
+            place(item, serverDisplayName(model, config.name), config.avatar, capsuleBackdrop,
+                  collapsed, collapsed && hiddenSelected, collapsed ? aggregateUnread : item.unread,
                   collapsed ? aggregateMention : item.mentioned, childStatus, childError);
             for (const auto &configChild : model.servers) {
                 if (configChild.sojuAccount || configChild.sojuParent != config.name)
@@ -1067,7 +1101,7 @@ struct ServerRail::Impl {
                     childItem.avatar->setVisible(false);
                     childItem.avatar->setExcludeSubtreeFromTabOrder(true);
                 } else {
-                    placeProfile(configChild);
+                    placeProfile(configChild, capsuleBackdrop);
                 }
             }
             item.capsule->setPosition(0, groupTop);
@@ -1078,7 +1112,7 @@ struct ServerRail::Impl {
         for (const auto &name : order) {
             auto &item = servers.at(name);
             if (item.seen == epoch)
-                place(item, serverDisplayName(model, name), {});
+                place(item, serverDisplayName(model, name), {}, railBackdrop);
         }
         for (auto it = servers.begin(); it != servers.end();) {
             if (it->second.seen != epoch) {
@@ -1950,7 +1984,8 @@ struct Sidebar::Impl {
                                                 : "No conversations match ") +
                           filterName + (search->value().empty() ? "." : " and this search."));
             labelFont(*empty, 13 * scale);
-            empty->setColor(themeForegroundColor("on_surface_variant"));
+            empty->setColor(themePairedForeground(themeForegroundColor("background"),
+                                                  themeForegroundColor("on_surface_variant")));
             empty->setMaxWidth(rowWidth);
             empty->setPosition(0, y);
             y += 78 * scale;
@@ -2174,7 +2209,7 @@ void Sidebar::remapBuffer(std::string_view oldId, std::string_view newId) {
 struct People::Impl final : VirtualListAdapter {
     struct Member {
         std::string name, prefix, account, lower, title, tooltip;
-        bool away = false, friendNick = false;
+        bool away = false, friendNick = false, colorOverride = false;
         double arrived = 0;
         std::uint32_t hash = 2166136261u;
         std::uint64_t key = 0, revision = 1, seen = 0;
@@ -2252,7 +2287,7 @@ struct People::Impl final : VirtualListAdapter {
         auto row = std::make_unique<Row>(std::string_view{}, true);
         row->setFocusable(false);
         row->setTabStop(false);
-        row->customTitle = true;
+        row->nickTitle = true;
         row->activate = [this](Row &item) {
             keyboardNick = item.key;
             execute("insert-nick:" + item.context + "\n" + item.key);
@@ -2277,6 +2312,7 @@ struct People::Impl final : VirtualListAdapter {
         row.context = buffer;
         row.title->setText(member.title);
         row.titleColor = member.color;
+        row.titleOverride = member.colorOverride;
         const bool compact = mode == SidebarMode::Compact;
         const bool avatars = model.settings.avatars && model.settings.avatarStyle != "none";
         const bool avatarOnly = compact && avatars;
@@ -2416,13 +2452,15 @@ struct People::Impl final : VirtualListAdapter {
                     ++member.revision;
                     changed = true;
                 }
-                auto color = memberColor(model, member.name, member.hash);
+                bool colorOverride;
+                auto color = memberColor(model, member.name, member.hash, colorOverride);
                 float fade = member.away ? .4f : 1.f;
                 if (!model.settings.reducedMotion && model.settings.fx != FxLevel::Off &&
                     member.arrived > 0)
                     fade *= std::clamp(float((model.now - member.arrived) / .18), 0.f, 1.f);
                 color.a *= fade;
-                if (member.color != color) {
+                if (member.color != color || member.colorOverride != colorOverride) {
+                    member.colorOverride = colorOverride;
                     member.color = color;
                     ++member.revision;
                     changed = true;
@@ -2485,10 +2523,12 @@ struct People::Impl final : VirtualListAdapter {
         header->setSize(std::max(0.f, width - 2 * padding), extent);
         header->setGap(6 * scale);
         peopleIcon->setSize(18 * scale, 18 * scale);
-        peopleIcon->setColor(themeForegroundColor("on_surface_variant"));
+        const auto ink = themePairedForeground(themeConversationBackdrop(),
+                                               themeForegroundColor("on_surface_variant"));
+        peopleIcon->setColor(ink);
         heading->setText(std::to_string(order.size()) + " members");
         labelFont(*heading, 12 * scale);
-        heading->setColor(themeForegroundColor("on_surface_variant"));
+        heading->setColor(ink);
         heading->setMaxWidth(std::max(0.f, width - 2 * padding - 24 * scale));
         const float top = verticalPadding + (expanded ? extent + 4 * scale : 0);
         navigation->setPosition(padding, top);
@@ -2500,7 +2540,7 @@ struct People::Impl final : VirtualListAdapter {
         empty->setText(channel ? "No members are loaded for this channel."
                                : "Select a channel to see its members.");
         labelFont(*empty, 13 * scale);
-        empty->setColor(themeForegroundColor("on_surface_variant"));
+        empty->setColor(ink);
         empty->setPosition(padding, top);
         empty->setMaxWidth(std::max(0.f, width - 2 * padding));
     }

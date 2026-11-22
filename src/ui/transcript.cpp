@@ -320,22 +320,23 @@ std::vector<RichLink> detectLinks(const IrcDocument &document) {
     }
     return links;
 }
-std::string markup(std::string_view text, const IrcStyle &style, bool link) {
+std::string markup(std::string_view text, const IrcStyle &style, bool link, bool colors = true) {
     auto painted = style;
     painted.foreground.reset();
     painted.underline |= link;
-    return ircMarkup(text, painted);
+    return ircMarkup(text, painted, colors);
 }
 struct Fragment {
     std::string text, url;
     TextFont font;
-    std::optional<Color> color;
+    std::array<std::optional<Color>, 2> color;
     float x = 0, y = 0, width = 0, height = 0, baseline = 0;
     size_t linkStart = absent, displayBegin = 0, displayEnd = 0;
     MessageSelectionFragment selection;
     bool selectionReady = false;
     std::string nick;
     float inset = 0;
+    std::string selectionMarkup;
 };
 struct VisualLine {
     float top = 0, height = 0;
@@ -397,7 +398,8 @@ std::vector<NickAnnotation> annotateNicksWithLinks(const Model &model, const Buf
 
 RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, float width,
                 float minimumLine, int columns, const Model &model, const Buffer &buffer,
-                const std::string &author, std::string_view matchedNick, Color background) {
+                const std::string &author, std::string_view matchedNick,
+                const std::array<Color, 2> &backgrounds, Color normal) {
     RichLayout result;
     const auto links = detectLinks(document);
     std::vector<size_t> boundaries;
@@ -454,21 +456,25 @@ RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, flo
                             break;
                         }
                     }
-                auto style = run.style;
-                if (!nick.empty() && !style.reverse &&
-                    style.foregroundSource.kind == IrcColor::Kind::Foreground)
-                    style.foreground = nickTextColor(model, nick, buffer.server,
-                                                     style.background.value_or(background));
-                auto text = markup(std::string_view(document.text).substr(at, next - at), style,
-                                   link != nullptr);
+                const auto &style = run.style;
+                const auto display = std::string_view(document.text).substr(at, next - at);
+                auto text = markup(display, style, link != nullptr);
                 const auto metrics = renderer.measureText(text, size, font, 0, 1, TextAlign::Start,
                                                           TextEllipsize::End, true);
                 const float cellWidth = metrics.width;
-                if (emit)
+                if (emit) {
+                    std::array<std::optional<Color>, 2> ink{style.foreground, style.foreground};
+                    if (!style.foreground && !nick.empty() && !style.reverse)
+                        for (size_t hover = 0; hover < ink.size(); ++hover)
+                            ink[hover] =
+                                nickTextColor(model, nick, buffer.server,
+                                              style.background.value_or(backgrounds[hover]));
+                    else if (!style.foreground && style.background)
+                        ink.fill(themePairedForeground(*style.background, normal));
                     result.fragments.push_back({std::move(text),
                                                 link ? link->url : std::string{},
                                                 font,
-                                                style.foreground,
+                                                ink,
                                                 x,
                                                 y,
                                                 cellWidth,
@@ -480,7 +486,11 @@ RichLayout wrap(Renderer &renderer, const IrcDocument &document, float size, flo
                                                 {},
                                                 false,
                                                 nick,
-                                                0});
+                                                0,
+                                                style.background
+                                                    ? markup(display, style, link != nullptr, false)
+                                                    : std::string{}});
+                }
                 x += cellWidth;
                 at = next;
             }
@@ -871,12 +881,22 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
         result.key += "|" + std::to_string(nick.name.size()) + ":" + nick.name;
     return result;
 }
-Color nicknameSurface(const Geometry &g, const Message &entry, bool mentionHighlight) {
-    if (mentionHighlight)
-        return themeSurfaceFill(themeMentionBackground());
-    return themeSurfaceColor(g.bubbles && !entry.presence && !entry.action
-                                 ? (entry.own ? "primary_container" : "surface_container_high")
-                                 : "surface_container_low");
+Color denseBackground(const Message &entry, bool mention, bool hovered) {
+    if (mention)
+        return themeSurfaceFill(themeMentionBackground(hovered));
+    return typedActivity(entry) || hovered ? themeSurfaceColor("surface_container_high")
+                                           : rgba(0, 0, 0, 0);
+}
+Color over(Color base, Color fill) { return withAlpha(lerpColor(base, fill, fill.a), 1.f); }
+Color rowBackdrop(const Geometry &g, const Message &entry, bool mention, bool hovered) {
+    auto base = themeConversationBackdrop();
+    const bool bubble = g.bubbles && !entry.presence && !entry.action;
+    if (typedActivity(entry) || (!entry.presence && !(bubble && mention)))
+        base = over(base, denseBackground(entry, mention, hovered));
+    if (bubble)
+        base = over(base,
+                    themeSurfaceFill(themeMessageBackground(entry.own, false, hovered, mention)));
+    return base;
 }
 
 } // namespace
@@ -898,6 +918,7 @@ struct TranscriptView::Impl {
         bool unreadEligible = false;
         bool friendAuthor = false;
         bool mentionHighlight = false;
+        std::array<Color, 2> backdrop, bodyInk, metadataInk;
         bool footerStacked = false;
         bool showClock = true;
         bool foolOpen = false;
@@ -987,7 +1008,7 @@ struct TranscriptView::Impl {
         RenderProxyNode *flight = nullptr;
         struct BodyText {
             TextNode *node;
-            std::optional<Color> color;
+            std::array<std::optional<Color>, 2> color;
             Node *glow = nullptr, *sheen = nullptr, *underline = nullptr;
             TextNode *glowText = nullptr;
             RectNode *line = nullptr, *glint = nullptr;
@@ -996,7 +1017,8 @@ struct TranscriptView::Impl {
         std::vector<BodyText> text;
         std::vector<RectNode *> selectionRects;
         float bodyX = 0;
-        std::vector<std::pair<Label *, Color>> nicks;
+        Label *leadingNick = nullptr;
+        std::vector<std::pair<Label *, std::array<Color, 2>>> labelInk;
         TextNode *channelTime = nullptr;
         TextNode *bubbleTime = nullptr;
         RectNode *nickChip = nullptr;
@@ -2226,7 +2248,7 @@ struct TranscriptView::Impl {
         }
     }
     void paintTextSelection(Slot &slot, const std::optional<OrderedTextRange> &selected,
-                            float sceneTop, float sceneBottom) {
+                            float sceneTop, float sceneBottom, bool hovered) {
         size_t used = 0;
         if (selected && selectionRenderer && slot.index >= selected->first &&
             slot.index <= selected->last && slot.index < cache->rows.size()) {
@@ -2252,6 +2274,8 @@ struct TranscriptView::Impl {
                     Node::mapFromScene(slot.body, 0, sceneBottom, unused, clipBottom);
                     if (clipBottom < clipTop)
                         std::swap(clipTop, clipBottom);
+                    const auto plate = themeSelectionPlate(
+                        row.backdrop[hovered], withAlpha(themeForegroundColor("primary"), .24f));
                     for (size_t i = 0; i < row.fragments.size() && i < slot.text.size(); ++i) {
                         auto &fragment = row.fragments[i];
                         const auto *text = slot.text[i].node;
@@ -2260,11 +2284,24 @@ struct TranscriptView::Impl {
                             continue;
                         ensureFragmentSelection(row, fragment);
                         fragment.selection.rectangles(begin, end, selectionScratch);
+                        if (selectionScratch.empty())
+                            continue;
+                        const auto &selectedText = fragment.selectionMarkup.empty()
+                                                       ? fragment.text
+                                                       : fragment.selectionMarkup;
+                        const auto selectedInk = themePairedForeground(
+                            plate, slot.text[i].color[hovered].value_or(row.bodyInk[hovered]));
                         const auto &metrics = fragment.selection.metrics();
                         for (const auto &cell : selectionScratch) {
                             if (used == slot.selectionRects.size()) {
-                                auto *rect = rectangle(*slot.body, 0, 0, 1, 1, {}, themeScale());
-                                rect->setZIndex(1);
+                                auto *rect = rectangle(*slot.body, 0, 0, 1, 1, {}, 0);
+                                rect->setZIndex(3);
+                                rect->setClipChildren(true);
+                                auto ink = std::make_unique<TextNode>();
+                                ink->setUseMarkup(true);
+                                ink->setMaxLines(1);
+                                ink->setHitTestVisible(false);
+                                rect->addChild(std::move(ink));
                                 addRowPaint(*slot.body, slot.body->removeChild(rect));
                                 slot.selectionRects.push_back(rect);
                             }
@@ -2275,8 +2312,21 @@ struct TranscriptView::Impl {
                                     std::floor(metrics.layoutBaseline * scale) / scale + cell.y);
                             rect->setSize(cell.width, cell.height);
                             auto style = rect->style();
-                            style.fill = withAlpha(themeForegroundColor("primary"), .24f);
+                            style.fill = plate;
                             rect->setStyle(style);
+                            auto &ink = static_cast<TextNode &>(*rect->children().front());
+                            if (ink.text() != selectedText)
+                                ink.setText(selectedText);
+                            if (ink.fontFamily() != text->fontFamily())
+                                ink.setFontFamily(text->fontFamily());
+                            if (ink.fontFeatures() != text->fontFeatures())
+                                ink.setFontFeatures(text->fontFeatures());
+                            ink.setFontSize(text->fontSize());
+                            ink.setFontWeight(text->fontWeight());
+                            ink.setSize(text->width(), text->height());
+                            ink.setPosition(area->x() + text->x() - rect->x(),
+                                            area->y() + text->y() - rect->y());
+                            ink.setColor(selectedInk);
                             rect->setVisible(true);
                         }
                     }
@@ -3858,6 +3908,13 @@ struct TranscriptView::Impl {
             entry.deleted || entry.presence    ? themeForegroundColor("on_surface_variant")
             : entry.own && g.bubbles && !emote ? themeForegroundColor("on_primary_container")
                                                : themeForegroundColor("on_surface");
+        for (size_t hover = 0; hover < row.backdrop.size(); ++hover) {
+            const auto background = rowBackdrop(g, entry, row.mentionHighlight, hover != 0);
+            row.backdrop[hover] = background;
+            row.bodyInk[hover] = themePairedForeground(background, normal);
+            row.metadataInk[hover] =
+                themePairedForeground(background, themeForegroundColor("on_surface_variant"));
+        }
         auto document = parseIrcFormatting(collapsed       ? std::string_view(row.activityLabel)
                                            : entry.deleted ? std::string_view("Message deleted")
                                                            : entry.text,
@@ -3872,7 +3929,7 @@ struct TranscriptView::Impl {
             wrap(renderer, document, notice ? g.activityFont : g.font, bodyMax,
                  notice ? g.activityLine : g.bodyLine, model.settings.messageWrapColumns, model,
                  sourceContext(buffer, entry) ? *sourceContext(buffer, entry) : buffer, entry.nick,
-                 entry.mentionNick, nicknameSurface(g, entry, row.mentionHighlight));
+                 entry.mentionNick, row.backdrop, normal);
         const auto previewLinks = detectLinks(document);
         row.previewUrl = previewLinks.empty() ? std::string{} : previewLinks.front().url;
         if (mediaController)
@@ -3898,10 +3955,11 @@ struct TranscriptView::Impl {
                                             : std::string_view("Message unavailable"),
                 themeForegroundColor("on_surface"), themeSurfaceColor("surface_container"));
             ircSingleParagraph(document);
-            for (const auto &run : document.runs)
-                row.quoteMarkup += ircMarkup(
-                    std::string_view(document.text).substr(run.start, run.end - run.start),
-                    run.style);
+            for (auto &run : document.runs)
+                if (!run.style.foreground && run.style.background)
+                    run.style.foreground = themePairedForeground(
+                        *run.style.background, themeForegroundColor("on_surface"));
+            row.quoteMarkup = ircMarkup(document);
         }
         row.contentWidth = bodyMax;
         row.authorWidth = row.authorHeight = 0;
@@ -4368,7 +4426,8 @@ struct TranscriptView::Impl {
         slot.text.clear();
         slot.preview = nullptr;
         slot.selectionRects.clear();
-        slot.nicks.clear();
+        slot.leadingNick = nullptr;
+        slot.labelInk.clear();
         slot.channelTime = nullptr;
         slot.bubbleTime = nullptr;
         slot.nickChip = nullptr;
@@ -4414,6 +4473,16 @@ struct TranscriptView::Impl {
         const float gap = g.rowGap(entry.presence, row.grouped);
         const float padding = notice ? g.activityPadding() : g.padding(entry.presence);
         const float avatarLane = g.avatarLane(entry.presence);
+        const auto senderInk = [&](const Message &sender) {
+            const auto &server = sourceServer(buffer, entry);
+            return std::array{nickTextColor(model, sender.nick, server, row.backdrop[0]),
+                              nickTextColor(model, sender.nick, server, row.backdrop[1])};
+        };
+        const auto rememberSender = [&](Label *label, const std::array<Color, 2> &ink) {
+            if (!slot.leadingNick)
+                slot.leadingNick = label;
+            slot.labelInk.emplace_back(label, ink);
+        };
         const float surfaceX =
             notice           ? (g.chatWidth - row.surfaceWidth) * .5f
             : entry.presence ? (c.width - row.surfaceWidth) * .5f
@@ -4510,8 +4579,11 @@ struct TranscriptView::Impl {
                                         "surface_container_high");
             auto *day =
                 label(*chip, date, 8 * g.scale, 4 * g.scale, std::max(1.f, width - 16 * g.scale),
-                      fontSize, themeForegroundColor("on_surface_variant"), font, {},
-                      ColorRole::OnSurfaceVariant);
+                      fontSize,
+                      themePairedForeground(over(themeConversationBackdrop(),
+                                                 themeSurfaceColor("surface_container_high")),
+                                            themeForegroundColor("on_surface_variant")),
+                      font);
             day->setMinWidth(std::max(1.f, width - 16 * g.scale));
             day->setTextAlign(TextAlign::Center);
             day->setHitTestVisible(false);
@@ -4523,9 +4595,11 @@ struct TranscriptView::Impl {
                 rectangle(*slot.decorations, 0, separatorY + g.unread - 5 * g.scale, c.width,
                           g.scale, withAlpha(themeForegroundColor("primary"), .5f)),
                 "primary");
-            label(*slot.decorations, "New since your last visit", 12 * g.scale,
-                  separatorY + 3 * g.scale, c.width - 24 * g.scale, g.uiFont,
-                  themeForegroundColor("primary"), themeUiFont(), {}, ColorRole::Primary);
+            label(
+                *slot.decorations, "New since your last visit", 12 * g.scale,
+                separatorY + 3 * g.scale, c.width - 24 * g.scale, g.uiFont,
+                themePairedForeground(themeConversationBackdrop(), themeForegroundColor("primary")),
+                themeUiFont());
         }
         const float x = surfaceX + padding + row.prefixWidth;
         slot.bodyX = x;
@@ -4595,13 +4669,10 @@ struct TranscriptView::Impl {
                             *area, nameX, (row.prefixHeight - chipHeight) * .5f, chipWidth,
                             chipHeight, themeForegroundColor("primary"), g.cornerRadius);
                     }
-                    auto *name =
-                        label(*area, text, nameX + chipPadding, 0, textWidth, g.metadataFont,
-                              entry.own && !entry.action
-                                  ? themeForegroundColor("on_primary")
-                                  : nickTextColor(model, entry.nick, sourceServer(buffer, entry),
-                                                  nicknameSurface(g, entry, row.mentionHighlight)),
-                              actorFont);
+                    const auto ink = !slot.ownNickChip ? senderInk(entry) : std::array<Color, 2>{};
+                    auto *name = label(
+                        *area, text, nameX + chipPadding, 0, textWidth, g.metadataFont,
+                        slot.ownNickChip ? themeForegroundColor("on_primary") : ink[0], actorFont);
                     name->setMinWidth(textWidth);
                     name->setTextAlign(g.inlineChannel ? TextAlign::End : TextAlign::Start);
                     name->measure(renderer);
@@ -4636,7 +4707,7 @@ struct TranscriptView::Impl {
                     if (entry.own && !entry.action)
                         slot.nickChipText = name;
                     else
-                        slot.nicks.emplace_back(name, name->color());
+                        rememberSender(name, ink);
                 } else {
                     area->setAcceptedButtons(0);
                     auto node = std::make_unique<TextNode>();
@@ -4671,22 +4742,21 @@ struct TranscriptView::Impl {
                 y += row.prefixHeight;
         }
         if (g.dense() && !g.channel && !entry.presence && row.showClock)
-            label(*slot.content, clockText(entry), surfaceX, y,
-                  std::max(1.f, row.prefixWidth - 4 * g.scale), g.metadataFont,
-                  themeForegroundColor("on_surface_variant"), themeUiFont(), entry.time,
-                  ColorRole::OnSurfaceVariant);
+            slot.labelInk.emplace_back(label(*slot.content, clockText(entry), surfaceX, y,
+                                             std::max(1.f, row.prefixWidth - 4 * g.scale),
+                                             g.metadataFont, row.metadataInk[0], themeUiFont(),
+                                             entry.time),
+                                       row.metadataInk);
         if (!collapsed && entry.action && !entry.presence && g.bubbles) {
             auto actorFont = themeMessageFont();
             actorFont.weight = FontWeight::Bold;
+            const auto ink = senderInk(entry);
             auto *name = label(
                 *slot.content, "↳ " + entry.nick, x - row.emotePrefix + g.authorAvatarInset(),
                 row.bodyOffset,
                 std::max(1.f, row.emotePrefix - g.authorAvatarInset() - friendExtent - 8 * g.scale),
-                g.font,
-                nickTextColor(model, entry.nick, sourceServer(buffer, entry),
-                              nicknameSurface(g, entry, row.mentionHighlight)),
-                actorFont, entry.nick);
-            slot.nicks.emplace_back(name, name->color());
+                g.font, ink[0], actorFont, entry.nick);
+            rememberSender(name, ink);
             if (row.friendAuthor)
                 slot.friendBadge =
                     friendGlyph(*slot.content, x - 8 * g.scale - 14 * g.scale,
@@ -4762,10 +4832,9 @@ struct TranscriptView::Impl {
                 const float actorWidth =
                     std::min(renderer.measureText(entry.nick, g.metadataFont, actorFont).width,
                              std::max(1.f, (row.contentWidth - friendExtent - 8 * g.scale) * .45f));
+                const auto ink = senderInk(entry);
                 auto *actor = label(*slot.content, entry.nick, x, y, actorWidth, g.metadataFont,
-                                    nickTextColor(model, entry.nick, sourceServer(buffer, entry),
-                                                  nicknameSurface(g, entry, row.mentionHighlight)),
-                                    actorFont, entry.nick);
+                                    ink[0], actorFont, entry.nick);
                 actor->setHitTestVisible(true);
                 actor->setFocusable(true);
                 actor->setTabFocusKey(slot.actionFocusKey("original-actor", entry.sourceId));
@@ -4777,7 +4846,7 @@ struct TranscriptView::Impl {
                         (event.sym == XKB_KEY_Return || event.sym == XKB_KEY_space))
                         openOriginal(bufferId, key);
                 });
-                slot.nicks.emplace_back(actor, actor->color());
+                rememberSender(actor, ink);
                 if (row.friendAuthor)
                     slot.friendBadge =
                         friendGlyph(*slot.content, x + actorWidth + 4 * g.scale,
@@ -4787,9 +4856,9 @@ struct TranscriptView::Impl {
                 contextWidth =
                     std::max(1.f, row.contentWidth - actorWidth - friendExtent - 8 * g.scale);
             }
-            auto *origin =
-                label(*slot.content, context, contextX, y, contextWidth, g.metadataFont,
-                      themeForegroundColor("on_surface_variant"), themeUiFont(), context);
+            auto *origin = label(*slot.content, context, contextX, y, contextWidth, g.metadataFont,
+                                 row.metadataInk[0], themeUiFont(), context);
+            slot.labelInk.emplace_back(origin, row.metadataInk);
             origin->setHitTestVisible(true);
             origin->setFocusable(readable(buffer, index));
             origin->setTabFocusKey(slot.actionFocusKey("original", entry.sourceId));
@@ -4824,27 +4893,31 @@ struct TranscriptView::Impl {
                       g.scale);
             auto authorFont = themeUiFont();
             authorFont.weight = FontWeight::Bold;
-            auto *author = label(
-                *reference, row.quoteAuthor, 12 * g.scale, 6 * g.scale,
-                std::max(1.f, row.contentWidth - 24 * g.scale), g.metadataFont,
-                [&] {
-                    const auto *parent = quotedMessage(buffer, entry);
-                    return parent && quoteReadable(buffer, entry, *parent)
-                               ? nickTextColor(model, parent->nick, sourceServer(buffer, entry),
-                                               themeSurfaceColor("surface_container"))
-                               : row.quoteColor;
-                }(),
-                authorFont);
+            const auto *parent = quotedMessage(buffer, entry);
+            std::array<Color, 2> authorInk, excerptInk;
+            for (size_t hover = 0; hover < authorInk.size(); ++hover) {
+                const auto background = over(row.backdrop[hover], style.fill);
+                authorInk[hover] = parent && quoteReadable(buffer, entry, *parent)
+                                       ? nickTextColor(model, parent->nick,
+                                                       sourceServer(buffer, entry), background)
+                                       : themePairedForeground(background, row.quoteColor);
+                excerptInk[hover] =
+                    themePairedForeground(background, themeForegroundColor("on_surface"));
+            }
+            auto *author = label(*reference, row.quoteAuthor, 12 * g.scale, 6 * g.scale,
+                                 std::max(1.f, row.contentWidth - 24 * g.scale), g.metadataFont,
+                                 authorInk[0], authorFont);
             author->setUseMarkup(false);
             auto *excerpt = label(*reference, row.quoteMarkup, 12 * g.scale,
                                   6 * g.scale + row.quoteAuthorHeight,
                                   std::max(1.f, row.contentWidth - 24 * g.scale), g.metadataFont,
-                                  themeForegroundColor("on_surface"), themeUiFont());
+                                  excerptInk[0], themeUiFont());
             excerpt->setUseMarkup(true);
             excerpt->setMaxLines(2);
             author->setHitTestVisible(false);
             excerpt->setHitTestVisible(false);
-            const auto *parent = quotedMessage(buffer, entry);
+            slot.labelInk.emplace_back(author, authorInk);
+            slot.labelInk.emplace_back(excerpt, excerptInk);
             if (parent && quoteReadable(buffer, entry, *parent)) {
                 reference->setHitTestVisible(true);
                 reference->setFocusable(true);
@@ -5323,7 +5396,7 @@ struct TranscriptView::Impl {
                 if (entrance.active && !g.bubbles && !entry.own &&
                     model.settings.incomingMotion == SendMotion::Pop) {
                     // Scale from the reading start, not the center of a wide history row.
-                    const auto *nick = slot.nicks.empty() ? nullptr : slot.nicks.front().first;
+                    const auto *nick = slot.leadingNick;
                     originX = nick ? nick->parent()->x() + nick->x() : slot.material->x();
                 }
                 slot.content->setTransformOrigin(originX, slot.material->y() +
@@ -5344,18 +5417,16 @@ struct TranscriptView::Impl {
                 if (haloVisible)
                     slot.mentionHalo->setOpacity(outlineStrength * .8f * opacity);
             }
-            paintTextSelection(slot, textRange, top, bottom);
             const bool hovered =
                 dispatcher ? owns(dispatcher->hoveredArea()) : slot.area->hovered();
-            const Color normal = entry.deleted || entry.presence
-                                     ? themeForegroundColor("on_surface_variant")
-                                 : entry.own && g.bubbles && !entry.action
-                                     ? themeForegroundColor("on_primary_container")
-                                     : themeForegroundColor("on_surface");
+            paintTextSelection(slot, textRange, top, bottom, hovered);
+            const auto normal = row.bodyInk[hovered];
+            if (slot.preview)
+                slot.preview->setBackdrop(row.backdrop[hovered]);
             const bool selected =
                 textRange && slot.index >= textRange->first && slot.index <= textRange->last;
             for (auto &text : slot.text) {
-                text.node->setColor(text.color.value_or(normal));
+                text.node->setColor(text.color[hovered].value_or(normal));
                 if (!text.glow)
                     continue;
                 const bool decorated = mention && !selected;
@@ -5398,8 +5469,8 @@ struct TranscriptView::Impl {
                     }
                 }
             }
-            for (auto &[label, color] : slot.nicks)
-                label->setColor(color);
+            for (auto &[label, ink] : slot.labelInk)
+                label->setColor(ink[hovered]);
             if (slot.friendBadge)
                 slot.friendBadge->setColor(
                     nickColor(model, entry.nick, sourceServer(*buffer, entry)));
@@ -5412,24 +5483,26 @@ struct TranscriptView::Impl {
                 auto style = slot.nickChip->style();
                 style.fill = color;
                 slot.nickChip->setStyle(style);
-                slot.nickChipText->setColor(slot.ownNickChip
-                                                ? themeForegroundColor("on_primary")
-                                                : readableTextColorForBackground(color));
+                const auto ink =
+                    slot.ownNickChip
+                        ? themePairedForeground(color, themeForegroundColor("on_primary"))
+                        : readableTextColorForBackground(color);
+                slot.nickChipText->setColor(ink);
                 if (slot.friendBadge)
-                    slot.friendBadge->setColor(slot.ownNickChip
-                                                   ? themeForegroundColor("on_primary")
-                                                   : readableTextColorForBackground(color));
+                    slot.friendBadge->setColor(ink);
             }
             if (slot.avatarInitial)
                 slot.avatarInitial->setColor(
                     nickColor(model, entry.nick, sourceServer(*buffer, entry)));
             if (slot.channelTime)
-                slot.channelTime->setColor(themeForegroundColor("on_surface_variant"));
+                slot.channelTime->setColor(row.metadataInk[hovered]);
             if (slot.bubbleTime)
-                slot.bubbleTime->setColor(themeForegroundColor(
-                    entry.own && !entry.action ? "on_primary_container" : "on_surface_variant"));
-            const auto statusColor = themeForegroundColor(
-                entry.action && g.bubbles ? "on_tertiary_container" : "on_primary_container");
+                slot.bubbleTime->setColor(entry.own && !entry.action ? normal
+                                                                     : row.metadataInk[hovered]);
+            const auto statusColor =
+                entry.action ? themePairedForeground(row.backdrop[hovered],
+                                                     themeForegroundColor("on_tertiary_container"))
+                             : normal;
             if (slot.statusSpinner)
                 slot.statusSpinner->setColor(statusColor);
             if (slot.statusCheck)
@@ -5458,12 +5531,7 @@ struct TranscriptView::Impl {
                 rectangle->setStyle(style);
             }
             RoundedRectStyle denseStyle{};
-            denseStyle.fill = typedActivity(entry) ? themeSurfaceColor("surface_container_high")
-                              : hovered            ? themeSurfaceColor("surface_container_high")
-                                                   : withAlpha(themeColor("surface"), 0);
-            if (row.mentionHighlight) {
-                denseStyle.fill = themeSurfaceFill(themeMentionBackground(hovered));
-            }
+            denseStyle.fill = denseBackground(entry, row.mentionHighlight, hovered);
             const bool highlighted = hovered || row.mentionHighlight;
             const float contentWidth =
                 g.bubbles || entry.presence ? slot.material->width() : row.selectionWidth;
@@ -6371,7 +6439,8 @@ struct TranscriptView::Impl {
         const float textGap = 5 * dotScale;
         const float overflowWidth = 40 * g.scale;
         typingPhrase->setFontSize(typingFont);
-        typingPhrase->setColor(themeForegroundColor("on_surface_variant"));
+        typingPhrase->setColor(themePairedForeground(themeConversationBackdrop(),
+                                                     themeForegroundColor("on_surface_variant")));
         const float dotsWidth = std::min(22 * dotScale, trayWidth);
         bool reserveOverflow = typingParticipants.size() > typingNicks.size();
         const auto phraseMetrics =
@@ -6559,6 +6628,9 @@ struct TranscriptView::Impl {
             listStyle.fill = themeSurfaceColor("surface_container_high");
             listStyle.radius = std::min({g.cornerRadius, listWidth * .5f, listHeight * .5f});
             typingListSurface->setStyle(listStyle);
+            const auto listBackdrop = over(themeConversationBackdrop(), listStyle.fill);
+            typingListTitle->setColor(
+                themePairedForeground(listBackdrop, themeForegroundColor("on_surface")));
             typingListTitle->setPosition(listX + 8 * g.scale, listY + 4 * g.scale);
             typingListTitle->setFontSize(14 * g.scale);
             typingListTitle->setMaxWidth(std::max(1.f, listWidth - 16 * g.scale));
@@ -6572,7 +6644,8 @@ struct TranscriptView::Impl {
                 name->setFontSize(14 * g.scale);
                 name->setFontFamily(themeUiFont().family);
                 name->setFontFeatures(themeUiFont().features);
-                name->setColor(nickColor(model, typingParticipants[i], buffer->server));
+                name->setColor(
+                    nickTextColor(model, typingParticipants[i], buffer->server, listBackdrop));
                 name->setMaxWidth(std::max(1.f, listWidth - 24 * g.scale));
                 row.setMinHeight(28 * g.scale);
                 row.setMaxHeight(28 * g.scale);

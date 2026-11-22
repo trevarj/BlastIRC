@@ -15,11 +15,14 @@ Color themeForegroundColor(std::string_view role);
 Color themePairedForeground(Color background, Color authored);
 // Opaque mention surface; attenuate the accent to preserve nominal body/metadata contrast.
 Color themeMentionBackground(bool hovered = false);
+Color themeMessageBackground(bool own, bool presence, bool hovered, bool mention);
 Color themeNickColor(std::uint32_t hash);
 // Background alpha is opt-in and never applied to a control's text or children.
 float themeSurfaceAlpha();
 Color themeSurfaceFill(Color);
 Color themeSurfaceColor(std::string_view role);
+Color themeConversationBackdrop();
+Color themeSelectionPlate(Color background, Color fill);
 // Font families include explicit overrides and the current presentation defaults.
 const TextFont &themeUiFont();
 const TextFont &themeMessageFont();

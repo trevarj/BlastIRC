@@ -90,7 +90,7 @@ std::string hostOf(std::string_view url) {
     auto host = url.substr(start + 3);
     return std::string(host.substr(0, host.find_first_of("/?#")));
 }
-void labelStyle(Label &label, float size, int lines = 1, std::string_view role = "on_surface") {
+void labelStyle(Label &label, float size, int lines = 1) {
     const auto &font = themeUiFont();
     label.setUseMarkup(false);
     label.setMaxLines(lines);
@@ -98,7 +98,6 @@ void labelStyle(Label &label, float size, int lines = 1, std::string_view role =
     label.setFontFeatures(font.features);
     label.setFontWeight(font.weight);
     label.setFontSize(size);
-    label.setColor(themeForegroundColor(role));
 }
 std::optional<DecodedRasterImage> readRaster(const PreviewAsset &asset, int target) {
     if (!asset.bytes || asset.bytes > 32ULL * 1024 * 1024)
@@ -270,11 +269,16 @@ struct MediaPreviewController::Impl {
             panel->setPosition((width() - w) / 2, (height() - h) / 2);
             panel->setSize(w, h);
             background->setSize(w, h);
-            background->setFill(themeSurfaceColor("surface_container_high"));
+            const auto fill = themeSurfaceColor("surface_container_high");
+            background->setFill(fill);
+            const auto ink =
+                themePairedForeground(lerpColor(themeConversationBackdrop(), fill, fill.a),
+                                      themeForegroundColor("on_surface"));
             background->setRadius(themeCornerRadius());
             const float pad = std::min(12 * scale, w / 8), inner = std::max(0.f, w - 2 * pad);
             for (auto *label : {title, status}) {
                 labelStyle(*label, Style::fontSizeCaption * scale);
+                label->setColor(ink);
                 label->setMaxWidth(inner);
             }
             title->setPosition(pad, pad);
@@ -397,7 +401,7 @@ struct MediaPreviewController::Impl {
             const bool showSite = !entry.title.empty() && entry.title != entry.host;
             site.setVisible(showSite);
             if (showSite) {
-                labelStyle(site, Style::fontSizeMini * scale, 1, "on_surface_variant");
+                labelStyle(site, Style::fontSizeMini * scale);
                 site.setMaxWidth(inner);
                 site.setText(entry.host);
                 site.measure(renderer);
@@ -1035,6 +1039,9 @@ struct MediaPreviewCard::Impl {
     std::uint64_t shownRevision = 0;
     std::shared_ptr<MediaPreviewController::Impl::CardPin> visibleAsset;
     float scale = 1;
+    std::optional<Color> backdrop;
+    bool web = false;
+    std::uint64_t inkThemeRevision = 0;
     explicit Impl(MediaPreviewController &c, Node &owner) : controller(c) {
         visibleAsset = std::make_shared<MediaPreviewController::Impl::CardPin>();
         visibleAsset->node = &owner;
@@ -1072,6 +1079,17 @@ struct MediaPreviewCard::Impl {
         typeIcon = icon.get();
         typeIcon->setHitTestVisible(false);
         owner.addChild(std::move(icon));
+    }
+    void paintInk(Color fill) {
+        const auto base = backdrop ? *backdrop : themeConversationBackdrop();
+        const auto plate = lerpColor(base, fill, fill.a);
+        const auto ink = themePairedForeground(plate, themeForegroundColor("on_surface"));
+        caption->setColor(ink);
+        status->setColor(
+            web ? themePairedForeground(plate, themeForegroundColor("on_surface_variant")) : ink);
+        if (!web)
+            typeIcon->setColor(ink);
+        inkThemeRevision = themeRevision();
     }
     bool readable(std::uint64_t message) {
         auto &state = *controller.impl_;
@@ -1162,6 +1180,13 @@ void MediaPreviewCard::setOpenLink(std::function<void(std::string, std::uint64_t
 void MediaPreviewCard::setReadable(std::function<bool(std::uint64_t)> callback) {
     impl_->isReadable = std::move(callback);
 }
+void MediaPreviewCard::setBackdrop(Color backdrop) {
+    auto &s = *impl_;
+    if (s.backdrop == backdrop && s.inkThemeRevision == themeRevision())
+        return;
+    s.backdrop = backdrop;
+    s.paintInk(themeSurfaceColor("surface_container"));
+}
 MediaPreviewCard::~MediaPreviewCard() = default;
 void MediaPreviewCard::bind(std::uint64_t id, std::string_view url, bool readable,
                             bool automaticAllowed) {
@@ -1196,7 +1221,7 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
     auto &entry = it->second;
     const float scale = s.scale;
     const bool replacing = s.controller.replacesUrl(s.id);
-    const bool web = entry.confirmedLink;
+    const bool web = s.web = entry.confirmedLink;
     const float w = std::min(width(), 320 * scale);
     const float captionHeight =
         web || replacing
@@ -1206,7 +1231,9 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
     s.visibleAsset->asset = entry.asset;
     entry.lastUse = ++controller.clock;
     s.background->setSize(w, h + captionHeight);
-    s.background->setFill(themeSurfaceColor("surface_container"));
+    const auto fill = themeSurfaceColor("surface_container");
+    s.background->setFill(fill);
+    s.paintInk(fill);
     const float radius = Style::radiusLg * themeScale();
     s.background->setRadius(radius);
     s.image->setFit(web ? ImageFit::Cover : ImageFit::Contain);
@@ -1260,7 +1287,6 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
     s.typeIcon->setName(entry.kind == PreviewKind::Audio   ? "music"
                         : entry.kind == PreviewKind::Video ? "video"
                                                            : "link");
-    s.typeIcon->setColor(themeForegroundColor("on_surface"));
     s.typeIcon->setPosition(8 * scale, 8 * scale);
     s.typeIcon->setSize(24 * scale, 24 * scale);
     if (contentTile)

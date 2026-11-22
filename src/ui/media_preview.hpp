@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <render/core/color.h>
 #include <render/scene/input_area.h>
 #include <span>
 #include <string>
@@ -50,6 +51,7 @@ class MediaPreviewCard final : public Node {
     ~MediaPreviewCard() override;
     void setOpenLink(std::function<void(std::string, std::uint64_t)>);
     void setReadable(std::function<bool(std::uint64_t)>);
+    void setBackdrop(Color);
     void bind(std::uint64_t messageId, std::string_view firstUrl, bool readable,
               bool automaticAllowed = true);
     float measure(Renderer &, float actualWidth, float scale) const;

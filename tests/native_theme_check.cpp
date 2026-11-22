@@ -54,6 +54,17 @@ float contrast(Color foreground, Color background) {
     return (std::max(foregroundLuminance, backgroundLuminance) + .05f) /
            (std::min(foregroundLuminance, backgroundLuminance) + .05f);
 }
+
+void selectionPlates() {
+    const auto white = hex("#ffffff");
+    const auto pale = withAlpha(hex("#fefefe"), .24f);
+    const auto fallback = themeSelectionPlate(white, pale);
+    assert(fallback.a == 1.f && contrast(fallback, white) >= 1.3f);
+    const auto dark = hex("#202020");
+    const auto visible = withAlpha(hex("#a8c7fa"), .24f);
+    const auto blended = withAlpha(lerpColor(dark, visible, visible.a), 1.f);
+    assert(themeSelectionPlate(dark, visible) == blended);
+}
 Palette publish(const ConfigDirectory &config, const char *primary, const char *onPrimary,
                 const char *onSurface, const char *inverseOnSurface, const char *scrim,
                 const char *shadow) {
@@ -93,6 +104,7 @@ Palette publish(const ConfigDirectory &config, const char *primary, const char *
     return ::palette;
 }
 void surfaces(const ConfigDirectory &config) {
+    selectionPlates();
     const auto writeSurface = [&](const char *surface) {
         std::ofstream output(config.path / "blastirc" / "noctalia.toml");
         output << "[colors]\n"
@@ -105,7 +117,11 @@ void surfaces(const ConfigDirectory &config) {
                << "background = '#10131a22'\n"
                << "terminal_background = '#10131a22'\n"
                << "primary_container = '#28477733'\n"
-               << "surface_container_low = '#191c2344'\n";
+               << "surface_container_low = '#191c2344'\n"
+               << "secondary = '#777777'\n"
+               << "on_secondary = '#777777'\n"
+               << "hover = '#7799aa'\n"
+               << "on_hover = '#7799aa'\n";
         output.close();
         assert(output);
     };
@@ -137,6 +153,13 @@ void surfaces(const ConfigDirectory &config) {
               &Palette::onSecondaryContainer, &Palette::onTertiaryContainer,
               &Palette::onErrorContainer, &Palette::onHover})
             assert((::palette.*field).a == 1.f);
+        for (const auto &pair : {std::pair{::palette.onSecondary, ::palette.secondary},
+                                 std::pair{::palette.onHover, ::palette.hover}}) {
+            assert(contrast(pair.first, pair.second) >= 4.5f);
+            assert(pair.first.a == 1.f);
+        }
+        assert(near(themeColor("on_secondary"), hex("#777777")));
+        assert(near(themeColor("on_hover"), hex("#7799aa")));
         for (const auto &pair : {std::pair{::palette.onPrimary, ::palette.primary},
                                  std::pair{::palette.onError, ::palette.error}}) {
             assert(contrast(pair.first, pair.second) >= 4.5f);

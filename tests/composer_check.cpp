@@ -1948,12 +1948,14 @@ void checkComposerCaretPalette(Renderer &renderer) {
             frame();
             const auto fill = caret->style().fill;
             const float luminance = relativeLuminance(fill);
-            const float surfaceLuminance =
-                relativeLuminance(themeForegroundColor("surface_container_high"));
-            assert(fill.a == 1.f && !sameColor(fill, themeForegroundColor("primary")) &&
-                   (std::max(luminance, surfaceLuminance) + .05f) /
-                           (std::min(luminance, surfaceLuminance) + .05f) >=
-                       4.5f);
+            const auto panel = lerpColor(themeForegroundColor("background"),
+                                         themeForegroundColor("surface_container_low"), opacity);
+            const auto surface =
+                lerpColor(panel, themeForegroundColor("surface_container_high"), opacity);
+            const float surfaceLuminance = relativeLuminance(surface);
+            assert(fill.a == 1.f && (std::max(luminance, surfaceLuminance) + .05f) /
+                                            (std::min(luminance, surfaceLuminance) + .05f) >=
+                                        4.5f);
             assert(input->editingStateMatches(document) && document.history->undo == undo &&
                    document.history->redo == redo &&
                    input->displayProjection()->rawToDisplay == map);

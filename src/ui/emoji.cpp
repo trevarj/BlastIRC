@@ -197,8 +197,10 @@ class SuggestionRow final : public InputArea {
             1.f);
         glyph->setColor(foreground);
         shortcode->setColor(foreground);
-        name->setColor(highlight || hover ? foreground
-                                          : themeForegroundColor("on_surface_variant"));
+        name->setColor(
+            highlight || hover
+                ? foreground
+                : themePairedForeground(rowBackground, themeForegroundColor("on_surface_variant")));
     }
     RectNode *background;
     Label *glyph, *shortcode, *name;

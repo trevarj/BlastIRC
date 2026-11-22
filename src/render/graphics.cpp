@@ -290,13 +290,7 @@ void MaterialNode::draw(RenderBackend &backend, const CustomDrawContext &incomin
         rect(backend, context, themeSurfaceColor("surface_container_low"), panelBorder(), radius,
              scale);
     } else {
-        auto fill = themeColor(p.presence ? "surface_container_low"
-                               : own      ? "primary_container"
-                                          : "surface_container_high");
-        if (p.mentionHighlight)
-            fill = themeMentionBackground(p.hovered);
-        else if (p.hovered)
-            fill = lerpColor(fill, themeColor("tertiary_container"), .15f);
+        const auto fill = themeMessageBackground(own, p.presence, p.hovered, p.mentionHighlight);
         rect(backend, context, themeSurfaceFill(fill),
              withAlpha(themeColor(p.hovered ? "tertiary" : "outline_variant"),
                        p.hovered ? .35f : .3f),

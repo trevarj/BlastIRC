@@ -4124,8 +4124,10 @@ void Ui::Impl::refresh(bool panelResize) {
     title->setFontSize(16 * scale);
     if (title->font().features != themeUiFont().features)
         title->setFontFeatures(themeUiFont().features);
-    title->setColor(themeForegroundColor(
-        applicationMenu->focused() || applicationMenu->hovered() ? "secondary" : "primary"));
+    title->setColor(themePairedForeground(
+        themeForegroundColor("background"),
+        themeForegroundColor(
+            applicationMenu->focused() || applicationMenu->hovered() ? "secondary" : "primary")));
     int unread = 0;
     for (const auto &[id, b] : model.buffers)
         if (!b.muted)

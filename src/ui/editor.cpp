@@ -119,7 +119,10 @@ constexpr std::array formatToggles{
                  '\x11', &IrcStyle::monospace},
     FormatToggle{"Reverse", "reverse", "Reverse", '\x16', &IrcStyle::reverse},
 };
-Color composerForeground(const Model &) { return themeForegroundColor("on_surface"); }
+Color composerAuthoredForeground() { return themeForegroundColor("on_surface"); }
+Color appLayerOver(Color backdrop, Color fill) {
+    return withAlpha(lerpColor(backdrop, fill, fill.a), 1.f);
+}
 void preserveIrcSuffix(const Input::EditSnapshot &before, Input::EditSnapshot &after, Color normal,
                        Color background, std::optional<SpellRange> replaced = {}) {
     if (before.value == after.value)
@@ -814,7 +817,7 @@ bool EditorStore::Impl::insert(PaneState &pane, std::string_view text) {
     auto e = editor(d);
     e.insert(text);
     Input::EditSnapshot candidate{std::move(e.text), e.cursor, e.anchor};
-    preserveIrcSuffix(committed(d.state), candidate, composerForeground(model),
+    preserveIrcSuffix(committed(d.state), candidate, composerAuthoredForeground(),
                       themeSurfaceColor("surface_container_high"));
     e.text = std::move(candidate.value);
     e.cursor = candidate.cursorPos;
@@ -840,7 +843,7 @@ void EditorStore::Impl::send(PaneState &pane, Draft &d) {
     recover(pane.buffer, d);
     const auto text = committed(d.state).value;
     if (text.empty() || !model.buffers.contains(pane.buffer) ||
-        parseIrcFormatting(text, composerForeground(model),
+        parseIrcFormatting(text, composerAuthoredForeground(),
                            themeSurfaceColor("surface_container_high"))
                 .text.find_first_not_of('\n') == std::string::npos)
         return;
@@ -1121,7 +1124,7 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
         e.mark = true;
     } else if (formatting) {
         const auto name = op.substr(7);
-        const Color normal = composerForeground(model);
+        const Color normal = composerAuthoredForeground();
         const auto document =
             parseIrcFormatting(e.text, normal, themeSurfaceColor("surface_container_high"));
         bool selected = e.mark && e.cursor != e.anchor;
@@ -1233,7 +1236,7 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
         if (op == "transpose-chars") {
             if (selected)
                 return true;
-            const auto document = parseIrcFormatting(e.text, composerForeground(model),
+            const auto document = parseIrcFormatting(e.text, composerAuthoredForeground(),
                                                      themeSurfaceColor("surface_container_high"));
             MessageSelectionText graphemes;
             graphemes.update(document.text);
@@ -1338,7 +1341,7 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
     const bool history = op == "history-previous" || op == "history-next";
     if (!history && e.text != committed(d.state).value) {
         Input::EditSnapshot candidate{std::move(e.text), e.cursor, e.anchor};
-        preserveIrcSuffix(committed(d.state), candidate, composerForeground(model),
+        preserveIrcSuffix(committed(d.state), candidate, composerAuthoredForeground(),
                           themeSurfaceColor("surface_container_high"));
         e.text = std::move(candidate.value);
         e.cursor = candidate.cursorPos;
@@ -1448,7 +1451,13 @@ Input::DisplayProjection EditorStore::Impl::Composer::project(std::string_view r
                 }
                 if (begin < commandEnd) {
                     style.bold = style.monospace = true;
-                    style.foreground = themeForegroundColor("primary");
+                    if (!style.foreground)
+                        style.foreground =
+                            themePairedForeground(style.background.value_or(projectionBackground),
+                                                  themeForegroundColor("primary"));
+                } else if (!style.foreground && style.background) {
+                    style.foreground =
+                        themePairedForeground(*style.background, projectionForeground);
                 }
                 if (misspelled) {
                     // Override only the underline; the stored IRC style remains untouched.
@@ -2735,8 +2744,10 @@ EditorStore::Impl::Composer::Composer(Impl &impl, PaneState &state)
     // One rounded composer surface contains native editing and its action controls.
     input->setFrameVisible(false);
     input->setClearButtonEnabled(false);
-    projectionForeground = composerForeground(owner.model);
-    projectionBackground = themeSurfaceColor("surface_container_high");
+    projectionBackground =
+        appLayerOver(themeConversationBackdrop(), themeSurfaceColor("surface_container_high"));
+    projectionForeground =
+        themePairedForeground(projectionBackground, composerAuthoredForeground());
     input->setDisplayProjector([this](std::string_view raw) { return project(raw); });
     input->setEditRewriter([this](const Input::EditSnapshot &before, Input::EditSnapshot &after,
                                   bool) {
@@ -3380,8 +3391,10 @@ void EditorStore::Impl::Composer::sync() {
                 button->setMaxWidth(target);
         }
     }
-    const auto foreground = composerForeground(owner.model);
-    const auto background = themeSurfaceColor("surface_container_high");
+    const auto replyBackground = themeConversationBackdrop();
+    const auto composerFill = themeSurfaceColor("surface_container_high");
+    const auto background = appLayerOver(replyBackground, composerFill);
+    const auto foreground = themePairedForeground(background, composerAuthoredForeground());
     const bool nickDecorationChanged = updateNickDecoration();
     if (projectionForeground != foreground || projectionBackground != background ||
         nickDecorationChanged) {
@@ -3389,7 +3402,7 @@ void EditorStore::Impl::Composer::sync() {
         projectionBackground = background;
         input->refreshDisplayProjection(true);
     }
-    formatting->setFill(background);
+    formatting->setFill(composerFill);
     formatting->setBorder(themeForegroundColor("outline_variant"), std::max(1.f, scale));
     const size_t selectionStart = std::min(input->cursorPosition(), input->selectionAnchor());
     const size_t selectionEnd = std::max(input->cursorPosition(), input->selectionAnchor());
@@ -3428,18 +3441,19 @@ void EditorStore::Impl::Composer::sync() {
         button->setEnabled(!input->composing());
     }
     const auto styleSurface = [&](auto &surface) {
-        surface.setFill(themeSurfaceColor("surface_container_high"));
+        surface.setFill(composerFill);
         surface.setRadius(themeCornerRadius());
         surface.setBorder(
             themeForegroundColor(input->inputArea()->focused() ? "primary" : "outline_variant"),
             input->inputArea()->focused() ? std::max(1.f, 2 * scale) : std::max(1.f, scale));
     };
     styleSurface(*tools);
+    const auto selectionFill =
+        themeSelectionPlate(background, themeSurfaceColor("primary_container"));
     input->setTextColors(
-        {}, themeSurfaceColor("primary_container"), themeForegroundColor("on_primary_container"),
-        withAlpha(themePairedForeground(themeForegroundColor("surface_container_high"),
-                                        themeForegroundColor("primary")),
-                  1.f));
+        input->enabled() ? std::optional{foreground} : std::nullopt, selectionFill,
+        themePairedForeground(selectionFill, themeForegroundColor("on_primary_container")),
+        themePairedForeground(background, themeForegroundColor("primary")));
     const auto &settings = owner.model.settings;
     const auto shape = settings.cursorShape == "box"         ? Input::CaretShape::Box
                        : settings.cursorShape == "underline" ? Input::CaretShape::Underline
@@ -3457,7 +3471,10 @@ void EditorStore::Impl::Composer::sync() {
         input->resetCaretEffects();
     replyScratch.clear();
     Color replyColor = themeForegroundColor("on_surface_variant");
-    Color replyTextColor = replyColor;
+    const auto replyHeadingColor = themePairedForeground(replyBackground, replyColor);
+    const auto replyBodyColor =
+        themePairedForeground(replyBackground, composerAuthoredForeground());
+    Color replyTextColor = replyHeadingColor;
     std::string author = "unknown sender";
     replyTooltip.clear();
     if (!pane.reply.empty()) {
@@ -3496,12 +3513,10 @@ void EditorStore::Impl::Composer::sync() {
             replyScratch = "Message hidden";
         else {
             if (!message->nick.empty()) {
-                author = parseIrcFormatting(message->nick, foreground,
-                                            themeSurfaceColor("surface_container"))
-                             .text;
+                author = parseIrcFormatting(message->nick, replyBodyColor, replyBackground).text;
                 replyColor = nickColor(owner.model, message->nick, source->server);
-                replyTextColor = nickTextColor(owner.model, message->nick, source->server,
-                                               themeSurfaceColor("surface_container_low"));
+                replyTextColor =
+                    nickTextColor(owner.model, message->nick, source->server, replyBackground);
             }
             replyScratch = message->text;
             replyTooltip.assign("Replying to ");
@@ -3514,19 +3529,21 @@ void EditorStore::Impl::Composer::sync() {
     IrcStyle authorStyle;
     authorStyle.bold = true;
     authorStyle.foreground = replyTextColor;
-    replyHeading->setColor(themeForegroundColor("on_surface_variant"));
+    replyHeading->setColor(replyHeadingColor);
     replyAuthorMarkup = ircMarkup(author, authorStyle);
     replyHeadingMarkup.assign("Replying to ");
     replyHeadingMarkup += replyAuthorMarkup;
     replyHeading->setText(replyHeadingMarkup);
     replyHeading->setTooltip(replyTooltip);
-    replyLabel->setColor(foreground);
+    replyLabel->setColor(replyBodyColor);
     if (replyScratch != renderedReply || replyTheme != themeRevision()) {
         renderedReply.swap(replyScratch);
         replyTheme = themeRevision();
-        auto document =
-            parseIrcFormatting(renderedReply, foreground, themeSurfaceColor("surface_container"));
+        auto document = parseIrcFormatting(renderedReply, replyBodyColor, replyBackground);
         ircSingleParagraph(document);
+        for (auto &run : document.runs)
+            if (!run.style.foreground && run.style.background)
+                run.style.foreground = themePairedForeground(*run.style.background, replyBodyColor);
         replyLabel->setText(ircMarkup(document));
     }
     shown(*replyRow, !pane.reply.empty());
@@ -3724,7 +3741,7 @@ EditorStore::UploadInsertResult EditorStore::insertUpload(const UploadOrigin &or
         auto edit = store.editor(draft);
         edit.insert(text);
         Input::EditSnapshot candidate{std::move(edit.text), edit.cursor, edit.anchor};
-        preserveIrcSuffix(before, candidate, composerForeground(store.model),
+        preserveIrcSuffix(before, candidate, composerAuthoredForeground(),
                           themeSurfaceColor("surface_container_high"));
         if (!store.valid(before.value, candidate.value))
             return UploadInsertResult::Invalid;

@@ -4790,9 +4790,9 @@ void messageTextSelection(TranscriptTestRenderer &renderer, float zoom) {
     const std::string firstPlain = "Alpha e\xCC\x81 X tail";
     const std::string middlePlain =
         "Middle words preserve every native wrapping space across a narrow retained selection.";
-    const std::string messages[] = {"Alpha \x02"
-                                    "e"
-                                    "\x02\x1d"
+    const std::string messages[] = {"Alpha \x02\x04"
+                                    "111111,111111e"
+                                    "\x0f\x1d"
                                     "\xCC\x81"
                                     "\x1d"
                                     " X tail",
@@ -4902,10 +4902,17 @@ void messageTextSelection(TranscriptTestRenderer &renderer, float zoom) {
     const auto selectedBody = body(view, "Alpha");
     std::vector<const RectNode *> highlights;
     for (const auto &child : selectedBody.body.children())
-        if (auto *rect = dynamic_cast<RectNode *>(child.get());
-            rect && rect->visible() &&
-            rect->style().fill == withAlpha(blast::themeForegroundColor("primary"), .24f)) {
+        if (auto *rect = dynamic_cast<RectNode *>(child.get()); rect && rect->visible()) {
             assert(rect->width() > 0 && rect->height() > 0);
+            assert(rect->style().fill.a == 1 && rect->clipChildren() && !rect->hitTestVisible());
+            assert(rect->children().size() == 1);
+            const auto *ink = dynamic_cast<const TextNode *>(rect->children().front().get());
+            assert(ink && ink->text().find("background=") == std::string::npos);
+            const float foreground = relativeLuminance(ink->color());
+            const float background = relativeLuminance(rect->style().fill);
+            assert((std::max(foreground, background) + .05f) /
+                       (std::min(foreground, background) + .05f) >=
+                   4.5f);
             highlights.push_back(rect);
         }
     assert(highlights.size() >= 2); // Both shaped style-cut halves of the selected grapheme.
@@ -4949,8 +4956,7 @@ void messageTextSelection(TranscriptTestRenderer &renderer, float zoom) {
     assert(view.copySelection() && clipboard.clipboardText() == "e\xCC\x81 X tail\nBeta");
     const auto deleted = body(view, "Message deleted");
     for (const auto &child : deleted.body.children())
-        if (auto *rect = dynamic_cast<RectNode *>(child.get()); rect && rect->visible())
-            assert(rect->style().fill != withAlpha(blast::themeForegroundColor("primary"), .24f));
+        assert(!dynamic_cast<RectNode *>(child.get()) || !child->visible());
     buffer.messages[2].deleted = false;
     arrange();
     assert(view.copySelection() && clipboard.clipboardText() == copied);
@@ -9829,6 +9835,7 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
     blast::Model model;
     model.settings.timestamps = model.settings.avatars = false;
     model.settings.reducedMotion = true;
+    ConfigDirectory config;
     blast::Theme theme;
     theme.update(model);
     auto &buffer = model.buffers["inline-nicks"];
@@ -9968,14 +9975,15 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
     parent.text = "Contrast parent excerpt";
     buffer.messages.push_back(parent);
     buffer.messages.front().reply = parent.id;
-    ConfigDirectory config;
     std::filesystem::create_directories(config.path / "blastirc");
     auto *palette = std::fopen((config.path / "blastirc" / "noctalia.toml").c_str(), "w");
     assert(palette);
-    assert(std::fputs("[colors]\nsurface='#ffffff'\non_surface='#111111'\n"
+    assert(std::fputs("[colors]\nsurface='#ffffff'\non_surface='#646464'\n"
+                      "primary='#f2f2f2'\non_primary='#eeeeee'\ntertiary='#aaaaaa'\n"
+                      "error='#aaaaaa'\ntertiary_container='#000000'\n"
                       "surface_container_low='#fafafa'\nsurface_container_high='#eeeeee'\n"
                       "surface_container='#f5f5f5'\nprimary_container='#e5e0ff'\n"
-                      "on_primary_container='#191040'\non_surface_variant='#333333'\n",
+                      "on_primary_container='#eeeeee'\non_surface_variant='#dddddd'\n",
                       palette) >= 0);
     assert(std::fclose(palette) == 0);
     const auto contrast = [](Color foreground, Color background) {
@@ -10038,11 +10046,13 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
                     assert(quoteOverride && quoteOverride->color() == hex("#ffffaa"));
                     model.networks[buffer.server].caseMapping = "ascii";
                     arrange();
-                    assert(
-                        nicknameInk("[nICK]", false) ==
-                        blast::themeForegroundColor(own && layout == blast::MessageLayout::Bubbles
-                                                        ? "on_primary_container"
-                                                        : "on_surface"));
+                    const auto ordinary = nicknameInk("[nICK]", false);
+                    const auto authored = blast::themeForegroundColor(
+                        own && layout == blast::MessageLayout::Bubbles ? "on_primary_container"
+                                                                       : "on_surface");
+                    assert(contrast(ordinary, surface) >= 4.5f);
+                    if (contrast(authored, surface) >= 4.5f)
+                        assert(ordinary == authored);
                     model.networks[buffer.server].caseMapping = "rfc1459";
                     model.settings.nickColors["{nICK}"] = "invalid";
                     arrange();
@@ -10052,6 +10062,32 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
         }
     }
     assert(adjusted && preserved);
+    model.settings.themeSource = "auto";
+    theme.update(model);
+    assert(std::string_view(blast::themeSource()) == "Noctalia");
+    model.settings.messageLayouts[buffer.id] = blast::MessageLayout::Bubbles;
+    buffer.messages.front().own = false;
+    dispatcher.setSceneRoot(&view);
+    arrange();
+    const auto authored = blast::themeForegroundColor("on_surface");
+    near(authored.r, hex("#646464").r);
+    const auto fill = hex("#eeeeee");
+    const auto hoverFill = lerpColor(fill, hex("#000000"), .15f);
+    assert(nicknameInk("malice", false) == authored);
+    assert(contrast(authored, hoverFill) < 4.5f);
+    const auto hovered = body(view, original, true);
+    float hoverX, hoverY;
+    Node::mapToScene(&hovered.body, 1, 1, hoverX, hoverY);
+    dispatcher.pointerMotion(hoverX, hoverY, 543);
+    arrange();
+    assert(contrast(nicknameInk("malice", false), hoverFill) >= 4.5f);
+    assert(contrast(nicknameInk("https://example.org/Alice", false), hoverFill) >= 4.5f);
+    dispatcher.pointerLeave();
+    arrange();
+    assert(nicknameInk("malice", false) == authored);
+    dispatcher.setSceneRoot(nullptr);
+    model.settings.themeSource = "builtin";
+    theme.update(model);
     buffer.messages.front().text = "Alice \x02[nICK]\x02 plain";
     for (const auto layout :
          {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc, blast::MessageLayout::Stacked})

@@ -250,6 +250,9 @@ float shellOuterPadding(float width, float height, float scale) {
     const bool compact = height < 600 * scale || width < 1000 * scale;
     return (height < 360 * scale ? 4.f : compact ? 8.f : 12.f) * scale;
 }
+float conversationPaddingY(float height, float scale) {
+    return height < 360 * scale ? 0.f : 8 * scale;
+}
 float panelWidth(SidebarMode mode, float expanded, float compact) {
     return mode == SidebarMode::Expanded ? expanded : mode == SidebarMode::Compact ? compact : 0.f;
 }
@@ -1726,9 +1729,9 @@ struct Ui::Impl::PaneView final : Node {
   protected:
     void doLayout(Renderer &renderer) override {
         const float s = userScale;
-        const bool shortPane = height() < 360 * s;
+        const float paddingY = conversationPaddingY(height(), s);
+        const bool shortPane = paddingY == 0;
         const float paddingX = (shortPane ? 8.f : panePaddingX) * s;
-        const float paddingY = shortPane ? 0.f : 8 * s;
         const float panelGap = (shortPane ? 6.f : 12.f) * s;
         const float left = paddingX;
         const float innerWidth = std::max(0.f, width() - 2 * left);
@@ -4454,7 +4457,12 @@ void Ui::Impl::refresh(bool panelResize) {
     restoreJumpFocus(false);
     syncUploadPanel();
     modeLine->sync(scale, navigationMode, chord, statusControlsAvailable());
-    place(*modeLine, outer, height - statusHeight, std::max(0.f, width - 2 * outer), statusHeight);
+    const auto activeView = views.find(workspace.focused);
+    const float composerInset = activeView != views.end() && activeView->second->composer->visible()
+                                    ? conversationPaddingY(conversationRect.height, scale)
+                                    : 0.f;
+    place(*modeLine, outer, height - statusHeight - (outer + composerInset) / 2,
+          std::max(0.f, width - 2 * outer), statusHeight);
     if (windowActive)
         repairFocus();
     if (paletteOpen && !commandMode) {

@@ -276,7 +276,7 @@ noctalia_ui_codecs_lib = static_library('noctalia-ui-codecs',
   sources: _noctalia_ui_codecs_sources,
   dependencies: _noctalia_ui_codecs_system_dependencies + [noctalia_ui_dep],
   include_directories: _noctalia_ui_wuffs_inc,
-  cpp_args: _noctalia_ui_cpp_args,
+  cpp_args: _noctalia_ui_cpp_args + (_noctalia_ui_blastirc_profile ? ['-DNOCTALIA_UI_WUFFS_IMAGE_ONLY'] : []),
 )
 
 noctalia_ui_codecs_dep = declare_dependency(

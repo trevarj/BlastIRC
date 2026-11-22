@@ -305,7 +305,7 @@ The trusted FILEHOST receives the parent account's actual username and password 
 
 ## Verification contract
 
-The UI dependency is the maintained [Noctalia library](vendor/noctalia/lib) in tracked `vendor/noctalia`, consumed directly by Meson and Nix with `library_only=true`. BlastIRC enables `blastirc_ui_profile` to skip SDK implementations the app does not link; other consumers still build the complete libraries. BlastIRC owns its asset and license installation paths and app-specific behavior. There is no external SDK download, copy, or root build-file replacement.
+The UI dependency is the maintained [Noctalia library](vendor/noctalia/lib) in tracked `vendor/noctalia`, consumed directly by Meson and Nix with `library_only=true`. BlastIRC enables `blastirc_ui_profile` to skip unused SDK implementations and build only Wuffs' image decoders and their dependencies; other consumers still build the complete libraries. BlastIRC owns its asset and license installation paths and app-specific behavior. There is no external SDK download, copy, or root build-file replacement.
 
 The vendored source originated at public [fork](https://github.com/trevarj/noctalia) revision `ad60f4c2a8841ce25c78f9d6ac8c111523fa34b6`, including 14 focused signed commits over the unchanged [Noctalia upstream](https://github.com/noctalia-dev/noctalia) base `5e4aae910b764c7aeee411f741a266263f104375` and generic scroll-into-view using the public border-aware viewport. BlastIRC's `main` tracks the source snapshot without importing SDK Git ancestry. Edit `vendor/noctalia` directly and commit UI changes with the app using signed commits (`git commit -S`); preserve upstream author attribution, identity, MIT license, credits, and source revision references.
 

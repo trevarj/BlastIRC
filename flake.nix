@@ -208,6 +208,46 @@
         default = blastirc;
         noctalia-ui-sdk = noctaliaUiSdk;
       };
+      apps.${system}.install-dev = {
+        type = "app";
+        program = pkgs.lib.getExe (
+          pkgs.writeShellApplication {
+            name = "blastirc-install-dev";
+            runtimeInputs = [ pkgs.coreutils ];
+            text = ''
+              if [[ ! -f flake.nix || ! -f packaging/run-dev.sh ]]; then
+                echo "Run this command from the BlastIRC checkout." >&2
+                exit 1
+              fi
+              nix develop -c bash packaging/run-dev.sh --build-only
+
+              applications="''${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+              mkdir -p -- "$applications"
+              entry=$(mktemp "$applications/.blastirc-dev.XXXXXX")
+              trap 'rm -f -- "$entry"' EXIT
+              checkout=''${PWD//\\/\\\\}
+              checkout=''${checkout// /\\s}
+              checkout=''${checkout//$'\t'/\\t}
+              checkout=''${checkout//$'\n'/\\n}
+              checkout=''${checkout//$'\r'/\\r}
+              cat > "$entry" <<EOF
+              [Desktop Entry]
+              Type=Application
+              Name=BlastIRC (Dev)
+              Exec=nix develop -c bash packaging/run-dev.sh
+              TryExec=nix
+              Path=$checkout
+              Icon=$checkout/assets/icon.png
+              Terminal=false
+              Categories=Network;IRCClient;Chat;
+              EOF
+              chmod 644 "$entry"
+              mv -fT -- "$entry" "$applications/io.github.trevarj.blastirc.dev.desktop"
+              echo "Installed BlastIRC (Dev) from $PWD"
+            '';
+          }
+        );
+      };
       checks.${system}.regression = blastirc.overrideAttrs (old: {
         mesonFlags = old.mesonFlags ++ [ "-Dtests=true" ];
         doCheck = true;

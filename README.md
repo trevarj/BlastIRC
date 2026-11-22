@@ -16,6 +16,8 @@ nix run .
 
 To build separately, use `nix build .#default` and run `./result/bin/blastirc`; for development setup, see [Development and design](UI-DESIGN.md#verification-contract).
 
+Run `nix run .#install-dev` from the checkout root to build the current source and install **BlastIRC (Dev)** in your app launcher. If the build fails, the launcher is left untouched. Opening it later rebuilds only what changed, including uncommitted edits. It shares your BlastIRC settings and history; close the stable instance first. No NixOS rebuild is needed.
+
 On the welcome screen, enter your server, port, nickname and identity, keep TLS enabled, add any auto-join channels, and select **Save and connect**.
 
 For soju, choose **Add soju account** in **Settings → Networks**, enter the bouncer endpoint and base-account identity without a `/network` suffix, then set **Password (SASL PLAIN)** credentials and select **Save and connect**.

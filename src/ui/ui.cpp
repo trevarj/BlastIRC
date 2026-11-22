@@ -967,8 +967,8 @@ struct Ui::Impl {
     Dialogs *dialogs = nullptr;
     std::map<std::uint64_t, PaneView *> views;
     std::array<InputArea *, 8> resizeEdges{};
-    std::array<IconButton *, 3> windowButtons{};
-    std::array<std::string, 4> windowBindings;
+    std::array<IconButton *, 4> windowButtons{};
+    std::array<std::string, 5> windowBindings;
     std::optional<SidebarMode> navigationHintPreferred, navigationHintEffective;
     ServerRail *rail = nullptr;
     std::array<Box *, 2> navigationDividers{};
@@ -1233,12 +1233,13 @@ struct Ui::Impl {
                 if (dispatcher && withinNode(dispatcher->focusedArea(), &row))
                     dispatcher->setFocus(nullptr);
             })));
-        const std::array<std::pair<const char *, const char *>, 3> tools = {
+        const std::array<std::pair<const char *, const char *>, 4> tools = {
             {{"panel-left", "Toggle Channels"},
              {"terminal", "Execute command"},
-             {"x", "Close window"}}};
-        constexpr std::array<const char *, 3> controlKeys = {"topbar-navigation", "topbar-command",
-                                                             "topbar-close"};
+             {"x", "Close window"},
+             {"settings", "Settings"}}};
+        constexpr std::array controlKeys = {"topbar-navigation", "topbar-command", "topbar-close",
+                                            "topbar-settings"};
         for (std::size_t i = 0; i < tools.size(); ++i) {
             auto button = std::make_unique<IconButton>(tools[i].first, tools[i].second, [this, i] {
                 if (i == 0)
@@ -1250,7 +1251,8 @@ struct Ui::Impl {
                         window.close();
                     else
                         queue(model, "quit");
-                }
+                } else
+                    pending.emplace_back("settings");
             });
             button->setTabFocusKey(controlKeys[i]);
             if (i == 0)
@@ -1264,8 +1266,6 @@ struct Ui::Impl {
             std::vector<std::string> commands;
             std::vector<ContextMenuEntry> entries;
             entries.push_back(menuLeaf(commands, "Add network", "plus", "add-server"));
-            entries.push_back(menuLeaf(commands, commandLabel(model, "Settings", "settings"),
-                                       "settings", "settings"));
             if (foldReadAll && hasUnread())
                 entries.push_back(
                     menuLeaf(commands, "Mark all read", "check-check", "mark-all-read"));
@@ -4193,6 +4193,7 @@ void Ui::Impl::refresh(bool panelResize) {
     updateTopbarHint(*networksButton, 2, "Toggle Networks", "toggle-networks");
     networksButton->selected(workspace.serverRailVisible);
     updateTopbarHint(*mentionsButton, 3, "Mentions — all networks", "global-mentions");
+    updateTopbarHint(*windowButtons.back(), 4, "Settings", "settings");
     mentionsButton->selected(model.activeBuffer == GlobalMentionsBufferId);
     if (!showReadAll && readAllButton->visible())
         retirePanel(*readAllButton, applicationMenu, true);

@@ -734,7 +734,7 @@ def shell_actions(layout):
     _, _, width, height = layout["topbar"]["rect"]
     extent = max(32, (32 if layout["compact"] else 34) * zoom)
     outer, gap = layout["rail"]["rect"][0], 8 * zoom
-    left = width - outer - 3 * extent - 2 * gap
+    left = width - outer - 4 * extent - 3 * gap
     database_path = next(reversed(GUI_DEBUG.values()))[0].native_database_path
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as database:
         unread = database.execute(
@@ -743,6 +743,7 @@ def shell_actions(layout):
     extra = extent + gap
     return {"navigation": (left + extent / 2, height / 2),
             "palette": (left + 1.5 * extent + gap, height / 2),
+            "settings": (width - outer - extent / 2, height / 2),
             "application": (outer + 60 * zoom, height / 2),
             "networks": (left - (3 if unread and not folded else 2) * extra + extent / 2, height / 2),
             "mentions": (left - (2 if unread and not folded else 1) * extra + extent / 2, height / 2),
@@ -753,9 +754,9 @@ def shell_actions(layout):
 
 def activate_shell_action(window, preferences, action):
     actions = shell_actions(read_layout(preferences))
-    if action in ("settings", "add_network") or (action == "mark_all_read" and actions["read_folded"]):
+    if action == "add_network" or (action == "mark_all_read" and actions["read_folded"]):
         popup = open_native_popup(window, lambda: click(window, *actions["application"]))
-        index = {"add_network": 0, "settings": 1, "mark_all_read": 2}[action]
+        index = {"add_network": 0, "mark_all_read": 1}[action]
         select_native_menu(window, popup, [index])
     else:
         assert actions[action] is not None, ("Unavailable shell action", action, actions)
@@ -766,7 +767,7 @@ def activate_shell_action(window, preferences, action):
 
 
 def open_settings(window, preferences, *, from_icon=False, action="settings"):
-    """Use the existing native Settings command without requiring a saved workspace."""
+    """Open native Settings by its topbar icon or existing command."""
     if from_icon:
         activate_shell_action(window, preferences, action)
     else:
@@ -5869,11 +5870,11 @@ def probe_menu_reachability(proc, window, preferences, database_path, args, dest
                                                         'retained_root': root['popup']})
 
     def outside_settings_click(root, child, native_before):
-        point = shell_actions(read_layout(preferences))['application']
+        point = shell_actions(read_layout(preferences))['settings']
         for member in (root, child):
             x, y, width, height = member['rect']
             assert not (x <= point[0] < x + width and y <= point[1] < y + height), (
-                'Application menu control is not outside this actual popup family', point, member)
+                'Settings control is not outside this actual popup family', point, member)
         photograph(child, 'outside-settings-before', retain=True)
         marker = debug.stat().st_size
         move_pointer(window, *point)
@@ -5884,10 +5885,10 @@ def probe_menu_reachability(proc, window, preferences, database_path, args, dest
         SESSION.until('outside click actual pointer release delivered', lambda:
                       release.search(debug.read_bytes()[marker:].decode(errors='replace')) is not None)
         saved = persist('outside-settings-click-swallowed')
-        assert saved == compact, ('Outside click activated underlying application control', compact, saved)
+        assert saved == compact, ('Outside click activated underlying Settings control', compact, saved)
         SESSION.until('outside click retains exact native editing context', lambda:
                       native_input_state(window) == native_before)
-        report['outside_click'] = {'point': point, 'live_control': 'Application menu',
+        report['outside_click'] = {'point': point, 'live_control': 'Settings',
                                    'protocol_offset': marker, 'family': [root['popup'], child['popup']],
                                    'release_delivered': True, 'settings_unchanged': True,
                                    'native_input': native_input_state(window),
@@ -7062,8 +7063,8 @@ def run(*, allow_focused_geometry=False):
                 layout = read_layout(preferences)
                 assert "settings" not in layout, layout
                 filter_sidebar(window, layout, args.zoom, "no-native-filter-match", 2)
-                move_pointer(window, *shell_actions(layout)["application"])
-                capture_window(window, destination, "application-menu-hover")
+                move_pointer(window, *shell_actions(layout)["settings"])
+                capture_window(window, destination, "settings-icon-hover")
                 open_settings(window, preferences, from_icon=True)
                 # Dialog metadata is live model state until a real user save;
                 # observing disk is not a promise of save-on-open/autosave timing.

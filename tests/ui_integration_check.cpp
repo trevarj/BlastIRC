@@ -1771,15 +1771,9 @@ void sidebarConversationFilterCheck() {
         if (auto *candidate = dynamic_cast<Dialogs *>(child.get()))
             dialogs = candidate;
     assert(dialogs);
-    auto *application = areaWithKey(ui.root(), "topbar-application");
-    assert(application && visible(*application));
-    activate(*application);
-    assert(menu.open);
-    const auto settingsEntry = std::find_if(
-        menu.request.menu.begin(), menu.request.menu.end(),
-        [](const ContextMenuEntry &entry) { return entry.label.starts_with("Settings"); });
-    assert(settingsEntry != menu.request.menu.end());
-    menu.select(settingsEntry->label);
+    auto *settings = areaWithKey(ui.root(), "topbar-settings");
+    assert(settings && visible(*settings));
+    click(dispatcher, *settings);
     frame();
     assert(dialogs->settingsOpen() && visible(*dialogs));
     unchangedSelection();
@@ -1787,8 +1781,14 @@ void sidebarConversationFilterCheck() {
     frame();
     assert(!dialogs->active() && !visible(*dialogs));
     unchangedSelection();
+    auto *application = areaWithKey(ui.root(), "topbar-application");
+    assert(application && visible(*application));
     activate(*application);
     assert(menu.open);
+    assert(!menu.request.menu.empty() && menu.request.menu.front().label == "Add network");
+    assert(std::none_of(
+        menu.request.menu.begin(), menu.request.menu.end(),
+        [](const ContextMenuEntry &entry) { return entry.label.starts_with("Settings"); }));
     const auto profilesBefore = model.servers.size();
     menu.select("Add network");
     frame();
@@ -2842,6 +2842,14 @@ void titlebarGeometryCheck() {
     blast::Theme theme;
     PangoRenderer renderer;
     blast::Ui ui(model, clipboard);
+    const auto checkSettingsEdge = [&](float width, float scale) {
+        auto *settings = areaWithKey(ui.root(), "topbar-settings");
+        assert(settings && visible(*settings));
+        assert(settings->width() >= 32 * scale && settings->height() >= 32 * scale);
+        float right = 0, y = 0;
+        Node::mapToScene(settings, settings->width(), 0, right, y);
+        assert(right <= width && right >= width - 12 * scale);
+    };
     for (const float scale : {1.f, 2.f}) {
         model.settings.scale = scale;
         theme.update(model);
@@ -2870,8 +2878,9 @@ void titlebarGeometryCheck() {
         assert(application->x() + application->width() + 64 * scale <=
                areaWithKey(ui.root(), "topbar-networks")->x());
         InputArea *previous = nullptr;
-        for (const auto key : {"topbar-networks", "topbar-mentions", "topbar-mark-all-read",
-                               "topbar-navigation", "topbar-command", "topbar-close"}) {
+        for (const auto key :
+             {"topbar-networks", "topbar-mentions", "topbar-mark-all-read", "topbar-navigation",
+              "topbar-command", "topbar-close", "topbar-settings"}) {
             auto *button = areaWithKey(ui.root(), key);
             assert(button);
             if (!visible(*button))
@@ -2888,6 +2897,11 @@ void titlebarGeometryCheck() {
             }
             previous = button;
         }
+        checkSettingsEdge(1600, scale);
+        const float compactWidth = 760 * scale - 1;
+        ui.update(compactWidth, 1000, 1);
+        ui.root().layout(renderer);
+        checkSettingsEdge(compactWidth, scale);
     }
 }
 
@@ -2937,6 +2951,9 @@ void topbarReadAllCheck() {
                                        [](const ContextMenuEntry &entry) {
                                            return entry.label == "Mark all read" && entry.enabled;
                                        });
+        assert(!menu.request.menu.empty() && menu.request.menu.front().label == "Add network");
+        if (found)
+            assert(menu.request.menu.size() > 1 && menu.request.menu[1].label == "Mark all read");
         menu.closeSelectDropdown();
         return found;
     };

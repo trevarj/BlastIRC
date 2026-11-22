@@ -398,7 +398,7 @@ def run_network_sidebar(ctx):
         assert popup['rect'][3] > empty_menu_height, ('Conditional read item did not appear', popup)
         evidence['folded_menu'] = str(gui.capture_native_popup(w, popup, destination,
                                                             'network-sidebar-folded-read'))
-        gui.select_native_menu(w, popup, [2])
+        gui.select_native_menu(w, popup, [1])
     else:
         gui.move_pointer(w, 0, 0)
         gui.SESSION.until('conditional native topbar read control appears', lambda:

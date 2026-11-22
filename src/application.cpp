@@ -4071,27 +4071,12 @@ void Application::action(const Action &a) {
         string before = a.extra.empty() ? (oldestLoaded ? oldestLoaded->id : string{}) : a.extra;
         if ((b->kind == "channel" || b->kind == "query") && !a.extra.empty())
             for (const auto &row : b->messages)
-                if (row.id == a.extra &&
-                    (row.presence ||
-                     (row.own && (row.pending || row.sendStatus == SendStatus::Queued ||
-                                  row.sendStatus == SendStatus::Unknown)))) {
+                if (row.id == a.extra && !isHistoryWindowMessage(row)) {
                     before = oldestLoaded ? oldestLoaded->id : string{};
                     break;
                 }
-        if (savingAllowed_)
-            try {
-                auto page = storage_.history(b->id, 200, before);
-                const bool local = !page.empty();
-                for (auto &m : page) {
-                    m.history = true;
-                    m.pending = false;
-                    insert(*b, std::move(m), false);
-                }
-                if (local)
-                    return;
-            } catch (const std::exception &e) {
-                report(e.what(), b->server);
-            }
+        if (loadLocalHistory(*b, 200, before))
+            return;
         if (b->historyState.beginning)
             return;
         string remote = before;

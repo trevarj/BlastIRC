@@ -200,12 +200,14 @@ struct Buffer {
     bool loading = false, joined = false;
     bool muted = false, archived = false;
 };
+inline bool isHistoryWindowMessage(const Message &message) {
+    return !message.presence &&
+           !(message.own && (message.pending || message.sendStatus == SendStatus::Queued ||
+                             message.sendStatus == SendStatus::Unknown));
+}
 inline const Message *oldestHistoryMessage(const Buffer &buffer) {
     for (const auto &message : buffer.messages)
-        if ((buffer.kind != "channel" && buffer.kind != "query") ||
-            (!message.presence &&
-             !(message.own && (message.pending || message.sendStatus == SendStatus::Queued ||
-                               message.sendStatus == SendStatus::Unknown))))
+        if ((buffer.kind != "channel" && buffer.kind != "query") || isHistoryWindowMessage(message))
             return &message;
     return nullptr;
 }

@@ -552,6 +552,8 @@ int main(int argc, char **argv) {
                     nextTick = now + std::chrono::milliseconds(16);
                     UiPhaseScope phase(UiPhase::Update);
                     app.tick(std::chrono::duration<double>(now - start).count());
+                    if (frame != 0)
+                        app.preloadScrollback();
                     notifications(app.model, active);
                     const auto revision = blast::themeRevision();
                     theme.update(app.model);

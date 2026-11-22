@@ -6466,6 +6466,56 @@ struct ApplicationRegression {
                                      [&](const auto &loaded) { return loaded.id == row.id; }) == 1);
         }
     }
+    static void preloadActiveScrollback() {
+        Application app;
+        app.model = Model{};
+        app.model.settings.retentionDays = 0;
+        app.storage_.prune(app.model.settings);
+        auto &room = app.buffer("preload", "#room");
+        auto &other = app.buffer("preload", "Peer", "query");
+        auto write = app.storage_.historyWrite();
+        for (int i = 0; i < 625; ++i) {
+            Message row;
+            row.id = "chat-" + std::to_string(i);
+            row.timestamp = 1793491200 + i * 2;
+            row.text = row.id;
+            app.storage_.append(room.id, row, {}, 0, false, &room);
+            row.id = "presence-" + std::to_string(i);
+            ++row.timestamp;
+            row.presence = true;
+            app.storage_.append(room.id, row);
+        }
+        write.commit();
+        for (auto &row : app.storage_.history(room.id))
+            room.messages.push_back(std::move(row));
+        Message livePresence;
+        livePresence.id = "live-presence";
+        livePresence.presence = true;
+        room.messages.push_front(livePresence);
+        app.messageCount_ = room.messages.size();
+        assert(room.messages.size() == 201 && oldestHistoryMessage(room)->id == "chat-425");
+
+        app.model.activeBuffer = other.id;
+        app.preloadScrollback();
+        app.model.now = 1;
+        app.model.activeBuffer = room.id;
+        app.preloadScrollback();
+        assert(oldestHistoryMessage(room)->id == "chat-425" && other.messages.empty());
+        app.model.now = 2;
+        app.preloadScrollback();
+        assert(oldestHistoryMessage(room)->id == "chat-375");
+        for (int tick = 0; tick < 10; ++tick) {
+            app.model.now += 0.016;
+            app.preloadScrollback();
+        }
+        assert(room.messages.size() == 601 && oldestHistoryMessage(room)->id == "chat-25" &&
+               other.messages.empty() && app.activeHistory_.empty() && app.model.effects.empty());
+        assert(std::count_if(room.messages.begin(), room.messages.end(),
+                             [](const auto &row) { return row.presence; }) == 1);
+
+        app.action({"history", room.id, {}, {}});
+        assert(room.messages.size() == 626 && oldestHistoryMessage(room)->id == "chat-0");
+    }
     static void discoveredLatestHistory() {
         RenameDrainPeer peer;
         Application app;
@@ -7086,6 +7136,7 @@ struct ApplicationRegression {
     }
     static void run() {
         localHistorySkipsProvisionalWindowEdge();
+        preloadActiveScrollback();
         commandArgumentContext();
         repeatSearch();
         retainedSearchJump();

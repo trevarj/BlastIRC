@@ -26,6 +26,7 @@ class Application {
     ~Application() noexcept;
     // Frame order: tick, Theme::update, Ui::update, Effects::draw.
     void tick(double now);
+    void preloadScrollback();
     bool save();
     Storage &storage() { return storage_; }
 
@@ -130,6 +131,8 @@ class Application {
     set<string> retiredSearchHistory_;
     map<string, CommandOrigin> commandOrigins_;
     set<string> namesInProgress_, requestedHistory_;
+    string scrollbackBuffer_;
+    std::optional<double> scrollbackPreloadAt_;
     map<string, set<string>> sojuCatalogSeen_;
     map<string, string> sojuCatalogBatch_;
     map<string, std::pair<string, string>> sojuMutations_;
@@ -213,6 +216,7 @@ class Application {
     string historyCursor(const Buffer &, const string &) const;
     bool historyUsesMsgid(const string &server, const string &id) const;
     bool zncPlayback(const string &server) const;
+    size_t loadLocalHistory(Buffer &, int limit, const string &before);
     void requestHistory(Buffer &, const string &before, bool initial);
     vector<string> historyOrder(const string &server) const;
     void scheduleHistory();

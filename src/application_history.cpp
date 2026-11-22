@@ -807,6 +807,61 @@ void Application::enqueueHistory(Buffer &b, HistoryRequest request, int64_t gapI
     page.gapId = gapId;
     submitHistory(std::move(page));
 }
+size_t Application::loadLocalHistory(Buffer &b, int limit, const string &before) {
+    if (!savingAllowed_)
+        return 0;
+    try {
+        auto page = storage_.history(b.id, limit, before);
+        for (auto &message : page) {
+            message.history = true;
+            message.pending = false;
+            insert(b, std::move(message), false);
+        }
+        return page.size();
+    } catch (const std::exception &e) {
+        report(e.what(), b.server);
+        return 0;
+    }
+}
+
+void Application::preloadScrollback() {
+    if (scrollbackBuffer_ != model.activeBuffer) {
+        scrollbackBuffer_ = model.activeBuffer;
+        scrollbackPreloadAt_ = model.now + 0.25;
+    }
+    if (!scrollbackPreloadAt_ || model.now < *scrollbackPreloadAt_)
+        return;
+    auto *b = findBuffer(scrollbackBuffer_);
+    if (!savingAllowed_ || !b || (b->kind != "channel" && b->kind != "query")) {
+        scrollbackPreloadAt_.reset();
+        return;
+    }
+    if (b->loading)
+        return;
+
+    const auto limit = static_cast<size_t>(std::clamp(model.settings.maxMessages, 1, 100000));
+    const auto target = std::min<size_t>(600, limit);
+    const Message *oldest = nullptr;
+    size_t count = 0;
+    for (const auto &message : b->messages) {
+        if (!isHistoryWindowMessage(message))
+            continue;
+        if (!oldest)
+            oldest = &message;
+        if (++count == target)
+            break;
+    }
+    if (!oldest || count == target || messageCount_ >= limit) {
+        scrollbackPreloadAt_.reset();
+        return;
+    }
+    const auto pageSize = std::min({size_t(50), target - count, limit - messageCount_});
+    const string before = oldest->id;
+    if (loadLocalHistory(*b, static_cast<int>(pageSize), before) < pageSize ||
+        oldestHistoryMessage(*b)->id == before)
+        scrollbackPreloadAt_.reset();
+}
+
 void Application::enqueueHistory(Buffer &b, const string &cursor, bool initial) {
     HistoryRequest request;
     request.initial = initial;

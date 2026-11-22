@@ -1235,27 +1235,23 @@ void metadataChecks(SSL_CTX *context, const Identity &identity) {
                         "draft/multiline=max-bytes=4096,max-lines=16";
     registerClient(peer, client, events, identity, caps);
     const string prefix = ":" + identity.nick + "!user@localhost ";
-    auto join = [&](const string &target, bool metadata) {
+    auto join = [&](const string &target) {
         peer.send(prefix + "JOIN " + target);
         peer.expect("WHO", {target});
-        if (metadata)
-            peer.expect("METADATA", {target, "SYNC"});
     };
-    auto enable = [&](const set<string> &targets) {
+    auto enable = [&] {
         peer.send(":server CAP " + identity.nick + " NEW :draft/metadata-2=max-subs=1");
         peer.expect("CAP", {"REQ", "draft/metadata-2"});
         peer.send(":server CAP " + identity.nick + " ACK :draft/metadata-2");
         peer.expect("METADATA", {"*", "SUB", "avatar"});
-        for (const auto &target : targets)
-            peer.expect("METADATA", {target, "SYNC"});
         peer.fence();
     };
-    join("#before", false);
-    join("#left-before", false);
-    join("#kicked-before", false);
+    join("#before");
+    join("#left-before");
+    join("#kicked-before");
     peer.send(prefix + "PART #left-before");
     peer.send(":operator!user@localhost KICK #kicked-before " + identity.nick + " :removed");
-    enable({"#before"});
+    enable();
     peer.send(":server CAP " + identity.nick + " ACK :draft/metadata-2");
     peer.fence(); // Duplicate ACK must not subscribe or synchronize twice.
 
@@ -1317,7 +1313,6 @@ void metadataChecks(SSL_CTX *context, const Identity &identity) {
         peer.expect("CAP", {"REQ", cap});
         peer.send(":server CAP " + identity.nick + " ACK :" + cap);
         peer.expect("METADATA", {"*", "SUB", "avatar"});
-        peer.expect("METADATA", {"#before", "SYNC"});
         peer.send(":server METADATA #before avatar * :https://example.org/fresh.png\r\n"
                   ":server BATCH -avatar-cap-hold");
         peer.fence();
@@ -1339,7 +1334,7 @@ void metadataChecks(SSL_CTX *context, const Identity &identity) {
 
     for (const auto &target : {"#retry", "#default", "#rename", "#cancel-part", "#cancel-kick",
                                "#huge", "#invalid", "#[fold]"})
-        join(target, true);
+        join(target);
     peer.fence();
     // All server deadlines start after this timestamp; no test clock or fast path.
     const auto postponed = Clock::now();
@@ -1397,10 +1392,6 @@ void metadataChecks(SSL_CTX *context, const Identity &identity) {
     peer.fence();
     peer.send(":server CAP " + identity.nick + " ACK :batch");
     peer.expect("METADATA", {"*", "SUB", "avatar"});
-    const set<string> remaining{"#RENAMED", "#[fold]",  "#before", "#default",
-                                "#huge",    "#invalid", "#retry"};
-    for (const auto &target : remaining)
-        peer.expect("METADATA", {target, "SYNC"});
     peer.fence();
     peer.send(":server 774 " + identity.nick + " #before 1\r\n" + ":server CAP " + identity.nick +
               " DEL :batch");
@@ -1410,22 +1401,20 @@ void metadataChecks(SSL_CTX *context, const Identity &identity) {
     peer.expect("CAP", {"REQ", "batch"});
     peer.send(":server CAP " + identity.nick + " ACK :batch");
     peer.expect("METADATA", {"*", "SUB", "avatar"});
-    for (const auto &target : remaining)
-        peer.expect("METADATA", {target, "SYNC"});
     peer.fence();
     peer.send(":server 774 " + identity.nick + " #before 1\r\n" + ":server CAP " + identity.nick +
               " DEL :draft/metadata-2");
     peer.fence();
     peer.quietUntil(Clock::now() + 1100ms);
 
-    enable(remaining);
+    enable();
     peer.send(":server 774 " + identity.nick + " #before 1");
     peer.fence();
     client.stop();
     collect(client, events);
     events.clear();
     registerClient(peer, client, events, identity, caps);
-    enable({}); // A new session has no remembered membership or retry deadlines.
+    enable(); // A new session has no remembered membership or retry deadlines.
     peer.quietUntil(Clock::now() + 1100ms);
     client.stop();
     collect(client, events);
@@ -1443,7 +1432,7 @@ void avatarSmoke(SSL_CTX *context, const Identity &identity, const fs::path &cer
     } // Public avatar HTTPS uses the caller's original trust configuration.
     peer.send(":" + identity.nick + "!user@localhost JOIN #avatar");
     peer.expect("WHO", {"#avatar"});
-    peer.expect("METADATA", {"#avatar", "SYNC"});
+    peer.fence();
     irc::WireMessage response;
     response.prefix = "server";
     response.command = "761";

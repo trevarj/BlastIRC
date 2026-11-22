@@ -287,7 +287,7 @@ struct NetworkClient::Impl {
     std::optional<int64_t> stsDuration;
     bool bound = false, deferred = false, reconfigure = false, registrationSent = false,
          registered = false;
-    bool metadataSubscribed = false;
+    bool metadataSubscribed = false, avatarMetadataRejected = false;
     string bindNetwork;
     string sojuCommand, sojuId, sojuLabel;
     Clock::time_point sojuDeadline;
@@ -762,6 +762,7 @@ struct NetworkClient::Impl {
     void closeTransport() {
         joinedChannels.clear();
         metadataSubscribed = false;
+        avatarMetadataRejected = false;
         if (tls) {
             SSL_free(tls);
             tls = nullptr;
@@ -1359,11 +1360,13 @@ struct NetworkClient::Impl {
         return n == limits.end() || integer(n->second, 0) > 0;
     }
     void enableMetadata() {
-        if (!metadataEnabled())
+        if (!metadataEnabled() || avatarMetadataRejected)
             return;
         metadataSubscribed = metadataSubscriptions();
-        if (metadataSubscribed)
+        if (metadataSubscribed) {
             raw("METADATA", {"*", "SUB", "avatar"});
+            return;
+        }
         const auto now = Clock::now();
         for (auto &[target, deadline] : joinedChannels)
             deadline = std::max(deadline, now);
@@ -1390,8 +1393,9 @@ struct NetworkClient::Impl {
         }
     }
     void postponeMetadata(const WireMessage &m) {
-        if (!metadataSubscriptions() || m.params.size() < 2 || m.params.size() > 3 ||
-            !own(m.params[0]) || !validChannel(m.params[1]))
+        if (avatarMetadataRejected || !(ready ? metadataSubscribed : metadataSubscriptions()) ||
+            m.params.size() < 2 || m.params.size() > 3 || !own(m.params[0]) ||
+            !validChannel(m.params[1]))
             return;
         auto joined = joinedChannel(m.params[1]);
         if (joined == joinedChannels.end())
@@ -1620,8 +1624,11 @@ struct NetworkClient::Impl {
             finishCaps();
             if (!metadataEnabled())
                 clearMetadataSync();
-            else if (wasReady && (!hadMetadata || metadataSubscribed != metadataSubscriptions()))
+            else if (wasReady && (!hadMetadata || metadataSubscribed != metadataSubscriptions())) {
+                if (hadMetadata && !metadataSubscribed)
+                    clearMetadataSync();
                 enableMetadata();
+            }
             if (config.sojuAccount && wasReady && has("soju.im/bouncer-networks") && !hadNetworks)
                 raw("BOUNCER", {"LISTNETWORKS"});
         } else if (sub == "DEL") {
@@ -2484,8 +2491,10 @@ struct NetworkClient::Impl {
                 if (joinedChannel(m.params[0]) == joinedChannels.end()) {
                     if (joinedChannels.size() >= 4096)
                         throw Failure("Joined IRC channel state exceeds receive limits");
+                    const bool lookup = ready && metadataEnabled() && !metadataSubscribed &&
+                                        !avatarMetadataRejected;
                     joinedChannels.emplace(m.params[0],
-                                           metadataEnabled() ? Clock::now() : Clock::time_point{});
+                                           lookup ? Clock::now() : Clock::time_point{});
                 }
                 if (!has("no-implicit-names") && !has("draft/no-implicit-names") &&
                     !has("soju.im/no-implicit-names")) {
@@ -2742,6 +2751,16 @@ struct NetworkClient::Impl {
                 e.text = m.params.back();
             emit(e);
             if (m.command == "FAIL") {
+                if (ready && !e.history && e.label.empty() && metadataEnabled() &&
+                    m.params.size() == 4 && m.params[0] == "METADATA" &&
+                    m.params[1] == "KEY_INVALID" && m.params[2] == "avatar" &&
+                    std::none_of(commands.begin(), commands.end(), [](const Command &command) {
+                        return command.name == "METADATA";
+                    })) {
+                    if (!std::exchange(avatarMetadataRejected, true))
+                        clearMetadataSync();
+                    return;
+                }
                 string rejectedMutation = rejectedReaction(m, e);
                 if (!rejectedMutation.empty()) {
                     undoReaction(rejectedMutation, e.text);

@@ -2321,6 +2321,64 @@ struct ApplicationRegression {
                other.messages.front().activity == ActivityKind::None &&
                other.draft == otherAdmission.text + "\nnewer disconnected draft");
     }
+    static void metadataStartup() {
+        RenameDrainPeer peer;
+        peer.context = "metadataStartup";
+        Application app;
+        app.model = Model{};
+        app.savingAllowed_ = false;
+        app.model.settings.retentionDays = 0;
+        Identity identity;
+        identity.nick = "Me";
+        ServerConfig server;
+        server.name = "metadata-startup";
+        server.host = "127.0.0.1";
+        server.port = peer.port;
+        server.tls = false;
+        app.model.identities = {identity};
+        app.model.servers = {server};
+        app.clients_[server.name] = std::make_unique<NetworkClient>(server, identity);
+        auto &client = *app.clients_.at(server.name);
+        const auto drain = [&] {
+            peer.fence();
+            for (const auto &event : client.poll())
+                app.reduce(event);
+        };
+
+        client.start();
+        peer.accept();
+        peer.expect("CAP", {"LS", "302"});
+        peer.send(":server CAP * LS "
+                  ":batch draft/metadata-2=before-connect,max-keys=0,max-value-bytes=1");
+        peer.expect("NICK", {identity.nick});
+        peer.expect("USER", {identity.username, "0", "*", identity.realname});
+        peer.expect("CAP", {"REQ", "batch draft/metadata-2"});
+        peer.send(":server CAP Me ACK :batch draft/metadata-2");
+        peer.expect("CAP", {"END"});
+        peer.send(":server 001 Me :Welcome\r\n:server 376 Me :End of MOTD");
+        peer.expect("METADATA", {"*", "SUB", "avatar"});
+        drain();
+        assert(app.model.networks.at(server.name).state == "Ready");
+
+        const auto status = app.model.status;
+        peer.send(":server FAIL METADATA KEY_INVALID avatar :Invalid key");
+        drain();
+        assert(app.model.status == status);
+        const auto &log = app.model.buffers.at(server.name + "/*server*").messages;
+        assert(std::any_of(log.begin(), log.end(), [](const auto &message) {
+            return message.nick == "server" && message.text == "Invalid key";
+        }));
+
+        peer.send(":Me!user@localhost JOIN #room");
+        peer.expect("WHO", {"#room"});
+        drain();
+        assert(app.model.buffers.at(server.name + "/#room").joined);
+        assert(app.model.status == status);
+
+        peer.send(":server FAIL METADATA KEY_INVALID display-name :Unrelated failure");
+        drain();
+        assert(app.model.status == "Unrelated failure");
+    }
     static void avatars() {
         Application app;
         app.model = Model{};
@@ -7007,6 +7065,7 @@ struct ApplicationRegression {
         discoveredLatestHistory();
         sojuReconnectCatalog();
         sendStatuses();
+        metadataStartup();
         avatars();
         messageRevisions();
         truthfulActivity();

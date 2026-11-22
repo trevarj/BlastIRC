@@ -6,11 +6,13 @@
 #include <array>
 #include <cmath>
 #include <core/input/key_symbols.h>
+#include <core/timer_manager.h>
 #include <map>
 #include <optional>
 #include <render/scene/input_area.h>
 #include <string>
 #include <ui/controls/box.h>
+#include <ui/controls/glyph.h>
 #include <ui/controls/label.h>
 #include <ui/controls/select_popup_context.h>
 #include <utility>
@@ -104,11 +106,16 @@ struct ModeLine::Impl {
     std::function<void(std::string)> execute;
     std::function<void(Node &)> retire;
     std::array<Label *, GroupCount> right;
+    std::array<Glyph *, GroupCount> icons;
     ActivityMap activity;
     std::vector<const ActivityMap::value_type *> ordered;
     std::vector<Slot> slots;
     std::vector<std::array<float, 2>> measuredChips;
     Button overflow;
+    Button feedbackButton;
+    Box *feedbackTip;
+    Label *feedbackTipText;
+    Timer feedbackHover;
     size_t firstOmitted = 0, historyRemaining = 0;
     decltype(Settings::fools) fools;
     bool foolUnread = false, visible = false, allowed = true, layoutReady = false;
@@ -124,9 +131,52 @@ struct ModeLine::Impl {
     Impl(Node &owner, Model &model, std::function<void(std::string)> execute,
          std::function<void(Node &)> retire)
         : owner(owner), model(model), execute(std::move(execute)), retire(std::move(retire)),
-          overflow(makeButton()) {
-        for (auto &label : right)
-            label = lineLabel(owner);
+          overflow(makeButton()), feedbackButton(makeButton()) {
+        constexpr std::array names{"history", "info-circle", "keyboard",
+                                   "user",    "server",      "plug-connected-x"};
+        for (size_t i = 0; i < right.size(); ++i) {
+            auto &parent = i == Feedback ? *feedbackButton.area : owner;
+            icons[i] = child<Glyph>(parent);
+            icons[i]->setGlyph(names[i]);
+            icons[i]->setHitTestVisible(false);
+            right[i] = i == Feedback ? feedbackButton.title : lineLabel(owner);
+        }
+        right[Feedback]->setHitTestVisible(false);
+        feedbackTip = child<Box>(owner);
+        feedbackTip->setHitTestVisible(false);
+        feedbackTip->setVisible(false);
+        feedbackTipText = child<Label>(*feedbackTip);
+        feedbackTipText->setUseMarkup(false);
+        feedbackTipText->setMaxLines(3);
+        feedbackButton.area->setOnEnter([this](const InputArea::PointerData &) {
+            feedbackButton.focus->setVisible(allowed);
+            if (allowed)
+                feedbackHover.start(std::chrono::milliseconds(400), [this] {
+                    if (allowed && feedbackButton.area->visible() &&
+                        feedbackButton.area->hovered()) {
+                        feedbackTip->setVisible(true);
+                        this->owner.markLayoutDirty();
+                    }
+                });
+        });
+        feedbackButton.area->setOnLeave([this] {
+            feedbackButton.focus->setVisible(allowed && feedbackButton.area->focused());
+            hideFeedbackTip();
+        });
+        feedbackButton.area->setOnPress(
+            [this](const InputArea::PointerData &) { hideFeedbackTip(); });
+        feedbackButton.area->setTabFocusKey("status-feedback");
+        const auto openFeedback = [this] {
+            hideFeedbackTip();
+            if (allowed && feedbackButton.area->visible() && !right[Feedback]->text().empty())
+                this->execute("status-details:" + std::string(right[Feedback]->text()));
+        };
+        feedbackButton.area->setOnClick(
+            [openFeedback](const InputArea::PointerData &) { openFeedback(); });
+        feedbackButton.area->setOnKeyDown([openFeedback](const InputArea::KeyData &key) {
+            if (activateKey(key))
+                openFeedback();
+        });
         overflow.area->setTabFocusKey("status-activity-overflow");
         overflow.area->setOnClick(
             [this](const InputArea::PointerData &pointer) { openPopup(pointer.serial); });
@@ -138,6 +188,10 @@ struct ModeLine::Impl {
     ~Impl() {
         alive.reset();
         closePopup();
+    }
+    void hideFeedbackTip() {
+        feedbackHover.stop();
+        feedbackTip->setVisible(false);
     }
     Button makeButton() {
         auto *area = static_cast<InputArea *>(
@@ -285,8 +339,7 @@ struct ModeLine::Impl {
 ModeLine::ModeLine(Model &model, std::function<void(std::string)> execute,
                    std::function<void(Node &)> retire)
     : impl_(std::make_unique<Impl>(*this, model, std::move(execute), std::move(retire))) {
-    setClipChildren(true);
-    setPaintContained(true);
+    setZIndex(1);
     sync(1, SidebarMode::Expanded);
 }
 ModeLine::~ModeLine() = default;
@@ -345,8 +398,23 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     text(*p.right[Nick], nick);
     text(*p.right[NetworkName], name);
     text(*p.right[State], p.healthy ? "Connected" : state == "Ready" ? "Failed" : state);
-    text(*p.right[Feedback], feedback);
+    if (p.right[Feedback]->setText(feedback)) {
+        if (p.feedbackButton.area->pressed())
+            p.retire(*p.feedbackButton.area);
+        p.feedbackButton.area->setTooltip(
+            feedback.empty() ? std::string{} : std::string(feedback) + "\nOpen status details");
+        p.feedbackTipText->setText(
+            feedback.empty() ? std::string{} : "Open status details\n" + std::string(feedback));
+    }
+    p.feedbackButton.area->setHitTestVisible(allowActivityMenu && !feedback.empty());
+    p.enableButton(p.feedbackButton, !feedback.empty());
+    if (!allowActivityMenu || feedback.empty()) {
+        p.feedbackButton.focus->setVisible(false);
+        p.hideFeedbackTip();
+    }
     text(*p.right[Chord], keyHint);
+    p.icons[State]->setGlyph(mentions ? "at" : p.healthy ? "plug" : "plug-connected-x");
+    p.icons[Feedback]->setGlyph(p.failureFeedback ? "alert-circle" : "info-circle");
     const auto historyRemaining = static_cast<size_t>(
         std::count_if(model.buffers.begin(), model.buffers.end(), [](const auto &entry) {
             return entry.second.initialHistorySync != HistorySyncState::Idle;
@@ -364,6 +432,7 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     p.activityInk = ink("primary");
     p.mentionInk = ink("error");
     p.focusInk = ink("secondary");
+    p.feedbackButton.focus->setFill(p.focusInk);
     const auto contextualInk = ink("on_surface_variant");
     const auto contextInk = ink("on_surface");
     for (size_t i = 0; i < p.right.size(); ++i) {
@@ -374,6 +443,8 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                            : i == Chord || i == Nick            ? contextInk
                                                                 : contextualInk;
         style(*p.right[i], font, p.scale, color);
+        p.icons[i]->setColor(color);
+        p.icons[i]->setGlyphSize(14 * p.scale);
     }
     if (!ledgerVisible) {
         for (auto &slot : p.slots)
@@ -481,7 +552,8 @@ void ModeLine::doLayout(Renderer &renderer) {
     const float ellipsis = measure("…");
     const float gap = std::min(12 * p.scale, width() / 32);
     const float inset = 4 * p.scale;
-    std::array<float, GroupCount> ideal{}, used{}, labelWidths{};
+    const float iconPrefix = std::round(14 * p.scale) + std::ceil(4 * p.scale);
+    std::array<float, GroupCount> ideal{}, used{}, labelWidths{}, iconWidths{};
     for (size_t i = 0; i < ideal.size(); ++i)
         ideal[i] = measure(p.right[i]->text());
     ideal[Nick] = std::min(ideal[Nick], std::ceil(140 * p.scale));
@@ -499,12 +571,14 @@ void ModeLine::doLayout(Renderer &renderer) {
         const float space = std::min(remaining, budget);
         if (ideal[group] <= 0 || space <= 0)
             return;
-        const float labelGap = std::min(gap, std::max(0.f, space - ideal[group]));
-        const float room = std::floor(space - (fitWhole ? labelGap : gap));
+        const float icon = space >= ideal[group] + gap + iconPrefix ? iconPrefix : 0.f;
+        const float labelGap = std::min(gap, std::max(0.f, space - ideal[group] - icon));
+        const float room = std::floor(space - icon - (fitWhole ? labelGap : gap));
         if (room < std::min(ideal[group], ellipsis) || (fitWhole && room < ideal[group]))
             return;
         const float label = std::min(ideal[group], room);
-        used[group] = label + (fitWhole ? labelGap : gap);
+        used[group] = icon + label + (fitWhole ? labelGap : gap);
+        iconWidths[group] = icon;
         labelWidths[group] = label;
         remaining -= used[group];
     };
@@ -622,8 +696,41 @@ void ModeLine::doLayout(Renderer &renderer) {
     take(History, remaining);
     x = width() - padding;
     for (size_t i = used.size(); i-- > 0;) {
-        placeLabel(*p.right[i], renderer, x - labelWidths[i], labelWidths[i], height());
+        if (i == Feedback) {
+            if (labelWidths[i] > 0)
+                p.moveButton(p.feedbackButton, x - labelWidths[i] - iconWidths[i],
+                             labelWidths[i] + iconWidths[i], height());
+            else {
+                p.hideButton(p.feedbackButton);
+                p.hideFeedbackTip();
+            }
+        }
+        const float labelX = i == Feedback ? iconWidths[i] : x - labelWidths[i];
+        placeLabel(*p.right[i], renderer, labelX, labelWidths[i], height());
+        auto &icon = *p.icons[i];
+        icon.setVisible(iconWidths[i] > 0);
+        if (icon.visible()) {
+            icon.measure(renderer);
+            icon.setPosition(labelX - iconWidths[i], (height() - icon.height()) / 2);
+        }
         x -= used[i];
+    }
+    if (p.feedbackTip->visible() && width() > 20 * p.scale) {
+        const float inset = 8 * p.scale;
+        const auto fill = themeForegroundColor("surface_container_high");
+        p.feedbackTip->setFill(fill);
+        p.feedbackTip->setBorder(themeForegroundColor("outline_variant"), 1.f);
+        p.feedbackTip->setRadius(inset);
+        auto &label = *p.feedbackTipText;
+        style(label, font, p.scale,
+              themePairedForeground(fill, themeForegroundColor("on_surface")));
+        label.setMaxWidth(std::min(width(), 420 * p.scale) - 2 * inset);
+        label.measure(renderer);
+        label.setPosition(inset, inset);
+        p.feedbackTip->setSize(label.width() + 2 * inset, label.height() + 2 * inset);
+        p.feedbackTip->setPosition(std::clamp(p.feedbackButton.area->x(), 0.f,
+                                              std::max(0.f, width() - p.feedbackTip->width())),
+                                   -p.feedbackTip->height() - 4 * p.scale);
     }
 }
 } // namespace blast

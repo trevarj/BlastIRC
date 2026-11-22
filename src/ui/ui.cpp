@@ -3694,6 +3694,12 @@ void Ui::Impl::dismissTopic(bool restoreFocus) {
 void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> pointer) {
     if (command.empty())
         return;
+    if (command.starts_with("status-details:")) {
+        if (!paletteOpen && !jumpOpen && !reactionTarget && !dialogs->active() && !topicSource &&
+            uploadStage == UploadStage::Closed && !media->active())
+            dialogs->open(command);
+        return;
+    }
     for (const auto &[id, view] : views)
         view->transcript->cancelAutoscroll();
     chord.clear();

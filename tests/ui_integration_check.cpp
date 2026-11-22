@@ -41,6 +41,7 @@
 #include <string_view>
 #include <ui/controls/box.h>
 #include <ui/controls/button.h>
+#include <ui/controls/glyph.h>
 #include <ui/controls/image.h>
 #include <ui/controls/input.h>
 #include <ui/controls/label.h>
@@ -3177,6 +3178,7 @@ void statusIdentityCheck() {
     frame();
     assert(visibleLabelContaining(line, "CurrentLocal") && visibleLabelContaining(line, "test") &&
            visibleLabelContaining(line, "Connected"));
+    assert(visibleCount<Glyph>(line) == 3);
     assert(!visibleLabelContaining(line, model.buffers.at(edgeBuffers[0]).target));
     assert(!visibleLabelContaining(line, "ConfiguredLocal"));
     network.nick = "RenamedLocal";
@@ -3239,6 +3241,67 @@ void statusIdentityCheck() {
     assert(!visibleLabelContaining(line, "Unrelated failure"));
     assert(visibleLabelContaining(line, "All networks") &&
            visibleLabelContaining(line, "Read only"));
+}
+
+void statusDetailsCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    model.networks["test"].state = "Ready";
+    const std::string snapshot = "Command failed\n" + std::string(500, 'x') + "\nEnd";
+    model.status = snapshot;
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    auto *status = areaWithKey(ui.root(), "status-feedback");
+    assert(status && visible(*status));
+    assert(areaWithTooltip(ui.root(), snapshot + "\nOpen status details") == status);
+    for (const std::uint32_t key :
+         {std::uint32_t(XKB_KEY_Return), std::uint32_t(XKB_KEY_space), 0u}) {
+        dispatcher.setFocus(status);
+        if (key)
+            nativeKey(ui, dispatcher, key);
+        else
+            click(dispatcher, *status);
+        frame();
+        auto *dialog = visibleNode<Dialogs>(ui.root());
+        assert(dialog && dialog->active());
+        auto *value = inputWithText(*dialog, snapshot);
+        assert(value && visible(*value));
+        assert(value->cursorPosition() == 0 && value->selectionAnchor() == 0);
+        value->selectAll();
+        assert(!value->insertText("changed"));
+        assert(value->value() == snapshot && model.status == snapshot);
+        model.status = "Later feedback";
+        frame();
+        assert(value->value() == snapshot);
+        model.status = snapshot;
+        hostKey(ui, dispatcher, XKB_KEY_Escape);
+        frame();
+        assert(!dialog->active() && dispatcher.focusedArea() == status);
+    }
+    model.networks["test"].error = "Connection failure\nDetails";
+    frame();
+    dispatcher.setFocus(status);
+    nativeKey(ui, dispatcher, XKB_KEY_Return);
+    frame();
+    auto *dialog = visibleNode<Dialogs>(ui.root());
+    assert(dialog && inputWithText(*dialog, model.networks["test"].error));
+    assert(model.status == snapshot);
+    hostKey(ui, dispatcher, XKB_KEY_Escape);
+    frame();
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
 }
 
 void selectedServerAvyCheck() {
@@ -10737,6 +10800,7 @@ void runUiIntegrationCheck() {
     sidebarAvatarCheck();
     statusIdentityCheck();
     initialHistoryConsumerCheck();
+    statusDetailsCheck();
     topbarReadAllCheck();
     serverLogConsumerCheck();
     queuedServerLogPaletteCheck();

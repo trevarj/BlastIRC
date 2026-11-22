@@ -262,6 +262,7 @@ struct Dialogs::Impl {
     Input *settingsSearch = nullptr;
     Select *settingsResults = nullptr;
     std::string settingsQuery, currentSection;
+    std::string statusSnapshot;
     std::string currentSectionId, selectedSection;
     struct SettingsSection {
         std::string id, title;
@@ -532,7 +533,8 @@ struct Dialogs::Impl {
                 control->setHorizontalPadding(Style::spaceMd * zoom);
                 control->setFrameRadius(corners);
                 if (metric.kind == MetricKind::ProfileInput)
-                    control->setSize(control->width(), 72.f * zoom);
+                    control->setSize(control->width(),
+                                     (mode == "status-details" ? 200.f : 72.f) * zoom);
                 break;
             }
             case MetricKind::Toggle:
@@ -1336,7 +1338,7 @@ struct Dialogs::Impl {
                 model.settings.nickColors.erase(nick);
                 save({}, true);
             });
-        } else if (mode != "whois" && mode != "channel-tools") {
+        } else if (mode != "whois" && mode != "channel-tools" && mode != "status-details") {
             button(*footer, "OK", [this] { dismiss(); }, ButtonVariant::Primary);
         }
         panel->addChild(std::move(layout));
@@ -1468,6 +1470,13 @@ struct Dialogs::Impl {
                          "Save now writes sooner, invalid profiles or storage errors block "
                          "saving, and Close does not undo changes.")
                 ->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
+        } else if (mode == "status-details") {
+            auto *field = profileField(*page, "Feedback", "blastirc.status.details");
+            field->setMultiline(true);
+            metrics.back().kind = MetricKind::ProfileInput;
+            field->setValue(statusSnapshot);
+            field->selectAll();
+            field->moveCaretLeft();
         } else if (mode == "whois") {
             profileLoading = profileField(*page, "Loading", "blastirc.whois.loading");
             profileError = profileField(*page, "Error", "blastirc.whois.error");
@@ -3656,6 +3665,12 @@ struct Dialogs::Impl {
     }
 
     void open(std::string_view name) {
+        if (name.starts_with("status-details:")) {
+            statusSnapshot = name.substr(15);
+            beginPanel("status-details", "Status details", false);
+            rebuildPage();
+            return;
+        }
         if (name == "settings-uploads") {
             tab = Tab::Chat;
             beginPanel("settings", "Settings", true);
@@ -4022,13 +4037,14 @@ struct Dialogs::Impl {
         const std::string &dialog = confirming ? confirmation : mode;
         if (showing && visible) {
             const float preferredWidth = confirming ? 540.f : mode == "settings" ? 1000.f : 630.f;
-            const float preferredHeight = confirming                ? 250.f
-                                          : mode == "settings"      ? 720.f
-                                          : mode == "first-run"     ? 720.f
-                                          : mode == "whois"         ? 720.f
-                                          : mode == "channel-tools" ? 720.f
-                                          : mode == "search"        ? 270.f
-                                                                    : 400.f;
+            const float preferredHeight = confirming                 ? 250.f
+                                          : mode == "settings"       ? 720.f
+                                          : mode == "first-run"      ? 720.f
+                                          : mode == "whois"          ? 720.f
+                                          : mode == "channel-tools"  ? 720.f
+                                          : mode == "search"         ? 270.f
+                                          : mode == "status-details" ? 300.f
+                                                                     : 400.f;
             const float w = std::min(preferredWidth * zoom, std::max(0.f, width - 24.f));
             const float verticalMargin = !confirming && mode == "whois" ? 48.f * zoom : 24.f;
             const float h =

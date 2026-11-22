@@ -146,8 +146,9 @@ class ProfileAvatar final : public Node {
             markLayoutDirty();
         }
         const auto network = model.networks.find(server);
-        const std::string_view mapping =
-            network == model.networks.end() ? "rfc1459" : network->second.caseMapping;
+        const auto mapping = network == model.networks.end()
+                                 ? std::string_view{"rfc1459"}
+                                 : std::string_view{network->second.caseMapping};
         if (caseMapping != mapping) {
             caseMapping.assign(mapping);
             markLayoutDirty();

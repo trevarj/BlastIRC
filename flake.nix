@@ -68,14 +68,8 @@
             BlastIRC application code remains MIT; the data is a separate aggregate.
             NOTICE
           '';
-      dependencies =
+      uiDependencies =
         (with pkgs; [
-          sdl3
-          sdl3-mixer
-          openssl
-          curl
-          sqlite
-          tomlplusplus
           wayland
           wayland-protocols
           libglvnd
@@ -90,11 +84,21 @@
           librsvg
           libwebp
           libjxl
+        ])
+        ++ [ stbHeaders ];
+      dependencies =
+        uiDependencies
+        ++ (with pkgs; [
+          sdl3
+          sdl3-mixer
+          openssl
+          curl
+          sqlite
+          tomlplusplus
           libxml2
           mpv-unwrapped
           hunspell
-        ])
-        ++ [ stbHeaders ];
+        ]);
       fallbackFonts = pkgs.makeFontsConf {
         includes = [ "${pkgs.fontconfig.out}/etc/fonts/conf.d" ];
         impureFontDirectories = [ ];
@@ -109,7 +113,31 @@
         pkg-config
         wayland-scanner
       ];
-      blastirc = pkgs.stdenv.mkDerivation {
+      releaseStdenv = pkgs.clangStdenv;
+      noctaliaUiSdk = releaseStdenv.mkDerivation {
+        pname = "blastirc-noctalia-ui-sdk";
+        version = pkgs.lib.removeSuffix "\n" (builtins.readFile ./vendor/noctalia/VERSION);
+        src = pkgs.lib.fileset.toSource {
+          root = ./vendor/noctalia;
+          fileset = pkgs.lib.fileset.unions [
+            ./vendor/noctalia/meson.build
+            ./vendor/noctalia/meson_options.txt
+            ./vendor/noctalia/VERSION
+            ./vendor/noctalia/LICENSE
+            ./vendor/noctalia/lib
+            ./vendor/noctalia/assets/translations
+            ./vendor/noctalia/assets/emoji.json
+          ];
+        };
+        nativeBuildInputs = nativeTools;
+        buildInputs = uiDependencies;
+        mesonBuildType = "release";
+        mesonFlags = [
+          "-Dlibrary_only=true"
+          "-Dblastirc_ui_profile=true"
+        ];
+      };
+      blastirc = releaseStdenv.mkDerivation {
         pname = "blastirc";
         version = "0.1.0";
         meta.license = with pkgs.lib.licenses; [
@@ -133,6 +161,7 @@
             ])
             && !(type == "directory" && pkgs.lib.hasPrefix "build" relative)
             && relative != "output"
+            && relative != "vendor/noctalia"
             && relative != "profiles"
             && relative != "subprojects/noctalia-ui"
             && !(type == "directory" && pkgs.lib.hasPrefix "subprojects/noctalia-" relative)
@@ -145,9 +174,10 @@
             makeWrapper
             autoAddDriverRunpath
           ]);
-        buildInputs = dependencies;
+        buildInputs = dependencies ++ [ noctaliaUiSdk ];
         mesonBuildType = "release";
         mesonFlags = [
+          "-Dexternal_noctalia_ui=true"
           "-Dfont_dir=${pkgs.nerd-fonts.jetbrains-mono}/share/fonts"
           "-Demoji_dir=${pkgs.noto-fonts-color-emoji}/share/fonts"
           "-Ddictionary_dir=${pkgs.hunspellDicts.en_US}/share/hunspell"
@@ -174,7 +204,10 @@
       };
     in
     {
-      packages.${system}.default = blastirc;
+      packages.${system} = {
+        default = blastirc;
+        noctalia-ui-sdk = noctaliaUiSdk;
+      };
       checks.${system}.regression = blastirc.overrideAttrs (old: {
         mesonFlags = old.mesonFlags ++ [ "-Dtests=true" ];
         doCheck = true;

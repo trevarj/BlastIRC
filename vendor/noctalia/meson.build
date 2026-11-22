@@ -12,11 +12,36 @@ project('noctalia', ['c', 'cpp'],
 if get_option('library_only')
   noctalia_ui_system_wuffs = get_option('system_libraries')
   noctalia_ui_blastirc_profile = get_option('blastirc_ui_profile')
+  noctalia_ui_install_sdk = not meson.is_subproject()
   subdir('lib')
   noctalia_ui_license = files('LICENSE')
   noctalia_ui_tabler_license = files('lib/assets/fonts/tabler-icons-license.txt')
   noctalia_ui_wuffs_licenses = files('lib/third_party/wuffs/LICENSE-APACHE', 'lib/third_party/wuffs/LICENSE-MIT')
   noctalia_ui_emoji = files('assets/emoji.json')
+  if noctalia_ui_install_sdk
+    pkgconfig = import('pkgconfig')
+    pkgconfig.generate(noctalia_ui_lib,
+      subdirs: 'noctalia-ui',
+      variables: {'sdkdatadir': '${datadir}/noctalia-ui'},
+    )
+    pkgconfig.generate(noctalia_ui_codecs_lib, subdirs: 'noctalia-ui')
+    fs = import('fs')
+    headers = run_command('find', 'lib/core', 'lib/i18n', 'lib/render', 'lib/ui', 'lib/util', 'lib/wayland',
+      '-type', 'f', '(', '-name', '*.h', '-o', '-name', '*.hpp', ')', check: true,
+    ).stdout().strip().split('\n')
+    foreach header : headers
+      install_headers(header, subdir: 'noctalia-ui' / fs.parent(header.substring(4)))
+    endforeach
+
+    sdkdatadir = get_option('datadir') / 'noctalia-ui'
+    install_subdir('assets/translations', install_dir: sdkdatadir)
+    install_subdir('lib/assets/fonts', install_dir: sdkdatadir)
+    install_data(noctalia_ui_license, noctalia_ui_emoji, install_dir: sdkdatadir)
+    install_data(noctalia_ui_wuffs_licenses,
+      install_dir: sdkdatadir,
+      rename: ['wuffs-LICENSE-APACHE', 'wuffs-LICENSE-MIT'],
+    )
+  endif
   subdir_done()
 endif
 

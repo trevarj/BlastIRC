@@ -5,6 +5,7 @@
 # and reads no other file outside lib/. Optional input, set before subdir():
 #   noctalia_ui_system_wuffs  true: compile the codec pack against a system
 #                             wuffs-v0.4.c instead of lib/third_party/wuffs
+#   noctalia_ui_install_sdk   true: install the archives and protocol headers
 #
 # Outputs:
 #   noctalia_ui_dep              core library: render, text, scene/input, Wayland
@@ -23,6 +24,7 @@
 # subdir shares the consumer's variable namespace.
 
 _noctalia_ui_cc = meson.get_compiler('c')
+_noctalia_ui_install_sdk = get_variable('noctalia_ui_install_sdk', false)
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 _noctalia_ui_egl_dep = dependency('egl', required: false)
@@ -60,11 +62,13 @@ _noctalia_ui_system_dependencies = [
 ]
 
 # ── Compile arguments ─────────────────────────────────────────────────────────
+_noctalia_ui_asset_prefix = _noctalia_ui_install_sdk ? '/usr/local' : get_option('prefix')
+_noctalia_ui_asset_datadir = _noctalia_ui_install_sdk ? 'share' : get_option('datadir')
 _noctalia_ui_cpp_args = [
   '-Wall', '-Wextra', '-Wno-missing-field-initializers', '-Wpedantic', '-Wconversion', '-Wshadow',
   '-fno-strict-aliasing', '-fno-strict-overflow',
-  '-DNOCTALIA_UI_INSTALL_PREFIX="' + get_option('prefix') + '"',
-  '-DNOCTALIA_UI_INSTALL_DATADIR="' + get_option('datadir') + '"',
+  '-DNOCTALIA_UI_INSTALL_PREFIX="' + _noctalia_ui_asset_prefix + '"',
+  '-DNOCTALIA_UI_INSTALL_DATADIR="' + _noctalia_ui_asset_datadir + '"',
 ]
 
 # ── Wayland protocols bound by the library ────────────────────────────────────
@@ -92,6 +96,8 @@ foreach _noctalia_ui_p : [
     input:   _noctalia_ui_p[1],
     output:  _noctalia_ui_p[0] + '-client-protocol.h',
     command: [_noctalia_ui_wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+    install: _noctalia_ui_install_sdk,
+    install_dir: get_option('includedir') / 'noctalia-ui',
   )
   _noctalia_ui_c = custom_target(_noctalia_ui_p[0] + '-client-source',
     input:   _noctalia_ui_p[1],
@@ -225,6 +231,7 @@ noctalia_ui_lib = static_library('noctalia-ui',
   dependencies: _noctalia_ui_system_dependencies,
   include_directories: _noctalia_ui_inc,
   cpp_args: _noctalia_ui_cpp_args,
+  install: _noctalia_ui_install_sdk,
 )
 
 noctalia_ui_dep = declare_dependency(
@@ -277,6 +284,7 @@ noctalia_ui_codecs_lib = static_library('noctalia-ui-codecs',
   dependencies: _noctalia_ui_codecs_system_dependencies + [noctalia_ui_dep],
   include_directories: _noctalia_ui_wuffs_inc,
   cpp_args: _noctalia_ui_cpp_args + (_noctalia_ui_blastirc_profile ? ['-DNOCTALIA_UI_WUFFS_IMAGE_ONLY'] : []),
+  install: _noctalia_ui_install_sdk,
 )
 
 noctalia_ui_codecs_dep = declare_dependency(

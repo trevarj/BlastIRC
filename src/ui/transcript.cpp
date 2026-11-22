@@ -3582,8 +3582,9 @@ struct TranscriptView::Impl {
                 typingExpansion > 0 && !entry.own && !entry.history && !entry.pending &&
                 !entry.presence && !foolish(buffer, entry)) {
                 const auto network = model.networks.find(buffer.server);
-                const std::string_view mapping =
-                    network == model.networks.end() ? "rfc1459" : network->second.caseMapping;
+                const auto mapping = network == model.networks.end()
+                                         ? std::string_view{"rfc1459"}
+                                         : std::string_view{network->second.caseMapping};
                 const auto nick = irc::casefold(entry.nick, mapping);
                 if (std::any_of(
                         typingParticipants.begin(), typingParticipants.end(),

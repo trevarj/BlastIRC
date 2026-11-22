@@ -1,4 +1,5 @@
 option('tests', type: 'boolean', value: false, description: 'Build core regression checks and the network probe')
+option('external_noctalia_ui', type: 'boolean', value: false, description: 'Use the installed Noctalia UI SDK instead of building the vendored sources')
 option('font_dir', type: 'string', value: '', description: 'Additional bundled Fontconfig directory')
 option('emoji_dir', type: 'string', value: '', description: 'Additional color emoji font directory')
 option('dictionary_dir', type: 'string', value: '', description: 'Directory containing Hunspell dictionaries')

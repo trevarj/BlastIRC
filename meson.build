@@ -5,12 +5,30 @@ project('blastirc', 'c', 'cpp',
   default_options: ['cpp_std=c++23', 'warning_level=3', 'buildtype=debugoptimized'],
 )
 
-noctalia = subproject('noctalia', default_options: ['library_only=true', 'blastirc_ui_profile=true'])
-noctalia_ui_dep = noctalia.get_variable('noctalia_ui_dep')
-noctalia_ui_codecs_dep = noctalia.get_variable('noctalia_ui_codecs_dep')
-noctalia_ui_assets_dir = noctalia.get_variable('noctalia_ui_assets_dir')
-fs = import('fs')
-noctalia_source_dir = fs.parent(fs.parent(noctalia_ui_assets_dir))
+if get_option('external_noctalia_ui')
+  noctalia_ui_dep = dependency('noctalia-ui', method: 'pkg-config')
+  noctalia_ui_codecs_dep = dependency('noctalia-ui-codecs', method: 'pkg-config')
+  noctalia_sdk_data = noctalia_ui_dep.get_variable(pkgconfig: 'sdkdatadir')
+  noctalia_translations = noctalia_sdk_data / 'translations'
+  noctalia_fonts = noctalia_sdk_data / 'fonts'
+  noctalia_emoji = [noctalia_sdk_data / 'emoji.json']
+  noctalia_license = noctalia_sdk_data / 'LICENSE'
+  noctalia_tabler_license = noctalia_fonts / 'tabler-icons-license.txt'
+  noctalia_wuffs_licenses = [noctalia_sdk_data / 'wuffs-LICENSE-APACHE', noctalia_sdk_data / 'wuffs-LICENSE-MIT']
+else
+  noctalia = subproject('noctalia', default_options: ['library_only=true', 'blastirc_ui_profile=true'])
+  noctalia_ui_dep = noctalia.get_variable('noctalia_ui_dep')
+  noctalia_ui_codecs_dep = noctalia.get_variable('noctalia_ui_codecs_dep')
+  noctalia_ui_assets_dir = noctalia.get_variable('noctalia_ui_assets_dir')
+  fs = import('fs')
+  noctalia_source_dir = fs.parent(fs.parent(noctalia_ui_assets_dir))
+  noctalia_translations = noctalia_source_dir / 'assets' / 'translations'
+  noctalia_fonts = noctalia_ui_assets_dir / 'fonts'
+  noctalia_emoji = noctalia.get_variable('noctalia_ui_emoji')
+  noctalia_license = noctalia.get_variable('noctalia_ui_license')
+  noctalia_tabler_license = noctalia.get_variable('noctalia_ui_tabler_license')
+  noctalia_wuffs_licenses = noctalia.get_variable('noctalia_ui_wuffs_licenses')
+endif
 
 src_inc = include_directories('src')
 openssl_dep = dependency('openssl')
@@ -107,10 +125,10 @@ word_completion_dep = declare_dependency(
   dependencies: [threads_dep, gio_dep],
 )
 
-app_deps = [irc_dep, avatar_dep, preview_dep, picker_dep, spell_dep, word_completion_dep, noctalia_ui_dep, noctalia_ui_codecs_dep,
+app_deps = [irc_dep, avatar_dep, preview_dep, picker_dep, spell_dep, word_completion_dep, noctalia_ui_codecs_dep,
   mpv_dep, sdl_dep, sdl_mixer_dep, fontconfig_dep] + storage_deps
-app_core_sources = files(
-  'src/application.cpp',
+application_sources = files('src/application.cpp', 'src/application_history.cpp')
+app_core_sources = application_sources + files(
   'src/storage.cpp',
   'src/platform/clipboard.cpp',
   'src/ui/ui.cpp',
@@ -169,7 +187,7 @@ if get_option('tests')
   foundry_avatar_check = executable('blastirc-foundry-avatar-check',
     'tests/foundry_avatar_check.cpp', 'src/ui/foundry_avatar.cpp',
     include_directories: src_inc,
-    dependencies: [noctalia_ui_dep, noctalia_ui_codecs_dep, openssl_dep],
+    dependencies: [noctalia_ui_codecs_dep, openssl_dep],
     cpp_args: check_args)
   test('foundry_avatar', foundry_avatar_check)
 
@@ -277,13 +295,13 @@ if get_option('tests')
     'tests/fx_check.cpp', 'src/render/graphics.cpp', 'src/theme/theme.cpp',
     'src/ui/presentation.cpp',
     include_directories: src_inc,
-    dependencies: [noctalia_ui_dep, noctalia_ui_codecs_dep, sdl_dep, sdl_mixer_dep,
+    dependencies: [noctalia_ui_codecs_dep, sdl_dep, sdl_mixer_dep,
       fontconfig_dep, toml_dep],
     cpp_args: check_args + app_cpp_args + ['-DBLASTIRC_FX_INTEGRATION'])
   test('effects_headless_integration', fx_integration_check, workdir: meson.project_source_root())
 
   application_check = executable('blastirc-application-check',
-    'tests/application_regression.cpp', 'src/application.cpp', 'src/storage.cpp',
+    ['tests/application_regression.cpp', 'src/storage.cpp'] + application_sources,
     include_directories: src_inc, dependencies: [irc_dep, avatar_dep] + storage_deps,
     cpp_args: check_args)
   test('application', application_check)
@@ -293,10 +311,9 @@ if get_option('tests')
 endif
 
 # The SDK requires the real English catalog before accepting an application bundle.
-translations_dir = noctalia_source_dir / 'assets' / 'translations'
-install_subdir(translations_dir, install_dir: asset_dir)
-install_subdir(noctalia_ui_assets_dir / 'fonts', install_dir: asset_dir)
-install_data(noctalia.get_variable('noctalia_ui_emoji'), install_dir: asset_dir)
+install_subdir(noctalia_translations, install_dir: asset_dir)
+install_subdir(noctalia_fonts, install_dir: asset_dir)
+install_data(noctalia_emoji, install_dir: asset_dir)
 install_subdir('assets/lucide', install_dir: asset_dir)
 install_subdir('assets/sfx', install_dir: asset_dir)
 install_data('assets/icon.png', install_dir: asset_dir)
@@ -312,19 +329,18 @@ license_dir = get_option('datadir') / 'licenses' / 'blastirc'
 install_data('LICENSE', install_dir: license_dir)
 install_data('assets/lucide/LICENSE', install_dir: license_dir, rename: 'lucide-LICENSE')
 install_data('assets/sfx/LICENSE', install_dir: license_dir, rename: 'sfx-LICENSE')
-install_data(noctalia.get_variable('noctalia_ui_license'),
-  install_dir: license_dir, rename: 'noctalia-ui-LICENSE.txt')
-install_data(noctalia.get_variable('noctalia_ui_tabler_license'), install_dir: license_dir)
-install_data(noctalia.get_variable('noctalia_ui_wuffs_licenses'),
+install_data(noctalia_license, install_dir: license_dir, rename: 'noctalia-ui-LICENSE.txt')
+install_data(noctalia_tabler_license, install_dir: license_dir)
+install_data(noctalia_wuffs_licenses,
   install_dir: license_dir, rename: ['wuffs-LICENSE-APACHE', 'wuffs-LICENSE-MIT'])
 
 # Keep uninstalled binaries on the same real asset bundle as installed binaries.
 build_assets = meson.project_build_root() / 'assets'
 run_command('mkdir', '-p', build_assets, check: true)
 foreach bundle_dir : [
-  translations_dir,
-  noctalia_source_dir / 'assets' / 'emoji.json',
-  noctalia_ui_assets_dir / 'fonts',
+  noctalia_translations,
+  noctalia_emoji[0],
+  noctalia_fonts,
   meson.project_source_root() / 'assets' / 'lucide',
   meson.project_source_root() / 'assets' / 'sfx',
   meson.project_source_root() / 'assets' / 'foundry',

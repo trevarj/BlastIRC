@@ -2398,6 +2398,34 @@ std::optional<Message> Storage::message(const string &buffer, const string &id) 
     }
     return {};
 }
+std::optional<Message> Storage::historyReplay(const string &buffer, const Message &message) {
+    if (message.pending || message.deleted || message.presence ||
+        message.activity != ActivityKind::None || message.timestamp <= 0)
+        return {};
+    const auto time = irc::parseTimestampParts(message.time);
+    if (!time || time->seconds != message.timestamp)
+        return {};
+    Statement query(
+        impl->db, "SELECT seq,id,nick,text,time,reply,label,timestamp,own,pending,deleted,mention,"
+                  "action,presence,local_echo,activity,activity_target,sort_time,tie_order,"
+                  "mention_nick FROM messages WHERE seq=(SELECT CASE WHEN COUNT(*)=1 THEN "
+                  "MIN(seq) END FROM (SELECT seq FROM messages WHERE buffer=? AND sort_time=? "
+                  "AND time=? AND nick=? AND text=? AND reply=? AND own=? AND action=? "
+                  "AND timestamp=sort_time AND pending=0 AND deleted=0 AND presence=0 AND "
+                  "local_echo=0 AND activity=0 AND id<>'' AND substr(id,1,6) NOT IN "
+                  "('local:','local-') LIMIT 2))");
+    query.bind(1, buffer);
+    query.bind(2, time->seconds);
+    query.bind(3, message.time);
+    query.bind(4, message.nick);
+    query.bind(5, message.text);
+    query.bind(6, message.reply);
+    query.bind(7, static_cast<int64_t>(message.own));
+    query.bind(8, static_cast<int64_t>(message.action));
+    if (query.step())
+        return storedMessage(impl->db, query);
+    return {};
+}
 std::optional<std::pair<int64_t, int64_t>> Storage::messagePosition(const string &buffer,
                                                                     const string &id) {
     Statement query(impl->db, "SELECT seq,tie_order FROM messages WHERE buffer=? AND id=?");

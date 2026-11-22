@@ -1362,17 +1362,35 @@ bool Application::insert(Buffer &b, Message m, bool persist, const string &compl
                        fold(b.server, old.nick) == fold(b.server, m.nick) && old.text == m.text &&
                        old.action == m.action && old.presence == m.presence &&
                        old.activity == m.activity &&
-                       (old.id.starts_with("local:") || m.id.starts_with("local:"));
+                       (old.id.starts_with("local:") || m.id.empty() || m.id.starts_with("local:"));
             });
         if (duplicate != b.messages.end()) {
             captureHistoryRow(b, *duplicate);
             return false;
         }
     }
+    bool anonymousReplay = false;
+    if (m.history && m.id.empty() && savingAllowed_ && persist && completedSend.empty() &&
+        (b.kind == "channel" || b.kind == "query")) {
+        try {
+            if (auto old = storage_.historyReplay(b.id, m);
+                old && std::none_of(b.messages.begin(), b.messages.end(),
+                                    [&](const auto &row) { return row.id == old->id; })) {
+                m = std::move(*old);
+                anonymousReplay = true;
+                if (applyingHistory_)
+                    historyCanonicalId_ = m.id;
+            }
+        } catch (const std::exception &e) {
+            if (applyingHistory_)
+                throw;
+            report(e.what(), b.server);
+        }
+    }
     if (m.id.empty())
         m.id = localId();
-    bool durableReplay = false;
-    if (savingAllowed_ && persist && !m.id.starts_with("local:")) {
+    bool durableReplay = anonymousReplay;
+    if (!anonymousReplay && savingAllowed_ && persist && !m.id.starts_with("local:")) {
         try {
             if (auto old = storage_.message(b.id, m.id)) {
                 durableReplay = true;
@@ -1403,13 +1421,14 @@ bool Application::insert(Buffer &b, Message m, bool persist, const string &compl
             }
     if (m.orderingTimestamp <= 0)
         m.orderingTimestamp = m.timestamp;
-    const bool stored = !persist || store(b, m, false, completedSend, confirmed);
+    const bool stored = anonymousReplay || !persist || store(b, m, false, completedSend, confirmed);
     if (persist && m.history && !m.presence && !m.deleted && !durableReplay && stored &&
         m.storageSequence > 0 && (b.kind == "channel" || b.kind == "query"))
         b.chatReplaySequences.insert(m.storageSequence);
     if (!m.history && !durableReplay)
         recordChatActivity(b, m);
-    activity(b, m);
+    if (!anonymousReplay)
+        activity(b, m);
     bool appendOnly = true;
     const auto incomingTime = irc::parseTimestampParts(m.time);
     const bool incomingKnown =
@@ -1770,7 +1789,7 @@ void Application::receive(Event e) {
     if (restoreArchive)
         b.archived = false;
     Message m;
-    m.id = e.id.empty() ? localId() : e.id;
+    m.id = e.id.empty() && !e.history ? localId() : e.id;
     m.nick = e.nick;
     m.text = e.text;
     m.time = e.time;

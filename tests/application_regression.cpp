@@ -5301,6 +5301,65 @@ struct ApplicationRegression {
         app.reduce(end);
         assert(!app.historyPages_.contains(owner));
     }
+    static void idlessReplayReusesUnloadedServerRow() {
+        Application app;
+        app.model = Model{};
+        app.messageCount_ = 0;
+        app.activity_.clear();
+        app.model.settings.retentionDays = 0;
+        auto &room = app.buffer("idless-retained-replay", "#room");
+        auto replay = tiedHistoryRow(room, "canonical-wire-id");
+        replay.reply = "retained-parent";
+        Message canonical;
+        canonical.id = replay.id;
+        canonical.nick = replay.nick;
+        canonical.text = replay.text;
+        canonical.time = replay.time;
+        canonical.timestamp = replay.timestamp;
+        canonical.reply = replay.reply;
+        canonical.label = "retained-label";
+        canonical.mention = true;
+        canonical.mentionNick = "EarlierNick";
+        canonical.reactions["ok"] = {"Peer"};
+        app.storage_.append(room.id, canonical, {}, 0, false, &room);
+        const auto identity = app.storage_.messagePosition(room.id, canonical.id);
+        assert(identity && room.messages.empty());
+
+        replay.id.clear();
+        replay.tags.clear();
+        completeOwnedHistory(app, room, replay, "idless-retained-owned");
+        assertHistoryIds(room.messages, {canonical.id});
+        Storage reopened;
+        const auto durable = reopened.history(room.id, -1);
+        assertHistoryIds(durable, {canonical.id});
+        const Message &loaded = room.messages.front();
+        for (const auto *row : {&durable.front(), &loaded})
+            assert(row->storageSequence == identity->first && row->reply == canonical.reply &&
+                   row->label == canonical.label && row->mention &&
+                   row->mentionNick == canonical.mentionNick &&
+                   row->reactions == canonical.reactions);
+        assert(app.model.effects.empty() && app.activity_.empty() && room.lastChatId.empty());
+
+        auto distinct = replay;
+        distinct.id = "distinct-wire-id";
+        distinct.tags["msgid"] = distinct.id;
+        completeOwnedHistory(app, room, distinct, "distinct-retained-owned");
+        assertHistoryIds(room.messages, {distinct.id, canonical.id});
+        assertHistoryIds(reopened.history(room.id, -1), {distinct.id, canonical.id});
+
+        auto &ambiguous = app.buffer(room.server, "#ambiguous");
+        app.storage_.append(ambiguous.id, canonical, {}, 0, false, &ambiguous);
+        canonical.id = distinct.id;
+        app.storage_.append(ambiguous.id, canonical, {}, 0, false, &ambiguous);
+        replay.target = ambiguous.target;
+        completeOwnedHistory(app, ambiguous, replay, "ambiguous-retained-owned");
+        const auto peers = reopened.history(ambiguous.id, -1);
+        assert(ambiguous.messages.size() == 1 &&
+               ambiguous.messages.front().id.starts_with("local:"));
+        assert(peers.size() == 3 && reopened.message(ambiguous.id, "canonical-wire-id") &&
+               reopened.message(ambiguous.id, distinct.id) &&
+               reopened.message(ambiguous.id, ambiguous.messages.front().id));
+    }
     static void mixedTimeOwnConfirmation() {
         for (const bool history : {true, false}) {
             Application app;
@@ -7051,6 +7110,7 @@ struct ApplicationRegression {
         sparseAroundRollbackPreservesLoadedWindow();
         historyWriterRollback();
         sameTimestampLatestThenOwnedBefore();
+        idlessReplayReusesUnloadedServerRow();
         sameTimestampCanonicalContextAndConfirmedOverlap();
         sameTimestampRankReconciliationRollback();
         unknownTimeAroundPreservesNativeOrder();

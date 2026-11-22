@@ -90,6 +90,7 @@ class Storage {
     vector<Message> history(const string &buffer, int limit = 200, const string &before = "");
     // Indexed exact lookup, including rows outside the in-memory history tail.
     std::optional<Message> message(const string &buffer, const string &id);
+    std::optional<Message> historyReplay(const string &buffer, const Message &);
     // Immutable identity and durable tie rank only; never loads message bodies/reactions.
     std::optional<std::pair<int64_t, int64_t>> messagePosition(const string &buffer,
                                                                const string &id);

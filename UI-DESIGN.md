@@ -55,6 +55,8 @@ Viewport-driven gap retries use the newest message body actually intersecting th
 
 Completed playback reconciles equal server-time rows in wire order using a separate durable tie rank, following MOTD's canonical playback-order reconciliation. Unanchored BEFORE/AROUND rows prepend and LATEST/AFTER rows append; confirmed contradictory overlap cannot oscillate the established order. Schema 11 adds this rank without changing original timestamps, message IDs, stable storage identities, activity keys, or existing version-10 history metadata.
 
+Playback without message IDs reuses an unloaded retained server-ID row only when its exact server time and chat payload identify one durable match; distinct server IDs stay distinct.
+
 Use durable effective timestamps and original server-time fractions before cohort-local playback ranks. Untimed live rows keep native arrival order; numeric history timestamps remain authoritative after own confirmation. Retimed known rows use the destination cohort's stored tie order, while same-cohort confirmations stay stable. Count new live arrivals even when the tail stays unchanged.
 
 ## Appearance and transparency

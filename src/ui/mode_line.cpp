@@ -9,6 +9,7 @@
 #include <core/timer_manager.h>
 #include <map>
 #include <optional>
+#include <render/animation/animation_manager.h>
 #include <render/scene/input_area.h>
 #include <string>
 #include <ui/controls/box.h>
@@ -80,6 +81,52 @@ ContextMenuEntry menuEntry(size_t value, std::string label, std::string_view ico
     entry.ellipsize = TextEllipsize::Middle;
     return entry;
 }
+
+class HoverGlow final : public Node {
+  public:
+    explicit HoverGlow(const Node &source) {
+        setHitTestVisible(false);
+        setParticipatesInLayout(false);
+        auto proxy = std::make_unique<RenderProxyNode>(&source);
+        halo_ = static_cast<RenderProxyNode *>(addChild(std::move(proxy)));
+        applyOpacity(0);
+    }
+
+    void setGeometry(float width, float height, float scale, Color tint) {
+        setFrameSize(width, height);
+        halo_->setFrameSize(width, height);
+        halo_->setForegroundBlurRadius(4 * scale);
+        halo_->setBlurTint(tint);
+    }
+
+    void setHovered(bool hovered, bool animated) {
+        const float target = hovered ? 1.f : 0.f;
+        if (target_ == hovered && (animated || opacity() == target))
+            return;
+        target_ = hovered;
+        auto *manager = animationManager();
+        if (manager && animation_)
+            manager->cancel(std::exchange(animation_, 0));
+        if (manager && animated && opacity() != target) {
+            animation_ = manager->animate(
+                opacity(), target, hovered ? 100 : 140, Easing::EaseOutCubic,
+                [this](float value) { applyOpacity(value); }, {}, this);
+            markPaintDirty();
+        } else {
+            applyOpacity(target);
+        }
+    }
+
+  private:
+    void applyOpacity(float value) {
+        setOpacity(value);
+        setVisible(value > 0);
+    }
+
+    RenderProxyNode *halo_;
+    AnimationManager::Id animation_ = 0;
+    bool target_ = false;
+};
 } // namespace
 
 struct ModeLine::Impl {
@@ -100,7 +147,9 @@ struct ModeLine::Impl {
     using ActivityMap = std::map<std::string, Activity, std::less<>>;
     struct Button {
         InputArea *area;
+        Node *content;
         Label *title;
+        HoverGlow *glow;
         Box *focus;
     };
     struct Slot {
@@ -149,6 +198,7 @@ struct ModeLine::Impl {
     Label *tipText;
     Timer hoverTimer;
     std::optional<Group> hoverGroup;
+    InputArea *pointerFocused = nullptr;
     size_t firstOmitted = 0, historyRemaining = 0;
     decltype(Settings::fools) fools;
     bool foolUnread = false, visible = false, allowed = true, layoutReady = false;
@@ -174,20 +224,11 @@ struct ModeLine::Impl {
                                   "status-nick",    "status-network",  "status-connection"};
         for (size_t i = controls.size(); i-- > 0;) {
             const auto group = static_cast<Group>(i);
-            auto &button = controls[i] = makeButton();
+            auto &button = controls[i] = makeButton(group);
             auto *area = button.area;
-            icons[i] = child<Glyph>(*area);
+            icons[i] = child<Glyph>(*button.content);
             icons[i]->setGlyph(names[i]);
-            icons[i]->setHitTestVisible(false);
-            button.title->setHitTestVisible(false);
             area->setTabFocusKey(keys[i]);
-            area->setOnEnter([this, group](const InputArea::PointerData &) { startHover(group); });
-            area->setOnLeave([this, group] {
-                updateFocus(controls[group]);
-                if (hoverGroup == group)
-                    hideTip();
-            });
-            area->setOnPress([this](const InputArea::PointerData &) { hideTip(); });
             area->setOnClick([this, group](const InputArea::PointerData &pointer) {
                 activateGroup(group, pointer.serial);
             });
@@ -224,8 +265,7 @@ struct ModeLine::Impl {
     }
     void startHover(Group group) {
         hideTip();
-        auto &button = controls[group];
-        updateFocus(button);
+        const auto &button = controls[group];
         if (!allowed || popupButton || !button.area->enabled())
             return;
         hoverGroup = group;
@@ -241,8 +281,15 @@ struct ModeLine::Impl {
     }
     void updateFocus(const Button &button) const {
         const auto &area = *button.area;
-        button.focus->setFill(focusInk);
-        button.focus->setVisible(allowed && area.enabled() && (area.focused() || area.hovered()));
+        button.focus->setVisible(allowed && area.enabled() && area.focused() &&
+                                 pointerFocused != &area);
+    }
+    void updateHover(const Button &button) const {
+        const auto &area = *button.area;
+        const bool available = allowed && !popupButton && area.visible() && area.enabled();
+        const auto &settings = model.settings;
+        const bool animated = !settings.reducedMotion && settings.fx != FxLevel::Off;
+        button.glow->setHovered(available && area.hovered(), available && animated);
     }
     std::string_view caption(Group group) const { return controls[group].title->text(); }
     void updateTipText(Group group) {
@@ -310,7 +357,7 @@ struct ModeLine::Impl {
         shownProfile = bool(current.profile);
         shownWritable = current.writable();
     }
-    Button makeButton() {
+    Button makeButton(std::optional<Group> group = {}) {
         auto *area = static_cast<InputArea *>(
             owner.insertChildAt(slots.size(), std::make_unique<InputArea>()));
         area->setVisible(false);
@@ -318,15 +365,37 @@ struct ModeLine::Impl {
         area->setRetainsFocusOnPointerRelease(true);
         area->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));
         area->setClipChildren(true);
+        auto *content = child<Node>(*area);
+        content->setHitTestVisible(false);
+        auto *glow =
+            static_cast<HoverGlow *>(area->insertChildAt(0, std::make_unique<HoverGlow>(*content)));
         auto *focus = child<Box>(*area);
         focus->setHitTestVisible(false);
         focus->setVisible(false);
-        const Button button{area, lineLabel(*area), focus};
-        const auto rule = [this, button] { updateFocus(button); };
-        area->setOnFocusGain(rule);
-        area->setOnFocusLoss(rule);
-        area->setOnEnter([rule](const InputArea::PointerData &) { rule(); });
-        area->setOnLeave(rule);
+        const Button button{area, content, lineLabel(*content), glow, focus};
+        area->setOnFocusGain([this, button] {
+            pointerFocused = nullptr;
+            updateFocus(button);
+        });
+        area->setOnFocusLoss([focus] { focus->setVisible(false); });
+        area->setOnEnter([this, button, group](const InputArea::PointerData &) {
+            updateHover(button);
+            if (group)
+                startHover(*group);
+        });
+        area->setOnLeave([this, button, group] {
+            updateHover(button);
+            if (group && hoverGroup == group)
+                hideTip();
+        });
+        area->setOnPress([this, button, group](const InputArea::PointerData &) {
+            if (button.area->focused()) {
+                pointerFocused = button.area;
+                updateFocus(button);
+            }
+            if (group)
+                hideTip();
+        });
         return button;
     }
     void moveButton(Button &button, float x, float width, float height) {
@@ -336,6 +405,9 @@ struct ModeLine::Impl {
         area.setPosition(x, 0);
         area.setSize(width, height);
         area.setVisible(true);
+        button.content->setFrameSize(width, height);
+        button.glow->setGeometry(width, height, scale, focusInk);
+        button.focus->setFill(focusInk);
         const float rule = std::max(1.f, scale);
         button.focus->setPosition(0, height - rule);
         button.focus->setSize(width, rule);
@@ -344,6 +416,7 @@ struct ModeLine::Impl {
         if (button.area->visible()) {
             retire(*button.area);
             button.area->setVisible(false);
+            updateHover(button);
         }
     }
     void enableButton(Button &button, bool enabled) {
@@ -351,6 +424,7 @@ struct ModeLine::Impl {
             retire(*button.area);
         button.area->setEnabled(enabled);
         updateFocus(button);
+        updateHover(button);
     }
     const Buffer *eligibleBuffer(const std::string &id) const {
         const auto found = model.buffers.find(id);
@@ -370,13 +444,12 @@ struct ModeLine::Impl {
                 if (activateKey(key))
                     activateSlot(index);
             });
-            slots.push_back({button, lineLabel(*button.area), lineLabel(*button.area), {}});
+            slots.push_back({button, lineLabel(*button.content), lineLabel(*button.content), {}});
         }
         return slots[index];
     }
     void styleButton(Button &button, const TextFont &font) {
         style(*button.title, font, scale, activityInk);
-        button.focus->setFill(focusInk);
     }
     static std::array<int, 4> anchor(const Button &button) {
         float left, top, rightEdge, bottom;
@@ -674,7 +747,10 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     };
     p.activityInk = ink("primary");
     p.mentionInk = ink("error");
-    p.focusInk = ink("secondary");
+    if (const auto secondary = ink("secondary"); p.focusInk != secondary) {
+        p.focusInk = secondary;
+        markLayoutDirty();
+    }
     const auto contextualInk = ink("on_surface_variant");
     const auto contextInk = ink("on_surface");
     for (size_t i = 0; i < p.controls.size(); ++i) {

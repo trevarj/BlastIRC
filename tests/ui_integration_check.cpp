@@ -3352,6 +3352,25 @@ void statusActionsCheck() {
         return area;
     };
     frame();
+    auto *connection = control("status-connection");
+    const auto hasUnderline = [&] {
+        return std::ranges::any_of(connection->children(), [&](const auto &node) {
+            return node->visible() && node->width() == connection->width() && node->height() == 1 &&
+                   node->y() == connection->height() - 1;
+        });
+    };
+    dispatcher.setFocus(control("status-network"));
+    nativeKey(ui, dispatcher, XKB_KEY_Tab);
+    frame();
+    assert(dispatcher.focusedArea() == connection && hasUnderline());
+    float x = 0, y = 0;
+    Node::mapToScene(connection, connection->width() / 2, connection->height() / 2, x, y);
+    dispatcher.pointerMotion(x, y, 1);
+    assert(hasUnderline());
+    dispatcher.pointerButton(x, y, BTN_LEFT, true, 2, 2, false);
+    assert(!hasUnderline());
+    dispatcher.cancelPointerCapture();
+    dispatcher.pointerLeave();
     auto *nick = control("status-nick");
     click(dispatcher, *nick);
     frame();
@@ -3389,14 +3408,14 @@ void statusActionsCheck() {
     hostKey(ui, dispatcher, XKB_KEY_Escape);
     frame();
 
-    click(dispatcher, *control("status-connection"));
+    click(dispatcher, *connection);
     assert(menu.open);
     menu.select("Reconnect");
     frame();
     assert(std::any_of(model.actions.begin(), model.actions.end(), [](const auto &action) {
         return action.type == "connect" && action.text == "test";
     }));
-    click(dispatcher, *control("status-connection"));
+    click(dispatcher, *connection);
     assert(menu.open);
     menu.select("Open server log");
     frame();

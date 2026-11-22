@@ -1,5 +1,7 @@
 #pragma once
 
+#include "render/core/color.h"
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -261,7 +263,14 @@ public:
     markPaintDirty();
   }
   const Node* source() const noexcept { return m_source; }
+  void setBlurTint(Color tint) {
+    if (m_blurTint == tint) return;
+    m_blurTint = tint;
+    markPaintDirty();
+  }
+  Color blurTint() const noexcept { return m_blurTint; }
 
 private:
   const Node* m_source = nullptr;
+  Color m_blurTint{.a = 0.0F};
 };

@@ -480,12 +480,16 @@ void RenderContext::renderNode(
       }
       // Glyph RGBA composition accepts premultiplied textures; image composition
       // would multiply alpha a second time. Framebuffer textures are bottom-up.
+      const Color tint = node->type() == NodeType::RenderProxy
+          ? static_cast<const RenderProxyNode*>(node)->blurTint() : Color{.a = 0.0F};
       m_backend->drawGlyph(RenderGlyphDraw{
           .texture = cache.image->colorTexture(),
           .surfaceWidth = sw, .surfaceHeight = sh,
           .width = width, .height = height,
           .v0 = 1.0F, .v1 = 0.0F,
           .opacity = effectiveOpacity,
+          .tint = tint,
+          .tinted = tint.a > 0.0F,
           .transform = worldTransform,
       });
     } catch (const std::exception& error) {

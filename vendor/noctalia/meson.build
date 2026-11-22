@@ -11,6 +11,7 @@ project('noctalia', ['c', 'cpp'],
 
 if get_option('library_only')
   noctalia_ui_system_wuffs = get_option('system_libraries')
+  noctalia_ui_blastirc_profile = get_option('blastirc_ui_profile')
   subdir('lib')
   noctalia_ui_license = files('LICENSE')
   noctalia_ui_tabler_license = files('lib/assets/fonts/tabler-icons-license.txt')

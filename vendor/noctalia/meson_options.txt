@@ -18,3 +18,9 @@ option(
   value: false,
   description: 'Build only the shared UI library and codecs, without the shell',
 )
+option(
+  'blastirc_ui_profile',
+  type: 'boolean',
+  value: false,
+  description: 'Omit Noctalia UI components unused by BlastIRC in library-only builds',
+)

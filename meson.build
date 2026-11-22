@@ -5,7 +5,7 @@ project('blastirc', 'c', 'cpp',
   default_options: ['cpp_std=c++23', 'warning_level=3', 'buildtype=debugoptimized'],
 )
 
-noctalia = subproject('noctalia', default_options: ['library_only=true'])
+noctalia = subproject('noctalia', default_options: ['library_only=true', 'blastirc_ui_profile=true'])
 noctalia_ui_dep = noctalia.get_variable('noctalia_ui_dep')
 noctalia_ui_codecs_dep = noctalia.get_variable('noctalia_ui_codecs_dep')
 noctalia_ui_assets_dir = noctalia.get_variable('noctalia_ui_assets_dir')

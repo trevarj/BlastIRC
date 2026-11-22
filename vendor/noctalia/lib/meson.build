@@ -104,11 +104,12 @@ foreach _noctalia_ui_p : [
 endforeach
 
 # ── Core library ──────────────────────────────────────────────────────────────
+_noctalia_ui_blastirc_profile = get_variable('noctalia_ui_blastirc_profile', false)
+
 _noctalia_ui_sources = files(
   'core/application_identity.cpp',
   'core/deferred_call.cpp',
   'core/files/resource_paths.cpp',
-  'core/inotify/inotify.cpp',
   'core/input/key_chord.cpp',
   'core/input/keybind_matcher.cpp',
   'core/log.cpp',
@@ -116,9 +117,6 @@ _noctalia_ui_sources = files(
   'core/timer_manager.cpp',
   'core/ui_phase.cpp',
   'core/ui_strings.cpp',
-  'i18n/i18n.cpp',
-  'i18n/i18n_service.cpp',
-  'i18n/language_tag.cpp',
   'render/animation/animation.cpp',
   'render/animation/animation_manager.cpp',
   'render/animation/motion_service.cpp',
@@ -132,7 +130,6 @@ _noctalia_ui_sources = files(
   'render/core/image_orientation.cpp',
   'render/core/image_resize.cpp',
   'render/core/shader_program.cpp',
-  'render/core/shared_texture_cache.cpp',
   'render/core/stb_image_resize_impl.cpp',
   'render/gl_shared_context.cpp',
   'render/programs/blur_program.cpp',
@@ -155,21 +152,15 @@ _noctalia_ui_sources = files(
   'ui/controls/box.cpp',
   'ui/controls/button.cpp',
   'ui/controls/checkbox.cpp',
-  'ui/controls/collapsible.cpp',
   'ui/controls/color_swatch_preview.cpp',
   'ui/controls/context_menu.cpp',
   'ui/controls/context_menu_popup.cpp',
-  'ui/controls/drag_source.cpp',
-  'ui/controls/drop_zone.cpp',
   'ui/controls/flex.cpp',
   'ui/controls/glyph.cpp',
-  'ui/controls/grid_tile.cpp',
-  'ui/controls/grid_view.cpp',
   'ui/controls/image.cpp',
   'ui/controls/input.cpp',
   'ui/controls/keybind_recorder.cpp',
   'ui/controls/label.cpp',
-  'ui/controls/list_editor.cpp',
   'ui/controls/progress_bar.cpp',
   'ui/controls/radio_button.cpp',
   'ui/controls/range_slider.cpp',
@@ -187,23 +178,39 @@ _noctalia_ui_sources = files(
   'ui/controls/toggle.cpp',
   'ui/controls/virtual_grid_view.cpp',
   'ui/controls/virtual_list_view.cpp',
-  'ui/drag_drop_controller.cpp',
   'ui/palette.cpp',
   'ui/popup_chrome.cpp',
   'ui/scroll_into_view.cpp',
-  'ui/split_pane_focus.cpp',
   'ui/style.cpp',
   'ui/surface_shadow.cpp',
   'util/clamp.cpp',
-  'util/string_utils.cpp',
   'wayland/popup_surface.cpp',
-  'wayland/subsurface.cpp',
   'wayland/surface.cpp',
   'wayland/text_input_service.cpp',
-  'wayland/toplevel_surface.cpp',
   'wayland/wayland_connection.cpp',
   'wayland/wayland_seat.cpp',
 )
+
+if not _noctalia_ui_blastirc_profile
+  _noctalia_ui_sources += files(
+    'core/inotify/inotify.cpp',
+    'i18n/i18n.cpp',
+    'i18n/i18n_service.cpp',
+    'i18n/language_tag.cpp',
+    'render/core/shared_texture_cache.cpp',
+    'ui/controls/collapsible.cpp',
+    'ui/controls/drag_source.cpp',
+    'ui/controls/drop_zone.cpp',
+    'ui/controls/grid_tile.cpp',
+    'ui/controls/grid_view.cpp',
+    'ui/controls/list_editor.cpp',
+    'ui/drag_drop_controller.cpp',
+    'ui/split_pane_focus.cpp',
+    'util/string_utils.cpp',
+    'wayland/subsurface.cpp',
+    'wayland/toplevel_surface.cpp',
+  )
+endif
 
 if get_option('b_sanitize') != 'none'
   _noctalia_ui_sources += files('core/lsan_suppressions.cpp')
@@ -239,10 +246,6 @@ else
   _noctalia_ui_wuffs_inc = [include_directories('third_party/wuffs', is_system: true)]
 endif
 
-if not _noctalia_ui_cc.has_header('stb/stb_image_write.h')
-  error('noctalia-ui: stb/stb_image_write.h not found')
-endif
-
 _noctalia_ui_dl_dep = meson.get_compiler('cpp').find_library('dl', required: false)
 
 _noctalia_ui_codecs_system_dependencies = [
@@ -253,15 +256,24 @@ _noctalia_ui_codecs_system_dependencies = [
   dependency('libjxl_threads'),
 ] + (_noctalia_ui_dl_dep.found() ? [_noctalia_ui_dl_dep] : [])
 
-noctalia_ui_codecs_lib = static_library('noctalia-ui-codecs',
-  sources: files(
-    'render/codecs/codecs.cpp',
-    'render/codecs/heif_library.cpp',
+_noctalia_ui_codecs_sources = files(
+  'render/codecs/codecs.cpp',
+  'render/codecs/heif_library.cpp',
+  'render/codecs/image_file_loader.cpp',
+  'render/codecs/raster_decoder.cpp',
+)
+if not _noctalia_ui_blastirc_profile
+  if not _noctalia_ui_cc.has_header('stb/stb_image_write.h')
+    error('noctalia-ui: stb/stb_image_write.h not found')
+  endif
+  _noctalia_ui_codecs_sources += files(
     'render/codecs/image_encoder.cpp',
-    'render/codecs/image_file_loader.cpp',
-    'render/codecs/raster_decoder.cpp',
     'render/codecs/thumbnail_service.cpp',
-  ),
+  )
+endif
+
+noctalia_ui_codecs_lib = static_library('noctalia-ui-codecs',
+  sources: _noctalia_ui_codecs_sources,
   dependencies: _noctalia_ui_codecs_system_dependencies + [noctalia_ui_dep],
   include_directories: _noctalia_ui_wuffs_inc,
   cpp_args: _noctalia_ui_cpp_args,

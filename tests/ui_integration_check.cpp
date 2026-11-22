@@ -1,4 +1,5 @@
 #include "../src/application.hpp"
+#include "../src/key_bindings.hpp"
 #include "../src/model.hpp"
 #include "../src/render/graphics.hpp"
 #include "../src/spellcheck.hpp"
@@ -6440,6 +6441,61 @@ void typingOverflowFocusCheck() {
     dispatcher.setSceneRoot(nullptr);
 }
 
+void commandShortcutCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    for (const auto *name : {"/join", "/quit", "mark-read"})
+        assert(model.settings.bindings.at(name).empty());
+    model.settings.bindings["/join"] = "C-F9";
+    model.settings.bindings["/quit"] = "C-F10";
+    model.settings.bindings["mark-read"] = "C-F11";
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1600, 1000, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    auto *input = inputWithText(ui.root(), edgeDrafts[0]);
+    assert(input && visible(*input));
+    auto *tool = headerTool(*input, "Search conversation");
+    assert(tool && visible(*tool));
+    const auto &buffer = model.buffers.at(edgeBuffers[0]);
+    const auto actions = model.actions.size();
+    for (const auto &[key, prefill] :
+         {std::pair{XKB_KEY_F9, "/join "}, std::pair{XKB_KEY_F10, "/quit "}}) {
+        auto *source = key == XKB_KEY_F9 ? input->inputArea() : tool;
+        dispatcher.setFocus(source);
+        assert(dispatcher.focusedArea() == source);
+        hostKey(ui, dispatcher, key, KeyMod::Ctrl);
+        frame();
+        assert(input->value() == prefill && buffer.draft == prefill &&
+               input->cursorPosition() == input->value().size());
+        assert(dispatcher.focusedArea() == input->inputArea());
+        assert(model.actions.size() == actions && !model.quit);
+        hostKey(ui, dispatcher, XKB_KEY_slash, KeyMod::Ctrl);
+        frame();
+        assert(input->value() == edgeDrafts[0] && buffer.draft == edgeDrafts[0]);
+        assert(model.actions.size() == actions && !model.quit);
+    }
+    dispatcher.setFocus(tool);
+    assert(dispatcher.focusedArea() == tool);
+    hostKey(ui, dispatcher, XKB_KEY_F11, KeyMod::Ctrl);
+    frame();
+    assert(model.actions.size() == actions + 1 && model.actions.back().type == "read" &&
+           model.actions.back().buffer == edgeBuffers[0]);
+    assert(dispatcher.focusedArea() == tool && input->value() == edgeDrafts[0]);
+    dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
 void ordinaryTypingFocusCheck() {
     using namespace blast;
     auto model = edgeModel();
@@ -10907,6 +10963,7 @@ void runTranscriptLinkFocusCheck(
 
 void runUiIntegrationCheck() {
     codecs::installImageDecoder();
+    commandShortcutCheck();
     wordPredictionBindingsCheck();
     cycleSpellingBindingsCheck();
     nextActivityNativeCheck();

@@ -27,6 +27,7 @@ For soju, choose **Add soju account** in **Settings → Networks**, enter the bo
 - Connect directly or through ZNC and soju with TLS, SASL authentication and native soju network management.
 - Choose messenger bubbles, adaptive traditional IRC rows or Traditional · two-line chat styles.
 - Use keyboard navigation, command and nickname completion, emoji completion and Emacs-style editing.
+- Assign shortcuts in **Settings → Keyboard**. New actions start unbound. IRC command shortcuts fill the composer without sending; Undo restores the previous draft.
 - Exchange native IRCv3 typing indicators, replies, reactions and read markers, and load history when supported by the server or bouncer.
 - Search local history and receive desktop mention notifications.
 - Configure independent UI and message fonts and weights, Noctalia colors, scale, transparency, motion and sound.

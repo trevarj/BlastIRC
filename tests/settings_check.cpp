@@ -1,4 +1,6 @@
 #include "../src/application.hpp"
+#include "../src/commands.hpp"
+#include "../src/key_bindings.hpp"
 #include "../src/spellcheck.hpp"
 #include "../src/theme/theme.hpp"
 #include "../src/ui/channel_avatar.hpp"
@@ -352,8 +354,7 @@ void settingsTreeControls() {
     using namespace blast;
     Model model;
     model.firstRun = false;
-    model.settings.bindings = defaultBindings();
-    model.settings.bindings["custom-action"] = "";
+    model.settings.bindings = {{"complete", "M-F6"}, {"custom-action", "C-F10"}};
     model.settings.cues["mention"] = {true, .5f, 1.f};
     model.identities.push_back({"tree", "TreeNick", "treeuser", "Tree User", {}, {}, {}});
     ServerConfig server;
@@ -387,7 +388,7 @@ void settingsTreeControls() {
         {"appearance.theme", "appearance.fonts", "appearance.spellcheck", "appearance.cursor",
          "appearance.messages", "appearance.previews", "appearance.navigation"},
         {"keyboard.messaging", "keyboard.cursor", "keyboard.editing", "keyboard.navigation",
-         "keyboard.other"},
+         "keyboard.other", "keyboard.formatting", "keyboard.irc"},
         {"chat.uploads", "chat.typing", "chat.people", "chat.colors", "chat.history"},
         {"effects.general", "effects.sending", "effects.receiving", "effects.physics"},
         {"sounds.playback", "sounds.cues"},
@@ -398,6 +399,21 @@ void settingsTreeControls() {
     for (std::size_t category = 0; category < leaves.size(); ++category) {
         picker->setSelectedIndex(category);
         frame();
+        if (category == 1) {
+            for (const auto &[name, chord] : defaultBindings()) {
+                const auto *field = dynamic_cast<Input *>(
+                    keyed(dialogs, "blastirc.settings.binding." + name)->textInputClient());
+                assert(field && field->value() == (name == "complete" ? "M-F6" : chord));
+                assert(dynamic_cast<Button *>(
+                    keyed(dialogs, "blastirc.settings.record." + name)->parent()));
+                assert(dynamic_cast<Button *>(
+                    keyed(dialogs, "blastirc.settings.reset." + name)->parent()));
+            }
+            assert(model.settings.bindings.at("custom-action") == "C-F10");
+            assert(!find<InputArea>(dialogs, [](const InputArea &area) {
+                return area.tabFocusKey() == "blastirc.settings.binding.custom-action";
+            }));
+        }
         key(XKB_KEY_Left);
         assert(!find<InputArea>(dialogs, [&](const InputArea &area) {
             return area.tabFocusKey() == "blastirc.settings.section." + leaves[category].front();
@@ -420,6 +436,33 @@ void settingsTreeControls() {
                    dispatcher.focusedArea() == pickerArea);
             frame();
             assert(dispatcher.focusedArea() == nav);
+            if (id == "keyboard.irc") {
+                for (const auto &command : commandCatalog) {
+                    const auto name = "/" + std::string(command.name);
+                    assert(defaultBindings().at(name).empty());
+                    const auto label = name + " · " + std::string(command.description);
+                    assert(named<Input>(dialogs, label)->inputArea() ==
+                           keyed(dialogs, "blastirc.settings.binding." + name));
+                }
+                auto *field = dynamic_cast<Input *>(
+                    keyed(dialogs, "blastirc.settings.binding./join")->textInputClient());
+                assert(field && field->value().empty() &&
+                       !model.settings.bindings.contains("/join"));
+                auto *record = keyed(dialogs, "blastirc.settings.record./join");
+                dispatcher.setFocus(record);
+                dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+                assert(record->capturesAllKeys());
+                const auto chord = stroke(XKB_KEY_F6, KeyMod::Ctrl);
+                assert(dialogs.handleKey(chord));
+                assert(dialogs.handleKey(stroke(XKB_KEY_Return, KeyMod::Ctrl)));
+                assert(!record->capturesAllKeys() && field->value() == bindingStroke(chord) &&
+                       model.settings.bindings.at("/join") == field->value());
+                auto *reset = dynamic_cast<Button *>(
+                    keyed(dialogs, "blastirc.settings.reset./join")->parent());
+                assert(reset);
+                press(dispatcher, *reset);
+                assert(field->value().empty() && model.settings.bindings.at("/join").empty());
+            }
             key(XKB_KEY_Left);
             assert(picker->selectedIndex() == category);
         }

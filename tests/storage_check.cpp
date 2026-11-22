@@ -1228,6 +1228,7 @@ static void conversationBindingPreferences(const fs::path &config) {
         assert(defaults.at("conversation-forward") == "C-i");
         assert(defaults.at("next-activity") == "C-SPC");
         assert(defaults.at("set-mark") == "C-S-SPC");
+        assert(defaults.at("/join").empty() && defaults.at("mark-read").empty());
     }
     struct Case {
         string source, back, forward;
@@ -1276,6 +1277,10 @@ static void conversationBindingPreferences(const fs::path &config) {
          "C-i",
          {{"set-mark", "C-SPC"}, {"next-activity", ""}}},
         {"next-activity = 'M-SPC'\n", "C-o", "C-i", {{"next-activity", "M-SPC"}}},
+        {"\"/join\" = 'C-x F8'\nmark-read = 'M-F8'\n",
+         "C-o",
+         "C-i",
+         {{"/join", "C-x F8"}, {"mark-read", "M-F8"}}},
     };
     for (const auto &test : cases) {
         {

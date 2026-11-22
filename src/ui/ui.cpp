@@ -1,6 +1,7 @@
 #include "ui.hpp"
 #include "../application.hpp"
 #include "../irc/protocol.hpp"
+#include "../key_bindings.hpp"
 #include "../model.hpp"
 #include "../platform/clipboard.hpp"
 #include "../platform/file_picker.hpp"
@@ -88,147 +89,6 @@ void configureNativeControlBindings() {
     });
 }
 
-const std::map<std::string, std::string> &defaultBindings() {
-    static const std::map<std::string, std::string> bindings = {
-        {"switch-buffer", "C-x b"},
-        {"execute-command", "M-x"},
-        {"jump-channel", "C-x j"},
-        {"conversation-back", "C-o"},
-        {"conversation-forward", "C-i"},
-        {"next-activity", "C-SPC"},
-        {"global-mentions", ""},
-        {"toggle-fools", "C-x f"},
-        {"show-fools", ""},
-        {"hide-fools", ""},
-        {"message-prev", "C-p"},
-        {"message-next", "C-n"},
-        {"scroll-up", "PRIOR"},
-        {"scroll-down", "NEXT"},
-        {"message-reply", "C-r"},
-        {"message-react", "C-e"},
-        {"cancel", "C-g"},
-        {"search", "C-s"},
-        {"settings", "C-,"},
-        {"toggle-people", ""},
-        {"toggle-navigation", ""},
-        {"toggle-networks", ""},
-        {"send", "RET"},
-        {"newline", "S-RET"},
-        {"beginning-of-line", "C-a"},
-        {"end-of-line", ""},
-        {"backward-char", "C-b"},
-        {"forward-char", "C-f"},
-        {"previous-line", ""},
-        {"next-line", ""},
-        {"backward-word", "M-b"},
-        {"forward-word", "M-f"},
-        {"beginning-of-buffer", "M-<"},
-        {"end-of-buffer", "M->"},
-        {"kill-word", "M-d"},
-        {"backward-kill-word", "M-BACKSPACE"},
-        {"delete-char", "C-d"},
-        {"backward-delete", "BACKSPACE"},
-        {"kill-line", "C-k"},
-        {"kill-region", "C-w"},
-        {"copy-region", "M-w"},
-        {"yank", "C-y"},
-        {"cycle-spelling", "C-;"},
-        {"undo", "C-/"},
-        {"redo", ""},
-        {"copy", ""},
-        {"cut", ""},
-        {"paste", ""},
-        {"select-all", ""},
-        {"transpose-chars", "C-t"},
-        {"backward-kill-line", ""},
-        {"set-mark", "C-S-SPC"},
-        {"history-previous", "M-p"},
-        {"history-next", "M-n"},
-        {"complete", "TAB"}};
-    return bindings;
-}
-std::string_view commandDisplayName(std::string_view command) {
-    static constexpr std::pair<std::string_view, std::string_view> names[] = {
-        {"switch-buffer", "Switch conversation"},
-        {"execute-command", "Execute command"},
-        {"jump-channel", "Jump to channel or conversation"},
-        {"conversation-back", "Previous viewed conversation"},
-        {"conversation-forward", "Next viewed conversation"},
-        {"next-activity", "Next channel with activity"},
-        {"global-mentions", "Global mentions"},
-        {"toggle-fools", "Toggle fools in this conversation"},
-        {"show-fools", "Show fools"},
-        {"hide-fools", "Hide fools"},
-        {"message-prev", "Select previous message"},
-        {"message-next", "Select next message"},
-        {"scroll-up", "Scroll chat up half a page"},
-        {"scroll-down", "Scroll chat down half a page"},
-        {"message-reply", "Reply to selected message"},
-        {"message-react", "React to selected message"},
-        {"cancel", "Cancel"},
-        {"search", "Search conversation"},
-        {"settings", "Settings"},
-        {"toggle-people", "Toggle People"},
-        {"toggle-navigation", "Toggle navigation"},
-        {"toggle-networks", "Toggle Networks"},
-        {"mute-buffer", "Mute conversation"},
-        {"unmute-buffer", "Unmute conversation"},
-        {"archive-buffer", "Archive conversation"},
-        {"unarchive-buffer", "Unarchive conversation"},
-        {"pin-buffer", "Pin chat"},
-        {"unpin-buffer", "Unpin chat"},
-        {"send", "Send message"},
-        {"newline", "Insert newline"},
-        {"beginning-of-line", "Beginning of line"},
-        {"end-of-line", "End of line"},
-        {"backward-char", "Previous character"},
-        {"forward-char", "Next character"},
-        {"previous-line", "Previous line"},
-        {"next-line", "Next line"},
-        {"backward-word", "Previous word"},
-        {"forward-word", "Next word"},
-        {"beginning-of-buffer", "Beginning of messages"},
-        {"end-of-buffer", "End of messages"},
-        {"kill-word", "Cut next word"},
-        {"backward-kill-word", "Cut previous word"},
-        {"delete-char", "Delete next character"},
-        {"backward-delete", "Delete previous character"},
-        {"kill-line", "Cut to end of line"},
-        {"kill-region", "Cut selection"},
-        {"copy-region", "Copy selection"},
-        {"yank", "Paste cut text"},
-        {"cycle-spelling", "Cycle spelling suggestions"},
-        {"undo", "Undo edit"},
-        {"redo", "Redo"},
-        {"copy", "Copy selection"},
-        {"cut", "Cut selection"},
-        {"paste", "Paste clipboard"},
-        {"select-all", "Select all"},
-        {"transpose-chars", "Transpose characters"},
-        {"backward-kill-line", "Cut to beginning of line"},
-        {"set-mark", "Set selection mark"},
-        {"history-previous", "Previous sent message"},
-        {"history-next", "Next sent message"},
-        {"complete", "Complete nickname or command"},
-        {"connect", "Connect or reconnect network"},
-        {"disconnect", "Disconnect network"},
-        {"add-server", "Add network"},
-        {"manage-networks", "Manage networks"},
-        {"load-history", "Load older messages"},
-        {"clear-history", "Clear local history"},
-        {"mark-read", "Mark read"},
-        {"mark-all-read", "Mark all buffers read"},
-        {"close-buffer", "Close buffer"},
-        {"topic", "Conversation details / topic"},
-        {"quit", "Quit BlastIRC"},
-        {"message-style:irc", "Use traditional IRC rows"},
-        {"message-style:bubbles", "Use message bubbles"},
-        {"message-style:stacked", "Use stacked IRC rows"}};
-    const auto found =
-        std::find_if(std::begin(names), std::end(names),
-                     [command](const auto &entry) { return entry.first == command; });
-    return found == std::end(names) ? command : found->second;
-}
 std::string commandLabel(const Model &model, std::string_view label, std::string_view command) {
     std::string result(label);
     if (const auto binding = model.settings.bindings.find(std::string(command));
@@ -524,17 +384,13 @@ std::string bindingStroke(const InputArea::KeyData &key) {
 }
 namespace {
 bool workspaceCommand(std::string_view name) {
-    return name == "switch-buffer" || name == "execute-command" || name == "jump-channel" ||
-           name == "conversation-back" || name == "conversation-forward" ||
-           name == "next-activity" || name == "settings" || name == "search" || name == "cancel" ||
-           name == "toggle-people" || name == "toggle-navigation" || name == "toggle-networks" ||
-           name == "quit" || name == "connect" || name == "disconnect" || name == "load-history" ||
-           name == "clear-history" || name == "manage-networks" || name == "mark-all-read" ||
-           name.starts_with("message-style:") || name == "message-prev" || name == "message-next" ||
-           name == "message-reply" || name == "message-react" || name == "mute-buffer" ||
-           name == "unmute-buffer" || name == "archive-buffer" || name == "unarchive-buffer" ||
-           name == "pin-buffer" || name == "unpin-buffer" || name == "global-mentions" ||
-           name == "toggle-fools" || name == "show-fools" || name == "hide-fools";
+    const auto command = bindingCommands().find(name);
+    return command != bindingCommands().end() &&
+           (command->second.group == BindingGroup::Irc ||
+            ((command->second.group == BindingGroup::Navigation ||
+              command->second.group == BindingGroup::Other) &&
+             name != "scroll-up" && name != "scroll-down" && name != "beginning-of-buffer" &&
+             name != "end-of-buffer"));
 }
 // Local review only: never pass untrusted files to the SVG-capable file loader.
 class UploadPreview final : public Node {
@@ -3150,47 +3006,14 @@ void Ui::Impl::rebuildMatches(std::string_view preferred) {
     if (commandMode) {
         const auto active = model.buffers.find(model.activeBuffer);
         const bool networkLog = active != model.buffers.end() && active->second.kind == "server";
-        std::set<std::string> names;
-        for (const auto &[name, binding] : model.settings.bindings) {
-            names.insert(name);
+        for (const auto &[name, command] : bindingCommands()) {
             if (networkLog && name == "close-buffer")
                 continue;
-            const std::string display(commandDisplayName(name));
             const int score =
-                std::max(ui_logic::fuzzy(query, name), ui_logic::fuzzy(query, display));
+                std::max(ui_logic::fuzzy(query, name), ui_logic::fuzzy(query, command.label));
             if (score > -100000)
                 found.push_back(
-                    {score, name, commandLabel(model, display, name) + "    [" + name + "]"});
-        }
-        for (const std::string name : {"connect",
-                                       "disconnect",
-                                       "load-history",
-                                       "clear-history",
-                                       "search",
-                                       "quit",
-                                       "add-server",
-                                       "manage-networks",
-                                       "mark-all-read",
-                                       "mark-read",
-                                       "close-buffer",
-                                       "topic",
-                                       "message-style:irc",
-                                       "message-style:bubbles",
-                                       "message-style:stacked",
-                                       "mute-buffer",
-                                       "unmute-buffer",
-                                       "archive-buffer",
-                                       "unarchive-buffer",
-                                       "pin-buffer",
-                                       "unpin-buffer"}) {
-            if (names.contains(name) || (networkLog && name == "close-buffer"))
-                continue;
-            const std::string display(commandDisplayName(name));
-            const int score =
-                std::max(ui_logic::fuzzy(query, name), ui_logic::fuzzy(query, display));
-            if (score > -100000)
-                found.push_back(
-                    {score, name, commandLabel(model, display, name) + "    [" + name + "]"});
+                    {score, name, commandLabel(model, command.label, name) + "    [" + name + "]"});
         }
     } else {
         paletteSources.clear();
@@ -3720,7 +3543,7 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
             if (auto pane = workspace.panes.find(workspace.focused);
                 pane != workspace.panes.end() && pane->second.buffer == origin &&
                 model.activeBuffer == origin)
-                editors.execute("prefill-nick", pane->second);
+                    editors.execute("prefill-command:/nick", pane->second);
         } else {
             const auto separator = route.find(':');
             if (separator == std::string_view::npos)
@@ -3742,12 +3565,29 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
     for (const auto &[id, view] : views)
         view->transcript->cancelAutoscroll();
     chord.clear();
+    if (command.starts_with('/') && bindingCommands().contains(command)) {
+        if (dialogs->active() || uploadStage != UploadStage::Closed)
+            return;
+        if (const auto pane = workspace.panes.find(workspace.focused);
+            pane != workspace.panes.end())
+            editors.execute("prefill-command:" + command, pane->second);
+        return;
+    }
     if (command.starts_with("upload-")) {
         uploadAction(command);
         return;
     }
     if (command == "settings-uploads") {
         dialogs->open(command);
+        return;
+    }
+    if (command == "open-server-log") {
+        const auto current = model.buffers.find(model.activeBuffer);
+        const auto &server = current != model.buffers.end() && !current->second.server.empty()
+                                 ? current->second.server
+                                 : selectedServer;
+        if (!server.empty())
+            queue(model, command, server);
         return;
     }
     if (command.starts_with("open-server-log:")) {
@@ -3855,6 +3695,12 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
             editors.execute("insert-nick:" + command, workspace.panes.at(pane));
             return;
         }
+    }
+    if (command == "channel-tools") {
+        const auto buffer = model.buffers.find(model.activeBuffer);
+        if (buffer != model.buffers.end() && buffer->second.kind == "channel")
+            queue(model, "channel-tools-open", buffer->first);
+        return;
     }
     if (chatControl(command, model.activeBuffer))
         return;
@@ -4023,9 +3869,11 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         queue(model, "read", model.activeBuffer);
     else if (command == "mark-all-read")
         queue(model, "read-all");
-    else if (command == "close-buffer")
-        queue(model, "close_buffer", model.activeBuffer);
-    else if (command == "quit")
+    else if (command == "close-buffer") {
+        if (const auto buffer = model.buffers.find(model.activeBuffer);
+            buffer != model.buffers.end() && buffer->second.kind != "server")
+            queue(model, "close_buffer", model.activeBuffer);
+    } else if (command == "quit")
         queue(model, "quit");
     else if (command == "message-style:irc" || command == "message-style:bubbles" ||
              command == "message-style:stacked") {
@@ -4040,11 +3888,13 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
             queue(model, "save");
         }
     } else if (command.starts_with("presence:")) {
+        const auto buffer = model.buffers.find(model.activeBuffer);
+        if (buffer == model.buffers.end() ||
+            (buffer->second.kind != "channel" && buffer->second.kind != "query"))
+            return;
         const auto value = command.substr(9);
         if (value == "global") {
-            const auto buffer = model.buffers.find(model.activeBuffer);
-            if (buffer != model.buffers.end() &&
-                model.settings.channelPresence.contains(buffer->second.target))
+            if (model.settings.channelPresence.contains(buffer->second.target))
                 model.settings.channelPresence[model.activeBuffer] = PresenceMode::Global;
             else
                 model.settings.channelPresence.erase(model.activeBuffer);
@@ -4883,14 +4733,15 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
                         return candidate == full || candidate.starts_with(full + " ");
                     });
     bool prefix = false;
+    const bool selecting = transcript && transcript->keyboardTextSelection();
     for (const auto &[command, binding] : model.settings.bindings) {
+        if (binding.empty() && !(selecting && command == "end-of-line"))
+            continue;
         const bool scrolling = command == "scroll-up" || command == "scroll-down" ||
                                command == "beginning-of-buffer" || command == "end-of-buffer";
-        const auto candidate =
-            transcript && transcript->keyboardTextSelection() && movement(command)
-                ? selectionCandidate(command, binding)
-                : ui_logic::canonical(binding);
-        if (candidate.empty() ||
+        const auto candidate = selecting && movement(command) ? selectionCandidate(command, binding)
+                                                              : ui_logic::canonical(binding);
+        if (candidate.empty() || !candidate.starts_with(full) ||
             (!workspaceCommand(command) && !composer &&
              !((command == "copy-region" || scrolling || command == "set-mark" ||
                 (movement(command) && transcript && transcript->keyboardTextSelection())) &&
@@ -4898,7 +4749,7 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
             (command == "message-react" && (!transcriptOwnsFocus() || selectionBinding)) ||
             (scrolling && dialogs->active()) ||
             (dialogs->active() &&
-             (command == "message-prev" || command == "message-next" ||
+             (command.starts_with('/') || command == "message-prev" || command == "message-next" ||
               command == "message-reply" || command == "message-react" ||
               command == "conversation-back" || command == "conversation-forward" ||
               command == "next-activity")))

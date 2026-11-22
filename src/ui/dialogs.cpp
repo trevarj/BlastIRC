@@ -1,6 +1,7 @@
 #include "dialogs.hpp"
 
 #include "../irc/protocol.hpp"
+#include "../key_bindings.hpp"
 #include "../model.hpp"
 #include "../spellcheck.hpp"
 #include "../storage.hpp"
@@ -1829,40 +1830,18 @@ struct Dialogs::Impl {
     }
 
     void keys() {
-        static constexpr const char *groups[] = {"Messaging", "Cursor movement",
-                                                 "Editing and selection", "Navigation",
-                                                 "Other commands"};
-        const auto groupFor = [](std::string_view name) {
-            if (name == "send" || name == "newline" || name == "complete" ||
-                name.starts_with("history-"))
-                return 0;
-            if (name == "beginning-of-line" || name == "end-of-line" || name == "backward-char" ||
-                name == "forward-char" || name == "previous-line" || name == "next-line" ||
-                name == "backward-word" || name == "forward-word")
-                return 1;
-            if (name.find("kill") != std::string_view::npos || name == "delete-char" ||
-                name == "backward-delete" || name == "copy-region" || name == "yank" ||
-                name == "undo" || name == "set-mark" || name == "redo" || name == "copy" ||
-                name == "cut" || name == "paste" || name == "select-all" ||
-                name == "transpose-chars" || name == "cycle-spelling")
-                return 2;
-            if (name == "switch-buffer" || name == "execute-command" || name == "jump-channel" ||
-                name == "next-activity" || name == "conversation-back" ||
-                name == "conversation-forward" || name.starts_with("toggle-") || name == "search" ||
-                name == "settings" || name == "cancel" || name == "beginning-of-buffer" ||
-                name == "end-of-buffer")
-                return 3;
-            return 4;
-        };
+        static constexpr std::array groups{
+            "Messaging",      "Cursor movement", "Editing and selection", "Navigation",
+            "Other commands", "Formatting",      "IRC commands"};
+        static constexpr std::array ids{
+            "keyboard.messaging", "keyboard.cursor",     "keyboard.editing", "keyboard.navigation",
+            "keyboard.other",     "keyboard.formatting", "keyboard.irc"};
         for (int category = 0; category < int(std::size(groups)); ++category) {
             Flex *tasks = nullptr;
-            for (const auto &[name, chord] : model.settings.bindings) {
-                if (groupFor(name) != category)
+            for (const auto &[name, command] : bindingCommands()) {
+                if (static_cast<int>(command.group) != category)
                     continue;
                 if (!tasks) {
-                    static constexpr const char *ids[] = {"keyboard.messaging", "keyboard.cursor",
-                                                          "keyboard.editing", "keyboard.navigation",
-                                                          "keyboard.other"};
                     tasks = section(ids[category], groups[category]);
                     label(*tasks, "Action · Shortcut · Default · Record / Reset", true);
                 }
@@ -1872,7 +1851,11 @@ struct Dialogs::Impl {
                 group->setFillWidth(true);
                 group->setGap(8);
                 track(group.get(), MetricKind::Flex);
-                auto *field = text(*group, commandDisplayName(name), chord,
+                const auto configured = model.settings.bindings.find(name);
+                auto *field = text(*group, command.label,
+                                   configured == model.settings.bindings.end()
+                                       ? std::string(command.defaultChord)
+                                       : configured->second,
                                    [this, name](const std::string &value) {
                                        model.settings.bindings[name] = value;
                                    });
@@ -1900,9 +1883,7 @@ struct Dialogs::Impl {
                     if (metric.node == actions)
                         metric.minWidth = 230;
                 actions->setFlexGrow(1);
-                const auto defaults = defaultBindings().find(name);
-                const std::string defaultChord =
-                    defaults == defaultBindings().end() ? "" : defaults->second;
+                const std::string defaultChord(command.defaultChord);
                 auto *secondary =
                     label(*actions, "Default: " + (defaultChord.empty() ? std::string("Unbound")
                                                                         : defaultChord));
@@ -1926,14 +1907,12 @@ struct Dialogs::Impl {
                                                                     key.sym, key.modifiers))
                         startRecording(record, field, name);
                 });
-                if (defaults != defaultBindings().end()) {
-                    auto *reset = button(*actions, "Reset", [this, name, field] {
-                        stopRecording(false);
-                        model.settings.bindings[name] = defaultBindings().at(name);
-                        field->setValue(model.settings.bindings.at(name));
-                    });
-                    reset->inputArea()->setTabFocusKey("blastirc.settings.reset." + name);
-                }
+                auto *reset = button(*actions, "Reset", [this, name, field, defaultChord] {
+                    stopRecording(false);
+                    model.settings.bindings[name] = defaultChord;
+                    field->setValue(defaultChord);
+                });
+                reset->inputArea()->setTabFocusKey("blastirc.settings.reset." + name);
                 tasks->addChild(std::move(group));
             }
             if (category == 0 && tasks)
@@ -1943,6 +1922,10 @@ struct Dialogs::Impl {
             if (category == 2 && tasks)
                 label(*tasks, "Cycle spelling suggestions replaces the misspelled word at the "
                               "composer caret. Repeat the shortcut to try the next suggestion.");
+            if (category == static_cast<int>(BindingGroup::Irc) && tasks)
+                label(*tasks,
+                      "IRC shortcuts fill the composer without sending. Add any "
+                      "arguments and press Send when ready. Undo restores the previous draft.");
         }
         button(*page, "Restore default keymap", [this] {
             stopRecording(false);
@@ -3847,9 +3830,12 @@ struct Dialogs::Impl {
             std::string warning;
             for (auto first = model.settings.bindings.begin();
                  first != model.settings.bindings.end(); ++first) {
+                if (first->second.empty())
+                    continue;
                 for (auto second = std::next(first); second != model.settings.bindings.end();
                      ++second) {
-                    if (!ui_logic::bindingConflicts(first->second, second->second))
+                    if (second->second.empty() ||
+                        !ui_logic::bindingConflicts(first->second, second->second))
                         continue;
                     if (!warning.empty())
                         warning += '\n';

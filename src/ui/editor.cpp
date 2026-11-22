@@ -55,7 +55,8 @@ void shown(Node &node, bool visible) {
 }
 bool composerWritable(const Model &model, const std::string &id) {
     const auto buffer = model.buffers.find(id);
-    return buffer != model.buffers.end() && buffer->second.kind != "mentions";
+    return buffer != model.buffers.end() && buffer->second.kind != "mentions" &&
+           buffer->second.kind != "search";
 }
 float inputMinimumWidth(float scale) {
     // Preserve Noctalia Input's native 48-unit baseline and the scaled hit target.
@@ -408,6 +409,7 @@ struct EditorStore::Impl {
         void openLiteralCompletion();
         bool acceptCommandCompletion(size_t index);
         void updateUpload();
+        void requestUpload(Node &anchor, std::optional<InputArea::PointerData> pointer = {});
         bool acceptCompletion(size_t index);
         std::string help() const;
         void fit(Renderer &, const LayoutConstraints &);
@@ -980,9 +982,13 @@ void EditorStore::Impl::paste(Composer &view) {
     }
 }
 bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
+    constexpr std::string_view prefillPrefix = "prefill-command:";
+    const bool prefill = op.starts_with(prefillPrefix) && op.size() > prefillPrefix.size() + 1 &&
+                         op[prefillPrefix.size()] == '/';
+    const bool composerAction = prefill || op == "toggle-formatting" || op == "upload";
     if (const auto buffer = model.buffers.find(pane.buffer);
         buffer != model.buffers.end() && buffer->second.kind == "mentions")
-        return false;
+        return composerAction;
     if (op.starts_with("insert-nick:")) {
         insert(pane, std::string(op.substr(12)) + ": ");
         return true;
@@ -993,18 +999,34 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
     }
     auto view = std::find_if(views.begin(), views.end(),
                              [&](const Composer *v) { return v->pane.id == pane.id; });
-    if (op == "prefill-nick") {
-        if (!composerWritable(model, pane.buffer) || view == views.end())
+    if (composerAction) {
+        if (!composerWritable(model, pane.buffer) || view == views.end() ||
+            (*view)->buffer != pane.buffer || !visibleInScene(**view))
             return true;
         auto &composer = **view;
-        if (composer.input->composing() || !composer.paste.empty()) {
-            model.status = "Finish composition or paste review before changing your nickname.";
+        if (op == "toggle-formatting") {
+            composer.toggleFormatting();
+            return true;
+        }
+        if (op == "upload") {
+            composer.requestUpload(*composer.input);
+            return true;
+        }
+        if (std::any_of(views.begin(), views.end(), [&](const Composer *v) {
+                return v->buffer == pane.buffer && (v->input->composing() || !v->paste.empty());
+            })) {
+            model.status = "Finish composition or paste review before prefilling a command.";
             return true;
         }
         auto &d = draft(pane.buffer);
         recover(pane.buffer, d);
         ui_logic::Editor edit;
-        edit.text = "/nick ";
+        const auto command = op.substr(prefillPrefix.size());
+        edit.text.reserve(command.size() + 1);
+        edit.text = command;
+        edit.text.push_back(' ');
+        if (!valid(committed(d.state).value, edit.text))
+            return true;
         edit.cursor = edit.anchor = edit.text.size();
         apply(pane.buffer, d, std::move(edit), pane.id);
         pane.focusComposer = true;
@@ -2199,6 +2221,13 @@ void EditorStore::Impl::Composer::toggleFormatting() {
     updateCompletion(true);
     markLayoutDirty();
 }
+void EditorStore::Impl::Composer::requestUpload(Node &anchor,
+                                               std::optional<InputArea::PointerData> pointer) {
+    if (!input->value().empty() || input->composing() || buffer != pane.buffer ||
+        !composerWritable(owner.model, buffer) || !owner.onUploadRequested)
+        return;
+    owner.onUploadRequested(pane.id, buffer, anchor, std::move(pointer));
+}
 void EditorStore::Impl::Composer::hideCompletion() {
     literalCompletion = false;
     predictedWord.clear();
@@ -2905,20 +2934,13 @@ EditorStore::Impl::Composer::Composer(Impl &impl, PaneState &state)
     toolbar->setAlign(FlexAlign::Start);
     input->setFlexGrow(1);
     toolbar->addChild(std::move(field));
-    uploadButton = iconButton(*toolbar, "paperclip", "Upload file", [this] {
-        if (!input->value().empty() || input->composing() || buffer != pane.buffer ||
-            !owner.model.buffers.contains(buffer) || !owner.onUploadRequested)
-            return;
-        owner.onUploadRequested(pane.id, buffer, *uploadButton, std::nullopt);
-    });
+    uploadButton = iconButton(*toolbar, "paperclip", "Upload file",
+                              [this] { requestUpload(*uploadButton); });
     uploadButton->setParticipatesInLayout(false);
     uploadButton->inputArea()->setTabFocusKey(focusKey("upload"));
     uploadButton->inputArea()->setFocusOnPointerPress(false);
     uploadButton->inputArea()->setOnClick([this](const InputArea::PointerData &pointer) {
-        if (!input->value().empty() || input->composing() || buffer != pane.buffer ||
-            !owner.model.buffers.contains(buffer) || !owner.onUploadRequested)
-            return;
-        owner.onUploadRequested(pane.id, buffer, *uploadButton, pointer);
+        requestUpload(*uploadButton, pointer);
     });
     formatButton =
         iconButton(*toolbar, "plus", "Formatting toolbar", [this] { toggleFormatting(); });

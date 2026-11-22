@@ -1,5 +1,6 @@
 #include "storage.hpp"
 #include "irc/protocol.hpp"
+#include "key_bindings.hpp"
 #include "ui/logic.hpp"
 #include <algorithm>
 #include <cctype>
@@ -442,60 +443,7 @@ Settings defaults() {
           "action", "notice", "boom",     "rumble",     "ding",      "blip",   "tick",
           "whoosh", "click",  "pop",      "hush",       "power_down"})
         settings.cues.emplace(cue, Cue{});
-    settings.bindings = {{"switch-buffer", "C-x b"},
-                         {"execute-command", "M-x"},
-                         {"jump-channel", "C-x j"},
-                         {"next-activity", "C-SPC"},
-                         {"conversation-back", "C-o"},
-                         {"conversation-forward", "C-i"},
-                         {"cancel", "C-g"},
-                         {"search", "C-s"},
-                         {"settings", "C-,"},
-                         {"toggle-people", ""},
-                         {"toggle-navigation", ""},
-                         {"toggle-fools", "C-x f"},
-                         {"show-fools", ""},
-                         {"hide-fools", ""},
-                         {"global-mentions", ""},
-                         {"send", "RET"},
-                         {"newline", "S-RET"},
-                         {"message-prev", "C-p"},
-                         {"message-next", "C-n"},
-                         {"scroll-up", "PRIOR"},
-                         {"scroll-down", "NEXT"},
-                         {"message-reply", "C-r"},
-                         {"message-react", "C-e"},
-                         {"beginning-of-line", "C-a"},
-                         {"end-of-line", ""},
-                         {"backward-char", "C-b"},
-                         {"forward-char", "C-f"},
-                         {"beginning-of-buffer", "M-<"},
-                         {"end-of-buffer", "M->"},
-                         {"kill-word", "M-d"},
-                         {"backward-kill-word", "M-BACKSPACE"},
-                         {"previous-line", ""},
-                         {"next-line", ""},
-                         {"backward-word", "M-b"},
-                         {"forward-word", "M-f"},
-                         {"delete-char", "C-d"},
-                         {"backward-delete", "BACKSPACE"},
-                         {"kill-line", "C-k"},
-                         {"backward-kill-line", ""},
-                         {"transpose-chars", "C-t"},
-                         {"kill-region", "C-w"},
-                         {"copy-region", "M-w"},
-                         {"yank", "C-y"},
-                         {"cycle-spelling", "C-;"},
-                         {"undo", "C-/"},
-                         {"redo", ""},
-                         {"copy", ""},
-                         {"cut", ""},
-                         {"paste", ""},
-                         {"select-all", ""},
-                         {"set-mark", "C-S-SPC"},
-                         {"history-previous", "M-p"},
-                         {"history-next", "M-n"},
-                         {"complete", "TAB"}};
+    settings.bindings = defaultBindings();
     return settings;
 }
 void range(float value, float low, float high, const char *name) {

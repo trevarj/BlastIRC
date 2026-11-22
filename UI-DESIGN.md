@@ -327,6 +327,12 @@ meson setup build-native --wrap-mode=nodownload \
   -Ddictionary_dir="$BLASTIRC_SPELL_DICT_DIR" \
   -Dwordlist_file="$BLASTIRC_WORDLIST_FILE"
 meson compile -C build-native
+```
+
+To run checks, use `nix flake check` or opt in to the local Meson targets:
+
+```sh
+meson setup --reconfigure build-native -Dtests=true
 meson test -C build-native --num-processes 1 --print-errorlogs
 ```
 
@@ -334,7 +340,7 @@ Outside Nix, supply `-Dwordlist_file=/absolute/path/to/prior.tsv` when configuri
 
 Existing builds normally regenerate automatically; when migrating a build directory from `subprojects/` to `vendor/`, rerun the setup command with `--wipe` to discard cached subproject paths and options.
 
-For app-only iterations, run `meson compile -C build-native blastirc`; the default build also refreshes checks. The app and native UI checks share common compilation when assertion flags match; assertion-disabling configurations retain separately compiled, assertion-enabled check objects. Nix supplies runtime paths for dynamically loaded libheif and Hunspell dictionary data without listing either as a compiler input.
+Default Meson and Nix builds compile only the app, not the regression executables or the network probe. To switch an existing local build back to app-only mode after running checks, run `meson configure build-native -Dtests=false`. With checks enabled, `meson compile -C build-native blastirc` still builds only the app. The app and native UI checks share common compilation when assertion flags match; assertion-disabling configurations retain separately compiled, assertion-enabled check objects. Nix supplies runtime paths for dynamically loaded libheif and Hunspell dictionary data without listing either as a compiler input.
 
 Use `tests/gui_smoke.py` against its private IRC servers and owned headless Sway compositor for actual native interaction, real-wire routing, SQLite/draft persistence, sidebar modes/resizing, per-channel message styles, and restart. `tests/dpi_smoke.py` exercises one native window through compositor density changes. Read each script's current help for scopes; obsolete split/dock/drag probes are not acceptance for this layout.
 

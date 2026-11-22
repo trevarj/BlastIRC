@@ -109,9 +109,7 @@
         pkg-config
         wayland-scanner
       ];
-    in
-    {
-      packages.${system}.default = pkgs.stdenv.mkDerivation {
+      blastirc = pkgs.stdenv.mkDerivation {
         pname = "blastirc";
         version = "0.1.0";
         meta.license = with pkgs.lib.licenses; [
@@ -150,20 +148,11 @@
         buildInputs = dependencies;
         mesonBuildType = "release";
         mesonFlags = [
-          "-Dtests=true"
           "-Dfont_dir=${pkgs.nerd-fonts.jetbrains-mono}/share/fonts"
           "-Demoji_dir=${pkgs.noto-fonts-color-emoji}/share/fonts"
           "-Ddictionary_dir=${pkgs.hunspellDicts.en_US}/share/hunspell"
           "-Dwordlist_file=${completionWordlist}/share/dict/wordfreq-en-small.tsv"
         ];
-        doCheck = true;
-        preCheck = ''
-          export XDG_CACHE_HOME="$TMPDIR/blastirc-test-cache"
-          export XDG_CONFIG_HOME="$TMPDIR/blastirc-test-config"
-          export XDG_DATA_HOME="$TMPDIR/blastirc-test-data"
-          mkdir -m 700 -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
-          export FONTCONFIG_FILE="${fallbackFonts}"
-        '';
         postInstall = ''
           install -Dm644 ${pkgs.hunspellDicts.en_US}/share/doc/hunspell-dict-en-us-wordlist.txt \
             $out/share/licenses/blastirc/hunspell-en_US-README.txt
@@ -183,6 +172,20 @@
             --replace-fail 'dirname --' '${pkgs.coreutils}/bin/dirname --'
         '';
       };
+    in
+    {
+      packages.${system}.default = blastirc;
+      checks.${system}.regression = blastirc.overrideAttrs (old: {
+        mesonFlags = old.mesonFlags ++ [ "-Dtests=true" ];
+        doCheck = true;
+        preCheck = ''
+          export XDG_CACHE_HOME="$TMPDIR/blastirc-test-cache"
+          export XDG_CONFIG_HOME="$TMPDIR/blastirc-test-config"
+          export XDG_DATA_HOME="$TMPDIR/blastirc-test-data"
+          mkdir -m 700 -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
+          export FONTCONFIG_FILE="${fallbackFonts}"
+        '';
+      });
       devShells.${system} = {
         icon-studio = pkgs.mkShellNoCC {
           packages = [
@@ -233,7 +236,7 @@
             printf '%s\n' \
               'Configure: meson setup build-native --wrap-mode=nodownload -Dfont_dir="$BLASTIRC_FONT_DIR" -Demoji_dir="$BLASTIRC_EMOJI_DIR" -Ddictionary_dir="$BLASTIRC_SPELL_DICT_DIR" -Dwordlist_file="$BLASTIRC_WORDLIST_FILE"' \
               'Build: meson compile -C build-native' \
-              'Checks: meson test -C build-native --print-errorlogs' \
+              'Checks: nix flake check (or meson setup --reconfigure build-native -Dtests=true before meson test)' \
               'Package: nix build path:.#default'
           '';
         };

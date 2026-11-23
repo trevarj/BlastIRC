@@ -2942,7 +2942,7 @@ void titlebarGeometryCheck() {
         assert(status && visible(*status));
         const float footerTop = 1000 - (compact ? 32.f : 40.f) * scale;
         assert(std::abs(paneY + paneFor(*composer)->height() - (footerTop - 10 * scale)) < .1f);
-        assert(std::abs(pointerPoint(*status)[1] - (footerTop + 1000) / 2) < .5f);
+        assert(std::abs(pointerPoint(*status)[1] - (footerTop + 1 + 1000) / 2) < .1f);
         const auto naturalTitle =
             renderer.measureText(title->text(), title->fontSize(), title->font(), 0, 1,
                                  title->textAlign(), title->ellipsize(), false);

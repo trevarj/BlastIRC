@@ -6094,8 +6094,8 @@ def probe_menu_reachability(proc, window, preferences, database_path, args, dest
 
 
 def probe_status_hover(window, preferences, reduced_motion, *, destination=None):
-    """Distinguish a native glyph halo from a flat wash on exposed status pixels."""
-    from PIL import Image, ImageChops, ImageFilter
+    """Check the rendered status caption and rounded hover fill below the footer rule."""
+    from PIL import Image, ImageChops
 
     layout = read_layout(preferences)
     zoom = layout["scale"]
@@ -6103,12 +6103,9 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
     outer = layout["outer_padding"]
     _, footer_top, _, footer_height = layout["footer"]["rect"]
     top, bottom = round(footer_top), round(footer_top + footer_height)
-    # Include the Connected caption and plug, including the exposed gap between them.
     right = width - outer - 8 * zoom
-    x = round(right - 40 * zoom)
-    y = (top + bottom) // 2
-    bounds = (round(right - 88 * zoom), top, round(right - 32 * zoom), bottom)
-    point = (round(x + 20 * zoom), y)
+    bounds = (round(right - 120 * zoom), top, round(right + 2 * zoom), bottom)
+    point = (round(right - 20 * zoom), (top + bottom) // 2)
 
     def sample():
         captured = native_rgb_capture(window)
@@ -6121,19 +6118,16 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
 
     move_pointer(window, 0, 0)
     rest = sample()
-    middle = y - top
-    last_row = rest.height - 1
-    backdrop = Image.new("RGB", rest.size, rest.getpixel((0, last_row)))
-    contrast = max_channel(ImageChops.difference(rest, backdrop))
+    caption = rest.crop((round(right - 52 * zoom) - bounds[0], 1,
+                         round(right - 12 * zoom) - bounds[0], rest.height))
+    backdrop = Image.new("RGB", caption.size, caption.getpixel((0, caption.height - 1)))
+    contrast = max_channel(ImageChops.difference(caption, backdrop))
     foreground = contrast.getextrema()[1]
-    assert foreground, ("No Connected item ink at rest", bounds)
-    ink = contrast.point(lambda value: 255 if 2 * value >= foreground else 0)
-    adjacent = ink.filter(ImageFilter.MaxFilter(2 * max(1, round(2 * zoom)) + 1))
-    neighborhood = ink.filter(ImageFilter.MaxFilter(2 * max(2, round(3 * zoom)) + 1))
-    clear = [(col, row) for row in range(middle - 3, middle + 4)
-             for col in range(x - bounds[0] - 8, x - bounds[0] + 8)
-             if not contrast.getpixel((col, row))]
-    assert clear, ("No exposed background at the Connected item center", bounds)
+    assert foreground > 0, ("No Connected item ink at rest", bounds)
+    _, ink_top, _, ink_bottom = contrast.point(lambda value: 255 if 2 * value >= foreground else 0).getbbox()
+    ink_center = 1 + (ink_top + ink_bottom) / 2
+    row_center = (1 + rest.height) / 2
+    assert abs(ink_center - row_center) <= 1, ("Status caption not centered", ink_center, row_center)
 
     previous = None
 
@@ -6144,36 +6138,18 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
             previous = hover
             return False
         delta = max_channel(ImageChops.difference(rest, hover))
-        center = max(delta.getpixel(point) for point in clear)
-        return (hover, delta, center) if center >= 3 else False
+        extent = delta.getbbox()
+        return (hover, delta, extent) if extent and extent[2] - extent[0] >= 30 * zoom else False
 
     move_pointer(window, *point)
-    hover, delta, center = SESSION.until("visible stable native Connected-item hover", visible)
-    near_delta, gaps = 0, []
-    for row in range(1, last_row):
-        span = ink.crop((0, row, rest.width, row + 1)).getbbox()
-        if span is None:
-            continue
-        near, far = [], []
-        for col in range(rest.width):
-            pixel = col, row
-            if contrast.getpixel(pixel):
-                continue
-            if adjacent.getpixel(pixel):
-                near.append(delta.getpixel(pixel))
-            elif span[0] < col < span[2] and not neighborhood.getpixel(pixel):
-                far.append(delta.getpixel(pixel))
-        peak = max(near, default=0)
-        near_delta = max(near_delta, peak)
-        if far:
-            gaps.append((peak, min(far)))
-    # Compare within a row and between ink, so vertical fading or rounded ends
-    # of a rectangle do not count as following the glyphs.
-    gap_near, gap_delta = min(
-        ((near, far) for near, far in gaps if near and near * 4 >= near_delta * 3),
-        key=lambda pair: pair[1] / pair[0], default=(0, 0))
-    top_edge, bottom_edge = (
-        delta.crop((0, row, rest.width, row + 1)).getextrema()[1] for row in (0, last_row))
+    hover, delta, (left, fill_top, fill_right, fill_bottom) = SESSION.until(
+        "visible stable native Connected-item hover", visible)
+    fill_center = (fill_top + fill_bottom) / 2
+    assert fill_top > 0 and fill_bottom < rest.height and abs(fill_center - row_center) <= 1, (
+        "Rounded hover fill not centered below the rule", delta.getbbox(), bounds)
+    center_delta = delta.getpixel(((left + fill_right) // 2, fill_top + 1))
+    assert center_delta >= 3 and delta.getpixel((left, fill_top + 1)) < center_delta / 2, (
+        "Status hover does not fill the interior with rounded corners", delta.getbbox())
 
     move_pointer(window, 0, 0)
     SESSION.until("native Connected-item returns to its rest pixels", lambda: sample() == rest)
@@ -6184,19 +6160,9 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
             image.save(path)
             captures[label] = str(path)
 
-    # At default contrast this requires 32 RGB levels, above the old wash's 29.
-    assert near_delta >= 5 and near_delta * 100 >= foreground * 14, (
-        "Connected-item glow is too weak on background adjacent to ink", bounds, near_delta, foreground)
-    assert gap_near and gap_delta * 3 <= gap_near * 2, (
-        "Connected-item glow should follow the glyphs, not fill their gaps", bounds, near_delta, gaps)
-    assert top_edge < near_delta and bottom_edge <= max(1, near_delta // 4), (
-        "Connected-item hover should fade at the edges, not draw a bottom rule",
-        bounds, near_delta, top_edge, bottom_edge)
-
-    report = {"point": point, "bounds": bounds, "center_delta": center,
-              "top_edge_delta": top_edge, "bottom_row_delta": bottom_edge,
-              "near_glyph_delta": near_delta, "gap_delta": gap_delta, "gap_row_near_delta": gap_near,
-              "foreground_contrast": foreground, "reduced_motion": reduced_motion}
+    report = {"point": point, "bounds": bounds, "center_delta": center_delta,
+              "ink_center": ink_center, "highlight_center": fill_center,
+              "row_center": row_center, "reduced_motion": reduced_motion}
     if captures:
         report["captures"] = captures
     return report

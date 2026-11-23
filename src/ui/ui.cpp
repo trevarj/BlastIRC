@@ -4143,10 +4143,11 @@ void Ui::Impl::refresh(bool panelResize) {
     const auto previousNavigation = navigationMode, previousPeople = peopleMode;
     navigationRegularMode = workspace.navigationMode;
     peopleRegularMode = channel ? model.settings.peopleMode : SidebarMode::Hidden;
+    constexpr float footerRuleHeight = 1.f;
     const float footerHeight = outer + (tight ? 22.f : compact ? 24.f : 28.f) * scale;
     const float footerTop = height - footerHeight;
     const float footerGap = (tight ? 4.f : 10.f) * scale;
-    place(*footerDivider, 0, footerTop, width, 1.f);
+    place(*footerDivider, 0, footerTop, width, footerRuleHeight);
     footerDivider->setFill(chromeDivider);
     const float contentTop = titleHeight + outer;
     const float contentHeight = std::max(1.f, footerTop - footerGap - contentTop);
@@ -4346,7 +4347,8 @@ void Ui::Impl::refresh(bool panelResize) {
     restoreJumpFocus(false);
     syncUploadPanel();
     modeLine->sync(scale, navigationMode, chord, statusControlsAvailable());
-    place(*modeLine, outer, footerTop, std::max(0.f, width - 2 * outer), footerHeight);
+    place(*modeLine, outer, footerTop + footerRuleHeight, std::max(0.f, width - 2 * outer),
+          footerHeight - footerRuleHeight);
     if (windowActive)
         repairFocus();
     if (paletteOpen && !commandMode) {

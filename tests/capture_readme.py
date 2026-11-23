@@ -120,6 +120,14 @@ def main():
                                ("XDG_STATE_HOME", "state"), ("XDG_CACHE_HOME", "cache")):
             (tmp / directory).mkdir(mode=0o700)
             env[key] = str(tmp / directory)
+        if fontconfig := env.get("BLASTIRC_SCREENSHOT_FONTCONFIG"):
+            env["FONTCONFIG_FILE"] = fontconfig
+            for variable in ("FONTCONFIG_PATH", "FONTCONFIG_SYSROOT"):
+                env.pop(variable, None)
+        font = subprocess.check_output(["fc-match", "-f", "%{family}", "Iosevka"],
+                                       env=env, text=True, timeout=5)
+        if "Iosevka" not in font.split(","):
+            parser.error("Iosevka is required; run the capture with nix develop")
         config = tmp / "config/blastirc"
         config.mkdir(mode=0o700)
         server = cleanup.enter_context(socketserver.ThreadingTCPServer(("127.0.0.1", 0), DemoIRC))
@@ -148,6 +156,8 @@ channels = {json.dumps([target for target in CHATS if target.startswith('#')])}
 [appearance]
 scale = 1.0
 message_scale = 1.05
+ui_font = "Iosevka"
+message_font = "Iosevka"
 avatar_style = "sprite"
 reduced_motion = true
 theme_source = "builtin"

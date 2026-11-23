@@ -43,6 +43,4 @@ For soju, choose **Add soju account** in **Settings → Networks**, enter the bo
 
 ![Chats picker listing channels and direct messages](assets/screenshot-chats.png)
 
-All screenshots use fictional conversations. After [building the native client](UI-DESIGN.md#verification-contract), regenerate them with `nix develop -c python3 tests/capture_readme.py`.
-
 [MIT license](LICENSE) · [Development and design](UI-DESIGN.md)

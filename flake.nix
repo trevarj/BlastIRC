@@ -107,6 +107,14 @@
           "${pkgs.nerd-fonts.jetbrains-mono}/share/fonts"
         ];
       };
+      screenshotFonts = pkgs.makeFontsConf {
+        includes = [ "${pkgs.fontconfig.out}/etc/fonts/conf.d" ];
+        impureFontDirectories = [ ];
+        fontDirectories = [
+          "${pkgs.iosevka-bin}/share/fonts"
+          "${pkgs.noto-fonts-color-emoji}/share/fonts"
+        ];
+      };
       nativeTools = with pkgs; [
         meson
         ninja
@@ -299,6 +307,7 @@
             ]);
           BLASTIRC_FONT_DIR = "${pkgs.nerd-fonts.jetbrains-mono}/share/fonts";
           BLASTIRC_EMOJI_DIR = "${pkgs.noto-fonts-color-emoji}/share/fonts";
+          BLASTIRC_SCREENSHOT_FONTCONFIG = "${screenshotFonts}";
           BLASTIRC_SPELL_DICT_DIR = "${pkgs.hunspellDicts.en_US}/share/hunspell";
           BLASTIRC_WORDLIST_FILE = "${completionWordlist}/share/dict/wordfreq-en-small.tsv";
           BLASTIRC_PORTAL = "${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal";

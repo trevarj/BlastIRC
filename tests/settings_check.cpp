@@ -354,7 +354,7 @@ void settingsTreeControls() {
     using namespace blast;
     Model model;
     model.firstRun = false;
-    model.settings.bindings = {{"complete", "M-F6"}, {"custom-action", "C-F10"}};
+    model.settings.bindings = {{"complete", "M-F6"}, {"custom-action", "M-F6 F8"}};
     model.settings.cues["mention"] = {true, .5f, 1.f};
     model.identities.push_back({"tree", "TreeNick", "treeuser", "Tree User", {}, {}, {}});
     ServerConfig server;
@@ -409,7 +409,11 @@ void settingsTreeControls() {
                 assert(dynamic_cast<Button *>(
                     keyed(dialogs, "blastirc.settings.reset." + name)->parent()));
             }
-            assert(model.settings.bindings.at("custom-action") == "C-F10");
+            assert(model.settings.bindings.at("custom-action") == "M-F6 F8");
+            assert(find<Label>(dialogs, [](const Label &caption) {
+                return caption.text() ==
+                       "Complete nickname or command / custom-action: overlapping shortcuts";
+            }));
             assert(!find<InputArea>(dialogs, [](const InputArea &area) {
                 return area.tabFocusKey() == "blastirc.settings.binding.custom-action";
             }));
@@ -1705,6 +1709,7 @@ void runSettingsCheck() {
     press(dispatcher, *button(*bindingRow, "Reset"));
     assert(model.settings.bindings.at("complete") == defaultBindings().at("complete"));
     edit(dispatcher, *bindingField, "M-F6");
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
     assert(model.settings.bindings.at("complete") == "M-F6");
     assert(commandLabel(model, "Complete", "complete").find("M-F6") != std::string::npos);
     assert(defaultBindings().at("cycle-spelling") == "C-;");
@@ -1729,11 +1734,56 @@ void runSettingsCheck() {
             break;
         }
     assert(editingGroup);
+    const auto rejectedBinding = [&](std::string_view command) {
+        return find<Label>(*spellingField->parent(), [&](const Label &caption) {
+            return caption.text() == "Shortcut not applied: conflicts with " +
+                                         std::string(commandDisplayName(command)) + ".";
+        });
+    };
+    const auto beforeDuplicate = model.settings.bindings;
+    edit(dispatcher, *spellingField, "M-F");
+    assert(model.settings.bindings == beforeDuplicate && spellingField->insertText("6"));
+    assert(model.settings.bindings == beforeDuplicate && spellingField->invalid() &&
+           rejectedBinding("complete"));
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    assert(spellingField->value() == beforeDuplicate.at("cycle-spelling") &&
+           !spellingField->invalid() && dispatcher.focusedArea() == spellingField->inputArea());
+
+    // A conflicting prefix is still editable and may become a distinct chord.
+    edit(dispatcher, *spellingField, "C-x");
+    assert(model.settings.bindings == beforeDuplicate && spellingField->invalid() &&
+           rejectedBinding("jump-channel"));
+    assert(spellingField->insertText(" F9"));
+    assert(model.settings.bindings == beforeDuplicate && !spellingField->invalid() &&
+           !rejectedBinding("jump-channel"));
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    assert(model.settings.bindings.at("cycle-spelling") == "C-x F9");
     edit(dispatcher, *spellingField, "M-F6");
-    assert(model.settings.bindings.at("cycle-spelling") == "M-F6");
+    dispatcher.setFocus(spellingRecord);
+    assert(spellingField->value() == "C-x F9" && !spellingField->invalid() &&
+           model.settings.bindings.at("cycle-spelling") == "C-x F9");
+
+    const auto beforeRecordedConflict = model.settings.bindings;
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    assert(spellingRecord->capturesAllKeys());
+    assert(dialogs.handleKey(stroke(XKB_KEY_Return)));
+    assert(dialogs.handleKey(stroke(XKB_KEY_F9)));
+    assert(dialogs.handleKey(stroke(XKB_KEY_Return, KeyMod::Ctrl)));
+    assert(model.settings.bindings == beforeRecordedConflict &&
+           spellingField->value() == "C-x F9" && rejectedBinding("send") &&
+           !spellingRecord->capturesAllKeys());
+
+    edit(dispatcher, *bindingField, "C-;");
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    assert(model.settings.bindings.at("complete") == "C-;");
+    const auto beforeResetConflict = model.settings.bindings;
     press(dispatcher, *button(*spellingField->parent()->parent(), "Reset"));
-    assert(model.settings.bindings.at("cycle-spelling") == "C-;" &&
-           spellingField->value() == "C-;");
+    assert(model.settings.bindings == beforeResetConflict && spellingField->value() == "C-x F9" &&
+           rejectedBinding("complete"));
+    press(dispatcher, *button(dialogs, "Restore default keymap"));
+    assert(model.settings.bindings == defaultBindings() &&
+           bindingField->value() == defaultBindings().at("complete") &&
+           spellingField->value() == "C-;" && !rejectedBinding("complete"));
 
     category(2);
     named<Select>(dialogs, "Presence rows")->setSelectedIndex(2);

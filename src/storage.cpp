@@ -921,39 +921,33 @@ void parseSettings(const toml::table &document, Settings &settings) {
           "close-tab", "next-tab", "style-modern", "style-glass", "style-hacker"})
         settings.bindings.erase(obsolete);
     std::erase_if(settings.bindings, [](const auto &entry) {
-        return entry.first.starts_with("aux-") || entry.first.starts_with("split-buffer:") ||
+        return entry.first.empty() || entry.first.starts_with("aux-") ||
+               entry.first.starts_with("split-buffer:") ||
                entry.first.starts_with("reorder-tab:") || entry.first.starts_with("select-tab:") ||
                entry.first.starts_with("select-tab-keyboard:") ||
                entry.first.starts_with("close-tab:");
     });
     const auto *savedBindings = table(document, "bindings");
-    if ((!savedBindings || !savedBindings->contains("jump-channel")) &&
-        std::any_of(settings.bindings.begin(), settings.bindings.end(), [](const auto &entry) {
-            return entry.first != "jump-channel" &&
-                   ui_logic::bindingConflicts("C-x j", entry.second);
-        }))
-        settings.bindings.at("jump-channel").clear();
-    ui_logic::migrateMessageBindings(settings.bindings, [&](std::string_view name) {
+    const auto hasSavedBinding = [&](std::string_view name) {
         return savedBindings && savedBindings->contains(name);
-    });
-    if ((!savedBindings || !savedBindings->contains("transpose-chars")) &&
-        std::any_of(settings.bindings.begin(), settings.bindings.end(), [](const auto &entry) {
-            return entry.first != "transpose-chars" &&
-                   ui_logic::bindingConflicts("C-t", entry.second);
-        }))
-        settings.bindings.at("transpose-chars").clear();
-    ui_logic::migrateActivityBinding(settings.bindings, [&](std::string_view name) {
-        return savedBindings && savedBindings->contains(name);
-    });
-    for (const char *name : {"conversation-back", "conversation-forward", "cycle-spelling"}) {
-        if (savedBindings && savedBindings->contains(name))
-            continue;
-        auto &binding = settings.bindings.at(name);
-        if (std::any_of(settings.bindings.begin(), settings.bindings.end(), [&](const auto &entry) {
-                return entry.first != name && ui_logic::bindingConflicts(binding, entry.second);
-            }))
-            binding.clear();
+    };
+    // Explicit chords take precedence over stock chords, even for unknown commands.
+    // Clear shadowed defaults first so they cannot block a legacy migration.
+    if (savedBindings && !savedBindings->empty()) {
+        for (auto &[name, binding] : settings.bindings) {
+            if (binding.empty() || hasSavedBinding(name))
+                continue;
+            if (std::any_of(settings.bindings.begin(), settings.bindings.end(),
+                            [&](const auto &entry) {
+                                return !entry.second.empty() && hasSavedBinding(entry.first) &&
+                                       ui_logic::bindingConflicts(binding, entry.second);
+                            }))
+                binding.clear();
+        }
     }
+    // Each migration checks new chords against the remaining bindings before assigning them.
+    ui_logic::migrateMessageBindings(settings.bindings, hasSavedBinding);
+    ui_logic::migrateActivityBinding(settings.bindings, hasSavedBinding);
     stringMap(document, "nick_colors", settings.nickColors);
     if (const auto *row = table(document, "workspace")) {
         if (const auto *node = row->get("people_mode")) {

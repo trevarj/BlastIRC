@@ -288,7 +288,11 @@ struct Dialogs::Impl {
     std::vector<SearchTarget> searchTargets;
     std::vector<std::size_t> rankedTargets;
     std::array<Flex *, 7> categoryPages{};
-    std::map<std::string, Input *> bindingFields;
+    struct BindingControls {
+        Input *field;
+        Label *warning;
+    };
+    std::map<std::string, BindingControls> bindingControls;
     Label *bindingConflicts = nullptr;
     std::map<std::string, std::string> lastConflictBindings;
     Select *categoryPicker = nullptr;
@@ -307,7 +311,7 @@ struct Dialogs::Impl {
     std::uint64_t profileRevision = 0;
     Button *recordingButton = nullptr;
     Input *recordingField = nullptr;
-    std::string recordingName, recordedStrokes, originalChord;
+    std::string recordingName, recordedStrokes;
     Flex *page = nullptr;
     Label *feedback = nullptr;
     Label *applicationStatus = nullptr;
@@ -1027,6 +1031,46 @@ struct Dialogs::Impl {
         applyLocation();
     }
 
+    std::string_view appliedBinding(const std::string &name) const {
+        const auto &bindings = model.settings.bindings;
+        const auto configured = bindings.find(name);
+        return configured == bindings.end() ? bindingCommands().at(name).defaultChord
+                                            : std::string_view(configured->second);
+    }
+
+    void restoreBindingField(Input &field, const std::string &name) {
+        const auto applied = appliedBinding(name);
+        if (field.value() != applied)
+            field.setValue(applied);
+        field.setInvalid(false);
+    }
+
+    static void showBindingWarning(Label &warning, std::string_view text) {
+        warning.setText(text);
+        warning.setVisible(!text.empty());
+        warning.setParticipatesInLayout(!text.empty());
+    }
+
+    void changeBinding(const std::string &name, std::string_view candidate, bool editing = false) {
+        const auto &[field, warning] = bindingControls.at(name);
+        auto &bindings = model.settings.bindings;
+        const auto conflict = ui_logic::bindingConflict(bindings, name, candidate);
+        if (conflict.empty()) {
+            if (!editing)
+                bindings.insert_or_assign(name, candidate);
+            showBindingWarning(*warning, "");
+        } else {
+            showBindingWarning(*warning, "Shortcut not applied: conflicts with " +
+                                             std::string(commandDisplayName(conflict)) + ".");
+            if (scroll)
+                scroll->requestScrollIntoView(field->parent()->parent());
+        }
+        if (editing)
+            field->setInvalid(!conflict.empty());
+        else
+            restoreBindingField(*field, name);
+    }
+
     void stopRecording(bool commit) {
         auto *control = std::exchange(recordingButton, nullptr);
         if (!control)
@@ -1034,16 +1078,13 @@ struct Dialogs::Impl {
         control->inputArea()->setCapturesAllKeys(false);
         control->setText("Record");
         control->setVariant(ButtonVariant::Default);
-        if (commit && !recordedStrokes.empty()) {
-            model.settings.bindings[recordingName] = recordedStrokes;
-            recordingField->setValue(recordedStrokes);
-        } else {
-            recordingField->setValue(originalChord);
-        }
+        if (commit && !recordedStrokes.empty())
+            changeBinding(recordingName, recordedStrokes);
+        else
+            restoreBindingField(*recordingField, recordingName);
         recordingField = nullptr;
         recordingName.clear();
         recordedStrokes.clear();
-        originalChord.clear();
     }
 
     void startRecording(Button *control, Input *field, const std::string &name) {
@@ -1051,7 +1092,6 @@ struct Dialogs::Impl {
         recordingButton = control;
         recordingField = field;
         recordingName = name;
-        originalChord = field->value();
         control->setText("Finish");
         control->setVariant(ButtonVariant::Primary);
         control->inputArea()->setCapturesAllKeys(true);
@@ -1112,7 +1152,7 @@ struct Dialogs::Impl {
         settingsResults = nullptr;
         searchTargets.clear();
         categoryPages.fill(nullptr);
-        bindingFields.clear();
+        bindingControls.clear();
         bindingConflicts = nullptr;
         topicTitle = nullptr;
         sections.clear();
@@ -1398,9 +1438,8 @@ struct Dialogs::Impl {
             std::erase_if(identityScopes, [&](const auto &scope) { return inside(scope.first); });
             std::erase_if(sharedIdentityFields,
                           [&](const auto &field) { return inside(field.control); });
-            if (tab == Tab::Keys) {
-                bindingFields.clear();
-            }
+            if (tab == Tab::Keys)
+                bindingControls.clear();
             if (tab == Tab::Servers) {
                 networkPicker = networkIdentityPicker = nullptr;
                 connectionStatus = sojuStatus = nullptr;
@@ -1427,7 +1466,7 @@ struct Dialogs::Impl {
         searchTargets.clear();
         sections.clear();
         categoryPages.fill(nullptr);
-        bindingFields.clear();
+        bindingControls.clear();
         bindingConflicts = nullptr;
         detach(page, *scroll->content());
         themeStatus = applicationStatus = motionStatus = soundStatus = cursorStatus =
@@ -1868,6 +1907,10 @@ struct Dialogs::Impl {
         static constexpr std::array ids{
             "keyboard.messaging", "keyboard.cursor",     "keyboard.editing", "keyboard.navigation",
             "keyboard.other",     "keyboard.formatting", "keyboard.irc"};
+        bindingConflicts = label(*page, "");
+        bindingConflicts->setColor(colorSpecFromRole(ColorRole::Error));
+        showBindingWarning(*bindingConflicts, "");
+        lastConflictBindings.clear();
         for (int category = 0; category < int(std::size(groups)); ++category) {
             Flex *tasks = nullptr;
             for (const auto &[name, command] : bindingCommands()) {
@@ -1883,14 +1926,9 @@ struct Dialogs::Impl {
                 group->setFillWidth(true);
                 group->setGap(8);
                 track(group.get(), MetricKind::Flex);
-                const auto configured = model.settings.bindings.find(name);
-                auto *field = text(*group, command.label,
-                                   configured == model.settings.bindings.end()
-                                       ? std::string(command.defaultChord)
-                                       : configured->second,
-                                   [this, name](const std::string &value) {
-                                       model.settings.bindings[name] = value;
-                                   });
+                auto *field = text(
+                    *group, command.label, appliedBinding(name),
+                    [this, name](const std::string &value) { changeBinding(name, value, true); });
                 auto *fieldGroup = dynamic_cast<Flex *>(field->parent());
                 fieldGroup->setFillWidth(false);
                 fieldGroup->setMinWidth(200);
@@ -1901,12 +1939,23 @@ struct Dialogs::Impl {
                         metric.maxWidth = 320;
                     }
                 fieldGroup->setFlexGrow(1);
-                bindingFields[name] = field;
+                auto *warning = label(*fieldGroup, "");
+                warning->setColor(colorSpecFromRole(ColorRole::Error));
+                showBindingWarning(*warning, "");
+                bindingControls.emplace(name, BindingControls{field, warning});
+                field->setSubmitOnFocusLoss(true);
+                field->setOnSubmit([this, field, name](const std::string &value) {
+                    if (value != appliedBinding(name))
+                        changeBinding(name, value);
+                    else
+                        field->setInvalid(false);
+                });
                 searchTargets.back().terms += " " + name;
                 field->inputArea()->setTabFocusKey("blastirc.settings.binding." + name);
                 field->inputArea()->setTooltip(
                     "Current binding for " + name +
-                    ". Space separates strokes; C = Control, M = Alt, S = Shift. "
+                    ". Enter or leave the field to apply. Space separates strokes; "
+                    "C = Control, M = Alt, S = Shift, Super = Windows key. "
                     "RET, TAB, SPC and BACKSPACE name special keys.");
                 auto *actions = row(*group, false);
                 actions->setFillWidth(false);
@@ -1939,10 +1988,9 @@ struct Dialogs::Impl {
                                                                     key.sym, key.modifiers))
                         startRecording(record, field, name);
                 });
-                auto *reset = button(*actions, "Reset", [this, name, field, defaultChord] {
+                auto *reset = button(*actions, "Reset", [this, name, defaultChord] {
                     stopRecording(false);
-                    model.settings.bindings[name] = defaultChord;
-                    field->setValue(defaultChord);
+                    changeBinding(name, defaultChord);
                 });
                 reset->inputArea()->setTabFocusKey("blastirc.settings.reset." + name);
                 tasks->addChild(std::move(group));
@@ -1962,12 +2010,11 @@ struct Dialogs::Impl {
         button(*page, "Restore default keymap", [this] {
             stopRecording(false);
             model.settings.bindings = defaultBindings();
-            for (const auto &[name, field] : bindingFields)
-                field->setValue(model.settings.bindings.at(name));
+            for (const auto &[name, controls] : bindingControls) {
+                restoreBindingField(*controls.field, name);
+                showBindingWarning(*controls.warning, "");
+            }
         });
-        bindingConflicts = label(*page, "");
-        bindingConflicts->setColor(colorSpecFromRole(ColorRole::Error));
-        lastConflictBindings.clear();
     }
 
     void effects() {
@@ -3873,12 +3920,10 @@ struct Dialogs::Impl {
                         warning += '\n';
                     warning += std::string(commandDisplayName(first->first)) + " / " +
                                std::string(commandDisplayName(second->first)) +
-                               ": overlapping sequence in the composer";
+                               ": overlapping shortcuts";
                 }
             }
-            bindingConflicts->setText(warning);
-            bindingConflicts->setVisible(!warning.empty());
-            bindingConflicts->setParticipatesInLayout(!warning.empty());
+            showBindingWarning(*bindingConflicts, warning);
         }
         if (topicTitle) {
             const auto found = model.buffers.find(topicBuffer);

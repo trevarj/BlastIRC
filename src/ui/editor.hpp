@@ -3,6 +3,7 @@
 #include "pane.hpp"
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <render/scene/input_area.h>
@@ -69,7 +70,8 @@ class EditorStore {
     bool handleCompletionKey(std::uint32_t sym, std::uint32_t modifiers);
     // Run before native traversal; IME text is distinct from disabled editing shortcuts.
     bool handleCompositionKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modifiers,
-                              bool preedit, bool handledRepeat);
+                              bool preedit, bool handledRepeat,
+                              const std::map<std::string, std::string> &bindings);
     // Inner native-logical width for the declared Input / Plus / Send minimums.
     static float minimumComposerWidth(float userScale);
     bool ownsFocus(const InputArea *) const;

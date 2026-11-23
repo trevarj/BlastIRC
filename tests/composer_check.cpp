@@ -47,6 +47,7 @@
 #include <ui/controls/scroll_view.h>
 #include <ui/controls/scrollbar.h>
 #include <ui/controls/select_popup_context.h>
+#include <utility>
 #include <variant>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
@@ -986,13 +987,14 @@ void checkComposerEditingCommands(Renderer &renderer) {
         execute(command);
         assert(input->editingStateMatches(composing));
         assert(composing.history->undo == imeUndo && composing.history->redo == imeRedo);
-        model.settings.bindings[command] = "C-F12 x";
-        assert(editors.handleCompositionKey(XKB_KEY_F12, 0, KeyMod::Ctrl, false, false));
-        assert(editors.handleCompositionKey('x', 'x', 0, false, false));
+        model.settings.bindings[command] = "c-f12 x";
+        const auto &bindings = model.settings.bindings;
+        assert(editors.handleCompositionKey(XKB_KEY_F12, 0, KeyMod::Ctrl, false, false, bindings));
+        assert(editors.handleCompositionKey('x', 'x', 0, false, false, bindings));
         assert(input->editingStateMatches(composing));
         model.settings.bindings.erase(command);
     }
-    assert(!editors.handleCompositionKey(0x732b, 0x732b, 0, true, false));
+    assert(!editors.handleCompositionKey(0x732b, 0x732b, 0, true, false, model.settings.bindings));
     assert(input->editingStateMatches(composing));
     input->textInputResetPreedit();
     dispatcher.setFocus(nullptr);
@@ -5929,11 +5931,13 @@ void runComposerNativeCheck() {
                 if (!ui.handleKey(key, physicalKey(sym)))
                     dispatcher.keyEvent(sym, utf32, modifiers, pressed, preedit);
             };
+            const auto previousComplete = std::exchange(model.settings.bindings.at("complete"), "");
             model.settings.bindings["paste"] = "TAB";
             for (const bool pressed : {true, false}) {
                 compositionKey(XKB_KEY_Tab, '\t', 0, pressed);
                 clipboardUnchanged();
             }
+            model.settings.bindings.at("complete") = previousComplete;
             model.settings.bindings["paste"] = "C-x p";
             const auto pastePrefix = [&] {
                 for (const auto &[sym, modifiers, pressed] :

@@ -3890,7 +3890,8 @@ void EditorStore::setOverlayHost(Node *host) {
         view->updateCompletion(true);
 }
 bool EditorStore::handleCompositionKey(std::uint32_t sym, std::uint32_t utf32,
-                                       std::uint32_t modifiers, bool preedit, bool handledRepeat) {
+                                       std::uint32_t modifiers, bool preedit, bool handledRepeat,
+                                       const std::map<std::string, std::string> &bindings) {
     auto &store = *impl_;
     const auto *area = store.dispatcher ? store.dispatcher->focusedArea() : nullptr;
     const auto *native = area ? dynamic_cast<const Input *>(area->textInputClient()) : nullptr;
@@ -3928,7 +3929,7 @@ bool EditorStore::handleCompositionKey(std::uint32_t sym, std::uint32_t utf32,
         key.modifiers = modifiers;
         key.pressed = true;
         key.preedit = preedit;
-        const auto stroke = ui_logic::canonical(bindingStroke(key));
+        const auto stroke = bindingStroke(key);
         if (KeySymbol::isEscape(sym) || stroke == "c-g") {
             view->compositionChord.clear();
             return false;
@@ -3937,16 +3938,17 @@ bool EditorStore::handleCompositionKey(std::uint32_t sym, std::uint32_t utf32,
             return false;
         const bool pending = !view->compositionChord.empty();
         const auto full = pending ? view->compositionChord + " " + stroke : stroke;
+        const auto prefixKey = full + " ";
         bool prefix = false, messagePrefix = false;
         for (const auto *command :
              {"message-prev", "message-next", "message-reply", "message-react", "conversation-back",
               "conversation-forward", "next-activity", "scroll-up", "scroll-down",
               "beginning-of-buffer", "end-of-buffer", "paste", "yank", "transpose-chars",
               "backward-kill-line", "redo", "copy", "cut", "select-all"}) {
-            const auto binding = store.model.settings.bindings.find(command);
-            if (binding == store.model.settings.bindings.end())
+            const auto binding = bindings.find(command);
+            if (binding == bindings.end())
                 continue;
-            const auto candidate = ui_logic::canonical(binding->second);
+            const auto &candidate = binding->second;
             const bool message = std::string_view(command).starts_with("message-");
             if (candidate == full) {
                 if (message)
@@ -3955,7 +3957,7 @@ bool EditorStore::handleCompositionKey(std::uint32_t sym, std::uint32_t utf32,
                 view->compositionChord.clear();
                 return true;
             }
-            const bool matches = candidate.starts_with(full + " ");
+            const bool matches = candidate.starts_with(prefixKey);
             prefix = prefix || matches;
             messagePrefix = messagePrefix || (message && matches);
         }

@@ -382,7 +382,7 @@ std::string bindingStroke(const InputArea::KeyData &key) {
     if (key.modifiers & KeyMod::Alt)
         result += "m-";
     if (key.modifiers & KeyMod::Super)
-        result += "s-";
+        result += "super-";
     if (shift)
         result += "s-";
     result += name;
@@ -895,6 +895,16 @@ struct Ui::Impl {
     TouchPanel touchPanel = TouchPanel::None;
     bool shellDirty = true;
     std::string lastBuffer, chord, query, publishedActive, selectedServer;
+    std::map<std::string, std::string> configuredBindings, activeBindings;
+    const auto &keyBindings() {
+        if (configuredBindings != model.settings.bindings) {
+            configuredBindings = model.settings.bindings;
+            activeBindings = ui_logic::unambiguousBindings(configuredBindings);
+            chord.clear();
+            repeatCommands.clear();
+        }
+        return activeBindings;
+    }
     std::map<std::string, std::string> lastServerBuffer;
     std::size_t selected = 0;
     std::set<std::uint32_t> consumed;
@@ -1007,18 +1017,7 @@ struct Ui::Impl {
         ui_logic::migrateActivityBinding(model.settings.bindings, [this](std::string_view name) {
             return model.settings.bindings.contains(std::string(name));
         });
-        for (const auto &[name, binding] : defaultBindings()) {
-            if ((name == "jump-channel" || name == "toggle-fools" || name == "conversation-back" ||
-                 name == "conversation-forward" || name == "cycle-spelling") &&
-                !model.settings.bindings.contains(name) &&
-                std::any_of(model.settings.bindings.begin(), model.settings.bindings.end(),
-                            [&](const auto &entry) {
-                                return ui_logic::bindingConflicts(binding, entry.second);
-                            }))
-                model.settings.bindings.emplace(name, "");
-            else
-                model.settings.bindings.try_emplace(name, binding);
-        }
+        ui_logic::fillDefaultBindings(model.settings.bindings);
         scene->beforeChildrenLayout = [this](Renderer &renderer) {
             if (panelFramePending)
                 layoutPanels(false);
@@ -2775,10 +2774,9 @@ void Ui::Impl::startJump() {
         if (const auto buffer = model.buffers.find(model.activeBuffer);
             buffer != model.buffers.end())
             jumpServer = buffer->second.server;
-    const auto cancel = model.settings.bindings.find("cancel");
-    jumpCancelBinding = cancel == model.settings.bindings.end()
-                            ? std::string{}
-                            : ui_logic::canonical(cancel->second);
+    const auto &bindings = keyBindings();
+    const auto cancel = bindings.find("cancel");
+    jumpCancelBinding = cancel == bindings.end() ? std::string{} : cancel->second;
     auto firstCancel = std::string_view(jumpCancelBinding).substr(0, jumpCancelBinding.find(' '));
     if (firstCancel.starts_with("s-"))
         firstCancel.remove_prefix(2);
@@ -4513,7 +4511,8 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
     }
     if (!event.preedit && event.sym == XKB_KEY_g && event.modifiers == KeyMod::Ctrl)
         model.status.clear();
-    const bool nativeLineEnd = !event.preedit && chord.empty() && bindingStroke(event) == "c-e" &&
+    const auto keyStroke = bindingStroke(event);
+    const bool nativeLineEnd = !event.preedit && chord.empty() && keyStroke == "c-e" &&
                                nativeInputFor(dispatcher ? dispatcher->focusedArea() : nullptr);
     if (!nativeLineEnd && media->handleKey(event))
         return consume();
@@ -4535,14 +4534,13 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
             return consume();
     }
     auto *focusedInput = nativeInputFor(dispatcher ? dispatcher->focusedArea() : nullptr);
-    if (!event.preedit && chord.empty() && bindingStroke(event) == "c-e" && focusedInput &&
+    const auto &bindings = keyBindings();
+    if (!event.preedit && chord.empty() && keyStroke == "c-e" && focusedInput &&
         !focusedInput->composing() && !editors.composing()) {
-        const bool customBinding = std::any_of(
-            model.settings.bindings.begin(), model.settings.bindings.end(), [](const auto &entry) {
-                if (entry.first == "message-react")
-                    return false;
-                const auto binding = ui_logic::canonical(entry.second);
-                return binding == "c-e" || binding.starts_with("c-e ");
+        const bool customBinding =
+            std::any_of(bindings.begin(), bindings.end(), [](const auto &entry) {
+                return entry.first != "message-react" &&
+                       (entry.second == "c-e" || entry.second.starts_with("c-e "));
             });
         if (!customBinding) {
             if (isConsumed())
@@ -4565,7 +4563,7 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
     if (nativeLineEnd && media->handleKey(event))
         return consume();
     if (topicSource) {
-        if (bindingStroke(event) == "c-g") {
+        if (keyStroke == "c-g") {
             dismissTopic();
             return consume();
         }
@@ -4573,7 +4571,6 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
             return consume();
         return false; // Native topic selection/copy/navigation, never global chat commands.
     }
-    const auto keyStroke = bindingStroke(event);
     const int listStep = event.preedit ? 0 : emacsListStep(event.sym, event.modifiers);
     const bool listUp = event.sym == XKB_KEY_Up || listStep < 0;
     const bool listDown = event.sym == XKB_KEY_Down || listStep > 0;
@@ -4647,7 +4644,7 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
     }
     if (!paletteOpen && !dialogs->active() &&
         editors.handleCompositionKey(event.sym, event.utf32, event.modifiers, event.preedit,
-                                     isConsumed()))
+                                     isConsumed(), bindings))
         return consume();
     if (event.preedit)
         return false;
@@ -4776,42 +4773,35 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
         return command == "backward-char" || command == "forward-char" ||
                command == "beginning-of-line" || command == "end-of-line";
     };
-    const auto selectionCandidate = [&](std::string_view command, const std::string &binding) {
-        auto candidate = ui_logic::canonical(binding);
-        if (command == "end-of-line" && candidate.empty()) {
-            const auto stock = ui_logic::canonical(defaultBindings().at("message-react"));
-            const bool claimed =
-                std::any_of(model.settings.bindings.begin(), model.settings.bindings.end(),
-                            [&](const auto &entry) {
-                                if (entry.first == "message-react")
-                                    return false;
-                                const auto other = ui_logic::canonical(entry.second);
-                                return other == stock || other.starts_with(stock + " ");
-                            });
-            if (!claimed)
-                candidate = stock;
-        }
-        return candidate;
+    const bool selecting = transcript && transcript->keyboardTextSelection();
+    const bool stockLineEnd =
+        selecting && full == "c-e" &&
+        (!model.settings.bindings.contains("end-of-line") ||
+         model.settings.bindings.at("end-of-line").empty()) &&
+        std::none_of(bindings.begin(), bindings.end(), [](const auto &entry) {
+            return entry.first != "message-react" &&
+                   (entry.second == "c-e" || entry.second.starts_with("c-e "));
+        });
+    const auto extends = [&](std::string_view candidate) {
+        return candidate.size() > full.size() && candidate.starts_with(full) &&
+               candidate[full.size()] == ' ';
     };
     const bool selectionBinding =
-        transcript && transcript->keyboardTextSelection() &&
-        std::any_of(model.settings.bindings.begin(), model.settings.bindings.end(),
-                    [&](const auto &entry) {
-                        if (!movement(entry.first))
-                            return false;
-                        const auto candidate = selectionCandidate(entry.first, entry.second);
-                        return candidate == full || candidate.starts_with(full + " ");
-                    });
+        selecting &&
+        (stockLineEnd || std::any_of(bindings.begin(), bindings.end(), [&](const auto &entry) {
+             return movement(entry.first) && (entry.second == full || extends(entry.second));
+         }));
     bool prefix = false;
-    const bool selecting = transcript && transcript->keyboardTextSelection();
-    for (const auto &[command, binding] : model.settings.bindings) {
-        if (binding.empty() && !(selecting && command == "end-of-line"))
-            continue;
+    const std::string *matched = nullptr;
+    bool scrollCommand = false;
+    if (stockLineEnd) {
+        static const std::string lineEnd = "end-of-line";
+        matched = &lineEnd;
+    }
+    for (const auto &[command, candidate] : bindings) {
         const bool scrolling = command == "scroll-up" || command == "scroll-down" ||
                                command == "beginning-of-buffer" || command == "end-of-buffer";
-        const auto candidate = selecting && movement(command) ? selectionCandidate(command, binding)
-                                                              : ui_logic::canonical(binding);
-        if (candidate.empty() || !candidate.starts_with(full) ||
+        if (!candidate.starts_with(full) ||
             (!workspaceCommand(command) && !composer &&
              !((command == "copy-region" || scrolling || command == "set-mark" ||
                 (movement(command) && transcript && transcript->keyboardTextSelection())) &&
@@ -4825,36 +4815,39 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
               command == "next-activity")))
             continue;
         if (candidate == full) {
-            if (!synchronizeInput())
-                throw std::logic_error("Commands cannot be dispatched during native layout");
-            chord.clear();
-            if (transcript && (command == "set-mark" ||
-                               (movement(command) && transcript->keyboardTextSelection()))) {
-                transcript->textSelectionCommand(command);
-                if (movement(command))
-                    repeatCommands[keyId] = "@selection:" + command;
-                refresh();
-                return consume();
-            }
-            if (command.starts_with("backward-") || command.starts_with("forward-") ||
-                command == "previous-line" || command == "next-line" || command == "delete-char" ||
-                command == "kill-word" || command == "history-previous" ||
-                command == "history-next" || command == "message-prev" ||
-                command == "message-next" || scrolling)
-                repeatCommands[keyId] = command;
-            if (composer && !workspaceCommand(command) && command != "copy-region" &&
-                command != "cycle-spelling" && !scrolling)
-                composerEdited(workspace.focused);
-            run(command);
-            if (command == "jump-channel" && jumpOpen)
-                jumpActivationKey = keyId;
-            if (command == "message-react" && reactionTarget)
-                reactionActivationKey = keyId;
+            matched = &command;
+            scrollCommand = scrolling;
+            break;
+        }
+        prefix |= extends(candidate);
+    }
+    if (matched) {
+        const auto &command = *matched;
+        if (!synchronizeInput())
+            throw std::logic_error("Commands cannot be dispatched during native layout");
+        chord.clear();
+        if (transcript && (command == "set-mark" || (movement(command) && selecting))) {
+            transcript->textSelectionCommand(command);
+            if (movement(command))
+                repeatCommands[keyId] = "@selection:" + command;
             refresh();
             return consume();
         }
-        if (candidate.starts_with(full + " "))
-            prefix = true;
+        if (command.starts_with("backward-") || command.starts_with("forward-") ||
+            command == "previous-line" || command == "next-line" || command == "delete-char" ||
+            command == "kill-word" || command == "history-previous" || command == "history-next" ||
+            command == "message-prev" || command == "message-next" || scrollCommand)
+            repeatCommands[keyId] = command;
+        if (composer && !workspaceCommand(command) && command != "copy-region" &&
+            command != "cycle-spelling" && !scrollCommand)
+            composerEdited(workspace.focused);
+        run(command);
+        if (command == "jump-channel" && jumpOpen)
+            jumpActivationKey = keyId;
+        if (command == "message-react" && reactionTarget)
+            reactionActivationKey = keyId;
+        refresh();
+        return consume();
     }
     if (prefix) {
         chord = full;

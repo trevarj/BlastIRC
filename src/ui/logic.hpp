@@ -344,37 +344,98 @@ inline bool sidebarPreview(const Model &model, const Buffer &buffer, std::string
     return hasDraft;
 }
 inline std::string canonical(std::string_view chord) {
-    std::string result, token;
-    auto flush = [&] {
-        if (token.empty())
-            return;
-        for (char &c : token)
+    static constexpr std::array modifiers{"c-", "m-", "super-", "s-"};
+    constexpr auto shift = modifiers.size() - 1;
+    std::string result;
+    while (!chord.empty()) {
+        if (std::isspace(static_cast<unsigned char>(chord.front()))) {
+            chord.remove_prefix(1);
+            continue;
+        }
+        const auto end = std::find_if(chord.begin(), chord.end(),
+                                      [](unsigned char c) { return std::isspace(c); });
+        const auto length = static_cast<std::size_t>(end - chord.begin());
+        std::string token(chord.substr(0, length));
+        chord.remove_prefix(length);
+        for (auto &c : token)
             c = std::tolower(static_cast<unsigned char>(c));
-        if (token == "enter" || token == "return")
-            token = "ret";
-        if (token == "space")
-            token = "spc";
+        std::array<bool, modifiers.size()> present{};
+        std::string_view key = token;
+        for (;;) {
+            const auto prefix =
+                std::find_if(modifiers.begin(), modifiers.end(),
+                             [&](std::string_view mod) { return key.starts_with(mod); });
+            if (prefix == modifiers.end())
+                break;
+            present[static_cast<std::size_t>(prefix - modifiers.begin())] = true;
+            key.remove_prefix(std::string_view(*prefix).size());
+        }
+        if (key == "enter" || key == "return" || key == "kp_enter")
+            key = "ret";
+        if (key == "space")
+            key = "spc";
+        if (key == "page_up" || key == "kp_page_up" || key == "kp_prior")
+            key = "prior";
+        if (key == "page_down" || key == "kp_page_down" || key == "kp_next")
+            key = "next";
+        if (key == "iso_left_tab") {
+            key = "tab";
+            present[shift] = true;
+        }
+        if (key == "<" || key == ">")
+            present[shift] = false;
         if (!result.empty())
             result += ' ';
-        result += token;
-        token.clear();
-    };
-    for (char c : chord) {
-        if (std::isspace(static_cast<unsigned char>(c)))
-            flush();
-        else
-            token += c;
+        for (std::size_t i = 0; i < modifiers.size(); ++i)
+            if (present[i])
+                result += modifiers[i];
+        result += key;
     }
-    flush();
     return result;
 }
-inline bool bindingConflicts(std::string_view first, std::string_view second) {
-    auto a = canonical(first), b = canonical(second);
+inline bool canonicalBindingConflict(std::string_view a, std::string_view b) {
     if (a.empty() || b.empty())
         return false;
     if (a.size() > b.size())
-        a.swap(b);
+        std::swap(a, b);
     return b.starts_with(a) && (a.size() == b.size() || b[a.size()] == ' ');
+}
+inline bool bindingConflicts(std::string_view first, std::string_view second) {
+    return canonicalBindingConflict(canonical(first), canonical(second));
+}
+inline std::string_view bindingConflict(const std::map<std::string, std::string> &bindings,
+                                        std::string_view command, std::string_view binding) {
+    const auto candidate = canonical(binding);
+    if (!candidate.empty())
+        for (const auto &[name, chord] : bindings)
+            if (name != command && canonicalBindingConflict(candidate, canonical(chord)))
+                return name;
+    return {};
+}
+inline void fillDefaultBindings(std::map<std::string, std::string> &bindings) {
+    for (const auto &[name, chord] : defaultBindings())
+        if (!bindings.contains(name))
+            bindings.emplace(name, bindingConflict(bindings, name, chord).empty() ? chord : "");
+}
+inline std::map<std::string, std::string>
+unambiguousBindings(const std::map<std::string, std::string> &bindings) {
+    std::map<std::string, std::string> active;
+    for (const auto &[name, chord] : bindings) {
+        if (name.empty())
+            continue;
+        if (auto key = canonical(chord); !key.empty())
+            active.emplace_hint(active.end(), name, std::move(key));
+    }
+    std::vector<decltype(active)::iterator> conflicts;
+    for (auto it = active.begin(); it != active.end(); ++it)
+        if (std::any_of(active.begin(), active.end(), [&](const auto &other) {
+                return other.first != it->first &&
+                       canonicalBindingConflict(it->second, other.second);
+            }))
+            conflicts.push_back(it);
+    for (const auto it : conflicts)
+        active.erase(it);
+    return active;
 }
 template <class Bindings, class HasSavedBinding>
 inline void migrateActivityBinding(Bindings &bindings, HasSavedBinding hasSavedBinding) {

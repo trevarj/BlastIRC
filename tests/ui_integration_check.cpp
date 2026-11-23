@@ -6571,6 +6571,27 @@ void commandShortcutCheck() {
     assert(model.actions.size() == actions + 1 && model.actions.back().type == "read" &&
            model.actions.back().buffer == edgeBuffers[0]);
     assert(dispatcher.focusedArea() == tool && input->value() == edgeDrafts[0]);
+    dispatcher.setFocus(input->inputArea());
+    for (const auto *collision : {" c-f9 ", "C-F9 C-F8"}) {
+        model.settings.bindings["/quit"] = collision;
+        hostKey(ui, dispatcher, XKB_KEY_F9, KeyMod::Ctrl);
+        if (std::string_view(collision).ends_with("C-F8"))
+            hostKey(ui, dispatcher, XKB_KEY_F8, KeyMod::Ctrl);
+        frame();
+        assert(input->value() == edgeDrafts[0] && buffer.draft == edgeDrafts[0] && !model.quit);
+    }
+    model.settings.bindings["/quit"] = "Super-F9";
+    model.settings.bindings["/join"] = "S-F9";
+    hostKey(ui, dispatcher, XKB_KEY_F9, KeyMod::Shift);
+    frame();
+    assert(input->value() == "/join " && !model.quit);
+    hostKey(ui, dispatcher, XKB_KEY_F9, KeyMod::Super);
+    frame();
+    assert(input->value() == "/quit " && !model.quit);
+    model.settings.bindings["/join"] = "C-Return";
+    hostKey(ui, dispatcher, XKB_KEY_Return, KeyMod::Ctrl);
+    frame();
+    assert(input->value() == "/join " && model.actions.size() == actions + 1);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -10802,7 +10823,8 @@ void conversationHistoryOwnershipCheck() {
                    model.settings.bindings.at("complete") == originalComplete);
             hostKey(ui, dispatcher, XKB_KEY_Return, KeyMod::Ctrl);
             frame();
-            assert(model.settings.bindings.at("complete") == "c-o c-i" &&
+            assert(model.settings.bindings.at("complete") == originalComplete &&
+                   model.settings.bindings.at("conversation-back") == "C-o" &&
                    !record->capturesAllKeys());
             assert(model.activeBuffer == edgeBuffers[1] && input->editingStateMatches(state));
             ui.execute("settings");

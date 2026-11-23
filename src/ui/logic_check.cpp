@@ -687,6 +687,9 @@ int main() {
     assert(bindingConflicts("c-x j", "c-x j"));
     assert(bindingConflicts("C-X J", "\t c-x  j \n"));
     assert(bindingConflicts("C-x Enter", "c-x RETURN"));
+    assert(bindingConflicts("S-C-Enter", "c-s-ret"));
+    assert(bindingConflicts("C-Space", "c-spc x"));
+    assert(!bindingConflicts("Super-F9", "S-F9"));
     assert(bindingConflicts("c-x j", "c-x j a"));
     assert(bindingConflicts("c-x j a", "c-x j"));
     assert(bindingConflicts("c-x", "c-x j"));
@@ -696,6 +699,9 @@ int main() {
     assert(!bindingConflicts("c-x j", "c-x jx"));
     assert(!bindingConflicts("c-x jx", "c-x j"));
     assert(!bindingConflicts("c-x j", "c-x b"));
+    const auto &stock = blast::defaultBindings();
+    for (const auto &[command, binding] : stock)
+        assert(bindingConflict(stock, command, binding).empty());
     assert(blast::irc::clientTagAllowed("", "+reply"));
     assert(!blast::irc::clientTagAllowed("*", "+reply"));
     assert(blast::irc::clientTagAllowed("*,-reply", "+reply"));

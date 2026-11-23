@@ -173,6 +173,33 @@ std::string clockText(const Message &message) {
            : message.time.size() >= 16 ? message.time.substr(11, 5)
                                        : "--:--";
 }
+bool sameDisplayMinute(const Message &left, const Message &right) {
+    if (left.timestamp && left.timestamp == right.timestamp)
+        return true;
+    const auto minute = [](const Message &message) -> int64_t {
+        if (message.timestamp) {
+            const std::time_t seconds = message.timestamp;
+            std::tm local{};
+            if (!localtime_r(&seconds, &local))
+                return -1;
+            return (int64_t(local.tm_year) + 1900) * 100000000 + (local.tm_mon + 1) * 1000000 +
+                   local.tm_mday * 10000 + local.tm_hour * 100 + local.tm_min;
+        }
+        const std::string_view time = message.time;
+        if (time.size() < 16 || time[4] != '-' || time[7] != '-' || time[10] != 'T' ||
+            time[13] != ':' || time.substr(11, 2) > "23" || time.substr(14, 2) > "59")
+            return -1;
+        int64_t result = 0;
+        for (const std::size_t i : {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15}) {
+            if (time[i] < '0' || time[i] > '9')
+                return -1;
+            result = result * 10 + (time[i] - '0');
+        }
+        return result;
+    };
+    const auto value = minute(left);
+    return value >= 0 && value == minute(right);
+}
 bool sendIndicator(const Message &message) {
     return message.own &&
            (message.sendStatus == SendStatus::Queued || message.sendStatus == SendStatus::Sent ||
@@ -669,6 +696,7 @@ struct Geometry {
     bool conversation = false, channel = false, inlineChannel = false;
     bool bubbles = false, avatars = false, timestamps = false, tight = false;
     std::string key;
+    bool groupsByMinute() const { return conversation && !inlineChannel; }
     bool dense() const { return !bubbles; }
     float rowGap(bool presence, bool) const {
         return (presence ? 2.f : metrics.groupedGap) * scale;
@@ -687,22 +715,21 @@ struct Geometry {
     float footerGap() const { return (tight ? 1 : 2) * scale; }
     float statusSize() const { return 12 * scale; }
     float statusGap() const { return 4 * scale; }
-    bool footerVisible(const Message &entry) const {
-        return bubbles && !entry.presence && (timestamps || sendIndicator(entry));
+    bool footerVisible(const Message &entry, bool showClock) const {
+        return bubbles && !entry.presence && (showClock || sendIndicator(entry));
     }
-    float footerWidth(const Message &entry) const {
-        const float clock = timestamps ? clockWidth : 0;
+    float footerWidth(const Message &entry, bool showClock) const {
+        const float clock = showClock ? clockWidth : 0;
         const float status = sendIndicator(entry) ? statusSize() : 0;
         return clock + status + (clock > 0 && status > 0 ? statusGap() : 0);
     }
-    float footerExtent(const Message &entry, float width) const {
-        if (!footerVisible(entry))
-            return 0;
+    float footerExtent(const Message &entry, float width, bool showClock) const {
         const float clock =
-            timestamps ? footer * std::max(1.f, std::ceil(clockWidth / std::max(1.f, width))) : 0;
+            showClock ? footer * std::max(1.f, std::ceil(clockWidth / std::max(1.f, width))) : 0;
         const float status = sendIndicator(entry) ? statusSize() : 0;
-        return clock > 0 && status > 0 && footerWidth(entry) > width ? clock + statusGap() + status
-                                                                     : std::max(clock, status);
+        return clock > 0 && status > 0 && footerWidth(entry, showClock) > width
+                   ? clock + statusGap() + status
+                   : std::max(clock, status);
     }
     float avatarLane(bool presence) const {
         // Compact avatars share the author header instead of narrowing the reading column.
@@ -746,15 +773,12 @@ struct Geometry {
                 : std::min(available, std::max(240 * scale, available * metrics.widthFraction));
         return std::max(minimum, surface - 2 * padding(presence) - prefixWidth(presence));
     }
-    bool stackedPrefix(bool, bool presence, bool) const {
-        return !presence && channel && !inlineChannel;
+    bool nickVisible(bool grouped, bool presence) const { return !presence && !grouped; }
+    bool stackedPrefix(bool grouped, bool presence) const {
+        return channel && !inlineChannel && nickVisible(grouped, presence);
     }
-    bool nickVisible(bool grouped, bool presence) const {
-        return !presence && (!grouped || (channel && !inlineChannel));
-    }
-    bool authorHeader(bool grouped, bool presence, bool clockVisible) const {
-        return !presence &&
-               ((!grouped && bubbles) || stackedPrefix(grouped, presence, clockVisible));
+    bool authorHeader(bool grouped, bool presence) const {
+        return (bubbles && nickVisible(grouped, presence)) || stackedPrefix(grouped, presence);
     }
 };
 Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, float width,
@@ -871,6 +895,10 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
             result.stackedBodyIndent =
                 1.5f * renderer.measureText("0", result.font, themeMessageFont()).width;
         }
+    }
+    if (result.groupsByMinute()) {
+        result.metrics.rowGap += result.tight ? 1 : 2;
+        result.metrics.groupedGap -= result.tight || result.dense() ? 1 : 2;
     }
     result.key = buffer.kind + "|" + themeMessageFont().family + "|" + themeMessageFont().features +
                  "|" + std::to_string(int(themeMessageFont().weight)) + "|" + themeUiFont().family +
@@ -3209,13 +3237,19 @@ struct TranscriptView::Impl {
         if (!model.settings.timestamps || row.hiddenActivity ||
             (row.activitySummary && !row.activityExpanded))
             return false;
-        if (cache->geometry.bubbles)
+        const auto &g = cache->geometry;
+        if (g.bubbles && (!g.groupsByMinute() || buffer.messages[index].presence))
             return true;
+        if (row.grouped && g.groupsByMinute())
+            return false;
         size_t previous = row.projected ? row.previousVisible : index ? index - 1 : absent;
-        while (previous < cache->rows.size() &&
-               (cache->rows[previous].hiddenActivity ||
-                (cache->rows[previous].activitySummary && !cache->rows[previous].activityExpanded)))
-            previous = cache->rows[previous].previousVisible;
+        while (previous < cache->rows.size()) {
+            const auto &prior = cache->rows[previous];
+            if (!prior.hiddenActivity && (!prior.activitySummary || prior.activityExpanded) &&
+                (!g.bubbles || !buffer.messages[previous].presence))
+                break;
+            previous = prior.previousVisible;
+        }
         if (previous >= buffer.messages.size())
             return true;
         const auto day = [](const Message &entry) {
@@ -3234,14 +3268,34 @@ struct TranscriptView::Impl {
         row.day =
             previous == absent || localDate(entry.timestamp, "%Y-%m-%d") !=
                                       localDate(buffer.messages[previous].timestamp, "%Y-%m-%d");
-        row.grouped = buffer.kind != "mentions" && previous != absent && previous + 1 == index &&
-                      row.gapHeight == 0 && !row.day && !row.unread && !entry.presence &&
-                      !(cache->geometry.channel && entry.own) && !entry.action && !entry.deleted &&
-                      !buffer.messages[previous].presence && !buffer.messages[previous].action &&
-                      !buffer.messages[previous].deleted &&
-                      entry.nick == buffer.messages[previous].nick &&
-                      entry.timestamp >= buffer.messages[previous].timestamp &&
-                      entry.timestamp - buffer.messages[previous].timestamp < 300;
+        const auto &g = cache->geometry;
+        row.grouped = false;
+        if (buffer.kind != "mentions" && previous < buffer.messages.size() && row.gapHeight == 0 &&
+            !row.day && !row.unread && !entry.presence && !entry.action && !entry.deleted) {
+            const auto &prior = buffer.messages[previous];
+            if (!prior.presence && !prior.action && !prior.deleted) {
+                if (g.groupsByMinute()) {
+                    const auto network = model.networks.find(buffer.server);
+                    const std::string_view mapping =
+                        network == model.networks.end() ? "rfc1459" : network->second.caseMapping;
+                    const auto ordinary = [&](const Message &message) {
+                        return !foolish(buffer, message) ||
+                               foolPolicy(buffer, message) == FoolDisplay::Shown ||
+                               foolPolicy(buffer, message) == FoolDisplay::Dimmed;
+                    };
+                    row.grouped = !entry.nick.empty() && entry.own == prior.own &&
+                                  sameNick(entry.nick, prior.nick, mapping) &&
+                                  sameDisplayMinute(entry, prior) && ordinary(entry) &&
+                                  ordinary(prior);
+                    for (size_t i = previous + 1; row.grouped && i < index; ++i)
+                        row.grouped = typedActivity(buffer.messages[i]);
+                } else {
+                    row.grouped = previous + 1 == index && !(g.channel && entry.own) &&
+                                  entry.nick == prior.nick && entry.timestamp >= prior.timestamp &&
+                                  entry.timestamp - prior.timestamp < 300;
+                }
+            }
+        }
         row.showClock = timestampVisible(row, buffer, index);
         row.mentionHighlight = cache->geometry.conversation && entry.mention && !entry.own &&
                                !entry.presence && !entry.pending && !entry.deleted &&
@@ -3273,17 +3327,18 @@ struct TranscriptView::Impl {
         const float line = notice ? g.activityLine : g.bodyLine;
         const float lines = std::max(1.f, std::ceil(float(text.size()) * font * .5f / bodyWidth));
         row.bodyHeight = line * lines;
-        row.bodyOffset = paddingY + (row.day ? g.day : 0) +
-                         (row.unread ? g.unread : 0) + g.groupGap(entry.presence, row.grouped) +
-                         (!collapsed && g.authorHeader(row.grouped, entry.presence, row.showClock)
+        row.bodyOffset = paddingY + (row.day ? g.day : 0) + (row.unread ? g.unread : 0) +
+                         g.groupGap(entry.presence, row.grouped) +
+                         (!collapsed && g.authorHeader(row.grouped, entry.presence)
                               ? (g.bubbles ? g.nickHeader : g.metadataHeader)
                               : 0) +
                          (entry.reply.empty() ? 0 : g.quote) +
                          (buffer.kind == "mentions" ? g.metadataHeader : 0);
-        row.height =
-            row.bodyOffset + row.bodyHeight +
-            (g.footerVisible(entry) ? g.footerExtent(entry, bodyWidth) + g.footerGap() : 0) +
-            paddingY + g.rowGap(entry.presence, row.grouped);
+        const float footer = g.footerVisible(entry, row.showClock)
+                                 ? g.footerExtent(entry, bodyWidth, row.showClock) + g.footerGap()
+                                 : 0;
+        row.height = row.bodyOffset + row.bodyHeight + footer + paddingY +
+                     g.rowGap(entry.presence, row.grouped);
         if (!entry.reactions.empty())
             row.height += g.reaction;
         row.height += row.gapHeight;
@@ -3368,6 +3423,7 @@ struct TranscriptView::Impl {
                            (reflow && typedActivity(entry));
             const double oldHeight = row.height;
             const bool oldClock = row.showClock;
+            const bool oldGroup = row.grouped, oldDay = row.day;
             row.hiddenActivity = hidden;
             row.activitySummary = summary;
             row.activityExpanded = expanded;
@@ -3385,7 +3441,8 @@ struct TranscriptView::Impl {
                 row.height = row.bodyHeight = row.bodyOffset = row.footerHeight = 0;
             } else {
                 rowState(row, buffer, index);
-                reshape = reshape || oldClock != row.showClock;
+                reshape = reshape || oldClock != row.showClock || oldGroup != row.grouped ||
+                          oldDay != row.day;
                 if (reshape)
                     estimateHeight(row, buffer, index, g, width);
                 previous = index;
@@ -3776,15 +3833,22 @@ struct TranscriptView::Impl {
             gapKey += "|" + std::to_string(gap.id) + ":" + gap.newer.id + ":" + gap.newer.time +
                       ":" + std::to_string(gap.unavailable);
         if (gapKey != c.gapKey) {
+            const auto setGapHeight = [&](size_t index, float height) {
+                auto &row = c.rows[index];
+                const double oldHeight = row.height;
+                const bool grouped = row.grouped;
+                row.height = std::max(0., row.height - row.gapHeight) + height;
+                row.gapHeight = height;
+                rowState(row, buffer, index);
+                if (grouped != row.grouped)
+                    estimateHeight(row, buffer, index, g, width);
+                row.measured = false;
+                c.heights.add(index, row.height - oldHeight);
+            };
             if (!c.gaps.empty())
                 for (size_t index = 0; index < c.rows.size(); ++index)
-                    if (auto &row = c.rows[index]; row.gapHeight > 0) {
-                        const double delta = -std::min(double(row.gapHeight), row.height);
-                        row.height += delta;
-                        c.heights.add(index, delta);
-                        row.gapHeight = 0;
-                        row.measured = false;
-                    }
+                    if (c.rows[index].gapHeight > 0)
+                        setGapHeight(index, 0);
             c.gaps.clear();
             for (const auto &gap : buffer.historyState.gaps) {
                 if (gap.id <= 0)
@@ -3816,14 +3880,9 @@ struct TranscriptView::Impl {
                     index = absent;
                 c.gaps.push_back({gap.id, index, gap.unavailable,
                                   index < c.rows.size() ? c.rows[index].gapHeight : 0});
-                if (index < c.rows.size()) {
-                    auto &row = c.rows[index];
-                    const float extent = std::max(32 * g.scale, g.header + 8 * g.scale);
-                    row.gapHeight += extent;
-                    row.height += extent;
-                    row.measured = false;
-                    c.heights.add(index, extent);
-                }
+                if (index < c.rows.size())
+                    setGapHeight(index, c.rows[index].gapHeight +
+                                            std::max(32 * g.scale, g.header + 8 * g.scale));
             }
             c.gapKey = std::move(gapKey);
         }
@@ -3871,8 +3930,9 @@ struct TranscriptView::Impl {
         const bool notice = typedActivity(entry);
         const bool collapsed = row.activitySummary && !row.activityExpanded;
         const auto &g = c.geometry;
+        rowState(row, buffer, index);
         size_t fingerprint = signature(entry, index ? &buffer.messages[index - 1] : nullptr);
-        fingerprint ^= size_t(timestampVisible(row, buffer, index)) << 17;
+        fingerprint ^= size_t(row.showClock) << 17 | size_t(row.grouped) << 19;
         const bool friendAuthor = this->friendAuthor(buffer, entry) && readable(buffer, index);
         fingerprint ^= size_t(friendAuthor) << 18;
         if (collapsed)
@@ -3890,7 +3950,6 @@ struct TranscriptView::Impl {
         row.signature = fingerprint;
         row.id = entry.id;
         c.ids[row.id] = index;
-        rowState(row, buffer, index);
         row.friendAuthor = friendAuthor;
         const auto &metrics = g.metrics;
         const float padding = notice ? g.activityPadding() : g.padding(entry.presence);
@@ -3991,10 +4050,11 @@ struct TranscriptView::Impl {
                     std::max({row.authorHeader, size, row.authorOffset + chipHeight + 3 * g.scale});
             }
         }
-        row.footerText = g.bubbles && !entry.presence && g.timestamps ? clockText(entry) : "";
+        row.footerText = g.bubbles && !entry.presence && row.showClock ? clockText(entry) : "";
         const bool status = g.bubbles && !entry.presence && sendIndicator(entry);
         const float statusSize = status ? g.statusSize() : 0;
-        const float naturalFooter = g.footerVisible(entry) ? g.footerWidth(entry) : 0;
+        const float naturalFooter =
+            g.footerVisible(entry, row.showClock) ? g.footerWidth(entry, row.showClock) : 0;
         const bool fitBubble = g.bubbles;
         row.reactions.clear();
         float reactionWidth = 0;
@@ -4144,8 +4204,7 @@ struct TranscriptView::Impl {
                     : row.prefixAscent + (row.prefixHeight - textHeight) * .5f;
             row.prefixBaseline = row.bodyOffset + row.prefixAscent;
         }
-        if (!collapsed && (!emote || g.channel) &&
-            g.authorHeader(row.grouped, entry.presence, row.showClock))
+        if (!collapsed && (!emote || g.channel) && g.authorHeader(row.grouped, entry.presence))
             row.bodyOffset += g.channel ? row.prefixHeight : row.authorHeader;
         row.bodyOffset += row.quoteHeight;
         if (buffer.kind == "mentions")
@@ -4217,18 +4276,19 @@ struct TranscriptView::Impl {
         if (!row.reactions.empty())
             bodyEnd += g.reaction;
         row.contentEnd = bodyEnd;
-        if (!collapsed && g.stackedPrefix(row.grouped, entry.presence, row.showClock) && g.avatars)
+        if (!collapsed && g.stackedPrefix(row.grouped, entry.presence) && g.avatars)
             bodyEnd = std::max(bodyEnd, row.prefixBaseline - row.prefixAscent +
                                             g.stackedAvatarY(row.prefixHeight) +
                                             g.compactAvatarSize(false));
-        row.height =
-            bodyEnd + (g.footerVisible(entry) ? row.footerHeight + g.footerGap() : 0) + paddingY;
+        const float footer =
+            g.footerVisible(entry, row.showClock) ? row.footerHeight + g.footerGap() : 0;
+        row.height = bodyEnd + footer + paddingY;
         if (g.bubbles && g.avatars && !row.grouped && !entry.presence)
             row.height =
                 std::max(row.height, double((row.day ? g.day : 0) + (row.unread ? g.unread : 0) +
                                             g.groupGap(entry.presence, row.grouped) +
                                             metrics.avatarSize * g.scale));
-        if (g.footerVisible(entry))
+        if (g.footerVisible(entry, row.showClock))
             row.footerOffset = float(row.height) - paddingY - row.footerHeight;
         row.height += g.rowGap(entry.presence, row.grouped);
         row.height += row.gapHeight;
@@ -4584,7 +4644,7 @@ struct TranscriptView::Impl {
                                           .5f,
                    metrics.avatarSize * g.scale);
         if (!collapsed && ((g.channel && !entry.presence) || (entry.presence && row.showClock))) {
-            const bool stacked = g.stackedPrefix(row.grouped, entry.presence, row.showClock);
+            const bool stacked = g.channel && !g.inlineChannel;
             float clusterEnd = surfaceX + padding;
             auto prefix = [&](std::string text, float left, float width, bool nick) {
                 auto hit = std::make_unique<InputArea>();
@@ -4705,7 +4765,7 @@ struct TranscriptView::Impl {
                        g.channelNickWidth(row.showClock), true);
             if (row.showClock && stacked)
                 prefix(clockText(entry), clusterEnd + 8 * g.scale, g.clockWidth, false);
-            if (g.stackedPrefix(row.grouped, entry.presence, row.showClock))
+            if (stacked)
                 y += row.prefixHeight;
         }
         if (g.dense() && !g.channel && !entry.presence && row.showClock)

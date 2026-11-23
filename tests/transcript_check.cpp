@@ -1435,11 +1435,11 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
     assert(sceneBounds(compact.body).width + .02f >= compactAuthor->parent()->width());
     visibleNickInk(*compactAuthor, *compactHit);
     const auto compactGrouped = body(view, "GroupedLine");
-    auto *groupedAuthor = plainText(compactGrouped.content, longNick);
-    assert(groupedAuthor);
-    auto *groupedHit = nickControl(*groupedAuthor);
-    assert(groupedHit && groupedHit->y() + groupedHit->height() <= compactGrouped.y() + .02f);
-    const auto previousBounds = bounds(body(view, "BetaLine"));
+    const auto compactLead = body(view, "BetaLine");
+    assert(plainText(compactLead.content, longNick));
+    assert(!plainText(compactGrouped.content, longNick));
+    near(compactGrouped.x(), compactLead.x());
+    const auto previousBounds = bounds(compactLead);
     assert(bounds(compactGrouped).top >= previousBounds.top + previousBounds.height);
     if (zoom == 2.f) {
         arrangeFirstRows({17, 23, 720, narrow.height});
@@ -1502,7 +1502,12 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
     view.sync();
     view.arrange(renderer, viewport);
     anchored();
-    // Prepending the same author removes the retained row's day/group boundary.
+    model.settings.messageLayouts[buffer.id] = blast::MessageLayout::Stacked;
+    view.sync();
+    view.arrange(renderer, viewport);
+    anchored();
+    assert(plainText(body(view, "ChannelAnchor").content, "Bob"));
+    // Same-minute history removes the retained row's stacked author header.
     auto older = buffer.messages.front();
     older.id = older.text = "PrependedChannel";
     older.history = true;
@@ -1512,6 +1517,13 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
     view.arrange(renderer, viewport);
     anchored();
     assert(!plainText(body(view, "ChannelAnchor").content, "Bob"));
+    unchanged(buffer, before);
+    buffer.messages.front().time = "2026-11-07T12:33:56Z";
+    before = buffer;
+    view.sync();
+    view.arrange(renderer, viewport);
+    anchored();
+    assert(plainText(body(view, "ChannelAnchor").content, "Bob"));
     unchanged(buffer, before);
     auto arrival = buffer.messages.back();
     arrival.id = arrival.text = "UnfollowedChannelArrival";
@@ -1636,38 +1648,44 @@ void bubbleGeometry(TranscriptTestRenderer &renderer, const Body &b, float zoom,
                     std::string_view clock) {
     auto *surface = bubbleSurface(b);
     auto *footer = bubbleFooter(b.content, zoom);
-    assert(surface && surface->visible() && footer);
-    assert(footer->text() == clock);
-    assert(footer->fontSize() < b.text.fontSize());
-    assert(footer->color().a == 1);
+    assert(surface && surface->visible());
+    assert(bool(footer) == !clock.empty());
     near(b.content.opacity(), 1);
-    const auto measured =
-        renderer.measureText(footer->text(), footer->fontSize(), footer->font(), footer->maxWidth(),
-                             0, footer->textAlign(), footer->ellipsize(), false);
-    float footerX, footerY, contentX, contentY;
-    Node::absolutePosition(footer, footerX, footerY);
-    Node::absolutePosition(&b.content, contentX, contentY);
-    footerX -= contentX;
-    footerY -= contentY;
-    const float footerTop = footerY + measured.top;
-    const float footerBottom = footerY + measured.bottom;
-    assert(measured.width <= footer->maxWidth() + .02f);
     const float inset = b.x() - surface->x();
     assert(inset > 0);
-    auto *status = bubbleStatus(b.content);
-    const float footerRight = status ? status->x() + status->width() : footerX + footer->width();
-    near(footerRight, surface->x() + surface->width() - inset);
-    if (status) {
-        near(status->width(), 12 * zoom);
-        near(status->height(), 12 * zoom);
-        assert(status->acceptedButtons() == 0 && !status->focusable());
-        assert(status->x() >= surface->x() + inset - .02f && status->y() >= footerTop - .02f &&
-               status->y() + status->height() <= surface->y() + surface->height() + .02f);
-        assert(status->y() >= footerBottom - .02f ||
-               status->x() >= footerX + footer->width() + 4 * zoom - .02f);
+    float footerTop = surface->y() + surface->height();
+    if (footer) {
+        assert(footer->text() == clock);
+        assert(footer->fontSize() < b.text.fontSize());
+        assert(footer->color().a == 1);
+        const auto measured = renderer.measureText(footer->text(), footer->fontSize(),
+                                                   footer->font(), footer->maxWidth(), 0,
+                                                   footer->textAlign(), footer->ellipsize(), false);
+        float footerX, footerY, contentX, contentY;
+        Node::absolutePosition(footer, footerX, footerY);
+        Node::absolutePosition(&b.content, contentX, contentY);
+        footerX -= contentX;
+        footerY -= contentY;
+        footerTop = footerY + measured.top;
+        const float footerBottom = footerY + measured.bottom;
+        assert(measured.width <= footer->maxWidth() + .02f);
+        auto *status = bubbleStatus(b.content);
+        const float footerRight =
+            status ? status->x() + status->width() : footerX + footer->width();
+        near(footerRight, surface->x() + surface->width() - inset);
+        if (status) {
+            near(status->width(), 12 * zoom);
+            near(status->height(), 12 * zoom);
+            assert(status->acceptedButtons() == 0 && !status->focusable());
+            assert(status->x() >= surface->x() + inset - .02f && status->y() >= footerTop - .02f &&
+                   status->y() + status->height() <= surface->y() + surface->height() + .02f);
+            assert(status->y() >= footerBottom - .02f ||
+                   status->x() >= footerX + footer->width() + 4 * zoom - .02f);
+        }
+        assert(footerX >= surface->x() + inset - .02f);
+        assert(footerTop >= surface->y() &&
+               footerBottom <= surface->y() + surface->height() + .02f);
     }
-    assert(footerX >= surface->x() + inset - .02f);
-    assert(footerTop >= surface->y() && footerBottom <= surface->y() + surface->height() + .02f);
     assert(surface->x() >= 0 && surface->x() + surface->width() <= b.row.width() + .02f);
     assert(surface->y() + surface->height() <= b.row.height() + .02f);
     for (const auto &child : b.body.children())
@@ -1863,13 +1881,15 @@ LayoutRect revealBubbleText(TranscriptTestRenderer &renderer, blast::TranscriptV
     }
     containedBounds(ink, ancestorPaintClip(*text));
     containedBounds(ink, clip);
-    bubbleGeometry(renderer, rendered, 2, "12:34");
+    auto *clock = bubbleFooter(rendered.content, 2);
+    bubbleGeometry(renderer, rendered, 2, clock ? std::string_view(clock->text()) : "");
     return ink;
 }
 
 void reachableBubble(TranscriptTestRenderer &renderer, blast::TranscriptView &view,
                      LayoutRect layout, std::string_view token) {
     const auto rendered = body(view, token, true);
+    const bool clock = bubbleFooter(rendered.content, 2);
     std::size_t fragments = 0;
     for (const auto &area : rendered.body.children())
         for (const auto &child : area->children())
@@ -1878,7 +1898,8 @@ void reachableBubble(TranscriptTestRenderer &renderer, blast::TranscriptView &vi
     assert(fragments);
     for (std::size_t i = 0; i < fragments; ++i)
         revealBubbleText(renderer, view, layout, token, false, i);
-    revealBubbleText(renderer, view, layout, token, true);
+    if (clock)
+        revealBubbleText(renderer, view, layout, token, true);
 }
 
 void tightBubbleViewport(TranscriptTestRenderer &renderer, const char *kind) {
@@ -1904,7 +1925,8 @@ void tightBubbleViewport(TranscriptTestRenderer &renderer, const char *kind) {
         message.id = message.text = "Compact-" + std::to_string(i);
         message.nick = i % 2 ? "Me" : "Peer";
         message.own = i % 2;
-        message.time = "2026-11-07T12:34:56Z";
+        // Alternate minutes so either side can exercise the clock's own hit area.
+        message.time = i % 2 ? "2026-11-07T12:35:56Z" : "2026-11-07T12:34:56Z";
         buffer.messages.push_back(std::move(message));
     }
     blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
@@ -2322,9 +2344,8 @@ void compactMeaningfulBodies(TranscriptTestRenderer &renderer, const char *kind)
                         renderer.measureText("Mg", nativeBodyFont, rendered.text.font(), 0, 1);
                     near(rendered.text.fontSize(), nativeBodyFont);
                     assert(position.height <= strut.bottom - strut.top + .02f);
-                    bubbleGeometry(renderer, rendered, 2, "12:34");
-                    auto *footer = bubbleFooter(rendered.content, 2);
-                    assert(footer && footer->fontSize() < rendered.text.fontSize());
+                    const bool first = original.messages.front().text == sentence;
+                    bubbleGeometry(renderer, rendered, 2, first ? "12:34" : "");
                     if (auto *author = plainText(rendered.content, own ? "Me" : "Peer")) {
                         RectNode *avatar = nullptr;
                         for (const auto &child : rendered.content.children())
@@ -2393,7 +2414,8 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
                                   "the quote, reactions and timestamp keep their own space."
                        : i == 6 ? "PendingBubble"
                                 : "DeletedBubble";
-        message.time = "2026-11-07T12:" + std::to_string(34 + i) + ":56Z";
+        const int minute = 34 + i - (i == 1 || i == 3);
+        message.time = "2026-11-07T12:" + std::to_string(minute) + ":56Z";
         message.action = i == 4;
         message.pending = i == 6;
         message.sendStatus = i == 6   ? blast::SendStatus::Queued
@@ -2529,7 +2551,8 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
                 containedBounds(nativeTextInk(renderer, rendered.text), sceneBounds(rendered.row));
                 containedBounds(nativeTextInk(renderer, *clock), sceneBounds(rendered.row));
             } else
-                bubbleGeometry(renderer, rendered, zoom, "12:" + std::to_string(34 + i));
+                bubbleGeometry(renderer, rendered, zoom,
+                               i == 1 || i == 3 ? "" : "12:" + std::to_string(34 + i));
             bubbleDelivery(rendered, buffer.messages[i], zoom);
             if (buffer.messages[i].deleted) {
                 const auto original =
@@ -2541,11 +2564,11 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
         }
     };
     geometry();
-    const float withFooter = grouped.row.height();
+    const float withFooter = incoming.row.height();
     model.settings.timestamps = false;
     view.sync();
     view.arrange(renderer, wide);
-    assert(body(view, "IncomingGrouped").row.height() < withFooter);
+    assert(body(view, "IncomingOne").row.height() < withFooter);
     for (std::size_t i = 0; i < buffer.messages.size(); ++i) {
         const auto rendered = messageBody(i);
         near(rendered.text.fontSize(), 14 * zoom);
@@ -2564,7 +2587,7 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
     view.sync();
     view.arrange(renderer, wide);
     geometry();
-    near(body(view, "IncomingGrouped").row.height(), withFooter);
+    near(body(view, "IncomingOne").row.height(), withFooter);
     buffer.messages.front().pending = true;
     for (const auto status : {blast::SendStatus::Queued, blast::SendStatus::Sent,
                               blast::SendStatus::Confirmed, blast::SendStatus::Unknown}) {
@@ -2705,6 +2728,129 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
     other.kind = "server";
     assert(!blast::messageBubbles(model.settings, other));
     unchanged(buffer, before);
+    assert(model.actions.empty());
+}
+
+void minuteAuthorGroups(TranscriptTestRenderer &renderer, const char *kind) {
+    blast::Model model;
+    model.settings.timestamps = model.settings.avatars = true;
+    model.settings.avatarStyle = "monogram";
+    model.settings.presence = blast::PresenceMode::Hidden;
+    model.settings.foolDisplay = blast::FoolDisplay::Hidden;
+    model.settings.fools.insert("Muted");
+    model.settings.reducedMotion = true;
+    model.settings.themeSource = "builtin";
+    blast::Theme theme;
+    theme.update(model);
+    auto &buffer = model.buffers["minute-groups"];
+    buffer.id = buffer.target = "minute-groups";
+    buffer.kind = kind;
+    buffer.server = "network";
+    model.networks[buffer.server].caseMapping = "rfc1459";
+    const auto append = [&](const char *token, const char *nick = "Peer[",
+                            const char *time = "2026-11-07T12:34:05Z") -> blast::Message & {
+        blast::Message message;
+        message.id = message.text = token;
+        message.nick = nick;
+        message.time = time;
+        return buffer.messages.emplace_back(std::move(message));
+    };
+    append("RunStart");
+    auto &event = append("Someone joined", "Other", "2026-11-07T12:34:10Z");
+    event.presence = true;
+    event.activity = blast::ActivityKind::Join;
+    append("RunContinues", "pEER{", "2026-11-07T12:34:56Z");
+    append("OwnStart").own = true;
+    append("OwnContinues").own = true;
+    append("IncomingAgain");
+    append("Visible notice", "Other").presence = true;
+    append("AfterNotice");
+    append("Hidden chat", "Muted");
+    append("AfterHiddenChat");
+    append("EmoteBreak").action = true;
+    append("AfterEmote");
+    append("DeletedBreak").deleted = true;
+    append("AfterDeleted");
+    append("AfterGap");
+    append("MinuteBreak", "Peer[", "2026-11-07T12:35:05Z");
+    append("DayBreak", "Peer[", "2026-11-08T12:35:05Z");
+    append("MissingTime", "Peer[", "");
+    append("InvalidTimeA", "Peer[", "2026-11-08T25:35:05Z");
+    append("InvalidTimeB", "Peer[", "2026-11-08T25:35:05Z");
+    buffer.historyState.gaps.push_back({73, {"AfterDeleted", {}}, {"AfterGap", {}}, false});
+    const auto before = buffer;
+    blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
+    Clipboard clipboard;
+    blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+    view.setReadEligible(false);
+    LayoutRect viewport{17, 23, 900, 2000};
+    const auto arrange = [&] {
+        view.sync();
+        view.arrange(renderer, viewport);
+    };
+    const auto header = [&](std::string_view token, bool shown, std::string_view nick = "Peer[") {
+        const auto rendered = body(view, token, true);
+        assert(bool(plainText(rendered.content, nick)) == shown);
+        assert(bool(plainText(rendered.content, nick.substr(0, 1))) == shown);
+    };
+    const auto clock = [&](std::string_view token, std::string_view value, bool shown) {
+        const auto rendered = body(view, token, true);
+        assert(bool(plainText(rendered.content, value)) == shown);
+        if (model.settings.messageLayouts.at(buffer.id) == blast::MessageLayout::Bubbles)
+            assert(bool(bubbleFooter(rendered.content, 1)) == shown);
+    };
+
+    model.settings.messageLayouts[buffer.id] = blast::MessageLayout::Irc;
+    arrange();
+    header("RunContinues", true, "pEER{"); // Wide Traditional keeps its inline author policy.
+    header("OwnContinues", true);
+    near(baseline(*plainText(body(view, "OwnContinues").content, "Peer[")),
+         baseline(body(view, "OwnContinues").text));
+    for (const auto &[layout, width] : {std::pair{blast::MessageLayout::Stacked, 900.f},
+                                        std::pair{blast::MessageLayout::Irc, 240.f},
+                                        std::pair{blast::MessageLayout::Bubbles, 900.f}}) {
+        model.settings.messageLayouts[buffer.id] = layout;
+        viewport.width = width;
+        for (const bool timestamps : {true, false}) {
+            model.settings.timestamps = timestamps;
+            arrange();
+            assert(!bodyText(view, "Someone joined"));
+            assert(bodyText(view, "Visible notice") && !bodyText(view, "Hidden chat"));
+            for (const auto token :
+                 {"RunStart", "OwnStart", "IncomingAgain", "AfterNotice", "AfterHiddenChat",
+                  "AfterEmote", "AfterDeleted", "AfterGap", "MinuteBreak", "DayBreak",
+                  "MissingTime", "InvalidTimeA", "InvalidTimeB"})
+                header(token, true);
+            header("RunContinues", false, "pEER{");
+            header("OwnContinues", false);
+            const auto lead = body(view, "RunStart");
+            const auto next = body(view, "RunContinues");
+            assert(&lead.row != &next.row);
+            near(lead.x(), next.x());
+            assert(bounds(next).top >= bounds(lead).top + bounds(lead).height - .02f);
+            clock("RunStart", "12:34", timestamps);
+            for (const auto token :
+                 {"RunContinues", "OwnStart", "OwnContinues", "IncomingAgain", "EmoteBreak"})
+                clock(token, "12:34", false);
+            clock("MinuteBreak", "12:35", timestamps);
+            clock("DayBreak", "12:35", timestamps);
+        }
+        model.settings.presence = blast::PresenceMode::All;
+        arrange();
+        assert(bodyText(view, "Someone joined"));
+        header("RunContinues", true, "pEER{");
+        model.settings.presence = blast::PresenceMode::Hidden;
+    }
+    unchanged(buffer, before);
+    view.setWindowActive(false);
+    buffer.messages.back().time = "2026-11-08T12:36:05Z";
+    arrange();
+    buffer.readMarker = buffer.messages.back().id;
+    buffer.unread = 1;
+    append("AfterUnread", "Peer[", "2026-11-08T12:36:30Z");
+    arrange();
+    assert(plainText(view, "New since your last visit"));
+    header("AfterUnread", true);
     assert(model.actions.empty());
 }
 
@@ -5190,6 +5336,7 @@ void emptyLineSelection(TranscriptTestRenderer &renderer, float zoom) {
         message.id = "empty-" + std::to_string(buffer.messages.size());
         message.nick = "Peer";
         message.text = text;
+        message.time = "2026-11-07T12:34:56Z";
         buffer.messages.push_back(std::move(message));
     }
     const auto before = buffer;
@@ -9714,6 +9861,7 @@ void contentFitAndConsecutiveGroups(TranscriptTestRenderer &renderer) {
         entry.id = "fit-" + std::to_string(i);
         entry.nick = i == 3 ? "B" : "A";
         entry.text = i == 0 ? "tiny\nlines" : "Short-" + std::to_string(i);
+        entry.time = "2026-11-07T12:34:56Z";
         if (i == 1) {
             entry.presence = true;
             entry.activity = blast::ActivityKind::Join;
@@ -9727,10 +9875,9 @@ void contentFitAndConsecutiveGroups(TranscriptTestRenderer &renderer) {
     view.sync();
     view.arrange(renderer, {17, 23, 900, 1600});
     assert(!bodyText(view, "Short-1"));
-    // A hidden event and a visible different sender each break the author group.
-    for (const int i : {2, 4})
-        assert(plainText(body(view, "Short-" + std::to_string(i)).content, "A"));
-    for (const int i : {5, 6})
+    // Hidden presence is skipped; the visible different sender starts a new run.
+    assert(plainText(body(view, "Short-4").content, "A"));
+    for (const int i : {2, 5, 6})
         assert(!plainText(body(view, "Short-" + std::to_string(i)).content, "A"));
     const auto multiline = body(view, "tiny");
     auto *surface = bubbleSurface(multiline);
@@ -10572,8 +10719,11 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
                 assert(markup.find("😀👩‍💻") != std::string::npos);
                 if (!traditional) {
                     auto *clock = bubbleFooter(rendered.content, 1);
-                    assert(clock &&
-                           clock->color() == blast::themeForegroundColor("on_surface_variant"));
+                    if (token == std::string_view("OwnEmote"))
+                        assert(!clock);
+                    else
+                        assert(clock &&
+                               clock->color() == blast::themeForegroundColor("on_surface_variant"));
                 }
                 float x, y;
                 Node::mapToScene(&rendered.fragment, rendered.fragment.width() * .5f,
@@ -11119,6 +11269,7 @@ void runTranscriptCheck() {
     for (const char *kind : {"channel", "query"}) {
         tightBubbleViewport(renderer, kind);
         compactMeaningfulBodies(renderer, kind);
+        minuteAuthorGroups(renderer, kind);
     }
     keyboardMenus(renderer);
     keyboardMenus(renderer, true);

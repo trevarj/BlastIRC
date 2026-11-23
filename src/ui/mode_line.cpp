@@ -95,7 +95,7 @@ class HoverGlow final : public Node {
     void setGeometry(float width, float height, float scale, Color tint) {
         setFrameSize(width, height);
         halo_->setFrameSize(width, height);
-        halo_->setForegroundBlurRadius(4 * scale);
+        halo_->setForegroundBlurRadius(2 * scale);
         halo_->setBlurTint(tint);
     }
 

@@ -97,7 +97,8 @@ struct Settings {
     map<string, Cue> cues;
     map<string, string> bindings, nickColors, workspace;
     set<string> friends, fools;
-    MessageLayout defaultMessageLayout = MessageLayout::Bubbles;
+    MessageLayout channelMessageLayout = MessageLayout::Stacked;
+    MessageLayout directMessageLayout = MessageLayout::Bubbles;
     map<string, MessageLayout> messageLayouts;
     vector<string> pinnedBuffers; // Full buffer IDs, newest pin first.
     map<string, PresenceMode> channelPresence;
@@ -201,6 +202,9 @@ struct Buffer {
     bool loading = false, joined = false;
     bool muted = false, archived = false;
 };
+inline MessageLayout defaultMessageLayout(const Settings &settings, const Buffer &buffer) {
+    return buffer.kind == "channel" ? settings.channelMessageLayout : settings.directMessageLayout;
+}
 inline bool isHistoryWindowMessage(const Message &message) {
     return !message.presence &&
            !(message.own && (message.pending || message.sendStatus == SendStatus::Queued ||

@@ -1223,7 +1223,14 @@ struct Dialogs::Impl {
             nav->setPadding(6);
             track(nav.get(), MetricKind::Flex);
             nav->focusArea()->setOnKeyDown([this](const InputArea::KeyData &key) {
-                if (!key.pressed || key.preedit || key.modifiers)
+                if (!key.pressed || key.preedit)
+                    return;
+                if (const int step = emacsListStep(key.sym, key.modifiers)) {
+                    categoryNavigation->controller().handleKey(step < 0 ? XKB_KEY_Up : XKB_KEY_Down,
+                                                               0);
+                    return;
+                }
+                if (key.modifiers)
                     return;
                 if (key.sym == XKB_KEY_Left) {
                     if (!selectedSection.empty())
@@ -1698,14 +1705,17 @@ struct Dialogs::Impl {
         auto *messages = section("appearance.messages", "Messages");
         static constexpr const char *layoutNames[] = {"Message bubbles", "Traditional IRC",
                                                       "Traditional · two-line"};
-        select(*messages, "Default message layout",
-               {std::begin(layoutNames), std::end(layoutNames)},
-               layoutNames[std::clamp(int(model.settings.defaultMessageLayout), 0, 2)],
-               [this](std::size_t index, std::string_view) {
-                   if (index < std::size(layoutNames))
-                       model.settings.defaultMessageLayout = MessageLayout(index);
-               });
-        label(*messages, "Conversation menus can override the default for individual channels "
+        const auto layoutSelect = [&](std::string_view name, MessageLayout &layout) {
+            select(*messages, name, {std::begin(layoutNames), std::end(layoutNames)},
+                   layoutNames[std::clamp(int(layout), 0, 2)],
+                   [&layout](std::size_t index, std::string_view) {
+                       if (index < std::size(layoutNames))
+                           layout = MessageLayout(index);
+                   });
+        };
+        layoutSelect("Channel message layout", model.settings.channelMessageLayout);
+        layoutSelect("Direct message layout", model.settings.directMessageLayout);
+        label(*messages, "Conversation menus can override these defaults for individual channels "
                          "and direct messages.");
         toggle(*messages, "Show timestamps", model.settings.timestamps,
                [this](bool value) { model.settings.timestamps = value; });
@@ -4220,6 +4230,13 @@ bool Dialogs::handleKey(const InputArea::KeyData &key) {
         return false;
     if (impl_->recordingButton) {
         impl_->recordKey(key);
+        return true;
+    }
+    if (settingsOpen() && impl_->dispatcher && impl_->categoryNavigation &&
+        impl_->dispatcher->focusedArea() == impl_->categoryNavigation->focusArea() &&
+        emacsListStep(key.sym, key.modifiers)) {
+        impl_->categoryNavigation->focusArea()->dispatchKey(key.sym, key.utf32, key.modifiers,
+                                                            key.pressed, key.preedit);
         return true;
     }
     const bool controlG =

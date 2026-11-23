@@ -89,6 +89,13 @@ void configureNativeControlBindings() {
     });
 }
 
+int emacsListStep(std::uint32_t sym, std::uint32_t modifiers) {
+    if (modifiers != KeyMod::Ctrl)
+        return 0;
+    const auto key = xkb_keysym_to_lower(sym);
+    return key == XKB_KEY_n ? 1 : key == XKB_KEY_p ? -1 : 0;
+}
+
 std::string commandLabel(const Model &model, std::string_view label, std::string_view command) {
     std::string result(label);
     if (const auto binding = model.settings.bindings.find(std::string(command));
@@ -1002,8 +1009,7 @@ struct Ui::Impl {
         });
         for (const auto &[name, binding] : defaultBindings()) {
             if ((name == "jump-channel" || name == "toggle-fools" || name == "conversation-back" ||
-                 name == "conversation-forward" || name == "next-activity" ||
-                 name == "cycle-spelling") &&
+                 name == "conversation-forward" || name == "cycle-spelling") &&
                 !model.settings.bindings.contains(name) &&
                 std::any_of(model.settings.bindings.begin(), model.settings.bindings.end(),
                             [&](const auto &entry) {
@@ -2703,6 +2709,7 @@ void Ui::Impl::showPalette(bool commands) {
         return;
     }
     commandMode = commands;
+    paletteTitle->setText(commands ? "Commands" : "Chats");
     if (!paletteOpen)
         openPanel(*palettePanel);
     paletteOpen = true;
@@ -4013,8 +4020,8 @@ void Ui::Impl::refresh(bool panelResize) {
     const auto avatarBox = serverAvatarBox(76.f * scale, scale);
     const float logoExtent = avatarBox.width;
     const float extent = std::max(32.f, (compact ? 32.f : 34.f) * scale);
-    const float gap = 8 * scale;
-    const float titlePadding = (tight ? 5.f : compact ? 8.f : 10.f) * scale;
+    const float gap = 6 * scale;
+    const float titlePadding = (tight ? 5.f : compact ? 6.f : 7.f) * scale;
     const float titleHeight = std::max(extent, logoExtent) + 2 * titlePadding;
     foldReadAll = width < 760 * scale;
     const bool showReadAll = !foldReadAll && hasUnread();
@@ -4532,11 +4539,14 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
         return false; // Native topic selection/copy/navigation, never global chat commands.
     }
     const auto keyStroke = bindingStroke(event);
+    const int listStep = event.preedit ? 0 : emacsListStep(event.sym, event.modifiers);
+    const bool listUp = event.sym == XKB_KEY_Up || listStep < 0;
+    const bool listDown = event.sym == XKB_KEY_Down || listStep > 0;
     if (jumpOpen) {
         if (jumpActivationKey == keyId && isConsumed())
             return true;
-        const bool up = KeySymbol::isUp(event.sym) || event.sym == XKB_KEY_KP_Up;
-        const bool down = KeySymbol::isDown(event.sym) || event.sym == XKB_KEY_KP_Down;
+        const bool up = listUp || event.sym == XKB_KEY_KP_Up;
+        const bool down = listDown || event.sym == XKB_KEY_KP_Down;
         const bool scrolling =
             up || down || KeySymbol::isPageUp(event.sym) || KeySymbol::isPageDown(event.sym);
         bool cancel = event.sym == XKB_KEY_Escape || keyStroke == "c-g" || event.preedit;
@@ -4612,7 +4622,7 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
     if (chord.empty() && !paletteOpen && !dialogs->active() &&
         editors.handleCompletionKey(event.sym, event.modifiers))
         return consume();
-    if (isConsumed() && !(paletteOpen && (event.sym == XKB_KEY_Up || event.sym == XKB_KEY_Down))) {
+    if (isConsumed() && !(paletteOpen && (listUp || listDown))) {
         if (const auto repeat = repeatCommands.find(keyId);
             repeat != repeatCommands.end() && !paletteOpen && !dialogs->active()) {
             if (repeat->second == "scroll-up" || repeat->second == "scroll-down" ||
@@ -4670,14 +4680,19 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
         if (!dialogs->settingsOpen())
             return false;
     }
+    if (listStep && chord.empty() && !paletteOpen && area &&
+        area->tabFocusKey() == "people-members") {
+        area->dispatchKey(event.sym, event.utf32, event.modifiers, event.pressed, event.preedit);
+        return true;
+    }
     if (paletteOpen) {
         if (event.sym == XKB_KEY_Escape || keyStroke == "c-g") {
             dismissPalette();
             return consume();
         }
-        if (event.sym == XKB_KEY_Up || event.sym == XKB_KEY_Down) {
+        if (listUp || listDown) {
             if (!matches.empty()) {
-                if (event.sym == XKB_KEY_Up)
+                if (listUp)
                     selected = selected ? selected - 1 : matches.size() - 1;
                 else
                     selected = (selected + 1) % matches.size();

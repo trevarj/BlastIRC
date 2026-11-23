@@ -2335,7 +2335,7 @@ struct People::Impl final : VirtualListAdapter {
         list->markLayoutDirty();
     }
     void handleKey(const InputArea::KeyData &key) {
-        if (!key.pressed || order.empty())
+        if (!key.pressed || key.preedit || order.empty())
             return;
         auto current = std::find_if(order.begin(), order.end(), [&](const Member *member) {
             return member->name == keyboardNick;
@@ -2352,9 +2352,10 @@ struct People::Impl final : VirtualListAdapter {
                 execute("nick:" + buffer + "\n" + order[index]->name);
             return;
         }
-        if (KeySymbol::isUp(key.sym))
+        const int step = emacsListStep(key.sym, key.modifiers);
+        if (KeySymbol::isUp(key.sym) || step < 0)
             index = index ? index - 1 : 0;
-        else if (KeySymbol::isDown(key.sym))
+        else if (KeySymbol::isDown(key.sym) || step > 0)
             index = std::min(index + 1, order.size() - 1);
         else if (KeySymbol::isHome(key.sym))
             index = 0;

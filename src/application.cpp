@@ -3366,8 +3366,8 @@ void Application::command(Buffer &b, const string &input) {
         }
         auto &layouts = model.settings.messageLayouts;
         const auto current = layouts.find(b.id);
-        const auto layout =
-            current == layouts.end() ? model.settings.defaultMessageLayout : current->second;
+        const auto layout = current == layouts.end() ? defaultMessageLayout(model.settings, b)
+                                                     : current->second;
         if (style == "default")
             layouts.erase(b.id);
         else if (style == "stacked")

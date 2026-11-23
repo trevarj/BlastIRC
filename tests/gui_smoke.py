@@ -666,7 +666,7 @@ def read_layout(path):
     compact = height < 600 * scale or width < 1000 * scale
     tight = height < 360 * scale
     extent = max(32, (32 if compact else 34) * scale)
-    title_height = extent + (10 if tight else 16 if compact else 20) * scale
+    title_height = max(extent, 44 * scale) + (10 if tight else 12 if compact else 14) * scale
     status_height = (22 if tight else 26 if compact else 30) * scale
     outer = (4 if tight else 8 if compact else 12) * scale
     rail_width = float(workspace.get("server_rail_width", 76)) * scale
@@ -733,7 +733,7 @@ def shell_actions(layout):
     zoom = layout["scale"]
     _, _, width, height = layout["topbar"]["rect"]
     extent = max(32, (32 if layout["compact"] else 34) * zoom)
-    outer, gap = layout["rail"]["rect"][0], 8 * zoom
+    outer, gap = layout["rail"]["rect"][0], 6 * zoom
     left = width - outer - 4 * extent - 3 * gap
     database_path = next(reversed(GUI_DEBUG.values()))[0].native_database_path
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as database:
@@ -1958,19 +1958,17 @@ def set_message_style(proc, window, preferences, database_path, args, destinatio
     assert before[1] == (buffer,), before
     settings = tomllib.loads(preferences.read_text())
     overrides = dict(settings["presentation"]["message_layouts"])
-    current = overrides.get(buffer, "bubbles")
+    channel = database_buffer_kind(database_path, buffer) == "channel"
+    default_key = "channel_message_layout" if channel else "direct_message_layout"
+    current = overrides.get(buffer, settings["presentation"][default_key])
     if current != mode:
-        channel = database_buffer_kind(database_path, buffer) == "channel"
         layout = read_layout(preferences)
         actions = title_actions(layout, args.zoom, channel=channel)
         popup = open_title_menu(window, actions)
         # Channels also have Channel tools before Close; queries do not.
         open_native_submenu(window, popup, 5 if channel else 4, from_end=True)
         popup_keys(window, popup, "Home", *(["Down"] * ("bubbles", "irc", "stacked").index(mode)), "Return")
-        if mode == "bubbles":
-            overrides.pop(buffer, None)
-        else:
-            overrides[buffer] = mode
+        overrides[buffer] = mode
         wait_preference(proc, preferences, "presentation", "message_layouts", overrides)
     after = save_state(proc, preferences, database_path)
     assert_same_state("Changing message display preserves conversations/drafts/read state", before, after)
@@ -6700,10 +6698,8 @@ def run(*, allow_focused_geometry=False):
         preferences.write_text(
             f'[appearance]\nscale = {args.zoom}\ntheme_source = "auto"\n'
             f'reduced_motion = {str(args.reduced_motion).lower()}\n'
-            '[presentation.message_layouts]\n'
-            + (f'{q(channel_id)} = {q(args.message_style)}\n'
-               f'{q("Local/guiobserver")} = {q(args.message_style)}\n'
-               if args.message_style != "bubbles" else '')
+            f'[presentation]\nchannel_message_layout = {q(args.message_style)}\n'
+            f'direct_message_layout = {q(args.message_style)}\n'
         )
         preferences.chmod(0o600)
         palette_bytes = None

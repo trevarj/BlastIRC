@@ -24,7 +24,7 @@ inline const auto &bindingCommands() {
             {"jump-channel", {"Jump to channel or conversation", "C-x j", Navigation}},
             {"conversation-back", {"Previous viewed conversation", "C-o", Navigation}},
             {"conversation-forward", {"Next viewed conversation", "C-i", Navigation}},
-            {"next-activity", {"Next channel with activity", "C-SPC", Navigation}},
+            {"next-activity", {"Next conversation with activity", "C-x C-SPC", Navigation}},
             {"global-mentions", {"Global mentions", "", Other}},
             {"toggle-fools", {"Toggle fools in this conversation", "C-x f", Navigation}},
             {"show-fools", {"Show fools", "", Other}},

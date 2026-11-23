@@ -379,9 +379,9 @@ void settingsTreeControls() {
     assert(picker);
     frame();
     auto *nav = keyed(dialogs, "blastirc.settings.categories");
-    const auto key = [&](std::uint32_t sym) {
+    const auto key = [&](std::uint32_t sym, std::uint32_t modifiers = 0) {
         dispatcher.setFocus(nav);
-        dispatcher.keyEvent(sym, 0, 0, true);
+        dispatcher.keyEvent(sym, 0, modifiers, true);
         frame();
     };
     const std::array<std::vector<std::string>, 7> leaves{{
@@ -470,8 +470,11 @@ void settingsTreeControls() {
     // Keyboard movement follows only visible entries and keeps the roving host as one Tab stop.
     key(XKB_KEY_Home);
     key(XKB_KEY_Left);
-    key(XKB_KEY_Down);
+    key(XKB_KEY_n, KeyMod::Ctrl);
     assert(picker->selectedIndex() == 1);
+    key(XKB_KEY_p, KeyMod::Ctrl);
+    assert(picker->selectedIndex() == 0);
+    key(XKB_KEY_n, KeyMod::Ctrl);
     key(XKB_KEY_Right);
     key(XKB_KEY_Right);
     assert(picker->selectedIndex() >= 7);
@@ -1475,15 +1478,29 @@ void runSettingsCheck() {
     assert(availability->text().find(model.settings.spellcheckLanguage) != std::string_view::npos);
     missingLanguage->setSelectedIndex(0);
     assert(model.settings.spellcheckLanguage == "auto");
-    auto *defaultLayout = named<Select>(dialogs, "Default message layout");
-    assert(defaultLayout->selectedText() == "Message bubbles" &&
-           model.settings.defaultMessageLayout == MessageLayout::Bubbles);
-    defaultLayout->setSelectedIndex(1);
-    assert(defaultLayout->selectedText() == "Traditional IRC" &&
-           model.settings.defaultMessageLayout == MessageLayout::Irc);
-    defaultLayout->setSelectedIndex(2);
-    assert(defaultLayout->selectedText() == "Traditional · two-line" &&
-           model.settings.defaultMessageLayout == MessageLayout::Stacked);
+    auto *channelLayout = named<Select>(dialogs, "Channel message layout");
+    auto *directLayout = named<Select>(dialogs, "Direct message layout");
+    assert(channelLayout && directLayout);
+    static constexpr const char *layoutNames[] = {"Message bubbles", "Traditional IRC",
+                                                   "Traditional · two-line"};
+    assert(channelLayout->selectedText() == layoutNames[2] &&
+           model.settings.channelMessageLayout == MessageLayout::Stacked);
+    assert(directLayout->selectedText() == layoutNames[0] &&
+           model.settings.directMessageLayout == MessageLayout::Bubbles);
+    for (const int index : {1, 2, 0}) {
+        channelLayout->setSelectedIndex(index);
+        assert(channelLayout->selectedText() == layoutNames[index] &&
+               model.settings.channelMessageLayout == MessageLayout(index));
+        assert(directLayout->selectedText() == layoutNames[0] &&
+               model.settings.directMessageLayout == MessageLayout::Bubbles);
+    }
+    for (const int index : {1, 0, 2}) {
+        directLayout->setSelectedIndex(index);
+        assert(directLayout->selectedText() == layoutNames[index] &&
+               model.settings.directMessageLayout == MessageLayout(index));
+        assert(channelLayout->selectedText() == layoutNames[0] &&
+               model.settings.channelMessageLayout == MessageLayout::Bubbles);
+    }
     assert(model.settings.foolDisplay == FoolDisplay::Minimized && !model.settings.foolUnread &&
            model.settings.messageWrapColumns == 80);
     for (int style = 0; style < 4; ++style) {
@@ -1610,8 +1627,8 @@ void runSettingsCheck() {
            model.settings.messageFont == "monospace");
     assert(named<Select>(dialogs, "UI font weight")->selectedText() == "400" &&
            named<Select>(dialogs, "Message font weight")->selectedText() == "600");
-    assert(named<Select>(dialogs, "Default message layout")->selectedText() ==
-           "Traditional · two-line");
+    assert(named<Select>(dialogs, "Channel message layout")->selectedText() == layoutNames[0] &&
+           named<Select>(dialogs, "Direct message layout")->selectedText() == layoutNames[2]);
 
     category(1);
     auto *record = keyed(dialogs, "blastirc.settings.record.complete");
@@ -1902,7 +1919,8 @@ void runSettingsCheck() {
     Model loaded;
     app.storage().load(loaded);
     assert(loaded.settings.wordPrediction && model.settings.wordPrediction);
-    assert(loaded.settings.defaultMessageLayout == MessageLayout::Stacked);
+    assert(loaded.settings.channelMessageLayout == MessageLayout::Bubbles &&
+           loaded.settings.directMessageLayout == MessageLayout::Stacked);
     assert(fileText(preferences).find("word_prediction = true") != std::string::npos);
     assert(loaded.settings.cursorShape == "box" && loaded.settings.cursorEffect == "trail" &&
            loaded.settings.cursorTrailDurationMs == 222 &&

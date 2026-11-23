@@ -1,5 +1,6 @@
 #pragma once
 #include "../irc/protocol.hpp"
+#include "../key_bindings.hpp"
 #include "../model.hpp"
 #include <algorithm>
 #include <array>
@@ -377,16 +378,26 @@ inline bool bindingConflicts(std::string_view first, std::string_view second) {
 }
 template <class Bindings, class HasSavedBinding>
 inline void migrateActivityBinding(Bindings &bindings, HasSavedBinding hasSavedBinding) {
+    const bool savedActivity = hasSavedBinding("next-activity");
+    const auto conflicts = [&](std::string_view name, std::string_view stock) {
+        return std::any_of(bindings.begin(), bindings.end(), [&](const auto &entry) {
+            return entry.first != name && bindingConflicts(stock, entry.second);
+        });
+    };
     const auto mark = bindings.find("set-mark");
     // C-SPC was the stock mark until the activity command was introduced.
-    if (mark != bindings.end() && hasSavedBinding("set-mark") &&
-        (hasSavedBinding("next-activity") || canonical(mark->second) != "c-spc"))
-        return;
-    constexpr auto stock = "C-S-SPC";
-    const bool conflict = std::any_of(bindings.begin(), bindings.end(), [&](const auto &entry) {
-        return entry.first != "set-mark" && bindingConflicts(stock, entry.second);
-    });
-    bindings.insert_or_assign("set-mark", conflict ? "" : stock);
+    if (mark == bindings.end() || !hasSavedBinding("set-mark") ||
+        (!savedActivity && canonical(mark->second) == "c-spc")) {
+        constexpr auto stock = "C-S-SPC";
+        bindings.insert_or_assign("set-mark", conflicts("set-mark", stock) ? "" : stock);
+    }
+    const auto activity = bindings.find("next-activity");
+    // Only the exact old default was written automatically; keep custom and empty chords.
+    if (!savedActivity || (activity != bindings.end() && activity->second == "C-SPC")) {
+        const std::string_view stock = defaultBindings().at("next-activity");
+        bindings.insert_or_assign("next-activity",
+                                  conflicts("next-activity", stock) ? std::string_view{} : stock);
+    }
 }
 template <class Bindings, class HasSavedBinding>
 inline void migrateMessageBindings(Bindings &bindings, HasSavedBinding hasSavedBinding) {

@@ -31,7 +31,8 @@ MessageLayout messageLayout(const Settings &settings, const Buffer &buffer) {
     if (buffer.kind != "channel" && buffer.kind != "query")
         return MessageLayout::Irc;
     const auto found = settings.messageLayouts.find(buffer.id);
-    return found == settings.messageLayouts.end() ? settings.defaultMessageLayout : found->second;
+    return found == settings.messageLayouts.end() ? defaultMessageLayout(settings, buffer)
+                                                  : found->second;
 }
 bool messageBubbles(const Settings &settings, const Buffer &buffer) {
     return messageLayout(settings, buffer) == MessageLayout::Bubbles;

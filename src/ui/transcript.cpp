@@ -12,6 +12,7 @@
 #include "media_preview.hpp"
 #include "message_selection.hpp"
 #include "presentation.hpp"
+#include "ui.hpp"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -663,6 +664,7 @@ struct Geometry {
     TextFont nickStyle, activityStyle;
     float header = 20, footer = 14, quote = 24, reaction = 29, day = 36, unread = 30;
     float bodyLine = 0, nickLine = 0, nickHeader = 0, activityLine = 0, metadataHeader = 0;
+    float stackedBodyIndent = 0;
     float verticalPadding = 0;
     bool conversation = false, channel = false, inlineChannel = false;
     bool bubbles = false, avatars = false, timestamps = false, tight = false;
@@ -725,7 +727,8 @@ struct Geometry {
     }
     float prefixWidth(bool presence) const {
         return presence  ? timeGutter
-               : channel ? (inlineChannel ? channelPrefix() : compactAvatarInset(false))
+               : channel ? (inlineChannel ? channelPrefix()
+                                          : compactAvatarInset(false) + stackedBodyIndent)
                : dense() ? timeGutter
                          : 0;
     }
@@ -865,6 +868,8 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
             result.nickGutter = inlineNick;
         else {
             result.nickGutter = available;
+            result.stackedBodyIndent =
+                1.5f * renderer.measureText("0", result.font, themeMessageFont()).width;
         }
     }
     result.key = buffer.kind + "|" + themeMessageFont().family + "|" + themeMessageFont().features +
@@ -897,10 +902,10 @@ Color over(Color base, Color fill) { return withAlpha(lerpColor(base, fill, fill
 Color rowBackdrop(const Geometry &g, const Message &entry, bool hovered) {
     auto base = themeConversationBackdrop();
     const bool bubble = g.bubbles && !entry.presence && !entry.action;
-    if (typedActivity(entry) || !entry.presence)
-        base = over(base, denseBackground(entry, hovered));
     if (bubble)
         base = over(base, themeSurfaceFill(themeMessageBackground(entry.own, false, hovered)));
+    else if (typedActivity(entry) || !entry.presence)
+        base = over(base, denseBackground(entry, hovered));
     return base;
 }
 
@@ -2808,13 +2813,15 @@ struct TranscriptView::Impl {
     bool handleTypingKey(const InputArea::KeyData &key) {
         if (!key.pressed || key.preedit || !nativeFocus(view))
             return false;
-        if (typingOverflow->inputArea()->focused() && typingListOpen && !key.modifiers) {
+        const int direction = emacsListStep(key.sym, key.modifiers);
+        if (typingOverflow->inputArea()->focused() && typingListOpen &&
+            (!key.modifiers || direction)) {
             const float step = 28 * themeScale();
             if (key.sym == XKB_KEY_Escape)
                 closeTypingList();
-            else if (key.sym == XKB_KEY_Up)
+            else if (key.sym == XKB_KEY_Up || direction < 0)
                 typingListScroll->scrollBy(-step);
-            else if (key.sym == XKB_KEY_Down)
+            else if (key.sym == XKB_KEY_Down || direction > 0)
                 typingListScroll->scrollBy(step);
             else if (key.sym == XKB_KEY_Page_Up)
                 typingListScroll->scrollBy(-typingListScroll->height());
@@ -4494,14 +4501,17 @@ struct TranscriptView::Impl {
                 *slot.content, 2 * g.scale, top, 2 * g.scale, surfaceHeight,
                 themePairedForeground(themeConversationBackdrop(), themeForegroundColor("primary")),
                 g.scale);
-        auto dense = std::make_unique<RectNode>();
-        slot.dense = dense.get();
-        slot.dense->setPosition(surfaceX, top);
-        slot.dense->setSize(row.surfaceWidth, surfaceHeight);
-        slot.dense->setVisible(notice || (!entry.presence && (g.dense() || entry.action)));
-        slot.dense->setHitTestVisible(false);
-        slot.dense->setZIndex(-1);
-        addRowPaint(*slot.content, std::move(dense));
+        slot.dense = nullptr;
+        if (!slot.material->visible()) {
+            auto dense = std::make_unique<RectNode>();
+            slot.dense = dense.get();
+            dense->setPosition(surfaceX, top);
+            dense->setSize(row.surfaceWidth, surfaceHeight);
+            dense->setVisible(notice || (!entry.presence && (g.dense() || entry.action)));
+            dense->setHitTestVisible(false);
+            dense->setZIndex(-1);
+            addRowPaint(*slot.content, std::move(dense));
+        }
         if (row.activitySummary) {
             auto chevron = std::make_unique<Glyph>();
             chevron->setGlyph(row.activityExpanded ? "chevron-down" : "chevron-right");
@@ -5318,10 +5328,6 @@ struct TranscriptView::Impl {
                                  : withAlpha(themeForegroundColor(role), style.fill.a);
                 rectangle->setStyle(style);
             }
-            RoundedRectStyle denseStyle{};
-            const bool bubble = slot.material->visible();
-            denseStyle.fill = denseBackground(entry, hovered);
-            const bool highlighted = hovered;
             const float contentWidth =
                 g.bubbles || entry.presence ? slot.material->width() : row.selectionWidth;
             const float padding = 3 * g.scale;
@@ -5337,19 +5343,23 @@ struct TranscriptView::Impl {
             const float highlightRadius = std::min(
                 {(slot.material->visible() ? themeBubbleRadius() * .75f : g.cornerRadius) + padding,
                  highlightWidth * .5f, highlightHeight * .5f});
-            slot.dense->setVisible(typedActivity(entry) ||
-                                   (!entry.presence && (g.dense() || entry.action || highlighted)));
-            slot.dense->setPosition(highlighted ? highlightX : slot.material->x(),
-                                    highlighted ? highlightY : slot.material->y());
-            slot.dense->setSize(highlighted ? highlightWidth : contentWidth,
-                                highlighted ? highlightHeight : slot.material->height());
-            denseStyle.radius = highlighted ? highlightRadius
+            if (slot.dense) {
+                slot.dense->setVisible(typedActivity(entry) ||
+                                       (!entry.presence && (g.dense() || entry.action || hovered)));
+                slot.dense->setPosition(hovered ? highlightX : slot.material->x(),
+                                        hovered ? highlightY : slot.material->y());
+                slot.dense->setSize(hovered ? highlightWidth : contentWidth,
+                                    hovered ? highlightHeight : slot.material->height());
+                RoundedRectStyle denseStyle{};
+                denseStyle.fill = denseBackground(entry, hovered);
+                denseStyle.radius = hovered ? highlightRadius
                                             : std::min({g.cornerRadius, slot.dense->width() * .5f,
                                                         slot.dense->height() * .5f});
-            slot.dense->setStyle(denseStyle);
-            if (bubble)
+                slot.dense->setStyle(denseStyle);
+            } else {
                 slot.material->setMessage(
                     themeSurfaceFill(themeMessageBackground(entry.own, false, hovered)), hovered);
+            }
             slot.material->sync();
             float l, t, r, b;
             Node::transformedBounds(slot.material, l, t, r, b);

@@ -30,7 +30,8 @@ static void mode(const fs::path &file, unsigned expected) {
 }
 static void presentation(const Settings &actual, const Settings &expected) {
     assert(actual.sendMotion == expected.sendMotion && actual.sendReveal == expected.sendReveal &&
-           actual.defaultMessageLayout == expected.defaultMessageLayout &&
+           actual.channelMessageLayout == expected.channelMessageLayout &&
+           actual.directMessageLayout == expected.directMessageLayout &&
            actual.messageLayouts == expected.messageLayouts && actual.uiFont == expected.uiFont &&
            actual.messageFont == expected.messageFont);
     assert(actual.scale == expected.scale && actual.messageScale == expected.messageScale);
@@ -1227,7 +1228,7 @@ static void conversationBindingPreferences(const fs::path &config) {
         defaults = model.settings.bindings;
         assert(defaults.at("conversation-back") == "C-o");
         assert(defaults.at("conversation-forward") == "C-i");
-        assert(defaults.at("next-activity") == "C-SPC");
+        assert(defaults.at("next-activity") == "C-x C-SPC");
         assert(defaults.at("set-mark") == "C-S-SPC");
         assert(defaults.at("/join").empty() && defaults.at("mark-read").empty());
     }
@@ -1258,7 +1259,7 @@ static void conversationBindingPreferences(const fs::path &config) {
         {"conversation-forward = 'C-o x'\n", "", "C-o x", {}},
         {"conversation-back = 'C-i'\nconversation-forward = 'C-o'\n", "C-i", "C-o", {}},
         {"set-mark = ' c-SpC '\n", "C-o", "C-i", {}},
-        {"set-mark = 'C-SPC x'\n", "C-o", "C-i", {{"set-mark", "C-SPC x"}, {"next-activity", ""}}},
+        {"set-mark = 'C-SPC x'\n", "C-o", "C-i", {{"set-mark", "C-SPC x"}}},
         {"set-mark = 'M-SPC'\n", "C-o", "C-i", {{"set-mark", "M-SPC"}}},
         {"set-mark = ''\n", "C-o", "C-i", {{"set-mark", ""}}},
         {"set-mark = 'C-SPC'\ntoggle-navigation = ' c-S-SPC x '\n",
@@ -1269,10 +1270,19 @@ static void conversationBindingPreferences(const fs::path &config) {
          "C-o",
          "C-i",
          {{"set-mark", ""}, {"next-activity", "C-S-SPC"}}},
-        {"toggle-navigation = 'C-SPC x'\n",
+        {"toggle-navigation = 'C-SPC x'\n", "C-o", "C-i", {{"toggle-navigation", "C-SPC x"}}},
+        {"toggle-navigation = 'C-x'\n",
          "C-o",
          "C-i",
-         {{"next-activity", ""}, {"toggle-navigation", "C-SPC x"}}},
+         {{"next-activity", ""}, {"jump-channel", ""}, {"toggle-navigation", "C-x"}}},
+        {"next-activity = 'C-SPC'\n", "C-o", "C-i", {}},
+        {"set-mark = 'C-SPC'\nnext-activity = 'C-SPC'\n", "C-o", "C-i", {{"set-mark", "C-SPC"}}},
+        {"next-activity = 'C-SPC'\ntoggle-navigation = ' c-X  c-SpC k '\n",
+         "C-o",
+         "C-i",
+         {{"next-activity", ""}, {"toggle-navigation", " c-X  c-SpC k "}}},
+        {"next-activity = ' c-SpC '\n", "C-o", "C-i", {{"next-activity", " c-SpC "}}},
+        {"next-activity = 'C-SPC x'\n", "C-o", "C-i", {{"next-activity", "C-SPC x"}}},
         {"set-mark = 'C-SPC'\nnext-activity = ''\n",
          "C-o",
          "C-i",
@@ -2639,6 +2649,8 @@ int main() {
             assert(expected.settings.peopleMode == SidebarMode::Hidden);
             assert(expected.settings.opacity == 1.f && !expected.settings.transparency &&
                    expected.settings.messageLayouts.empty());
+            assert(expected.settings.channelMessageLayout == MessageLayout::Stacked &&
+                   expected.settings.directMessageLayout == MessageLayout::Bubbles);
             storage.save(expected); // Closing an unfinished wizard preserves preferences only.
             assert(!fs::exists(config / "config.toml") && fs::exists(config / "settings.toml"));
             Model unfinished;
@@ -2698,7 +2710,8 @@ int main() {
             s.friends = {"alice", "bob"};
             s.fools = {"mallory"};
             s.channelPresence["Libera/#a"] = PresenceMode::All;
-            s.defaultMessageLayout = MessageLayout::Stacked;
+            s.channelMessageLayout = MessageLayout::Bubbles;
+            s.directMessageLayout = MessageLayout::Stacked;
             s.messageLayouts = {{"Libera/#a", MessageLayout::Irc},
                                 {"Other/#a", MessageLayout::Irc}};
             s.pinnedBuffers = {"Other/#a", "Libera/#a"};
@@ -3093,7 +3106,8 @@ int main() {
             storage.load(legacy);
             assert(!legacy.firstRun && legacy.settings.opacity == .5f);
             assert(!legacy.settings.transparency && legacy.settings.messageLayouts.empty());
-            assert(legacy.settings.defaultMessageLayout == MessageLayout::Bubbles);
+            assert(legacy.settings.channelMessageLayout == MessageLayout::Stacked &&
+                   legacy.settings.directMessageLayout == MessageLayout::Bubbles);
             assert(legacy.settings.scale == 1.f && legacy.settings.messageScale == 1.f);
             assert(!legacy.settings.bindings.contains("split-below") &&
                    !legacy.settings.bindings.contains("close-pane") &&
@@ -3138,7 +3152,8 @@ int main() {
                        legacy.settings.workspace == expected.settings.workspace);
                 assert(legacy.settings.sendMotion == SendMotion::Flight &&
                        legacy.settings.sendReveal == SendReveal::None);
-                assert(legacy.settings.defaultMessageLayout == MessageLayout::Bubbles);
+                assert(legacy.settings.channelMessageLayout == MessageLayout::Stacked &&
+                       legacy.settings.directMessageLayout == MessageLayout::Bubbles);
                 assert(legacy.settings.messageLayouts == expected.settings.messageLayouts &&
                        legacy.settings.uiFont == "Legacy UI font" &&
                        legacy.settings.messageFont == "Legacy message font");
@@ -3173,35 +3188,51 @@ int main() {
                 assert(saved.find("glass") == string::npos && saved.find("hacker") == string::npos);
             }
         }
-        // Canonical layouts take precedence over legacy input and round-trip all three tokens.
-        for (const auto &[token, layout] :
-             {std::pair{"bubbles", MessageLayout::Bubbles}, std::pair{"irc", MessageLayout::Irc},
-              std::pair{"stacked", MessageLayout::Stacked}}) {
+        // New defaults override the old scalar independently; per-buffer layouts still win
+        // over the old list.
+        struct LayoutCase {
+            const char *source;
+            MessageLayout channel, direct;
+        };
+        for (const auto &[source, channel, direct] :
+             {LayoutCase{"message_layout = 'bubbles'\n", MessageLayout::Stacked,
+                         MessageLayout::Bubbles},
+              LayoutCase{"message_layout = 'irc'\n", MessageLayout::Irc, MessageLayout::Irc},
+              LayoutCase{"message_layout = 'stacked'\n", MessageLayout::Stacked,
+                         MessageLayout::Stacked},
+              LayoutCase{"message_layout = 'irc'\nchannel_message_layout = 'bubbles'\n",
+                         MessageLayout::Bubbles, MessageLayout::Irc},
+              LayoutCase{"message_layout = 'stacked'\ndirect_message_layout = 'irc'\n",
+                         MessageLayout::Stacked, MessageLayout::Irc},
+              LayoutCase{"channel_message_layout = 'irc'\ndirect_message_layout = 'stacked'\n",
+                         MessageLayout::Irc, MessageLayout::Stacked}}) {
             {
                 std::ofstream output(config / "settings.toml");
-                output
-                    << "[presentation]\nmessage_layout = '" << token
-                    << "'\nirc_channels = ['legacy/ignored']\n"
-                       "[presentation.message_layouts]\n"
-                       "'Libera/#a' = 'stacked'\n'Other/#a' = 'irc'\n'Explicit/#b' = 'bubbles'\n";
+                output << "[presentation]\n" << source
+                       << "irc_channels = ['legacy/ignored']\n"
+                          "[presentation.message_layouts]\n"
+                          "'Libera/#a' = 'stacked'\n'Other/#a' = 'irc'\n'Explicit/#b' = 'bubbles'\n";
             }
             Storage storage;
             Model layouts;
             storage.load(layouts);
-            assert(layouts.settings.defaultMessageLayout == layout &&
+            assert(layouts.settings.channelMessageLayout == channel &&
+                   layouts.settings.directMessageLayout == direct &&
                    layouts.settings.messageLayouts.size() == 3 &&
                    layouts.settings.messageLayouts.at("Libera/#a") == MessageLayout::Stacked &&
                    layouts.settings.messageLayouts.at("Other/#a") == MessageLayout::Irc &&
                    layouts.settings.messageLayouts.at("Explicit/#b") == MessageLayout::Bubbles &&
                    !layouts.settings.messageLayouts.contains("legacy/ignored"));
             storage.save(layouts);
-            const auto saved = contents(config / "settings.toml");
-            assert(saved.find("irc_channels") == string::npos &&
-                   saved.find("message_layouts") != string::npos);
-            assert(toml::parse(saved)["presentation"]["message_layout"].value<string>() == token);
+            const auto saved = toml::parse(contents(config / "settings.toml"));
+            const auto *row = saved["presentation"].as_table();
+            assert(row && !row->contains("message_layout") && !row->contains("irc_channels") &&
+                   row->contains("channel_message_layout") &&
+                   row->contains("direct_message_layout") && row->contains("message_layouts"));
             Model reopened;
             storage.load(reopened);
-            assert(reopened.settings.defaultMessageLayout == layout &&
+            assert(reopened.settings.channelMessageLayout == channel &&
+                   reopened.settings.directMessageLayout == direct &&
                    reopened.settings.messageLayouts == layouts.settings.messageLayouts);
         }
         // Every motion/reveal pairing is independently decoded and survives save/restart.
@@ -3560,6 +3591,8 @@ int main() {
               "appearance.incoming_duration_ms", "appearance.fool_display",
               "appearance.message_wrap_columns", "previews",
               "previews.max_height", "previews.media_max_mib", "previews.media_max_seconds",
+              "presentation.channel_message_layout", "presentation.direct_message_layout",
+              "presentation.message_layouts.Libera/#a",
               "cursor.shape", "cursor.effect"}) {
             Storage storage;
             Model invalid = legacy;
@@ -3585,6 +3618,12 @@ int main() {
                 invalid.settings.previewMediaMaxMiB = 513;
             else if (diagnostic == "previews.media_max_seconds")
                 invalid.settings.previewMediaMaxSeconds = 7201;
+            else if (diagnostic == "presentation.channel_message_layout")
+                invalid.settings.channelMessageLayout = static_cast<MessageLayout>(-1);
+            else if (diagnostic == "presentation.direct_message_layout")
+                invalid.settings.directMessageLayout = static_cast<MessageLayout>(-1);
+            else if (diagnostic == "presentation.message_layouts.Libera/#a")
+                invalid.settings.messageLayouts["Libera/#a"] = static_cast<MessageLayout>(-1);
             else
                 invalid.settings.sendReveal = static_cast<SendReveal>(-1);
             bool failed = false;
@@ -3871,6 +3910,10 @@ int main() {
             {"[presentation]\nmessage_layout = 'IRC'\n", "presentation.message_layout"},
             {"[presentation]\nmessage_layout = ''\n", "presentation.message_layout"},
             {"[presentation]\nmessage_layout = 'other'\n", "presentation.message_layout"},
+            {"[presentation]\nchannel_message_layout = false\n", "presentation.channel_message_layout"},
+            {"[presentation]\nchannel_message_layout = 'IRC'\n", "presentation.channel_message_layout"},
+            {"[presentation]\ndirect_message_layout = false\n", "presentation.direct_message_layout"},
+            {"[presentation]\ndirect_message_layout = 'IRC'\n", "presentation.direct_message_layout"},
             {"[presentation]\nmessage_layouts = []\n", "message_layouts"},
             {"[presentation.message_layouts]\n'a' = false\n", "presentation.message_layouts.a"},
             {"[presentation.message_layouts]\n'a' = 'IRC'\n", "presentation.message_layouts.a"},

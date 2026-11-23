@@ -71,4 +71,5 @@ std::string commandLabel(const Model &, std::string_view label, std::string_view
 std::string sidebarModeToggleLabel(std::string_view panel, SidebarMode preferred,
                                    SidebarMode regularEffective);
 std::string bindingStroke(const InputArea::KeyData &);
+int emacsListStep(std::uint32_t sym, std::uint32_t modifiers);
 } // namespace blast

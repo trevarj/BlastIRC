@@ -251,13 +251,14 @@ std::optional<Id> Workspace::navigateHistory(bool forward) {
     }
 }
 std::optional<Id> Workspace::navigateActivity() {
-    const auto unreadChannel = [](const Buffer &buffer) {
-        return buffer.kind == "channel" && !buffer.archived && buffer.unread > 0;
+    const auto unreadChat = [](const Buffer &buffer) {
+        return (buffer.kind == "channel" || buffer.kind == "query") && !buffer.archived &&
+               buffer.unread > 0;
     };
     if (!activityOrigin_) {
         std::vector<const Buffer *> candidates;
         for (const auto &[id, buffer] : model_.buffers)
-            if (id != publishedActive_ && unreadChannel(buffer))
+            if (id != publishedActive_ && unreadChat(buffer))
                 candidates.push_back(&buffer);
         if (candidates.empty())
             return std::nullopt;
@@ -273,7 +274,7 @@ std::optional<Id> Workspace::navigateActivity() {
         auto target = std::move(activityPending_.back());
         activityPending_.pop_back();
         const auto found = model_.buffers.find(target);
-        if (found != model_.buffers.end() && unreadChannel(found->second)) {
+        if (found != model_.buffers.end() && unreadChat(found->second)) {
             advancingActivity_ = true;
             const auto pane = open(target);
             advancingActivity_ = false;

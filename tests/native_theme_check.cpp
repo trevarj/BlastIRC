@@ -257,7 +257,7 @@ void presentation() {
     query.kind = "query";
     server.id = "network";
     server.kind = "server";
-    assert(messageBubbles(model.settings, channel));
+    assert(messageLayout(model.settings, channel) == MessageLayout::Stacked);
     assert(messageBubbles(model.settings, query));
     assert(!messageBubbles(model.settings, server));
     model.settings.messageLayouts[channel.id] = MessageLayout::Irc;
@@ -266,8 +266,14 @@ void presentation() {
     model.settings.messageLayouts[query.id] = MessageLayout::Stacked;
     assert(!messageBubbles(model.settings, query));
     model.settings.messageLayouts.erase(channel.id);
-    assert(messageBubbles(model.settings, channel));
+    assert(messageLayout(model.settings, channel) == MessageLayout::Stacked);
     assert(!messageBubbles(model.settings, query));
+    model.settings.channelMessageLayout = MessageLayout::Bubbles;
+    model.settings.directMessageLayout = MessageLayout::Irc;
+    assert(messageBubbles(model.settings, channel));
+    assert(messageLayout(model.settings, query) == MessageLayout::Stacked);
+    model.settings.messageLayouts.erase(query.id);
+    assert(messageLayout(model.settings, query) == MessageLayout::Irc);
 }
 } // namespace
 

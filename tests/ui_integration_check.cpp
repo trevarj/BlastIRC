@@ -2848,7 +2848,7 @@ void titlebarGeometryCheck() {
         auto *close = areaWithKey(ui.root(), "topbar-close");
         assert(settings && visible(*settings) && close && visible(*close));
         assert(settings->width() >= 32 * scale && settings->height() >= 32 * scale);
-        assert(std::abs(close->x() - (settings->x() + settings->width()) - 8 * scale) < .1f);
+        assert(std::abs(close->x() - (settings->x() + settings->width()) - 6 * scale) < .1f);
         const float right = close->x() + close->width();
         assert(right <= width && right >= width - 12 * scale);
     };
@@ -2871,6 +2871,7 @@ void titlebarGeometryCheck() {
         Node::mapToScene(logo, 0, logo->height() / 2, logoX, logoCenter);
         assert(std::abs(controlCenter - logoCenter) <= .5f);
         assert(control->width() >= 32 * scale && control->height() >= 32 * scale);
+        assert(logoY <= 8 * scale);
         auto *application = areaWithKey(ui.root(), "topbar-application");
         assert(application && visible(*application));
         const auto naturalTitle =
@@ -2894,7 +2895,7 @@ void titlebarGeometryCheck() {
                 float previousRight = 0, previousY = 0, left = 0, y = 0;
                 Node::mapToScene(previous, previous->width(), 0, previousRight, previousY);
                 Node::mapToScene(button, 0, 0, left, y);
-                assert(std::abs(left - previousRight - 8 * scale) < .1f &&
+                assert(std::abs(left - previousRight - 6 * scale) < .1f &&
                        std::abs(y - previousY) < .1f);
             }
             previous = button;
@@ -4526,7 +4527,7 @@ void queuedPaneCommandCheck(bool rename) {
                            std::pair{"Hidden", Intent::Presence},
                            std::pair{"Close buffer", Intent::Close}};
     auto model = edgeModel();
-    model.settings.defaultMessageLayout = MessageLayout::Stacked;
+    model.settings.directMessageLayout = MessageLayout::Stacked;
     Clipboard clipboard;
     Theme theme;
     theme.update(model);
@@ -9533,6 +9534,7 @@ void messageReplyCheck() {
     using namespace blast;
     for (const bool tagged : {true, false}) {
         auto model = messageActionModel();
+        model.settings.messageLayouts[model.activeBuffer] = MessageLayout::Bubbles;
         // Keep the body marker separate from nick-token styling: native text is fragmented.
         model.buffers.at(model.activeBuffer).messages[1].text =
             "ReplyTailBody real conversation message";
@@ -10211,12 +10213,17 @@ void nextActivityNativeCheck() {
         return buffer;
     };
     auto &older = addChannel("test", "#older", 10);
-    auto &newer = addChannel("remote", "#newer", 20);
+    auto &newer = addChannel("remote", "#newer", 30);
     newer.muted = true;
-    addChannel("test", "#archived", 30).archived = true;
+    addChannel("test", "#archived", 40).archived = true;
     auto &query = model.buffers.at(edgeBuffers[2]);
     query.unread = 1;
-    query.lastChatTimestamp = 40;
+    query.lastChatTimestamp = 20;
+    auto &archivedQuery = model.buffers.at(edgeBuffers[3]);
+    archivedQuery.unread = 1;
+    archivedQuery.lastChatTimestamp = 50;
+    archivedQuery.archived = true;
+    model.buffers.at(edgeBuffers[0]).unread = 1;
 
     Clipboard clipboard;
     Theme theme;
@@ -10236,8 +10243,11 @@ void nextActivityNativeCheck() {
         auto *composer = inputWithText(ui.root(), model.buffers.at(id).draft);
         assert(composer && visible(*composer) && dispatcher.focusedArea() == composer->inputArea());
     };
+    const auto prefix = [&] { hostKey(ui, dispatcher, XKB_KEY_x, KeyMod::Ctrl, 'x'); };
+    const auto space = [&] { hostKey(ui, dispatcher, XKB_KEY_space, KeyMod::Ctrl, ' '); };
     const auto next = [&](const std::string &id) {
-        hostKey(ui, dispatcher, XKB_KEY_space, KeyMod::Ctrl, ' ');
+        prefix();
+        space();
         frame();
         at(id);
     };
@@ -10246,22 +10256,32 @@ void nextActivityNativeCheck() {
     assert(origin && visible(*origin));
     dispatcher.setFocus(origin->inputArea());
     at(edgeBuffers[0]);
-    next(newer.id);
+    space();
+    frame();
+    at(edgeBuffers[0]);
+    prefix();
+    at(edgeBuffers[0]);
+    space();
+    frame();
+    at(newer.id);
+    next(query.id);
     next(older.id);
-    // Read requests have not reached the Application, so neither visit has cleared unread.
-    assert(newer.unread && older.unread);
+    // These visits only queue read requests; the Application has not cleared unread.
+    assert(newer.unread && query.unread && older.unread);
     next(edgeBuffers[0]);
-    newer.unread = older.unread = 0;
+    newer.unread = query.unread = older.unread = 0;
     next(edgeBuffers[0]);
 
-    newer.unread = older.unread = 1;
+    model.buffers.at(edgeBuffers[0]).unread = 0;
+    newer.unread = query.unread = older.unread = 1;
     next(newer.id);
-    ui.execute("buffer:" + query.id);
+    ui.execute("buffer:" + std::string(edgeBuffers[1]));
     frame();
-    at(query.id);
+    at(edgeBuffers[1]);
     next(newer.id); // Manual navigation starts a fresh cycle.
-    older.unread = 0;
-    next(query.id); // A buffer read after the snapshot is skipped.
+    query.unread = 0;
+    next(older.id); // A DM read after the snapshot is skipped.
+    next(edgeBuffers[1]);
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }
@@ -10453,6 +10473,7 @@ void conversationFinderOrderNativeCheck() {
                       : nullptr;
     assert(query && visibleLabelContaining(*query, "Find a conversation…"));
     auto &picker = *query->parent();
+    assert(visibleLabelContaining(picker, "Chats") && !visibleLabelContaining(picker, "Commands"));
     const auto assertOrder = [&](bool filtered) {
         Label *previous = nullptr;
         for (int i : {1, 0, 2, 3}) {
@@ -10471,6 +10492,12 @@ void conversationFinderOrderNativeCheck() {
     frame();
     assert(query->value() == "review");
     assertOrder(true);
+    hostKey(ui, dispatcher, XKB_KEY_n, KeyMod::Ctrl);
+    hostKey(ui, dispatcher, XKB_KEY_n, KeyMod::Ctrl);
+    hostKey(ui, dispatcher, XKB_KEY_p, KeyMod::Ctrl);
+    hostKey(ui, dispatcher, XKB_KEY_Return);
+    frame();
+    assert(model.activeBuffer == edgeBuffers[0]);
 
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);

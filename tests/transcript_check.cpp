@@ -911,10 +911,12 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 viewport.width <= 240 * zoom ||
                 model.settings.messageLayouts.at(buffer.id) == blast::MessageLayout::Stacked;
             if (stacked) {
-                near(bodyBounds.x, hx + (enabled ? 40 * zoom : 0));
-                near(bodyBounds.x,
-                     labelBounds.x -
-                         (i == 1 ? labelBounds.x - sceneBounds(*find<RectNode>(*hit)).x : 0));
+                const float indent =
+                    1.5f *
+                    renderer.measureText("0", rendered.text.fontSize(), rendered.text.font()).width;
+                const float headerX = hx + (enabled ? 40 * zoom : 0);
+                near(bodyBounds.x, headerX + indent);
+                near(i == 1 ? sceneBounds(*find<RectNode>(*hit)).x : labelBounds.x, headerX);
                 assert(nativeInk.y + nativeInk.height <= bodyBounds.y + .02f);
             } else {
                 assert(labelBounds.x + labelBounds.width <= bodyBounds.x + .02f);
@@ -1254,6 +1256,7 @@ LayoutRect nativeHistoryClip(blast::TranscriptView &view);
 
 void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.scale = zoom;
     model.settings.messageScale = zoom;
     model.settings.timestamps = true;
@@ -1424,7 +1427,11 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
     auto *compactHit = nickControl(*compactAuthor);
     assert(compactHit && compactHit->y() + compactHit->height() <= compact.y() + .02f);
     assert(compact.x() < withTime);
-    near(sceneBounds(compact.body).x, sceneBounds(*compactAuthor->parent()).x);
+    const auto indent = [&](const Body &rendered) {
+        return 1.5f *
+               renderer.measureText("0", rendered.text.fontSize(), rendered.text.font()).width;
+    };
+    near(sceneBounds(compact.body).x, sceneBounds(*compactAuthor->parent()).x + indent(compact));
     assert(sceneBounds(compact.body).width + .02f >= compactAuthor->parent()->width());
     visibleNickInk(*compactAuthor, *compactHit);
     const auto compactGrouped = body(view, "GroupedLine");
@@ -1443,7 +1450,7 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
         assert(prefix && prefix->y() + prefix->height() <= minimum.y() + .02f);
         const auto minimumBody = sceneBounds(minimum.body);
         const auto minimumNick = sceneBounds(*minimumAuthor->parent());
-        near(minimumBody.x, minimumNick.x);
+        near(minimumBody.x, minimumNick.x + indent(minimum));
         assert(minimumNick.x + minimumNick.width <= minimumBody.x + minimumBody.width + .02f);
         containedBounds(minimumBody, nativeHistoryClip(view));
         containedBounds(sceneBounds(*prefix), nativeHistoryClip(view));
@@ -1680,6 +1687,7 @@ void bubbleGeometry(TranscriptTestRenderer &renderer, const Body &b, float zoom,
 
 void rowGapReflow(TranscriptTestRenderer &renderer, bool presence) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.timestamps = false;
     model.settings.avatars = false;
     model.settings.reducedMotion = true;
@@ -1875,6 +1883,7 @@ void reachableBubble(TranscriptTestRenderer &renderer, blast::TranscriptView &vi
 
 void tightBubbleViewport(TranscriptTestRenderer &renderer, const char *kind) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.scale = 2;
     model.settings.timestamps = true;
     model.settings.avatars = false;
@@ -2266,6 +2275,7 @@ void compactMeaningfulBodies(TranscriptTestRenderer &renderer, const char *kind)
     for (const bool own : {false, true})
         for (const int count : {2, 6}) {
             blast::Model model;
+            model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
             model.settings.scale = 2;
             model.settings.timestamps = true;
             model.settings.avatars = true;
@@ -2353,6 +2363,7 @@ void compactMeaningfulBodies(TranscriptTestRenderer &renderer, const char *kind)
 
 void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char *kind) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.scale = zoom;
     model.settings.messageScale = zoom;
     model.settings.timestamps = true;
@@ -4238,6 +4249,7 @@ void messageIdentityRevision(TranscriptTestRenderer &renderer) {
 
 void channelActivity(TranscriptTestRenderer &renderer, float zoom) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.scale = zoom;
     model.settings.messageScale = zoom;
     model.settings.timestamps = true;
@@ -4660,6 +4672,7 @@ void ownJoinProjection(TranscriptTestRenderer &renderer) {
     for (int layout = 0; layout < 3; ++layout)
         for (const bool history : {false, true}) {
             blast::Model model;
+            model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
             model.settings.timestamps = model.settings.avatars = false;
             model.settings.reducedMotion = true;
             model.settings.presence = blast::PresenceMode::Smart;
@@ -4785,6 +4798,7 @@ void ownJoinProjection(TranscriptTestRenderer &renderer) {
 
 void messageTextSelection(TranscriptTestRenderer &renderer, float zoom) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.scale = zoom;
     model.settings.messageScale = zoom;
     model.settings.timestamps = true;
@@ -5160,6 +5174,7 @@ void messageTextSelection(TranscriptTestRenderer &renderer, float zoom) {
 
 void emptyLineSelection(TranscriptTestRenderer &renderer, float zoom) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.scale = zoom;
     model.settings.messageScale = zoom;
     model.settings.timestamps = false;
@@ -5448,6 +5463,7 @@ void messageLinkEnter(TranscriptTestRenderer &renderer) {
 
 void messageNavigation(TranscriptTestRenderer &renderer, bool traditional) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.timestamps = true;
     model.settings.reducedMotion = true;
     model.settings.themeSource = "builtin";
@@ -5654,6 +5670,7 @@ void messageNavigation(TranscriptTestRenderer &renderer, bool traditional) {
 
 void linkPreviewMenus(TranscriptTestRenderer &renderer) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.reducedMotion = true;
     model.settings.themeSource = "builtin";
     blast::Theme theme;
@@ -5739,6 +5756,7 @@ void linkPreviewMenus(TranscriptTestRenderer &renderer) {
 void keyboardMenus(TranscriptTestRenderer &renderer, bool traditional = false,
                    const char *kind = "channel") {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.timestamps = true;
     model.settings.reducedMotion = true;
     model.settings.themeSource = "builtin";
@@ -6340,6 +6358,7 @@ void transcriptAffordanceMotion(TranscriptTestRenderer &renderer) {
         }
     } motion;
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.timestamps = model.settings.avatars = false;
     model.settings.reducedMotion = false;
     model.settings.fx = blast::FxLevel::Full;
@@ -6541,6 +6560,7 @@ void transcriptAffordanceMotion(TranscriptTestRenderer &renderer) {
 
 void check(TranscriptTestRenderer &renderer, float zoom, bool traditional) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.scale = zoom;
     model.settings.messageScale = zoom;
     model.settings.timestamps = false;
@@ -7534,6 +7554,7 @@ void independentSendEffects(TranscriptTestRenderer &renderer) {
 void cappedTranscriptBodies(TranscriptTestRenderer &renderer) {
     for (const bool traditional : {false, true}) {
         blast::Model model;
+        model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
         model.settings.timestamps = model.settings.avatars = false;
         model.settings.reducedMotion = true;
         blast::Theme theme;
@@ -8648,6 +8669,7 @@ void searchSourceConsumers(TranscriptTestRenderer &renderer) {
 
 void retainedMentionFooter(TranscriptTestRenderer &renderer) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.timestamps = model.settings.avatars = false;
     model.settings.reducedMotion = true;
     blast::Theme theme;
@@ -9678,6 +9700,7 @@ void smartPresenceRedactionInvalidation(TranscriptTestRenderer &renderer) {
 
 void contentFitAndConsecutiveGroups(TranscriptTestRenderer &renderer) {
     blast::Model model;
+    model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.timestamps = model.settings.avatars = false;
     model.settings.reducedMotion = true;
     model.settings.presence = blast::PresenceMode::Hidden;
@@ -9795,9 +9818,10 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
         auto &buffer = model.buffers["selection-material"];
         buffer.id = buffer.target = "selection-material";
         buffer.kind = variant % 4 == 2 ? "query" : "channel";
-        if (dense)
-            model.settings.messageLayouts[buffer.id] =
-                variant % 4 == 3 ? blast::MessageLayout::Stacked : blast::MessageLayout::Irc;
+        model.settings.messageLayouts[buffer.id] =
+            !dense ? blast::MessageLayout::Bubbles
+            : variant % 4 == 3 ? blast::MessageLayout::Stacked
+                               : blast::MessageLayout::Irc;
         for (int i = 0; i < 6; ++i) {
             blast::Message entry;
             entry.id = "material-" + std::to_string(i);
@@ -9821,10 +9845,15 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
         view.sync();
         view.arrange(renderer, viewport);
         for (int i = 0; i < 6; ++i) {
+            if (!dense) {
+                dispatcher.setFocus(nullptr);
+                dispatcher.pointerLeave();
+                view.arrange(renderer, viewport);
+            }
             const auto rendered = body(view, "MaterialBody-" + std::to_string(i));
             const auto before = sceneBounds(rendered.row);
             auto *material = find<blast::MaterialNode>(rendered.content);
-            assert(material);
+            assert(material && material->visible() == !dense);
             const auto surfaceBefore = sceneBounds(*material);
             RectNode *highlight = nullptr;
             for (const auto &child : rendered.content.children())
@@ -9837,11 +9866,46 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
                 assert(highlight->style().radius.tl < blast::themeCornerRadius());
             const auto contentBounds = dense ? sceneBounds(*highlight) : surfaceBefore;
             const auto bodyBefore = sceneBounds(rendered.body);
+            const auto paintMaterial = [&] {
+                TranscriptPaintRecorder paint;
+                material->draw(paint, {.surfaceWidth = viewport.width,
+                                       .surfaceHeight = viewport.height,
+                                       .width = material->width(),
+                                       .height = material->height()});
+                assert(paint.rectangles.size() == 1);
+                return paint.rectangles.front();
+            };
+            const auto normal = dense ? TranscriptPaintRecorder::Rect{} : paintMaterial();
             dispatcher.pointerMotion(before.x + 1, surfaceBefore.y + surfaceBefore.height * .5f, 1);
             assert(dispatcher.hoveredArea() == &rendered.row);
             dispatcher.pointerMotion(bodyBefore.x + 2, bodyBefore.y + bodyBefore.height * .25f, 2);
             assert(dispatcher.hoveredArea() &&
                    dispatcher.hoveredArea()->parent() == &rendered.body);
+            if (!dense) {
+                view.arrange(renderer, viewport);
+                const auto hover = paintMaterial();
+                const bool own = buffer.messages[i].own;
+                assert(normal.style.fill ==
+                       blast::themeSurfaceFill(blast::themeMessageBackground(own, false, false)));
+                assert(hover.style.fill ==
+                       blast::themeSurfaceFill(blast::themeMessageBackground(own, false, true)));
+                assert(hover.style.fill != normal.style.fill);
+                auto border = blast::themeColor("tertiary");
+                border.a = .35f;
+                assert(hover.style.border == border);
+                near(hover.width, normal.width);
+                near(hover.height, normal.height);
+                near(hover.width, surfaceBefore.width);
+                near(hover.height, surfaceBefore.height);
+                nearRadii(hover.style.radius, normal.style.radius);
+                near(hover.style.radius.tl,
+                     std::min({blast::themeBubbleRadius() * .75f,
+                               hover.width * .5f, hover.height * .5f}));
+                for (const auto &child : rendered.content.children())
+                    if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+                        rect && rect->visible() && rect->style().fill.a > 0)
+                        assert(rect->width() < hover.width || rect->height() < hover.height);
+            }
             dispatcher.setFocus(&rendered.row);
             view.arrange(renderer, viewport);
             RectNode *ring = nullptr;
@@ -9874,41 +9938,61 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
             near(bodyAfter.width, bodyBefore.width);
             near(bodyAfter.height, bodyBefore.height);
             assert(!ring->hitTestVisible());
-            highlight = nullptr;
-            for (const auto &child : rendered.content.children())
-                if (auto *rect = dynamic_cast<RectNode *>(child.get());
-                    rect && rect->visible() && rect->style().fill.a > 0) {
-                    const auto painted = sceneBounds(*rect);
-                    if (painted.width > contentBounds.width &&
-                        painted.height > contentBounds.height) {
-                        assert(!highlight);
-                        highlight = rect;
+            if (dense) {
+                highlight = nullptr;
+                for (const auto &child : rendered.content.children())
+                    if (auto *rect = dynamic_cast<RectNode *>(child.get());
+                        rect && rect->visible() && rect->style().fill.a > 0) {
+                        const auto painted = sceneBounds(*rect);
+                        if (painted.width > contentBounds.width &&
+                            painted.height > contentBounds.height) {
+                            assert(!highlight);
+                            highlight = rect;
+                        }
                     }
-                }
-            assert(highlight && !highlight->hitTestVisible());
-            const auto highlightBounds = sceneBounds(*highlight);
-            near(bounds.x, highlightBounds.x);
-            near(bounds.y, highlightBounds.y);
-            near(bounds.width, highlightBounds.width);
-            near(bounds.height, highlightBounds.height);
-            nearRadii(ring->style().radius, highlight->style().radius);
+                assert(highlight && !highlight->hitTestVisible());
+                const auto highlightBounds = sceneBounds(*highlight);
+                near(bounds.x, highlightBounds.x);
+                near(bounds.y, highlightBounds.y);
+                near(bounds.width, highlightBounds.width);
+                near(bounds.height, highlightBounds.height);
+                nearRadii(ring->style().radius, highlight->style().radius);
+            }
             for (const auto &fragment : rendered.body.children())
                 if (fragment->visible() && dynamic_cast<InputArea *>(fragment.get()))
                     containedBounds(sceneBounds(*fragment), bounds);
             if (!dense) {
-                TranscriptPaintRecorder paint;
-                material->draw(paint, {.surfaceWidth = viewport.width,
-                                       .surfaceHeight = viewport.height,
-                                       .width = material->width(),
-                                       .height = material->height()});
-                assert(paint.rectangles.size() == 1);
-                near(surface.width, paint.rectangles.front().width);
-                near(surface.height, paint.rectangles.front().height);
-                assert(paint.rectangles.front().style.radius.tl < blast::themeBubbleRadius());
-                const auto innerRadius = paint.rectangles.front().style.radius.tl;
+                const auto innerRadius = normal.style.radius.tl;
                 const auto outerRadius = ring->style().radius.tl;
                 assert(outerRadius > innerRadius);
                 assert(outerRadius <= std::min(bounds.width, bounds.height) * .5f);
+                if (i == 0) {
+                    const auto &text = rendered.text;
+                    constexpr std::string_view selected = "MaterialBody";
+                    std::vector<TextCursorStop> stops;
+                    renderer.measureTextCaretStops(text.text(), text.fontSize(),
+                                                   {0, selected.size()}, 0, stops, text.font(),
+                                                   true);
+                    assert(stops.size() == 2);
+                    const auto metrics = renderer.measureText(
+                        text.text(), text.fontSize(), text.font(), 0, 0, TextAlign::Start,
+                        TextEllipsize::End, true);
+                    const auto point = [&](const TextCursorStop &stop) {
+                        float x, y;
+                        Node::mapToScene(&text, stop.x - metrics.alignOffsetX,
+                                         stop.y + stop.height * .5f -
+                                             std::floor(metrics.layoutBaseline),
+                                         x, y);
+                        return std::pair{x, y};
+                    };
+                    const auto [x, y] = point(stops.front());
+                    const auto [endX, endY] = point(stops.back());
+                    assert(dispatcher.pointerButton(x, y, BTN_LEFT, true, 10, 100, false));
+                    dispatcher.pointerMotion(endX, endY, 11);
+                    dispatcher.pointerButton(endX, endY, BTN_LEFT, false, 12, 120, false);
+                    assert(view.copySelection() && clipboard.clipboardText() == selected);
+                    view.clearTextSelection();
+                }
             } else {
                 // Actual text/metadata, not a full-width empty reading strip.
                 if (width == 900.f)
@@ -9972,6 +10056,7 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
 void replyCardNativeGeometry(TranscriptTestRenderer &renderer) {
     for (const bool dense : {false, true}) {
         blast::Model model;
+        model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
         model.settings.timestamps = model.settings.avatars = false;
         model.settings.reducedMotion = true;
         blast::Theme theme;
@@ -10148,6 +10233,7 @@ void foundryTranscriptAvatars(TranscriptTestRenderer &renderer) {
     std::array<uint64_t, 3> hashes{};
     for (size_t variant = 0; variant < hashes.size(); ++variant) {
         blast::Model model;
+        model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
         model.settings.timestamps = false;
         model.settings.avatars = true;
         model.settings.avatarStyle = "sprite";
@@ -10260,6 +10346,7 @@ void foundryTranscriptAvatars(TranscriptTestRenderer &renderer) {
 void friendAuthorIndicators(TranscriptTestRenderer &renderer) {
     for (int mode = 0; mode < 5; ++mode) {
         blast::Model model;
+        model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
         model.settings.timestamps = model.settings.avatars = false;
         model.settings.reducedMotion = true;
         model.settings.friends.insert("{a}");
@@ -10392,6 +10479,7 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
     for (const int weight : {300, 400, 500, 600, 700})
         for (const bool traditional : {false, true}) {
             blast::Model model;
+            model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
             model.settings.timestamps = true;
             model.settings.avatars = false;
             model.settings.reducedMotion = true;
@@ -10527,7 +10615,10 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
                         assert(sceneBounds(*actor->parent()).y +
                                    sceneBounds(*actor->parent()).height <=
                                bodyBounds.y + .02f);
-                        near(sceneBounds(*actor->parent()).x, bodyBounds.x);
+                        const auto glyph = renderer.measureText("0", rendered.text.fontSize(),
+                                                                rendered.text.font());
+                        const float indent = 1.5f * glyph.width;
+                        near(sceneBounds(*actor->parent()).x + indent, bodyBounds.x);
                     }
                     for (const auto &child : rendered.content.children())
                         if (auto *rect = dynamic_cast<RectNode *>(child.get());
@@ -10597,6 +10688,7 @@ void nativeReactionRow(TranscriptTestRenderer &renderer) {
     for (const int mode : {0, 1, 2})
         for (const float scale : {1.f, 2.f}) {
             blast::Model model;
+            model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
             model.settings.scale = model.settings.messageScale = scale;
             model.settings.uiFont = "DejaVu Serif";
             model.settings.uiFontWeight = 700;
@@ -10863,7 +10955,7 @@ void independentMessageScales(TranscriptTestRenderer &renderer) {
         if (traditional)
             model.settings.messageLayouts[buffer.id] = blast::MessageLayout::Irc;
         else
-            model.settings.messageLayouts.erase(buffer.id);
+            model.settings.messageLayouts[buffer.id] = blast::MessageLayout::Bubbles;
         model.settings.scale = model.settings.messageScale = 1;
         arrange();
         const auto rendered = body(view, "ScaleBody");

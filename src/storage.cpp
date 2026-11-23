@@ -820,9 +820,18 @@ void parseSettings(const toml::table &document, Settings &settings) {
         exactField(*row, "allow_local", settings.previewAllowLocal);
     }
     if (const auto *row = table(document, "presentation")) {
-        if (const auto *layout = row->get("message_layout"))
-            settings.defaultMessageLayout =
-                messageLayoutValue(*layout, "presentation.message_layout");
+        if (const auto *layout = row->get("message_layout")) {
+            const auto legacy = messageLayoutValue(*layout, "presentation.message_layout");
+            // Older versions wrote bubbles even when no layout had been chosen.
+            if (legacy != MessageLayout::Bubbles)
+                settings.channelMessageLayout = settings.directMessageLayout = legacy;
+        }
+        if (const auto *layout = row->get("channel_message_layout"))
+            settings.channelMessageLayout =
+                messageLayoutValue(*layout, "presentation.channel_message_layout");
+        if (const auto *layout = row->get("direct_message_layout"))
+            settings.directMessageLayout =
+                messageLayoutValue(*layout, "presentation.direct_message_layout");
         if (row->contains("message_layouts")) {
             const auto *layouts = table(*row, "message_layouts");
             for (const auto &[name, value] : *layouts)
@@ -927,8 +936,7 @@ void parseSettings(const toml::table &document, Settings &settings) {
     ui_logic::migrateActivityBinding(settings.bindings, [&](std::string_view name) {
         return savedBindings && savedBindings->contains(name);
     });
-    for (const char *name :
-         {"conversation-back", "conversation-forward", "cycle-spelling", "next-activity"}) {
+    for (const char *name : {"conversation-back", "conversation-forward", "cycle-spelling"}) {
         if (savedBindings && savedBindings->contains(name))
             continue;
         auto &binding = settings.bindings.at(name);
@@ -1091,10 +1099,13 @@ toml::table settingsDocument(const Settings &settings) {
                                  {"allow_local", settings.previewAllowLocal},
                                  {"media_max_seconds", settings.previewMediaMaxSeconds}}},
         {"presentation",
-         toml::table{{"message_layout", messageLayoutName(settings.defaultMessageLayout,
-                                                          "presentation.message_layout")},
-                     {"message_layouts", std::move(messageLayouts)},
-                     {"pinned_buffers", array(settings.pinnedBuffers)}}},
+         toml::table{
+             {"channel_message_layout", messageLayoutName(settings.channelMessageLayout,
+                                                          "presentation.channel_message_layout")},
+             {"direct_message_layout", messageLayoutName(settings.directMessageLayout,
+                                                         "presentation.direct_message_layout")},
+             {"message_layouts", std::move(messageLayouts)},
+             {"pinned_buffers", array(settings.pinnedBuffers)}}},
         {"composer", toml::table{{"spellcheck", settings.spellcheck},
                                  {"spellcheck_language", settings.spellcheckLanguage},
                                  {"word_prediction", settings.wordPrediction}}},

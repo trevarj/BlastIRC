@@ -422,11 +422,10 @@ int main(int argc, char **argv) {
                     event.sym == XKB_KEY_g)
                     app.model.status.clear();
                 auto menuKey = event;
-                if (!event.preedit && event.modifiers == KeyMod::Ctrl &&
-                    (event.sym == XKB_KEY_n || event.sym == XKB_KEY_p || event.sym == XKB_KEY_g)) {
-                    menuKey.sym = event.sym == XKB_KEY_g   ? XKB_KEY_Escape
-                                  : event.sym == XKB_KEY_n ? XKB_KEY_Down
-                                                           : XKB_KEY_Up;
+                const int step = blast::emacsListStep(event.sym, event.modifiers);
+                if (!event.preedit &&
+                    (step || (event.modifiers == KeyMod::Ctrl && event.sym == XKB_KEY_g))) {
+                    menuKey.sym = step > 0 ? XKB_KEY_Down : step < 0 ? XKB_KEY_Up : XKB_KEY_Escape;
                     menuKey.utf32 = 0;
                     menuKey.modifiers = 0;
                 }

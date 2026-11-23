@@ -6094,7 +6094,7 @@ def probe_menu_reachability(proc, window, preferences, database_path, args, dest
 
 
 def probe_status_hover(window, preferences, reduced_motion, *, destination=None):
-    """Check the rendered status caption and rounded hover fill below the footer rule."""
+    """Check that status ink and hover fill center between the chat frame and window edge."""
     from PIL import Image, ImageChops
 
     layout = read_layout(preferences)
@@ -6103,6 +6103,8 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
     outer = layout["outer_padding"]
     _, footer_top, _, footer_height = layout["footer"]["rect"]
     top, bottom = round(footer_top), round(footer_top + footer_height)
+    _, chat_top, _, chat_height = layout["conversation"]["rect"]
+    row_center = (chat_top + chat_height + bottom) / 2 - top
     right = width - outer - 8 * zoom
     bounds = (round(right - 120 * zoom), top, round(right + 2 * zoom), bottom)
     point = (round(right - 20 * zoom), (top + bottom) // 2)
@@ -6126,7 +6128,6 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
     assert foreground > 0, ("No Connected item ink at rest", bounds)
     _, ink_top, _, ink_bottom = contrast.point(lambda value: 255 if 2 * value >= foreground else 0).getbbox()
     ink_center = 1 + (ink_top + ink_bottom) / 2
-    row_center = (1 + rest.height) / 2
     assert abs(ink_center - row_center) <= 1, ("Status caption not centered", ink_center, row_center)
 
     previous = None
@@ -6139,14 +6140,19 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
             return False
         delta = max_channel(ImageChops.difference(rest, hover))
         extent = delta.getbbox()
-        return (hover, delta, extent) if extent and extent[2] - extent[0] >= 30 * zoom else False
+        if not extent:
+            return False
+        rows = [row for row in range(extent[1], extent[3])
+                if (span := delta.crop((0, row, delta.width, row + 1)).getbbox())
+                and span[2] - span[0] >= 30 * zoom]
+        return (hover, delta, extent[0], extent[2], rows[0], rows[-1] + 1) if rows else False
 
     move_pointer(window, *point)
-    hover, delta, (left, fill_top, fill_right, fill_bottom) = SESSION.until(
+    hover, delta, left, fill_right, fill_top, fill_bottom = SESSION.until(
         "visible stable native Connected-item hover", visible)
     fill_center = (fill_top + fill_bottom) / 2
     assert fill_top > 0 and fill_bottom < rest.height and abs(fill_center - row_center) <= 1, (
-        "Rounded hover fill not centered below the rule", delta.getbbox(), bounds)
+        "Rounded hover fill not centered between the chat frame and bottom edge", delta.getbbox(), bounds)
     center_delta = delta.getpixel(((left + fill_right) // 2, fill_top + 1))
     assert center_delta >= 3 and delta.getpixel((left, fill_top + 1)) < center_delta / 2, (
         "Status hover does not fill the interior with rounded corners", delta.getbbox())

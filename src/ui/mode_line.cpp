@@ -157,7 +157,7 @@ struct ModeLine::Impl {
     decltype(Settings::fools) fools;
     bool foolUnread = false, visible = false, allowed = true, layoutReady = false;
     bool healthy = false, failureFeedback = false;
-    float scale = 1;
+    float scale = 1, contentBottomInset = 0;
     Color activityInk{}, mentionInk{}, focusInk{};
     Color hoverFill{};
     std::array<Color, GroupCount> controlInks{};
@@ -373,16 +373,17 @@ struct ModeLine::Impl {
         });
         return button;
     }
-    void moveButton(Button &button, float x, float width, float height) {
+    void moveButton(Button &button, float x, float width, float contentHeight) {
         auto &area = *button.area;
+        const float height = owner.height();
         if (area.pressed() && (area.x() != x || area.width() != width || area.height() != height))
             retire(area);
         area.setPosition(x, 0);
         area.setSize(width, height);
         area.setVisible(true);
-        button.content->setFrameSize(width, height);
-        const float inset = std::min(scale * 2, height / 4);
-        const float highlightHeight = height - 2 * inset;
+        button.content->setFrameSize(width, contentHeight);
+        const float inset = std::min(scale * 2, contentHeight / 4);
+        const float highlightHeight = contentHeight - 2 * inset;
         button.highlight->setPosition(0, inset);
         button.highlight->setFrameSize(width, highlightHeight);
         button.highlight->setRadius(
@@ -846,6 +847,13 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     }
 }
 
+void ModeLine::setContentBottomInset(float inset) {
+    if (impl_->contentBottomInset == inset)
+        return;
+    impl_->contentBottomInset = inset;
+    markLayoutDirty();
+}
+
 LayoutSize ModeLine::doMeasure(Renderer &, const LayoutConstraints &constraints) {
     return constraints.constrain({420 * impl_->scale, 26 * impl_->scale});
 }
@@ -853,6 +861,7 @@ LayoutSize ModeLine::doMeasure(Renderer &, const LayoutConstraints &constraints)
 void ModeLine::doLayout(Renderer &renderer) {
     auto &p = *impl_;
     using enum Impl::Group;
+    const float contentHeight = std::max(0.f, height() - p.contentBottomInset);
     const auto &font = themeUiFont();
     auto bold = font;
     bold.weight = FontWeight::Bold;
@@ -965,10 +974,10 @@ void ModeLine::doLayout(Renderer &renderer) {
         style(*slot.button.suffix, font, p.scale);
         p.styleButton(slot.button, font);
         const float chipWidth = title + fixed;
-        p.moveButton(slot.button, x, chipWidth, height());
-        placeLabel(*slot.button.marker, renderer, inset, mark, height());
-        placeLabel(*slot.button.title, renderer, inset + mark, title, height());
-        placeLabel(*slot.button.suffix, renderer, inset + mark + title, suffix, height());
+        p.moveButton(slot.button, x, chipWidth, contentHeight);
+        placeLabel(*slot.button.marker, renderer, inset, mark, contentHeight);
+        placeLabel(*slot.button.title, renderer, inset + mark, title, contentHeight);
+        placeLabel(*slot.button.suffix, renderer, inset + mark + title, suffix, contentHeight);
         x += chipWidth;
         remaining -= chipWidth;
     }
@@ -990,9 +999,9 @@ void ModeLine::doLayout(Renderer &renderer) {
         if (p.overflow.title->setText(overflowLabel))
             p.overflow.area->setTooltip(overflowLabel);
         const float overflowSize = std::min(remaining, overflowText + 2 * inset);
-        p.moveButton(p.overflow, x, overflowSize, height());
+        p.moveButton(p.overflow, x, overflowSize, contentHeight);
         placeLabel(*p.overflow.title, renderer, (overflowSize - overflowText) / 2, overflowText,
-                   height());
+                   contentHeight);
         remaining -= overflowSize;
     } else {
         p.hideButton(p.overflow);
@@ -1017,13 +1026,13 @@ void ModeLine::doLayout(Renderer &renderer) {
         }
         const float buttonWidth = labelWidths[i] + iconWidths[i];
         const float side = (used[i] - buttonWidth) / 2;
-        p.moveButton(button, x - used[i], used[i], height());
-        placeLabel(*button.title, renderer, side + iconWidths[i], labelWidths[i], height());
+        p.moveButton(button, x - used[i], used[i], contentHeight);
+        placeLabel(*button.title, renderer, side + iconWidths[i], labelWidths[i], contentHeight);
         auto &icon = *p.icons[i];
         icon.setVisible(iconWidths[i] > 0);
         if (icon.visible()) {
             icon.measure(renderer);
-            icon.setPosition(side, (height() - icon.height()) / 2);
+            icon.setPosition(side, (contentHeight - icon.height()) / 2);
         }
         x -= used[i];
     }

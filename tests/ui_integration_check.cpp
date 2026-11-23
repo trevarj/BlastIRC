@@ -2938,11 +2938,15 @@ void titlebarGeometryCheck() {
         assert(std::abs(paneY - (compact ? 57.f : 63.f) * scale) < .1f);
         assert(headerFor(*composer)->height() >= 32 * scale &&
                headerFor(*composer)->height() <= 36 * scale);
-        const auto *status = areaWithKey(ui.root(), "status-nick");
+        auto *status = areaWithKey(ui.root(), "status-nick");
         assert(status && visible(*status));
         const float footerTop = 1000 - (compact ? 32.f : 40.f) * scale;
-        assert(std::abs(paneY + paneFor(*composer)->height() - (footerTop - 4 * scale)) < .1f);
+        const float chatBottom = paneY + paneFor(*composer)->height();
+        assert(std::abs(chatBottom - (footerTop - 4 * scale)) < .1f);
         assert(std::abs(pointerPoint(*status)[1] - (footerTop + 1 + 1000) / 2) < .1f);
+        auto *statusLabel = visibleNode<Label>(*status);
+        assert(statusLabel);
+        assert(std::abs(pointerPoint(*statusLabel)[1] - (chatBottom + 1000) / 2) < .1f);
         const auto naturalTitle =
             renderer.measureText(title->text(), title->fontSize(), title->font(), 0, 1,
                                  title->textAlign(), title->ellipsize(), false);

@@ -4374,6 +4374,7 @@ void Ui::Impl::refresh(bool panelResize) {
     restoreJumpFocus(false);
     syncUploadPanel();
     modeLine->sync(scale, navigationMode, chord, statusControlsAvailable());
+    modeLine->setContentBottomInset(footerGap + footerRuleHeight);
     place(*modeLine, outer, footerTop + footerRuleHeight, std::max(0.f, width - 2 * outer),
           footerHeight - footerRuleHeight);
     if (windowActive)

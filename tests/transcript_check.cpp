@@ -4418,11 +4418,11 @@ void messageIdentityRevision(TranscriptTestRenderer &renderer) {
     dispatcher.setSceneRoot(nullptr);
 }
 
-void channelActivity(TranscriptTestRenderer &renderer, float zoom) {
+void channelActivity(TranscriptTestRenderer &renderer, float zoom, float messageZoom) {
     blast::Model model;
     model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
     model.settings.scale = zoom;
-    model.settings.messageScale = zoom;
+    model.settings.messageScale = messageZoom;
     model.settings.timestamps = true;
     model.settings.presence = blast::PresenceMode::Smart;
     model.settings.reducedMotion = true;
@@ -4477,7 +4477,8 @@ void channelActivity(TranscriptTestRenderer &renderer, float zoom) {
     InputDispatcher dispatcher;
     dispatcher.setSceneRoot(&view);
     view.setInputDispatcher(dispatcher);
-    const LayoutRect viewport{17, 23, 700 * zoom, 2000 * zoom};
+    const float fixtureScale = std::max(zoom, messageZoom);
+    const LayoutRect viewport{17, 23, 700 * fixtureScale, 2000 * fixtureScale};
     const auto arrange = [&] {
         view.sync();
         view.arrange(renderer, viewport);
@@ -4508,10 +4509,10 @@ void channelActivity(TranscriptTestRenderer &renderer, float zoom) {
         const auto rendered = body(view, original[index]);
         near(rendered.body.foregroundBlurRadius(), 0);
         near(rendered.text.fontSize(),
-             kinds[index] == blast::ActivityKind::None ? 14 * zoom : 12 * zoom);
+             kinds[index] == blast::ActivityKind::None ? 14 * messageZoom : 12 * messageZoom);
         if (kinds[index] != blast::ActivityKind::None) {
             assert(rendered.text.font().family == "monospace");
-            assert(plainText(rendered.content, "12:34"));
+            assert(plainText(rendered.content, "· 12:34"));
         }
     };
     const auto toggle = [&](InputArea &control, std::uint32_t key) {
@@ -4525,7 +4526,7 @@ void channelActivity(TranscriptTestRenderer &renderer, float zoom) {
     assert(folded.size() == 2);
     assert(bodyText(*folded[0], "3") && bodyText(*folded[1], "2"));
     for (auto *control : folded) {
-        assert(!plainText(*control, "12:34"));
+        assert(!plainText(*control, "· 12:34"));
         auto *chevron = find<GlyphNode>(*control);
         assert(chevron && chevron->codepoint() == GlyphRegistry::lookup("chevron-right"));
         near(body(*control, "channel events").body.foregroundBlurRadius(), 0);
@@ -4549,7 +4550,7 @@ void channelActivity(TranscriptTestRenderer &renderer, float zoom) {
     arrange();
     assert(controls("Expand channel activity").size() == 1);
     actual(6);
-    near(body(view, original[7]).text.fontSize(), 12 * zoom);
+    near(body(view, original[7]).text.fontSize(), 12 * messageZoom);
     buffer.messages[12].timestamp = 0;
     model.settings.presence = blast::PresenceMode::Hidden;
     arrange();
@@ -4584,11 +4585,19 @@ void channelActivity(TranscriptTestRenderer &renderer, float zoom) {
         const float leftPadding = text.x - bounds.x;
         const float rightPadding = bounds.x + bounds.width - text.x - text.width;
         assert(leftPadding > 0 && rightPadding > 0);
-        auto *clock = plainText(rendered.content, "12:34");
+        auto *clock = plainText(rendered.content, "· 12:34");
         assert((clock && clock->visible()) == clockShown);
-        if (clockShown)
+        if (clockShown) {
+            const auto clockBounds = sceneBounds(*clock);
+            const auto natural =
+                renderer.measureText(clock->text(), clock->fontSize(), clock->font(), 0, 1);
+            assert(clock->maxWidth() >= natural.width && clockBounds.width >= natural.width);
+            assert(clockBounds.x > text.x + text.width &&
+                   clock->fontSize() < rendered.text.fontSize());
+            near(baseline(*clock), baseline(rendered.text));
+            near(bounds.x + bounds.width - clockBounds.x - clockBounds.width, leftPadding);
             containedBounds(nativeTextInk(renderer, *clock), bounds);
-        else
+        } else
             near(leftPadding, rightPadding);
         return std::array{bounds.width,
                           bounds.height,
@@ -4601,9 +4610,9 @@ void channelActivity(TranscriptTestRenderer &renderer, float zoom) {
     const auto compactActivity = activityGeometry(false);
     const float removedGutter = clockedActivity[0] - compactActivity[0];
     assert(removedGutter >= clockedActivity[4] && removedGutter > 0);
-    near(removedGutter, clockedActivity[2] - compactActivity[2]);
+    near(clockedActivity[2], compactActivity[2]);
     near(clockedActivity[1], compactActivity[1]);
-    near(clockedActivity[3], compactActivity[3]);
+    near(removedGutter, clockedActivity[3] - compactActivity[3]);
     near(clockedActivity[5], compactActivity[5]);
     model.settings.timestamps = true;
     auto &event = buffer.messages[5];
@@ -11326,8 +11335,9 @@ void runTranscriptCheck() {
     messageTextSelection(renderer, 2);
     emptyLineSelection(renderer, 1);
     emptyLineSelection(renderer, 2);
-    channelActivity(renderer, 1);
-    channelActivity(renderer, 2);
+    channelActivity(renderer, 1, 1);
+    channelActivity(renderer, 2, 2);
+    channelActivity(renderer, .7f, 2);
     smartPresenceEligibility(renderer);
     ownJoinProjection(renderer);
     tailAppendKeepsActions(renderer);

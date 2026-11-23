@@ -4248,7 +4248,7 @@ void Ui::Impl::refresh(bool panelResize) {
     constexpr float footerRuleHeight = 1.f;
     const float footerHeight = outer + (tight ? 22.f : compact ? 24.f : 28.f) * scale;
     const float footerTop = height - footerHeight;
-    const float footerGap = (tight ? 4.f : 10.f) * scale;
+    const float footerGap = 4 * scale;
     place(*footerDivider, 0, footerTop, width, footerRuleHeight);
     footerDivider->setFill(chromeDivider);
     const float contentTop = titleHeight + outer;

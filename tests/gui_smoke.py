@@ -673,7 +673,7 @@ def read_layout(path):
     rail_width = float(workspace.get("server_rail_width", 76)) * scale
     rail_visible = workspace.get("native_server_rail_visible", "true") == "true"
     top = title_height + outer
-    content_height = max(1, footer_top - (4 if tight else 10) * scale - top)
+    content_height = max(1, footer_top - 4 * scale - top)
     navigation_intent = workspace["native_navigation_mode"]
     navigation = navigation_intent
     database_path = next(reversed(GUI_DEBUG.values()))[0].native_database_path

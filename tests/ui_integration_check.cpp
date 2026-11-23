@@ -623,7 +623,7 @@ void shellMotionCheck() {
     for (const auto &child : ui.root().children())
         if (auto *panel = dynamic_cast<ServerRail *>(child.get()))
             serverRail = panel;
-    assert(serverRail);
+    assert(serverRail && serverRail->x() == 0);
     const float fullRailWidth = serverRail->width();
     const auto navigationPreference = model.settings.workspace.at("native_navigation_mode");
     ui.execute("toggle-networks");
@@ -642,6 +642,7 @@ void shellMotionCheck() {
     model.settings.reducedMotion = true;
     frame();
     assert(!visible(*serverRail) && serverRail->width() == 0);
+    assert(sidebar->x() == 0);
     ui.execute("toggle-networks");
     assert(visible(*serverRail) && serverRail->width() == fullRailWidth);
     assert(model.settings.workspace.at("native_navigation_mode") == navigationPreference);
@@ -1500,7 +1501,7 @@ void nativePanelResizeCheck() {
         assert(!areaWithKey(*serverRail, "rail-add-server") &&
                !areaWithKey(*serverRail, "rail-settings") &&
                !areaWithKey(*serverRail, "rail-mark-all-read"));
-        const float reclaimedRailExtent = serverRail->width() + serverRail->x();
+        const float reclaimedRailExtent = serverRail->width() + 12 * scale;
         const auto visibleComposerWidth = composer->width();
         const auto visibleSidebarX = pointerPoint(*channels)[0];
         const auto hiddenState = [&] {
@@ -2839,6 +2840,8 @@ void staleUploadHostMenuCheck() {
 
 void titlebarGeometryCheck() {
     auto model = edgeModel();
+    model.settings.workspace["native_navigation_mode"] = "hidden";
+    model.settings.workspace["native_server_rail_visible"] = "false";
     Clipboard clipboard;
     blast::Theme theme;
     PangoRenderer renderer;
@@ -2874,6 +2877,10 @@ void titlebarGeometryCheck() {
         assert(logoY <= 8 * scale);
         auto *application = areaWithKey(ui.root(), "topbar-application");
         assert(application && visible(*application));
+        auto *composer = inputWithText(ui.root(), edgeDrafts[0]);
+        assert(composer);
+        assert(logoX == 0 && application->x() == 0 && paneFor(*composer)->x() == 0 &&
+               headerFor(*composer)->x() == 0);
         const auto naturalTitle =
             renderer.measureText(title->text(), title->fontSize(), title->font(), 0, 1,
                                  title->textAlign(), title->ellipsize(), false);

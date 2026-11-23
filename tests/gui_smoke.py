@@ -683,15 +683,15 @@ def read_layout(path):
     compact_width = float(workspace.get("compact_channel_sidebar_width", 56)) * scale
     if "server_rail_width" in workspace:
         rail_width = min(rail_width, max(56 * scale,
-            width - 4 * outer - compact_width - chat_minimum))
-    rail_width = min(rail_width, max(0, width - 2 * outer))
+            width - 3 * outer - compact_width - chat_minimum))
+    rail_width = min(rail_width, max(0, width - outer))
     if not rail_visible:
         rail_width = 0
     widths = {"expanded": float(workspace.get("channel_sidebar_width", 250)) * scale,
               "compact": compact_width, "hidden": 0}
     people_widths = {"expanded": 220 * scale, "compact": 56 * scale, "hidden": 0}
     rail_gap = outer if rail_visible else 0
-    remaining = max(1, width - 2 * outer - rail_width - rail_gap)
+    remaining = max(1, width - outer - rail_width - rail_gap)
 
     def available():
         return (remaining - widths[navigation] - (outer if navigation != "hidden" else 0)
@@ -704,17 +704,18 @@ def read_layout(path):
     if available() < chat_minimum and people == "compact":
         people = "hidden"
     sidebar_width, people_width = widths[navigation], people_widths[people]
-    sidebar_x = outer + rail_width + rail_gap
+    sidebar_x = rail_width + rail_gap
     left = sidebar_x + sidebar_width + (outer if navigation != "hidden" else 0)
     right = width - outer - people_width - (outer if people != "hidden" else 0)
     chat = (left, top, max(1, right - left), content_height)
     layout = {"compact": compact, "tight": tight, "scale": scale,
+              "outer_padding": outer,
               "rail_visible": rail_visible,
               "topbar": {"rect": (0, 0, width, title_height)},
               "navigation_intent": navigation_intent,
               "active_buffer": active_buffer,
               "conversation": {"rect": chat, "buffer": active_buffer},
-              "rail": {"rect": (outer, top, rail_width, content_height)},
+              "rail": {"rect": (0, top, rail_width, content_height)},
               "channels": {"rect": (sidebar_x, top, sidebar_width, content_height),
                            "mode": navigation},
               "people": {"rect": (right + (outer if people != "hidden" else 0),
@@ -733,7 +734,7 @@ def shell_actions(layout):
     zoom = layout["scale"]
     _, _, width, height = layout["topbar"]["rect"]
     extent = max(32, (32 if layout["compact"] else 34) * zoom)
-    outer, gap = layout["rail"]["rect"][0], 6 * zoom
+    outer, gap = layout["outer_padding"], 6 * zoom
     left = width - outer - 4 * extent - 3 * gap
     database_path = next(reversed(GUI_DEBUG.values()))[0].native_database_path
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as database:
@@ -744,7 +745,7 @@ def shell_actions(layout):
     return {"navigation": (left + extent / 2, height / 2),
             "palette": (left + 1.5 * extent + gap, height / 2),
             "settings": (width - outer - extra - extent / 2, height / 2),
-            "application": (outer + 60 * zoom, height / 2),
+            "application": (60 * zoom, height / 2),
             "networks": (left - (3 if unread and not folded else 2) * extra + extent / 2, height / 2),
             "mentions": (left - (2 if unread and not folded else 1) * extra + extent / 2, height / 2),
             "mark_all_read": ((left - extra + extent / 2, height / 2)
@@ -6081,7 +6082,7 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
     zoom = layout["scale"]
     width, height = GUI_SIZE
     _, pane_top, _, pane_height = layout["conversation"]["rect"]
-    outer = layout["rail"]["rect"][0]
+    outer = layout["outer_padding"]
     bottom = round(height - (outer + pane_metrics(layout, zoom)["padding_y"]) / 2)
     top = bottom - round(height - pane_top - pane_height - outer)
     # Include the Connected caption and plug, including the exposed gap between them.
@@ -6205,7 +6206,7 @@ def probe_shell_interactions(proc, window, preferences, database_path, args, des
     def drag(key, delta, *, rail=False):
         layout = read_layout(preferences)
         x, y, width, height = layout["rail" if rail else "channels"]["rect"]
-        outer = layout["rail"]["rect"][0]
+        outer = layout["outer_padding"]
         point = (x + width + (outer - 1) / 2, y + height / 2)
         old = float(before_drag.get(key, defaults[keys.index(key)]))
         marker = GUI_DEBUG[window][1].stat().st_size

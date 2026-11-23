@@ -123,8 +123,7 @@ float conversationPaddingY(float height, float scale) {
 float panelWidth(SidebarMode mode, float expanded, float compact) {
     return mode == SidebarMode::Expanded ? expanded : mode == SidebarMode::Compact ? compact : 0.f;
 }
-float fittedRailWidth(const Workspace &workspace, float width, float outer, float boundary,
-                      float scale) {
+float fittedRailWidth(const Workspace &workspace, float width, float outer, float scale) {
     float preferred = workspace.serverRailWidth().value_or(76.f) * scale;
     if (workspace.serverRailWidth()) {
         const float minimumChat = std::max(360 * scale, EditorStore::minimumComposerWidth(scale) +
@@ -132,12 +131,12 @@ float fittedRailWidth(const Workspace &workspace, float width, float outer, floa
         preferred = std::min(
             preferred,
             std::max(Workspace::minServerRailWidth * scale,
-                     width - 2 * outer - 2 * boundary -
+                     width - 3 * outer -
                          workspace.compactChannelSidebarWidth().value_or(compactPanelExtent) *
                              scale -
                          minimumChat));
     }
-    return std::min(preferred, std::max(0.f, width - 2 * outer));
+    return std::min(preferred, std::max(0.f, width - outer));
 }
 std::pair<SidebarMode, SidebarMode> fitSidebarModes(SidebarMode navigation, SidebarMode people,
                                                     float remaining, float boundary, float scale,
@@ -1730,9 +1729,9 @@ void Ui::Impl::updateRegularPanelModes() {
     const float currentScale = ui_logic::userScale(model.settings.scale);
     const float outer = shellOuterPadding(width, height, currentScale);
     const float rail = workspace.serverRailVisible
-                           ? fittedRailWidth(workspace, width, outer, outer, currentScale) + outer
+                           ? fittedRailWidth(workspace, width, outer, currentScale) + outer
                            : 0.f;
-    const float remaining = std::max(1.f, width - 2 * outer - rail);
+    const float remaining = std::max(1.f, width - outer - rail);
     const float minimum =
         std::max(360 * currentScale,
                  EditorStore::minimumComposerWidth(currentScale) + 2 * panePaddingX * currentScale);
@@ -4016,7 +4015,7 @@ void Ui::Impl::refresh(bool panelResize) {
     const bool tight = height < 360 * scale;
     const float outer = shellOuterPadding(width, height, scale);
     const float boundary = outer;
-    const float preferredRailWidth = fittedRailWidth(workspace, width, outer, boundary, scale);
+    const float preferredRailWidth = fittedRailWidth(workspace, width, outer, scale);
     const auto avatarBox = serverAvatarBox(76.f * scale, scale);
     const float logoExtent = avatarBox.width;
     const float extent = std::max(32.f, (compact ? 32.f : 34.f) * scale);
@@ -4028,12 +4027,10 @@ void Ui::Impl::refresh(bool panelResize) {
     const std::size_t controlCount = windowButtons.size() + 2 + (showReadAll ? 1 : 0);
     const float controls = controlCount * extent + (controlCount - 1) * gap;
     const float controlsLeft = width - outer - controls;
-    const float logoLeft = outer + avatarBox.x;
-    const float titleLeft = logoLeft + logoExtent + gap;
+    const float titleLeft = logoExtent + gap;
     const float titleWidth = std::max(0.f, controlsLeft - gap - titleLeft - 64 * scale);
-    place(*logo, logoLeft, (titleHeight - logoExtent) / 2, logoExtent, logoExtent);
-    place(*applicationMenu, outer, (titleHeight - extent) / 2, titleLeft + titleWidth - outer,
-          extent);
+    place(*logo, 0, (titleHeight - logoExtent) / 2, logoExtent, logoExtent);
+    place(*applicationMenu, 0, (titleHeight - extent) / 2, titleLeft + titleWidth, extent);
     place(*titleMove, titleLeft + titleWidth, 0,
           std::max(0.f, controlsLeft - gap - titleLeft - titleWidth), titleHeight);
     // The rounded body spans approximately y=340..1074 in the 1254px master; exclude collar,
@@ -4149,7 +4146,7 @@ void Ui::Impl::refresh(bool panelResize) {
     const float chatMinimum =
         std::max(360 * scale, EditorStore::minimumComposerWidth(scale) + 2 * panePaddingX * scale);
     const float targetRail = workspace.serverRailVisible ? preferredRailWidth + boundary : 0.f;
-    const float remaining = std::max(1.f, width - 2 * outer - targetRail);
+    const float remaining = std::max(1.f, width - outer - targetRail);
     const auto regularModes =
         fitSidebarModes(navigationRegularMode, peopleRegularMode, remaining, boundary, scale,
                         chatMinimum, expandedWidth, compactNavigationWidth);
@@ -4206,14 +4203,14 @@ void Ui::Impl::refresh(bool panelResize) {
                 replacement = input;
         retirePanel(control, replacement, true);
     };
-    const WorkspaceRect railRect{outer, contentTop, railWidth, contentHeight};
+    const WorkspaceRect railRect{0, contentTop, railWidth, contentHeight};
     place(*rail, railRect);
     if (railWidth > 0)
         rail->sync(selectedServer, railRect.width, railRect.height, scale);
     rail->setVisible(panelExtent[2] > 0);
     rail->setHitTestVisible(workspace.serverRailVisible);
     rail->setExcludeSubtreeFromTabOrder(!workspace.serverRailVisible);
-    float left = outer + panelExtent[2];
+    float left = panelExtent[2];
     const WorkspaceRect navigationRect{left, contentTop, navigationWidth, contentHeight};
     place(*sidebar, navigationRect);
     sidebar->sync(selectedServer, lastBuffer, navigationRect.width, navigationRect.height, scale,
@@ -4222,7 +4219,7 @@ void Ui::Impl::refresh(bool panelResize) {
     sidebar->setHitTestVisible(navigationMode != SidebarMode::Hidden);
     sidebar->setExcludeSubtreeFromTabOrder(navigationMode == SidebarMode::Hidden);
     const auto dividerColor = withAlpha(themeColor("outline_variant"), .18f * themeSurfaceAlpha());
-    const float dividerX = outer + railWidth + (railGap - 1.f) / 2;
+    const float dividerX = railWidth + (railGap - 1.f) / 2;
     place(*navigationDividers[0], dividerX, contentTop, 1.f, contentHeight);
     navigationDividers[0]->setVisible(panelExtent[2] > 0);
     place(*navigationDividers[1], left + navigationWidth + (navigationGap - 1.f) / 2, contentTop,

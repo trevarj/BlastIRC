@@ -331,7 +331,7 @@ def run_network_sidebar(ctx):
     toggle(False)
     upload.focus_composer(w)
     after_caret = gui.native_input_rectangle(w)
-    reclaimed = layout['rail']['rect'][2] + layout['rail']['rect'][0]
+    reclaimed = layout['rail']['rect'][2] + layout['outer_padding']
     assert abs((before_caret[0] - after_caret[0]) - reclaimed) <= 2*z, (
         'Native composer did not reclaim the complete rail and gap', before_caret, after_caret, reclaimed)
     gui._composer_native(w, draft, size, size)

@@ -836,6 +836,29 @@ float baseline(const TextNode &text) {
 LayoutRect sceneBounds(const Node &node);
 LayoutRect nativeTextInk(TranscriptTestRenderer &renderer, const TextNode &text);
 
+const GlyphNode *actionGlyph(const Node &node) {
+    if (const auto *glyph = dynamic_cast<const GlyphNode *>(&node);
+        glyph && glyph->codepoint() == GlyphRegistry::lookup("asterisk"))
+        return glyph;
+    for (const auto &child : node.children())
+        if (const auto *glyph = actionGlyph(*child))
+            return glyph;
+    return nullptr;
+}
+
+TextNode *actionActor(const Body &rendered, std::string_view nick) {
+    assert(GlyphRegistry::contains("activity"));
+    auto *actor = plainText(rendered.content, nick);
+    const auto *glyph = actionGlyph(rendered.row);
+    assert(actor && glyph && glyph->visible());
+    // The native Glyph control owns the layout box; its child holds the codepoint.
+    const auto *marker = dynamic_cast<const Glyph *>(glyph->parent());
+    assert(marker && marker->visible());
+    const auto bounds = sceneBounds(*marker);
+    assert(bounds.width > 0 && bounds.x + bounds.width <= sceneBounds(*actor).x + .02f);
+    return actor;
+}
+
 void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
     ConfigDirectory config;
     blast::Model model;
@@ -2539,8 +2562,8 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
             const auto rendered = messageBody(i);
             if (buffer.messages[i].action) {
                 assert(!bubbleSurface(rendered));
-                auto *actor = plainText(rendered.content, "↳ " + buffer.messages[i].nick);
-                assert(actor && actor->fontWeight() == FontWeight::Bold &&
+                auto *actor = actionActor(rendered, buffer.messages[i].nick);
+                assert(actor->fontWeight() == FontWeight::Bold &&
                        actor->color() ==
                            blast::nickTextColor(model, buffer.messages[i].nick, buffer.server,
                                                 blast::themeSurfaceColor("surface_container_low")));
@@ -2550,9 +2573,11 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
                        clock->color() == blast::themeForegroundColor("on_surface_variant"));
                 containedBounds(nativeTextInk(renderer, rendered.text), sceneBounds(rendered.row));
                 containedBounds(nativeTextInk(renderer, *clock), sceneBounds(rendered.row));
-            } else
+            } else {
+                assert(!actionGlyph(rendered.row));
                 bubbleGeometry(renderer, rendered, zoom,
                                i == 1 || i == 3 ? "" : "12:" + std::to_string(34 + i));
+            }
             bubbleDelivery(rendered, buffer.messages[i], zoom);
             if (buffer.messages[i].deleted) {
                 const auto original =
@@ -10619,7 +10644,7 @@ void friendAuthorIndicators(TranscriptTestRenderer &renderer) {
         assert(glyph && glyph->visible() && glyph->codepoint() == GlyphRegistry::lookup("star"));
         const auto badgeBounds = sceneBounds(*badge);
         const auto rendered = body(view, "FriendBody");
-        auto *actor = plainText(rendered.content, entry.action ? "↳ [A]" : "[A]");
+        auto *actor = plainText(rendered.content, "[A]");
         assert(actor);
         const auto actorBounds = sceneBounds(*actor);
         assert(actorBounds.x + actorBounds.width <= badgeBounds.x + .02f);
@@ -10654,8 +10679,7 @@ void friendAuthorIndicators(TranscriptTestRenderer &renderer) {
             auto *current = indicator();
             assert(current);
             const auto *nativeGlyph = find<GlyphNode>(*current);
-            auto *currentActor =
-                plainText(body(view, "FriendBody").content, entry.action ? "↳ [A]" : "[A]");
+            auto *currentActor = plainText(body(view, "FriendBody").content, "[A]");
             assert(nativeGlyph && currentActor && nativeGlyph->color() == currentActor->color());
             assert(view.copySelection() && clipboard.clipboardText() == selected);
         };
@@ -10676,7 +10700,9 @@ void friendAuthorIndicators(TranscriptTestRenderer &renderer) {
 
 void actionPresentation(TranscriptTestRenderer &renderer) {
     for (const int weight : {300, 400, 500, 600, 700})
-        for (const bool traditional : {false, true}) {
+        for (const auto layout : {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc,
+                                  blast::MessageLayout::Stacked}) {
+            const bool traditional = layout != blast::MessageLayout::Bubbles;
             blast::Model model;
             model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
             model.settings.timestamps = true;
@@ -10694,8 +10720,7 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
             buffer.id = buffer.target = "actions";
             buffer.kind = "channel";
             buffer.server = "network";
-            if (traditional)
-                model.settings.messageLayouts[buffer.id] = blast::MessageLayout::Irc;
+            model.settings.messageLayouts[buffer.id] = layout;
             const std::string raw = "ActionPlain \x02"
                                     "ActionBold\x02 \x1f"
                                     "ActionUnder\x1f \x03"
@@ -10731,8 +10756,8 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
             arrange();
             for (const auto token : {"ActionPlain", "OwnEmote"}) {
                 const auto rendered = body(view, token);
-                auto *actor = plainText(rendered.content, "↳ A");
-                assert(actor && actor->font().weight == FontWeight::Bold);
+                auto *actor = actionActor(rendered, "A");
+                assert(actor->font().weight == FontWeight::Bold);
                 const float actorNatural =
                     renderer.measureText(actor->text(), actor->fontSize(), actor->font()).width;
                 assert(actor->maxWidth() + .02f >= actorNatural);
@@ -10790,38 +10815,31 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
                        blast::parseIrcFormatting(message.text, {}, {}).text);
             }
             const auto normal = body(view, "NormalBody");
-            assert(!plainText(normal.content, "↳ Peer"));
+            assert(plainText(normal.content, "Peer") && !actionGlyph(normal.row));
             assert(normal.text.text().find("style=\"italic\"") == std::string::npos);
             assert(bool(bubbleSurface(normal)) == !traditional);
             const auto presence = body(view, "PresenceBody");
-            assert(!plainText(presence.content, "↳ Peer") && !bubbleSurface(presence));
+            assert(!actionGlyph(presence.row) && !bubbleSurface(presence));
             model.settings.avatars = true;
             for (const float width : {1100.f, 240.f}) {
                 view.sync();
                 view.arrange(renderer, {17, 23, width, 1800});
-                for (const auto token : {"ActionPlain", "OwnEmote"}) {
-                    const auto rendered = body(view, token);
-                    auto *actor = plainText(rendered.content, "↳ A");
-                    assert(actor);
+                for (const int index : {0, 1}) {
+                    const auto text =
+                        blast::parseIrcFormatting(buffer.messages[index].text, {}, {}).text;
+                    const auto rendered = body(view, text, true);
+                    auto *actor = actionActor(rendered, "A");
                     const auto actorBounds = sceneBounds(*actor);
                     const float actorNatural =
                         renderer.measureText(actor->text(), actor->fontSize(), actor->font()).width;
                     assert(actor->maxWidth() + .02f >= actorNatural);
                     const auto bodyBounds = sceneBounds(rendered.body);
-                    if (!traditional)
-                        assert(actorBounds.x + actorBounds.width + 7.9f <= bodyBounds.x);
-                    else if (width > 240) {
-                        assert(actorBounds.x + actorBounds.width + 7.9f <= bodyBounds.x);
+                    assert(actorBounds.x + actorBounds.width + 7.9f <=
+                           sceneBounds(rendered.fragment).x);
+                    if (traditional)
                         near(baseline(*actor), baseline(rendered.text));
-                    } else {
-                        assert(sceneBounds(*actor->parent()).y +
-                                   sceneBounds(*actor->parent()).height <=
-                               bodyBounds.y + .02f);
-                        const auto glyph = renderer.measureText("0", rendered.text.fontSize(),
-                                                                rendered.text.font());
-                        const float indent = 1.5f * glyph.width;
-                        near(sceneBounds(*actor->parent()).x + indent, bodyBounds.x);
-                    }
+                    if (width == 240)
+                        assert(bounds(rendered).height > rendered.fragment.height());
                     for (const auto &child : rendered.content.children())
                         if (auto *rect = dynamic_cast<RectNode *>(child.get());
                             rect && rect->visible() && rect->style().fill.a > 0 &&
@@ -10848,9 +10866,8 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
             ++buffer.messagesRevision;
             view.sync();
             view.arrange(renderer, {17, 23, 240, 1800});
-            const auto narrow = body(view, "ActionPlain");
-            auto *boundedActor = plainText(narrow.content, "↳ " + longActor);
-            assert(boundedActor);
+            const auto narrow = body(view, blast::parseIrcFormatting(raw, {}, {}).text, true);
+            auto *boundedActor = actionActor(narrow, longActor);
             assert(boundedActor->maxWidth() < renderer
                                                   .measureText(boundedActor->text(),
                                                                boundedActor->fontSize(),
@@ -10860,8 +10877,9 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
             const auto rowBounds = sceneBounds(narrow.row);
             assert(bounded.x >= rowBounds.x - .02f &&
                    bounded.x + bounded.width <= rowBounds.x + rowBounds.width + .02f);
-            if (!traditional)
-                assert(bounded.x + bounded.width + 7.9f <= sceneBounds(narrow.body).x);
+            assert(bounded.x + bounded.width + 7.9f <= sceneBounds(narrow.fragment).x);
+            if (traditional)
+                near(baseline(*boundedActor), baseline(narrow.text));
             buffer.messages.front().nick = "A";
             ++buffer.messagesRevision;
             model.settings.avatars = false;

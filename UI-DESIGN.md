@@ -127,7 +127,7 @@ Center nick-pill text using cached visible glyph coverage rather than the font s
 
 Use the smaller local theme radius for message-area chips, reactions, reply/media cards and dense highlights, and 75% of the theme bubble radius for conversation bubbles. Clamp radii to the painted bounds. Hover changes a bubble's own surface without enlarging it. Dense message highlights keep a small UI-scaled outer gap. Neither changes layout or text selection. Preserve circular avatars and indicators; leave shell rounding unchanged.
 
-For `/me`, measure the styled nickname prefix and include it in intrinsic body width so short names fit without clipping; reserve the friend glyph's space and bound only genuinely long names.
+For `/me`, place a native six-arm asterisk and the actor’s nickname on the first line of the italic action text, even in the two-line layout. Long actions wrap normally. Include the asterisk and styled nickname in prefix measurement, reserve the friend glyph’s space, and bound the prefix in narrow layouts.
 
 Keep reactions in one horizontal row of complete chips, stopping before the first chip that exceeds the available message width. Omit overflow controls from paint, hit testing and keyboard focus without discarding reaction data; never wrap into another row.
 

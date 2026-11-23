@@ -712,6 +712,10 @@ struct Geometry {
     float activityPadding() const { return (tight ? 6 : 8) * scale; }
     float activityPaddingY() const { return 2 * scale; }
     float activityChevron() const { return 16 * scale; }
+    float actionMarkerWidth(float fontSize, float available) const {
+        const float width = std::round(fontSize) + 3 * scale;
+        return width + 1 <= available ? width : 0;
+    }
     float footerGap() const { return (tight ? 1 : 2) * scale; }
     float statusSize() const { return 12 * scale; }
     float statusGap() const { return 4 * scale; }
@@ -1058,6 +1062,7 @@ struct TranscriptView::Impl {
         RectNode *nickChip = nullptr;
         Label *nickChipText = nullptr;
         Glyph *friendBadge = nullptr;
+        Glyph *actionMarker = nullptr;
         bool ownNickChip = false;
         TextNode *avatarInitial = nullptr;
         Spinner *statusSpinner = nullptr;
@@ -3935,6 +3940,7 @@ struct TranscriptView::Impl {
         const bool notice = typedActivity(entry);
         const bool collapsed = row.activitySummary && !row.activityExpanded;
         const auto &g = c.geometry;
+        const bool stackedEmote = emote && g.channel && !g.inlineChannel;
         rowState(row, buffer, index);
         size_t fingerprint = signature(entry, index ? &buffer.messages[index - 1] : nullptr);
         fingerprint ^= size_t(row.showClock) << 17 | size_t(row.grouped) << 19;
@@ -3961,19 +3967,28 @@ struct TranscriptView::Impl {
         const float paddingY = notice ? g.activityPaddingY() : g.paddingY(entry.presence);
         row.prefixWidth =
             collapsed || (notice && !row.showClock) ? 0 : g.prefixWidth(entry.presence);
-        const float availableBody = activityBodyWidth(row, entry, g, c.width);
+        float availableBody = activityBodyWidth(row, entry, g, c.width);
+        if (stackedEmote) {
+            const float prefix = g.compactAvatarInset(false) + (row.showClock ? g.timeGutter : 0);
+            availableBody = std::max(1.f, availableBody + row.prefixWidth - prefix);
+            row.prefixWidth = prefix;
+        }
         auto emoteFont = themeMessageFont();
         emoteFont.weight = FontWeight::Bold;
         const float friendExtent = row.friendAuthor ? 18 * g.scale : 0;
-        row.emotePrefix =
-            emote && g.bubbles
-                ? g.authorAvatarInset() +
-                      std::min(
-                          std::max(0.f, availableBody - g.authorAvatarInset()) * .45f,
-                          std::ceil(
-                              renderer.measureText("↳ " + entry.nick, g.font, emoteFont).width) +
-                              friendExtent + 8 * g.scale)
-                : 0;
+        row.emotePrefix = 0;
+        if (emote && (g.bubbles || stackedEmote)) {
+            const float avatarInset = g.authorAvatarInset();
+            const float width = std::max(0.f, availableBody - avatarInset);
+            const float trailing = friendExtent + 8 * g.scale;
+            const float name = std::ceil(renderer.measureText(entry.nick, g.font, emoteFont).width);
+            const float shortPrefix = std::min(name, g.font) +
+                                      g.actionMarkerWidth(g.font, width) + trailing;
+            const float limit = std::max(width * .45f, std::min(shortPrefix, width - 3 * g.font));
+            row.emotePrefix =
+                avatarInset + std::min(limit, name + g.actionMarkerWidth(g.font, limit - trailing) +
+                                                  trailing);
+        }
         row.prefixWidth += row.emotePrefix;
         const float bodyMax = std::max(1.f, availableBody - row.emotePrefix);
         const Color normal =
@@ -4150,9 +4165,10 @@ struct TranscriptView::Impl {
         row.bodyOffset = paddingY + (row.day ? g.day : 0) +
                          (row.unread ? g.unread : 0) + g.groupGap(entry.presence, row.grouped);
         row.prefixBaseline = row.prefixAscent = row.prefixHeight = 0;
-        if (!collapsed && ((g.channel && g.nickVisible(row.grouped, entry.presence)) ||
-                           (g.channel && !entry.presence && row.showClock) ||
-                           (entry.presence && row.showClock))) {
+        if (!collapsed &&
+            ((g.channel && !stackedEmote && g.nickVisible(row.grouped, entry.presence)) ||
+             (g.channel && !entry.presence && row.showClock) ||
+             (entry.presence && row.showClock))) {
             float descent = 0, nickInkCenter = 0;
             auto include = [&](std::string_view text, float width, TextAlign align, bool nick) {
                 auto font = notice && !nick ? g.activityStyle : themeUiFont();
@@ -4160,7 +4176,7 @@ struct TranscriptView::Impl {
                     font.weight = FontWeight::Bold;
                 const float size = nick     ? g.metadataFont
                                    : notice ? g.activityFont
-                                   : g.channel && !g.inlineChannel && !entry.presence
+                                   : g.channel && !g.inlineChannel && !stackedEmote && !entry.presence
                                        ? g.timeFont
                                        : g.metadataFont;
                 const auto measured = renderer.measureText(text, size, font, std::max(1.f, width),
@@ -4170,26 +4186,25 @@ struct TranscriptView::Impl {
                 if (nick)
                     nickInkCenter = (measured.inkTop + measured.inkBottom) * .5f;
             };
-            if (g.nickVisible(row.grouped, entry.presence)) {
+            if (!stackedEmote && g.nickVisible(row.grouped, entry.presence)) {
                 const auto align = g.inlineChannel ? TextAlign::End : TextAlign::Start;
                 const float nickWidth =
                     std::max(1.f, g.channelNickWidth(row.showClock) -
                                       g.compactAvatarInset(g.inlineChannel) - friendExtent -
                                       (entry.own && !entry.action ? 2 * g.chipPadding() : 0));
-                if (entry.action)
-                    include("↳ " + entry.nick, nickWidth, align, true);
-                else
-                    include(entry.nick, nickWidth, align, true);
+                const float marker =
+                    entry.action ? g.actionMarkerWidth(g.metadataFont, nickWidth) : 0;
+                include(entry.nick, nickWidth - marker, align, true);
             }
             if (row.showClock)
                 include(clockText(entry),
-                        g.channel && !g.inlineChannel && !entry.presence
+                        g.channel && !g.inlineChannel && !stackedEmote && !entry.presence
                             ? g.clockWidth
                             : g.timeGutter - 4 * g.scale,
                         TextAlign::Start, false);
             const float textHeight = row.prefixAscent + descent;
             row.prefixHeight = std::max(entry.presence ? 0.f : g.metadataHeader, textHeight);
-            if (g.nickVisible(row.grouped, entry.presence))
+            if (!stackedEmote && g.nickVisible(row.grouped, entry.presence))
                 row.prefixHeight = std::max(
                     row.prefixHeight, g.metadataHeader + (entry.own ? 2 * g.chipPaddingY() : 0));
             if (g.inlineChannel && g.nickVisible(row.grouped, entry.presence) &&
@@ -4209,14 +4224,14 @@ struct TranscriptView::Impl {
                     : row.prefixAscent + (row.prefixHeight - textHeight) * .5f;
             row.prefixBaseline = row.bodyOffset + row.prefixAscent;
         }
-        if (!collapsed && (!emote || g.channel) && g.authorHeader(row.grouped, entry.presence))
+        if (!collapsed && !emote && g.authorHeader(row.grouped, entry.presence))
             row.bodyOffset += g.channel ? row.prefixHeight : row.authorHeader;
         row.bodyOffset += row.quoteHeight;
         if (buffer.kind == "mentions")
             row.bodyOffset += g.metadataHeader;
-        if (!collapsed &&
-            ((g.channel && g.inlineChannel && !entry.presence && row.prefixHeight > 0) ||
-             (entry.presence && row.showClock))) {
+        if (!collapsed && ((emote && (g.bubbles || stackedEmote)) ||
+                           (g.channel && g.inlineChannel && !entry.presence && row.prefixHeight > 0) ||
+                           (entry.presence && row.showClock))) {
             const float baseline = row.fragments.empty()
                                        ? -renderer.measureFont(g.font, themeMessageFont()).top
                                        : row.fragments.front().y + row.fragments.front().baseline;
@@ -4226,30 +4241,29 @@ struct TranscriptView::Impl {
         float bodyEnd = row.bodyOffset + row.bodyHeight;
         if (!collapsed && ((g.channel && !entry.presence) || (entry.presence && row.showClock)))
             bodyEnd = std::max(bodyEnd, row.prefixBaseline - row.prefixAscent + row.prefixHeight);
+        if (stackedEmote)
+            bodyEnd = std::max(bodyEnd, row.bodyOffset + g.compactAvatarSize(false));
         row.selectionWidth = row.contentWidth;
         if (!g.bubbles && !entry.presence) {
             row.selectionWidth = layout.width;
             if (row.quoteHeight > 0 || !row.previewUrl.empty() || !entry.reactions.empty())
                 row.selectionWidth = row.contentWidth;
             row.selectionWidth += row.prefixWidth;
-            if (g.channel && !g.inlineChannel) {
+            if (g.channel && !g.inlineChannel && !stackedEmote) {
                 float metadataWidth = 0;
                 if (g.nickVisible(row.grouped, entry.presence)) {
                     const float chipPadding = entry.own && !entry.action ? g.chipPadding() : 0;
                     const float adornments =
                         g.compactAvatarInset(false) + 2 * chipPadding + friendExtent;
-                    const float textLimit = std::max(
-                        1.f, g.channelNickWidth(row.showClock) - adornments);
-                    const auto text = entry.action ? "↳ " + entry.nick : entry.nick;
+                    const float textLimit =
+                        std::max(1.f, g.channelNickWidth(row.showClock) - adornments);
                     auto actorFont = themeUiFont();
                     actorFont.weight = FontWeight::Bold;
+                    const float nickWidth = std::ceil(
+                        renderer.measureText(entry.nick, g.metadataFont, actorFont).width);
                     metadataWidth = std::max(
                         metadataWidth,
-                        adornments +
-                            std::min(
-                                textLimit,
-                                std::ceil(
-                                    renderer.measureText(text, g.metadataFont, actorFont).width)) +
+                        adornments + std::min(textLimit, nickWidth) +
                             (row.showClock ? g.clockWidth + 8 * g.scale : 0));
                 }
                 row.selectionWidth = std::max(row.selectionWidth, metadataWidth);
@@ -4301,6 +4315,20 @@ struct TranscriptView::Impl {
         row.revision = ++c.revision;
         c.heights.add(index, row.height - oldHeight);
         return row.height - oldHeight;
+    }
+
+    Glyph *renderActionMarker(Node &parent, float x, float centerY, float fontSize, Color ink) {
+        auto marker = std::make_unique<Glyph>();
+        auto *result = marker.get();
+        const float size = std::round(fontSize);
+        marker->setGlyph("asterisk");
+        marker->setGlyphSize(fontSize);
+        marker->setColor(ink);
+        marker->setPosition(x, centerY - size * .5f);
+        marker->setSize(size, size);
+        marker->setHitTestVisible(false);
+        parent.addChild(std::move(marker));
+        return result;
     }
 
     Glyph *friendGlyph(Node &parent, float x, float y, float size, Color color) {
@@ -4501,6 +4529,7 @@ struct TranscriptView::Impl {
         slot.nickChip = nullptr;
         slot.nickChipText = nullptr;
         slot.friendBadge = nullptr;
+        slot.actionMarker = nullptr;
         slot.ownNickChip = false;
         slot.avatarInitial = nullptr;
         slot.statusSpinner = nullptr;
@@ -4636,6 +4665,7 @@ struct TranscriptView::Impl {
         const float x = surfaceX + padding + row.prefixWidth;
         slot.bodyX = x;
         float y = top + (notice ? g.activityPaddingY() : g.paddingY(entry.presence));
+        const bool stackedEmote = entry.action && !entry.presence && g.channel && !g.inlineChannel;
         if (!collapsed && g.bubbles && g.avatars && !row.grouped && !entry.presence)
             avatar(renderer, slot, entry,
                    g.tight ? x - row.emotePrefix
@@ -4649,7 +4679,7 @@ struct TranscriptView::Impl {
                                           .5f,
                    metrics.avatarSize * g.scale);
         if (!collapsed && ((g.channel && !entry.presence) || (entry.presence && row.showClock))) {
-            const bool stacked = g.channel && !g.inlineChannel;
+            const bool stacked = g.channel && !g.inlineChannel && !stackedEmote;
             float clusterEnd = surfaceX + padding;
             auto prefix = [&](std::string text, float left, float width, bool nick) {
                 auto hit = std::make_unique<InputArea>();
@@ -4677,22 +4707,24 @@ struct TranscriptView::Impl {
                     const float avatarSize = g.compactAvatarSize(g.inlineChannel);
                     const float avatarInset = g.compactAvatarInset(g.inlineChannel);
                     const float chipPadding = entry.own && !entry.action ? g.chipPadding() : 0;
-                    const float textLimit =
-                        std::max(1.f, width - avatarInset - 2 * chipPadding - friendExtent);
+                    const float available = width - avatarInset - 2 * chipPadding - friendExtent;
+                    const float marker =
+                        entry.action ? g.actionMarkerWidth(g.metadataFont, available) : 0;
+                    const float textLimit = std::max(1.f, available - marker);
                     auto actorFont = themeUiFont();
                     actorFont.weight = FontWeight::Bold;
                     const float textWidth = std::min(
                         textLimit,
                         std::ceil(renderer.measureText(text, g.metadataFont, actorFont).width));
                     const float chipWidth = textWidth + 2 * chipPadding + friendExtent;
-                    const float clusterWidth = avatarInset + chipWidth;
+                    const float clusterWidth = avatarInset + marker + chipWidth;
                     if (stacked) {
                         clusterEnd = left + clusterWidth;
                         area->setSize(clusterWidth, row.prefixHeight);
                     }
                     const float clusterX =
                         g.inlineChannel ? std::max(0.f, width - clusterWidth) : 0;
-                    const float nameX = clusterX + avatarInset;
+                    const float nameX = clusterX + avatarInset + marker;
                     if (entry.own && !entry.action) {
                         slot.ownNickChip = true;
                         const float chipHeight =
@@ -4702,6 +4734,10 @@ struct TranscriptView::Impl {
                             chipHeight, themeForegroundColor("primary"), g.cornerRadius);
                     }
                     const auto ink = !slot.ownNickChip ? senderInk(entry) : std::array<Color, 2>{};
+                    if (marker > 0)
+                        slot.actionMarker = renderActionMarker(*area, nameX - marker,
+                                                               row.prefixHeight * .5f,
+                                                               g.metadataFont, ink[0]);
                     auto *name = label(
                         *area, text, nameX + chipPadding, 0, textWidth, g.metadataFont,
                         slot.ownNickChip ? themeForegroundColor("on_primary") : ink[0], actorFont);
@@ -4764,9 +4800,8 @@ struct TranscriptView::Impl {
             };
             if (row.showClock && !stacked)
                 prefix(clockText(entry), surfaceX + padding, g.timeGutter - 4 * g.scale, false);
-            if (g.nickVisible(row.grouped, entry.presence))
-                prefix(entry.action ? "↳ " + entry.nick : entry.nick,
-                       surfaceX + padding + (stacked ? 0 : g.timeGutter),
+            if (!stackedEmote && g.nickVisible(row.grouped, entry.presence))
+                prefix(entry.nick, surfaceX + padding + (stacked ? 0 : g.timeGutter),
                        g.channelNickWidth(row.showClock), true);
             if (row.showClock && stacked)
                 prefix(clockText(entry), clusterEnd + 8 * g.scale, g.clockWidth, false);
@@ -4779,15 +4814,26 @@ struct TranscriptView::Impl {
                                              g.metadataFont, row.metadataInk[0], themeUiFont(),
                                              entry.time),
                                        row.metadataInk);
-        if (!collapsed && entry.action && !entry.presence && g.bubbles) {
+        if (!collapsed && entry.action && !entry.presence && (g.bubbles || stackedEmote)) {
             auto actorFont = themeMessageFont();
             actorFont.weight = FontWeight::Bold;
             const auto ink = senderInk(entry);
-            auto *name = label(
-                *slot.content, "↳ " + entry.nick, x - row.emotePrefix + g.authorAvatarInset(),
-                row.bodyOffset,
-                std::max(1.f, row.emotePrefix - g.authorAvatarInset() - friendExtent - 8 * g.scale),
-                g.font, ink[0], actorFont, entry.nick);
+            if (stackedEmote && g.avatars)
+                avatar(renderer, slot, entry, surfaceX + (row.showClock ? g.timeGutter : 0),
+                       row.bodyOffset, g.compactAvatarSize(false));
+            const float left = x - row.emotePrefix + g.authorAvatarInset();
+            const float available = row.emotePrefix - g.authorAvatarInset() - friendExtent -
+                                    8 * g.scale;
+            const float marker = g.actionMarkerWidth(g.font, available);
+            if (marker > 0)
+                slot.actionMarker = renderActionMarker(*slot.content, left,
+                                                       row.bodyOffset + g.bodyLine * .5f, g.font,
+                                                       ink[0]);
+            auto *name = label(*slot.content, entry.nick, left + marker, row.bodyOffset,
+                               std::max(1.f, available - marker), g.font, ink[0], actorFont,
+                               entry.nick);
+            name->measure(renderer);
+            name->setPosition(name->x(), row.prefixBaseline - name->baselineOffset());
             rememberSender(name, ink);
             if (row.friendAuthor)
                 slot.friendBadge =
@@ -5334,6 +5380,8 @@ struct TranscriptView::Impl {
                 text.node->setColor(text.color[hovered].value_or(normal));
             for (auto &[label, ink] : slot.labelInk)
                 label->setColor(ink[hovered]);
+            if (slot.actionMarker)
+                slot.actionMarker->setColor(slot.leadingNick->color());
             if (slot.friendBadge)
                 slot.friendBadge->setColor(
                     nickColor(model, entry.nick, sourceServer(*buffer, entry)));

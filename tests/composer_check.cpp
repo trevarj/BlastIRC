@@ -2622,7 +2622,8 @@ void runComposerCheck() {
     model.settings.typingSend = false;
     model.settings.reducedMotion = true;
     model.settings.cursorShape = "box";
-    model.settings.cursorEffect = "trail";
+    model.settings.cursorBlink = "smooth";
+    model.settings.cursorTrail = true;
     ServerConfig server;
     server.name = "test";
     server.host = "example.invalid";
@@ -3504,7 +3505,7 @@ void runComposerCheck() {
     input->setValue("draft");
     editors.sync();
 
-    // Budget, font/zoom/style and effective trail suppression are paint/layout only.
+    // Budget, font/zoom and cursor shape/blink/trail policy are paint/layout only.
     auto selected = input->editingState();
     selected.current.cursorPos = 4;
     selected.current.selectionAnchor = 1;
@@ -3520,8 +3521,16 @@ void runComposerCheck() {
            composing.preeditBase->cursorPos == 4 && composing.preeditBase->selectionAnchor == 1);
     const auto undoBeforeLayout = composing.history->undo;
     const auto redoBeforeLayout = composing.history->redo;
-    for (const float scale : {.7f, 1.f, 2.f}) {
+    const auto originalFx = model.settings.fx;
+    for (const auto &[scale, blink, trail, fx, reduced] :
+         {std::tuple{.7f, "step", true, FxLevel::Off, false},
+          {1.f, "off", false, FxLevel::Full, false},
+          {2.f, "smooth", true, FxLevel::Full, true}}) {
         model.settings.scale = scale;
+        model.settings.cursorBlink = blink;
+        model.settings.cursorTrail = trail;
+        model.settings.fx = fx;
+        model.settings.reducedMotion = reduced;
         model.settings.messageFont = "monospace";
         theme.update(model);
         editors.setComposerHeightLimit(a.id, 80 * scale);
@@ -3531,8 +3540,10 @@ void runComposerCheck() {
         assert(composing.history->undo == undoBeforeLayout &&
                composing.history->redo == redoBeforeLayout);
         assert(shared->composing() && a.reply == replyKey && b.reply == "missing-reply");
-        assert(model.settings.cursorShape == "box" && model.settings.cursorEffect == "trail");
+        assert(model.settings.cursorShape == "box" && model.settings.cursorBlink == blink &&
+               model.settings.cursorTrail == trail);
     }
+    model.settings.fx = originalFx;
     editors.setComposerHeightLimit(a.id, 0);
     assert(input->editingStateMatches(composing));
     assert(editors.execute("cancel", a));

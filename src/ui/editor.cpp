@@ -3497,15 +3497,23 @@ void EditorStore::Impl::Composer::sync() {
     const auto shape = settings.cursorShape == "box"         ? Input::CaretShape::Box
                        : settings.cursorShape == "underline" ? Input::CaretShape::Underline
                                                              : Input::CaretShape::Line;
-    const auto effect = settings.reducedMotion || settings.fx == FxLevel::Off
-                            ? Input::CaretEffect::Off
-                        : settings.cursorEffect == "trail"  ? Input::CaretEffect::Trail
-                        : settings.cursorEffect == "comet"  ? Input::CaretEffect::Comet
-                        : settings.cursorEffect == "ribbon" ? Input::CaretEffect::Ribbon
-                        : settings.cursorEffect == "pulse"  ? Input::CaretEffect::Pulse
-                                                            : Input::CaretEffect::Off;
-    input->setCaretStyle(shape, effect, settings.cursorTrailDurationMs,
-                         settings.cursorTrailStrength);
+    const bool motion = !settings.reducedMotion && settings.fx != FxLevel::Off;
+    const auto blink = !motion || settings.cursorBlink == "off" ? Input::CaretBlink::Off
+                       : settings.cursorBlink == "smooth"       ? Input::CaretBlink::Smooth
+                                                                : Input::CaretBlink::Step;
+    const bool trail = motion && settings.cursorTrail;
+    using TrailStyle = Input::CaretTrailStyle;
+    static constexpr std::array trailStyles{
+        TrailStyle::Classic, TrailStyle::MotionBlur, TrailStyle::Blaze,    TrailStyle::Lightning,
+        TrailStyle::Railgun, TrailStyle::Torpedo,    TrailStyle::Pixiedust};
+    static_assert(trailStyles.size() == cursorTrailStyleIds.size());
+    auto style = TrailStyle::Classic;
+    if (trail) {
+        const auto selected = std::ranges::find(cursorTrailStyleIds, settings.cursorTrailStyle);
+        if (selected != cursorTrailStyleIds.end())
+            style = trailStyles[selected - cursorTrailStyleIds.begin()];
+    }
+    input->setCaretStyle(shape, blink, trail, style);
     if (!visibleInScene(*this))
         input->resetCaretEffects();
     replyScratch.clear();

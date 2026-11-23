@@ -2,6 +2,7 @@
 #include "irc/protocol.hpp"
 #include "upload.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -64,6 +65,9 @@ struct Cue {
     bool enabled = true;
     float volume = .5f, pitch = 1.f;
 };
+// Ordered like Input::CaretTrailStyle.
+inline constexpr std::array<std::string_view, 7> cursorTrailStyleIds{
+    "classic", "motion-blur", "blaze", "lightning", "railgun", "torpedo", "pixiedust"};
 struct Settings {
     UploadConfig uploads;
     FxLevel fx = FxLevel::Subtle;
@@ -91,8 +95,9 @@ struct Settings {
     bool spellcheck = true;
     string spellcheckLanguage = "auto";
     bool wordPrediction = false;
-    string cursorShape = "line", cursorEffect = "off";
-    float cursorTrailDurationMs = 120.f, cursorTrailStrength = .20f;
+    string cursorShape = "line", cursorBlink = "step";
+    bool cursorTrail = false;
+    string cursorTrailStyle = "classic";
     SidebarMode peopleMode = SidebarMode::Hidden;
     map<string, Cue> cues;
     map<string, string> bindings, nickColors, workspace;

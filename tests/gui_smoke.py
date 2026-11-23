@@ -2496,12 +2496,10 @@ def save_settings_footer(window, *, saved_path, destination=None, label="setting
 
 
 def set_native_cursor_preferences(proc, window, prefs, db, args, dest, *,
-                                  shape, effect, duration=120, strength=.2):
-    assert shape in ("line", "box", "underline") and effect in ("off", "trail", "comet", "ribbon", "pulse")
-    assert math.isfinite(duration) and 40 <= duration <= 240 and int(duration) == duration
-    assert math.isfinite(strength) and .05 <= strength <= .35
-    steps = round((strength - .05) / .01)
-    assert math.isclose(.05 + steps * .01, strength, abs_tol=1e-6), strength
+                                  shape, blink, trail, style=None):
+    assert shape in ("line", "box", "underline") and blink in ("off", "step", "smooth")
+    styles = ("classic", "motion-blur", "blaze", "lightning", "railgun", "torpedo", "pixiedust")
+    assert style is None or style in styles
     baseline = tomllib.loads(prefs.read_text())
     open_settings(window, prefs)
     framed_keys(window, "shift+Tab")
@@ -2509,22 +2507,24 @@ def set_native_cursor_preferences(proc, window, prefs, db, args, dest, *,
     shape_stop = 12
     framed_keys(window, *(["Tab"] * shape_stop))
     settings_select(window, ("line", "box", "underline").index(shape))
-    label = f"settings-cursor-{shape}-{effect}-{duration:g}-{strength:g}"
+    label = f"settings-cursor-{shape}-{blink}-trail-{'on' if trail else 'off'}"
     capture_window(window, dest, label + "-shape")
     framed_keys(window, "Tab")
-    settings_select(window, ("off", "trail", "comet", "ribbon", "pulse").index(effect))
-    capture_window(window, dest, label + "-effective-policy")
-    pages, remainder = divmod(int(duration) - 40, 10)
-    framed_keys(window, "Tab", "Home", *(["Page_Up"] * pages), *(["Right"] * remainder))
-    capture_window(window, dest, label + "-duration")
-    framed_keys(window, "Tab", "Home", *(["Right"] * steps))
-    capture_window(window, dest, label + "-strength")
+    settings_select(window, ("off", "step", "smooth").index(blink))
+    capture_window(window, dest, label + "-blink")
+    framed_keys(window, "Tab")
+    if baseline["cursor"]["trail"] != trail:
+        framed_keys(window, "Return")
+    capture_window(window, dest, label + "-trail")
+    framed_keys(window, "Tab")
+    if style is not None:
+        settings_select(window, styles.index(style))
+        capture_window(window, dest, label + "-" + style)
     framed_keys(window, *(["shift+Tab"] * (shape_stop + 3)))
     saved = save_settings_footer(window, saved_path=prefs, destination=dest, label=label + "-saved")
     cursor = saved["cursor"]
-    assert cursor["shape"] == shape and cursor["effect"] == effect, cursor
-    assert math.isclose(cursor["trail_duration_ms"], duration, abs_tol=1e-5), cursor
-    assert math.isclose(cursor["trail_strength"], strength, abs_tol=1e-6), cursor
+    assert cursor == {"shape": shape, "blink": blink, "trail": trail,
+                      "trail_style": style or baseline["cursor"]["trail_style"]}, cursor
     for section in ("appearance", "audio"):
         assert saved[section] == baseline[section], f"Cursor controls changed {section} suppression preferences"
     framed_keys(window, *(["Tab"] * (shape_stop + 4)), "Return")  # Try in conversation.
@@ -5016,7 +5016,6 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
     for character in text:
         boundaries.append(boundaries[-1] + len(character.encode('utf-8')))
     assert initial['cursor'] in boundaries and initial['anchor'] in boundaries, initial
-    previous = boundaries[-2]
     keyboard_press = re.compile(r'wl_keyboard[@#]\d+\.key\(\d+,\s*\d+,\s*\d+,\s*1\)')
     original_node = native_window(window)
     identity = (original_node['id'], original_node['pid'], original_node['app_id'])
@@ -5038,7 +5037,7 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
               'native_before': initial, 'cursor_controls': [], 'suppression': [], 'dpi': [],
               'timed_movements': [],
               'protocol_log': str(debug), 'status': 'running',
-              'limits': 'Timed native RGB captures distinguish Trail from Reduced/Effects Off. Comet/Ribbon/Pulse have real selector, persistence, editor-state and still-capture coverage only, not animation/distinctness proof. No private geometry is inferred from IME rectangles; physical IM engines and candidate windows are not exercised.'}
+              'limits': 'Native RGB samples distinguish Off/Step/Smooth blink and trail movement/settling from suppression. Crops use IME rectangles only to locate the caret; no private trail geometry, physical IM engine or candidate window is inferred.'}
 
     def artifact(label, suffix):
         return dest.with_name(dest.stem + '-' + label + suffix)
@@ -5142,12 +5141,43 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
         return [line for line in data.decode('utf-8', errors='replace').splitlines()
                 if any(pattern.search(line) for pattern in patterns)]
 
+    def blink_pixels(label, expected):
+        caret = state(len(encoded), len(encoded))
+        x, y, width, height = caret['caret']
+        geometry = window_geometry(window)
+        region = {'X': geometry['X'] + x, 'Y': geometry['Y'] + y, 'WIDTH': width, 'HEIGHT': height}
+        variants = {}
+        started = time.monotonic_ns()
+        samples = 0
+        # Cover more than two Kitty 500ms half-cycles without touching the input.
+        while time.monotonic_ns() - started < 1_250_000_000:
+            image = native_rgb_capture(window, geometry=region)
+            variants.setdefault(image['pixels'], time.monotonic_ns() - started)
+            samples += 1
+        assert window_geometry(window) == geometry and state(len(encoded), len(encoded)) == caret
+        captures = []
+        for index, (pixels, elapsed_ns) in enumerate(variants.items()):
+            path = artifact(f'{label}-blink-{index:02d}', '.ppm')
+            path.write_bytes(f'P6\n{width} {height}\n255\n'.encode() + pixels)
+            captures.append({'capture': str(path), 'observed_after_ns': elapsed_ns,
+                             'pixel_sha256': hashlib.sha256(pixels).hexdigest()})
+        count = len(variants)
+        valid = count > 2 if expected == 'smooth' else count == {'off': 1, 'step': 2}[expected]
+        assert samples >= 3 and valid, (
+            'Unexpected native caret opacity variants', expected, samples, captures)
+        return {'expected': expected, 'native_state': caret, 'samples': samples, 'pixel_variants': captures}
+
     def move(chord, cursor, label, *, sample, expect_trail=False):
         before = native_input_state(window)
         assert before and before['caret'], before
         geometry = window_geometry(window)
+        dwell_started = time.monotonic_ns()
+        if sample:
+            time.sleep(.05)  # Let the old position dwell before the real multi-cell jump.
         offset = debug.stat().st_size
         started = time.monotonic_ns()
+        if sample:
+            assert started - dwell_started >= 50_000_000
         key(chord)
         returned = time.monotonic_ns()
         root_wait_started = time.monotonic_ns()
@@ -5164,71 +5194,36 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
                   'native_state_observed_ns': native_state_observed, 'samples': []}
         if sample:
             report['timed_movements'].append(result)
-            duration_ns = round(report['selectedCursorPrefs']['trail_duration_ms'] * 1_000_000)
-            result.update(configured_duration_ms=report['selectedCursorPrefs']['trail_duration_ms'],
-                          expected_visible_trail=expect_trail, sampling_deadline_ms=300,
-                          late_frame_bound_ns=root_paint_observed + duration_ns,
+            early_ns = 120_000_000
+            late_bound = root_paint_observed + 750_000_000
+            result.update(source_dwell_ns=started - dwell_started,
+                          expected_visible_trail=expect_trail, early_window_ms=early_ns // 1_000_000,
+                          late_frame_bound_ns=late_bound,
                           capture_clock='CLOCK_MONOTONIC: verified private wlroots 0.20.2 or EXT protocol')
             first, last = before['caret'], immediate['caret']
-            assert first[:2] != last[:2], (
-                'The real previous-codepoint step did not visibly displace the insertion point; '
-                'this input cannot establish a cursor trail', first, last)
-            margin = 2 * max(first[3], last[3])
+            # Jump across the full mixed-Unicode draft, comfortably above Kitty's
+            # >2-cell threshold even with proportional glyphs.
+            assert first[1] == last[1] and abs(first[0] - last[0]) > 3 * max(first[3], last[3]), (
+                'The native line jump did not travel far enough to trigger a Kitty trail', first, last)
+            margin = max(first[3], last[3])
             left = max(0, min(first[0], last[0]) - margin)
-            top = max(0, min(first[1], last[1]) - margin)
+            top = max(0, first[1] - 1)
             right = min(geometry['WIDTH'], max(first[0] + first[2], last[0] + last[2]) + margin)
-            bottom = min(geometry['HEIGHT'], max(first[1] + first[3], last[1] + last[3]) + margin)
+            bottom = min(geometry['HEIGHT'], first[1] + margin + 1)
             assert left < right and top < bottom, (first, last, geometry)
-            # Use both actual insertion positions and a bounded native-height
-            # margin, not one-codepoint/monospace width assumptions. The exact
-            # crop includes the shaped cell/path context but is not a claim
-            # about private painted rectangles or native viewport geometry.
+            # Bound the horizontal path with a line-height margin for wide glyphs;
+            # keep the vertical crop on the same native composer row.
             result.update(crop_bounds=(left, top, right - left, bottom - top),
-                          crop_expansion_logical_px=margin,
+                          crop_horizontal_margin_logical_px=margin,
                           crop_source='actual before/after narrow caret rectangles at native output scale 1')
             pending = []
             settled = 0
 
-            def post_deadline_root_render():
-                # A new output timestamp can still show a pre-deadline client
-                # buffer. Require a real later client tick and rendered root
-                # attach/commit before requesting a settled screencopy.
-                with debug.open('rb') as log:
-                    log.seek(offset)
-                    records = log.read().decode(errors='replace')
-                root = GUI_DEBUG[window][2]
-                callbacks = set(re.findall(
-                    rf'wl_surface[@#]{root}\.frame\(new id wl_callback[@#](\d+)\)', records))
-                deadline_ms = math.ceil((root_paint_observed + duration_ns) / 1_000_000)
-                tick = rendered = None
-                attached = False
-                pattern = (rf'wl_callback[@#](\d+)\.done\((\d+)\)'
-                           rf'|wl_surface[@#]{root}\.attach\(wl_buffer[@#]\d+,'
-                           rf'|wl_surface[@#]{root}\.commit\(')
-                for event in re.finditer(pattern, records):
-                    if event[1] is not None:
-                        # wl_callback.done is uint32 milliseconds; compare it
-                        # to the same monotonic clock across its normal wrap.
-                        elapsed = ((int(event[2]) - deadline_ms + (1 << 31)) % (1 << 32)) - (1 << 31)
-                        if event[1] in callbacks and elapsed >= 0:
-                            tick = int(event[2])
-                            attached = False
-                    elif '.attach(' in event[0]:
-                        attached = tick is not None
-                    elif attached:
-                        rendered = {'callback_milliseconds32': tick,
-                                    'root_surface': root, 'root_buffer_commit': event[0]}
-                        attached = False
-                if rendered is not None:
-                    rendered['observed_monotonic_ns'] = time.monotonic_ns()
-                return rendered
-
-            # grim waits on actual screencopy frames: no settling sleep or
-            # synthesized intermediate image. Stay strictly below blink time.
+            # The early frames are unmodified screencopies. Leave the compositor
+            # idle afterwards: a settled caret may not request another root frame.
             while settled < 2:
-                assert time.monotonic_ns() - started < 300_000_000, (
-                    'Cursor sampling missed its <300ms blink-free observation window', result)
-                late_render = post_deadline_root_render()
+                if time.monotonic_ns() >= started + early_ns:
+                    time.sleep(max(0, (late_bound - time.monotonic_ns()) / 1_000_000_000))
                 shot_started = time.monotonic_ns()
                 image = native_rgb_capture(window, geometry=geometry, capture_timing=True)
                 shot_finished = time.monotonic_ns()
@@ -5246,16 +5241,12 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
                                           'capture_timestamps': timestamps,
                                           'timestamp_usable': timestamp_usable}
                 assert timestamp_usable, ('Native capture timestamp is stale or not on the process monotonic clock', result)
-                assert frame_time - started < 300_000_000, (
-                    'Native captured frame exceeded the <300ms blink-free observation window', result)
-                assert image['geometry'] == geometry, 'Native client moved during timed cursor sampling'
                 # Process completion includes readback/encoding/IO after the
                 # image was captured. Bound the image by its real presentation
                 # timestamp; missing/stale metadata cannot certify this window.
-                in_window = frame_time - started < duration_ns
-                after_duration = (late_render is not None and
-                                  frame_time - root_paint_observed >= duration_ns)
-                settled += int(after_duration)
+                in_window = frame_time - started < early_ns
+                after_settling = frame_time >= late_bound
+                settled += int(after_settling)
                 observed = native_input_state(window, offset=offset, initial=before)
                 assert observed == immediate, 'Paint animation changed native editing/caret state'
                 result['samples'].append({'capture_started_ns': shot_started,
@@ -5263,14 +5254,12 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
                                           'capture_timestamps': timestamps,
                                           'timestamp_usable': timestamp_usable,
                                           'classification_clock': 'compositor',
-                                          'guaranteed_within_duration': in_window,
-                                          'guaranteed_after_duration': after_duration,
-                                          'post_deadline_root_render': late_render,
+                                          'early_after_input': in_window,
+                                          'after_settling_bound': after_settling,
                                           'native_state': observed,
                                           'protocol_end_offset': debug.stat().st_size})
                 pending.append(image)
-            # Full state/file scans and compositor identity/geometry IPC belong
-            # outside the unchanged 120ms/300ms native pixel observation window.
+            # Keep full state and compositor identity/geometry scans outside the timed captures.
             alive()
             assert window_geometry(window) == geometry, 'Native client moved during timed cursor sampling'
             crops = []
@@ -5291,22 +5280,22 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
                             crop_sha256=hashlib.sha256(crop).hexdigest(),
                             capture_protocol_log=str(protocol_path))
                 crops.append(crop)
-            result['protocol_records'] = trace(offset)
-            early = [index for index, item in enumerate(result['samples']) if item['guaranteed_within_duration']]
-            settled_indices = [index for index, item in enumerate(result['samples']) if item['guaranteed_after_duration']]
-            assert early, ('No actual native frame captured inside the configured trail duration', result)
+            early = [index for index, item in enumerate(result['samples']) if item['early_after_input']]
+            settled_indices = [index for index, item in enumerate(result['samples']) if item['after_settling_bound']]
+            assert early, ('No actual native frame captured in the early post-jump window', result)
             assert len(settled_indices) == 2, result
             settled_crop = crops[settled_indices[-1]]
             result['settled_crops_equal'] = all(crops[index] == settled_crop for index in settled_indices)
-            result['within_duration_crop_differs_from_settled'] = any(crops[index] != settled_crop for index in early)
+            result['early_crop_differs_from_settled'] = any(crops[index] != settled_crop for index in early)
+            result['settled_crop_sha256'] = hashlib.sha256(settled_crop).hexdigest()
             result['all_crops_equal'] = all(crop == settled_crop for crop in crops)
             assert result['settled_crops_equal'], ('Native caret-local pixels did not settle after the finite duration', result)
             if expect_trail:
-                assert result['within_duration_crop_differs_from_settled'], (
-                    'Enabled Box/Trail showed no actual caret-local moving-to-settled pixel difference', result)
+                assert result['early_crop_differs_from_settled'], (
+                    'Enabled Box trail showed no actual caret-local moving-to-settled pixel difference', result)
             else:
                 assert result['all_crops_equal'], (
-                    'Reduced motion/Effects Off did not keep the actual caret-local pixels static', result)
+                    'Disabled or suppressed trail did not keep the actual caret-local pixels static', result)
         else:
             result.update(photo(label))
         result['native_settled'] = state(cursor, cursor)
@@ -5316,8 +5305,8 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
 
     def movement(label, *, sample=False, expect_trail=False):
         collapse_at_end()
-        backward = move('ctrl+b', previous, label + '-backward', sample=sample, expect_trail=expect_trail)
-        forward = move('ctrl+f', len(encoded), label + '-forward', sample=sample, expect_trail=expect_trail)
+        backward = move('ctrl+Home', 0, label + '-backward', sample=sample, expect_trail=expect_trail)
+        forward = move('ctrl+End', len(encoded), label + '-forward', sample=sample, expect_trail=expect_trail)
         return {'backward': backward, 'forward': forward}
 
     def output_at(scale):
@@ -5368,6 +5357,20 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
         assert (native_window(window)['floating'] in ('auto_on', 'user_on')) == original_floating
         return response
 
+    def cursor_control(shape, blink, trail, style=None):
+        saved = set_native_cursor_preferences(proc, window, prefs, db, args, dest,
+                                              shape=shape, blink=blink, trail=trail, style=style)
+        selected = saved['cursor'].copy()
+        report['selectedCursorPrefs'] = selected
+        label = f"cursor-{shape}-{blink}-trail-{'on' if trail else 'off'}"
+        if style is not None:
+            label += "-" + style
+        _, saved_path = disk(label, selected)
+        item = {'saved_cursor_preferences': selected, 'saved_settings': saved_path,
+                'editor': photo(label + '-actual-editor')}
+        report['cursor_controls'].append(item)
+        return label, item
+
     database = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
     geometry_changed = False
     try:
@@ -5378,29 +5381,41 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
         enabled_fx = appearance['fx'] if appearance['fx'] != 'off' else 'subtle'
         try:
             policy(enabled_fx, False, 'cursor-motion-enabled')
-            for shape, effect in (('line', 'off'), ('box', 'off'), ('underline', 'off'),
-                                  ('box', 'comet'), ('box', 'ribbon'), ('box', 'pulse'),
-                                  ('box', 'trail')):
-                saved = set_native_cursor_preferences(proc, window, prefs, db, args, dest,
-                                                      shape=shape, effect=effect, duration=120, strength=.2)
-                selected = saved['cursor'].copy()
-                # Each real control operation is independently persisted by the
-                # authoritative Settings helper; record its actual disk contents.
-                report['selectedCursorPrefs'] = selected
-                label = f'cursor-{shape}-{effect}'
-                _, saved_path = disk(label, selected)
-                report['cursor_controls'].append({'shape': shape, 'effect': effect,
-                    'saved_cursor_preferences': selected, 'saved_settings': saved_path,
-                    'editor': photo(label + '-actual-editor'),
-                    'movement': movement(label, sample=effect == 'trail', expect_trail=effect == 'trail')})
-            selected = report['selectedCursorPrefs']
-            assert selected['shape'] == 'box' and selected['effect'] == 'trail', selected
+            blink_checks = {}
+            for shape, blink, trail in (('line', 'off', False), ('underline', 'off', False),
+                                        ('line', 'step', False), ('line', 'smooth', True)):
+                label, item = cursor_control(shape, blink, trail)
+                if shape == 'line':
+                    if trail:
+                        time.sleep(.75)  # Leave only blink changing during the opacity probe.
+                    item['blink_pixels'] = blink_pixels(label, blink)
+                    blink_checks[blink] = item['blink_pixels']['pixel_variants']
+                item['movement'] = movement(label)
+            steady_line = blink_checks['off'][0]['pixel_sha256']
+            assert steady_line in {frame['pixel_sha256'] for frame in blink_checks['step']}, (
+                'Solid line pixels did not match either phase of Step blink', blink_checks)
+            smooth_trail = report['selectedCursorPrefs']
             for fx, reduced, label in ((enabled_fx, True, 'cursor-reduced-motion'),
                                        ('off', False, 'cursor-effects-off')):
                 item = policy(fx, reduced, label)
                 item['movement'] = movement(label, sample=True)
-                _, item['saved_settings'] = disk(label + '-after-keyboard', selected)
+                item['blink_pixels'] = blink_pixels(label, 'off')
+                assert item['blink_pixels']['pixel_variants'][0]['pixel_sha256'] == steady_line, (
+                    'Suppression changed the solid line caret appearance', item['blink_pixels'])
+                _, item['saved_settings'] = disk(label + '-after-keyboard', smooth_trail)
                 report['suppression'].append(item)
+            policy(enabled_fx, False, 'cursor-motion-reenabled')
+            label, box = cursor_control('box', 'off', False)
+            box['movement'] = movement(label, sample=True)
+            label, trail_box = cursor_control('box', 'off', True, 'classic')
+            trail_box['movement'] = movement(label, sample=True, expect_trail=True)
+            for direction in ('backward', 'forward'):
+                steady, animated = box['movement'][direction], trail_box['movement'][direction]
+                assert (steady['crop_bounds'], steady['settled_crop_sha256']) == (
+                    animated['crop_bounds'], animated['settled_crop_sha256']), (
+                    'The animated caret did not return to its trail-disabled appearance', direction)
+            cursor_control('box', 'off', True, 'pixiedust')
+            selected = report['selectedCursorPrefs']
         finally:
             # The ordinary success path closes every modal through its sticky
             # Close control. Do not inject Escape into a composer (reply cancel).
@@ -6502,7 +6517,9 @@ def run_advanced_scope(*, proc, window, binary, env, screenshot, logs, preferenc
             before_cursor = evidence["beforeCursorPrefs"]
             selected_cursor = evidence["selectedCursorPrefs"]
             assert before_cursor == baseline_settings["cursor"], (before_cursor, baseline_settings["cursor"])
-            assert selected_cursor["shape"] == "box" and selected_cursor["effect"] == "trail", selected_cursor
+            assert selected_cursor == {
+                "shape": "box", "blink": "off", "trail": True, "trail_style": "pixiedust",
+            }, selected_cursor
             assert tomllib.loads(preferences.read_text())["cursor"] == selected_cursor
             cursor_history = database.execute(
                 "SELECT * FROM messages WHERE presence=0 ORDER BY seq").fetchall()
@@ -6542,27 +6559,26 @@ def run_advanced_scope(*, proc, window, binary, env, screenshot, logs, preferenc
             shape_stop = 12
             framed_keys(window, *(["Tab"] * shape_stop))
             controls = []
-            # Appearance's cursor Selects initialize from the
-            # reloaded model; SDK SelectDropdownPopup sets its checkmark and
-            # initialHighlight from selectedIndex. Do not choose/rewrite them.
-            for label in ("shape", "effect"):
+            # The restarted Selects initialize from disk; inspect their native
+            # highlights without choosing/re-saving them.
+            for label in ("shape", "blink"):
                 focused = capture_window(window, destination, "cursor-restart-selected-" + label)
                 popup = open_native_popup(window, lambda: key("Return"))
                 opened = capture_window(window, destination, "cursor-restart-selected-" + label + "-popup")
                 controls.append({"control": label, "popup": popup,
                                  "captures": [str(focused), str(opened)]})
                 popup_keys(window, popup, "Escape", root_changed=False)
-                if label == "shape":
-                    framed_keys(window, "Tab")
-            framed_keys(window, "Tab", "Tab", "Tab", "Return")  # Try in conversation.
+                framed_keys(window, "Tab")
+            focused = capture_window(window, destination, "cursor-restart-selected-trail")
+            controls.append({"control": "trail", "captures": [str(focused)]})
+            framed_keys(window, "Tab", "Return")  # Try in conversation.
             SETTINGS_OPEN[window] = False
             saved_controls = save_state(proc, preferences, database_path)
             assert_same_state("Restarted selected cursor controls inspection", restarted, saved_controls)
             assert tomllib.loads(preferences.read_text())["cursor"] == selected_cursor
             restored = set_native_cursor_preferences(
                 proc, window, preferences, database_path, args, destination,
-                shape=before_cursor["shape"], effect=before_cursor["effect"],
-                duration=before_cursor["trail_duration_ms"], strength=before_cursor["trail_strength"])
+                **before_cursor)
             assert restored["cursor"] == before_cursor, restored["cursor"]
             evidence = {"beforeCursorPrefs": before_cursor,
                         "selectedCursorPrefs": selected_cursor,

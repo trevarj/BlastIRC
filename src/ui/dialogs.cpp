@@ -1682,25 +1682,34 @@ struct Dialogs::Impl {
                    if (index < std::size(shapeIds))
                        model.settings.cursorShape = shapeIds[index];
                });
-        static constexpr const char *effectIds[] = {"off", "trail", "comet", "ribbon", "pulse"};
-        static constexpr const char *effectNames[] = {"Off", "Trail", "Comet", "Ribbon", "Pulse"};
-        std::size_t effectIndex = 0;
-        for (std::size_t i = 0; i < std::size(effectIds); ++i)
-            if (model.settings.cursorEffect == effectIds[i])
-                effectIndex = i;
-        select(*cursor, "Cursor animation", {std::begin(effectNames), std::end(effectNames)},
-               effectNames[effectIndex], [this](std::size_t index, std::string_view) {
-                   if (index < std::size(effectIds))
-                       model.settings.cursorEffect = effectIds[index];
+        static constexpr const char *blinkIds[] = {"off", "step", "smooth"};
+        static constexpr const char *blinkNames[] = {"Off", "Step", "Smooth"};
+        const std::size_t blinkIndex = model.settings.cursorBlink == "off"         ? 0
+                                       : model.settings.cursorBlink == "smooth" ? 2
+                                                                                : 1;
+        select(*cursor, "Cursor blink", {std::begin(blinkNames), std::end(blinkNames)},
+               blinkNames[blinkIndex], [this](std::size_t index, std::string_view) {
+                   if (index < std::size(blinkIds))
+                       model.settings.cursorBlink = blinkIds[index];
+               });
+        toggle(*cursor, "Cursor trail", model.settings.cursorTrail,
+               [this](bool value) { model.settings.cursorTrail = value; });
+        static constexpr const char *trailNames[] = {
+            "Classic", "Motion Blur", "Blaze", "Lightning", "Railgun", "Torpedo", "Pixiedust"};
+        static_assert(std::size(trailNames) == cursorTrailStyleIds.size());
+        const auto trail = std::ranges::find(cursorTrailStyleIds, model.settings.cursorTrailStyle);
+        const auto trailIndex =
+            trail == cursorTrailStyleIds.end() ? 0 : trail - cursorTrailStyleIds.begin();
+        select(*cursor, "Trail style", {std::begin(trailNames), std::end(trailNames)},
+               trailNames[trailIndex], [this](std::size_t index, std::string_view) {
+                   if (index < cursorTrailStyleIds.size())
+                       model.settings.cursorTrailStyle = cursorTrailStyleIds[index];
                });
         cursorStatus = label(*cursor, "");
-        slider(*cursor, "Animation duration (40–240 ms)", model.settings.cursorTrailDurationMs, 40,
-               240, 1, [this](float value) { model.settings.cursorTrailDurationMs = value; });
-        slider(*cursor, "Animation strength (0.05–0.35)", model.settings.cursorTrailStrength, .05,
-               .35, .01, [this](float value) { model.settings.cursorTrailStrength = value; });
         label(*cursor,
-              "Trail fades, Comet tapers, Ribbon bends and Pulse expands; duration and "
-              "strength tune the animation, while Effects Off or Reduced motion pauses it.");
+              "Step blinks on and off; Smooth fades. Trail follows cursor movement and remembers "
+              "its style when turned off. "
+              "Effects Off or Reduced motion suppresses both without changing the shape.");
         button(*cursor, "Try in conversation", [this] { dismiss(); });
         auto *messages = section("appearance.messages", "Messages");
         static constexpr const char *layoutNames[] = {"Message bubbles", "Traditional IRC",
@@ -3926,15 +3935,19 @@ struct Dialogs::Impl {
                     ? "Effective: master volume is zero; enabled cues are silent."
                     : "Effective: enabled cues can play at the saved volumes. Reduced motion "
                       "does not mute sound.");
-        if (cursorStatus)
-            cursorStatus->setText(
-                model.settings.cursorEffect == "off"
-                    ? "Effective: static cursor only; cursor animation is Off."
-                : model.settings.fx == FxLevel::Off
-                    ? "Effective: cursor animation suppressed by Effects Off; shape stays."
-                : model.settings.reducedMotion
-                    ? "Effective: cursor animation suppressed by Reduced motion; shape stays."
-                    : "Effective: selected animation follows the focused composer cursor.");
+        if (cursorStatus) {
+            const auto &settings = model.settings;
+            const std::string_view status =
+                settings.cursorBlink == "off" && !settings.cursorTrail
+                    ? "Effective: cursor blink and trail are off."
+                : settings.fx == FxLevel::Off
+                    ? "Effective: cursor blink and trail suppressed by Effects Off."
+                : settings.reducedMotion
+                    ? "Effective: cursor blink and trail suppressed by Reduced motion."
+                    : "Effective: selected blink and trail settings apply in the focused composer.";
+            if (cursorStatus->text() != status)
+                cursorStatus->setText(std::string(status));
+        }
         bool serverSourcePresent = true;
         if (displayedServer) {
             const auto index = resolveServer(displayedServer);

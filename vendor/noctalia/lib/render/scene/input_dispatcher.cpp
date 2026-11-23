@@ -89,9 +89,7 @@ void InputDispatcher::setSceneRoot(Node* root) {
   }
 
   m_sceneRoot = root;
-  if (m_sceneRoot != nullptr && m_hasPointerPosition) {
-    updateHover(m_lastPointerX, m_lastPointerY, m_lastSerial);
-  }
+  syncPointerHover();
 }
 
 void InputDispatcher::setHoverChangeCallback(HoverChangeCallback callback) {
@@ -404,10 +402,10 @@ bool InputDispatcher::pointerButton(
 }
 
 void InputDispatcher::syncPointerHover() {
-  if (!m_hasPointerPosition || m_capturedArea != nullptr) {
+  if (m_sceneRoot == nullptr || !m_hasPointerPosition || m_capturedArea != nullptr) {
     return;
   }
-  updateHover(m_lastPointerX, m_lastPointerY, m_lastSerial);
+  updateHover(m_lastPointerX, m_lastPointerY, m_lastSerial, false);
 }
 
 bool InputDispatcher::pointerAxis(
@@ -706,7 +704,7 @@ InputArea* InputDispatcher::findInputAreaAt(float x, float y) {
   return nullptr;
 }
 
-void InputDispatcher::updateHover(float x, float y, std::uint32_t serial) {
+void InputDispatcher::updateHover(float x, float y, std::uint32_t serial, bool notifyMotion) {
   pruneDetachedAreas();
 
   // While a button is held, all motion goes to the captured area; hover stays frozen.
@@ -737,7 +735,7 @@ void InputDispatcher::updateHover(float x, float y, std::uint32_t serial) {
       Node::mapFromScene(m_hoveredArea, x, y, localX, localY);
       m_hoveredArea->dispatchEnter(localX, localY);
     }
-  } else if (m_hoveredArea != nullptr) {
+  } else if (notifyMotion && m_hoveredArea != nullptr) {
     float localX = 0.0F;
     float localY = 0.0F;
     Node::mapFromScene(m_hoveredArea, x, y, localX, localY);

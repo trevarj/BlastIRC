@@ -9,14 +9,18 @@
 #include "render/animation/animation.h"
 #include "render/animation/animation_manager.h"
 #include "render/animation/motion_service.h"
+#include "render/backend/render_backend.h"
 #include "render/core/color.h"
 #include "render/core/render_styles.h"
 #include "render/core/renderer.h"
+#include "render/core/shader_program.h"
+#include "render/scene/custom_draw_node.h"
 #include "render/scene/glyph_node.h"
 #include "render/scene/input_area.h"
 #include "render/scene/rect_node.h"
 #include "render/scene/text_node.h"
 #include "render/text/glyph_registry.h"
+#include "ui/controls/input_caret_trail.h"
 #include "ui/controls/label.h"
 #include "ui/palette.h"
 #include "ui/style.h"
@@ -50,8 +54,11 @@ namespace {
   constexpr float kCursorHeightRatio = 0.50F;
   constexpr float kCursorRevealPadding = 2.0F;
   constexpr float kClearGlyphScale = 0.85F;
-  constexpr auto kCursorBlinkInterval = std::chrono::milliseconds(530);
-  constexpr auto kCursorBlinkResumeDelay = std::chrono::milliseconds(650);
+  constexpr auto kCursorBlinkInterval = std::chrono::milliseconds(500);
+  constexpr auto kCursorBlinkIdle = std::chrono::seconds(15);
+  constexpr auto kCursorBlinkSample = std::chrono::milliseconds(50);
+  constexpr auto kCursorTrailDwell = std::chrono::milliseconds(1);
+  constexpr auto kCursorTrailSample = std::chrono::milliseconds(10);
   constexpr float kTextInnerInset = 3.0F;
   constexpr float kPlaceholderAlpha = 0.68F;
   constexpr float kPrimaryPlaceholderAlpha = 0.50F;
@@ -143,6 +150,183 @@ namespace {
 
 } // namespace
 
+class CaretTrailNode final : public CustomDrawNode {
+  struct AttributeState {
+    explicit AttributeState(GLuint attribute) : index(attribute) {
+      glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled);
+      glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buffer);
+      glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+      glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+      glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &normalized);
+      glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+      glGetVertexAttribPointerv(index, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pointer);
+    }
+
+    ~AttributeState() {
+      glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(buffer));
+      glVertexAttribPointer(
+          index, size, static_cast<GLenum>(type), static_cast<GLboolean>(normalized), stride, pointer
+      );
+      if (enabled)
+        glEnableVertexAttribArray(index);
+      else
+        glDisableVertexAttribArray(index);
+    }
+
+    GLuint index;
+    GLint enabled, buffer, size, type, normalized, stride;
+    void* pointer;
+  };
+
+  class Program final : public RenderExtension {
+  public:
+    void destroy() override { shader.destroy(); }
+    void abandon() noexcept override { shader.abandon(); }
+
+    void initialize() {
+      if (shader.isValid())
+        return;
+      shader.create(
+          R"(
+        attribute vec4 a_point_uv;
+        attribute vec4 a_tint;
+        uniform mat3 u_transform;
+        uniform vec2 u_surface;
+        #ifdef GL_FRAGMENT_PRECISION_HIGH
+        varying highp vec2 v_point;
+        #else
+        varying mediump vec2 v_point;
+        #endif
+        varying mediump vec2 v_uv;
+        varying mediump vec4 v_tint;
+        void main() {
+          v_point = a_point_uv.xy;
+          v_uv = a_point_uv.zw;
+          v_tint = a_tint;
+          vec2 p = (u_transform * vec3(a_point_uv.xy, 1.0)).xy / u_surface;
+          gl_Position = vec4(2.0 * p.x - 1.0, 1.0 - 2.0 * p.y, 0.0, 1.0);
+        }
+      )",
+          R"(
+        #ifdef GL_FRAGMENT_PRECISION_HIGH
+        precision highp float;
+        #else
+        precision mediump float;
+        #endif
+        uniform vec4 u_caret;
+        uniform vec2 u_viewport;
+        uniform vec4 u_color;
+        uniform mediump float u_opacity;
+        #ifdef GL_FRAGMENT_PRECISION_HIGH
+        varying highp vec2 v_point;
+        #else
+        varying mediump vec2 v_point;
+        #endif
+        varying mediump vec2 v_uv;
+        varying mediump vec4 v_tint;
+        void main() {
+          if (any(lessThan(v_point, vec2(0.0))) ||
+              any(greaterThanEqual(v_point, u_viewport))) discard;
+          if (all(greaterThanEqual(v_point, u_caret.xy)) &&
+              all(lessThan(v_point, u_caret.zw))) discard;
+          if (u_opacity > 0.0) {
+            float coverage = 1.0 - smoothstep(0.0, 1.0, dot(v_uv, v_uv));
+            gl_FragColor = v_tint * (u_opacity * coverage);
+          } else {
+            gl_FragColor = u_color;
+          }
+        }
+      )"
+      );
+      const auto id = shader.id();
+      point = static_cast<GLuint>(glGetAttribLocation(id, "a_point_uv"));
+      tint = static_cast<GLuint>(glGetAttribLocation(id, "a_tint"));
+      transform = glGetUniformLocation(id, "u_transform");
+      surface = glGetUniformLocation(id, "u_surface");
+      caret = glGetUniformLocation(id, "u_caret");
+      viewport = glGetUniformLocation(id, "u_viewport");
+      color = glGetUniformLocation(id, "u_color");
+      opacity = glGetUniformLocation(id, "u_opacity");
+    }
+
+    ShaderProgram shader;
+    GLuint point = 0, tint = 0;
+    GLint transform = -1, surface = -1, caret = -1, viewport = -1, color = -1, opacity = -1;
+  };
+
+public:
+  explicit CaretTrailNode(const input_caret::Corners& corners) : m_corners(corners) {
+    setVisible(false);
+    setHitTestVisible(false);
+    setParticipatesInLayout(false);
+  }
+
+  input_caret_trail::Effects& effects() {
+    if (!m_effects)
+      m_effects = std::make_unique<input_caret_trail::Effects>();
+    return *m_effects;
+  }
+
+  void reset() {
+    if (m_effects)
+      m_effects->reset();
+    setVisible(false);
+  }
+
+  void draw(RenderBackend& backend, const CustomDrawContext& context) const override {
+    if (!visible() || context.opacity <= 0.0F || !MotionService::instance().enabled())
+      return;
+    const bool effect = m_effects && !m_effects->mesh.vertices.empty();
+    auto& program = backend.extension<Program>();
+    program.initialize();
+    // Custom draws share the native renderer's program and vertex array state.
+    GLint previousProgram = 0, previousBuffer = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &previousBuffer);
+    {
+      const AttributeState position(program.point);
+      glUseProgram(program.shader.id());
+      glUniformMatrix3fv(program.transform, 1, GL_FALSE, context.transform.m.data());
+      glUniform2f(program.surface, context.surfaceWidth, context.surfaceHeight);
+      glUniform4f(program.caret, mask.x, mask.y, mask.x + mask.width, mask.y + mask.height);
+      glUniform2f(program.viewport, context.width, context.height);
+      glBindBuffer(GL_ARRAY_BUFFER, 0);
+      glEnableVertexAttribArray(program.point);
+      if (effect) {
+        const AttributeState tint(program.tint);
+        const auto& vertices = m_effects->mesh.vertices;
+        constexpr GLsizei stride = sizeof(input_caret_trail::Vertex);
+        glUniform1f(program.opacity, context.opacity);
+        glVertexAttribPointer(program.point, 4, GL_FLOAT, GL_FALSE, stride, vertices.front().xyUv.data());
+        glVertexAttribPointer(program.tint, 4, GL_FLOAT, GL_FALSE, stride, vertices.front().color.data());
+        glEnableVertexAttribArray(program.tint);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
+      } else {
+        GLint tintEnabled = 0;
+        glGetVertexAttribiv(program.tint, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &tintEnabled);
+        if (tintEnabled)
+          glDisableVertexAttribArray(program.tint);
+        const float alpha = color.a * context.opacity;
+        glUniform1f(program.opacity, 0.0F);
+        glUniform4f(program.color, color.r * alpha, color.g * alpha, color.b * alpha, alpha);
+        glVertexAttribPointer(program.point, 2, GL_FLOAT, GL_FALSE, sizeof(Vec2), m_corners.data());
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        if (tintEnabled)
+          glEnableVertexAttribArray(program.tint);
+      }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(previousBuffer));
+    glUseProgram(static_cast<GLuint>(previousProgram));
+  }
+
+  Color color{};
+  LayoutRect mask{};
+
+private:
+  const input_caret::Corners& m_corners;
+  std::unique_ptr<input_caret_trail::Effects> m_effects;
+};
+
 Input::Input() {
   // 0: background
   auto bg = std::make_unique<RectNode>();
@@ -206,7 +390,6 @@ Input::Input() {
   area->setOnLeave([this] { applyVisualState(); });
   area->setOnFocusGain([this] {
     revealCursor();
-    startCursorBlink();
     applyVisualState();
     m_revealCursorYPending = true;
     markLayoutDirty();
@@ -320,6 +503,7 @@ Input::Input() {
     }
   });
   area->setOnMotion([this](const InputArea::PointerData& data) {
+    if (m_inputArea->focused()) revealCursor();
     if (m_inputArea != nullptr && m_inputArea->pressed() && m_primaryPointerSelecting) {
       if (m_textMetricsDirty) return;
       resetUndoCoalescing();
@@ -411,7 +595,10 @@ Input::Input() {
     notifyTextInputStateChanged(TextInputChangeCause::Other);
     return true;
   });
-  area->setOnKeyDown([this](const InputArea::KeyData& k) { handleKey(k.sym, k.utf32, k.modifiers, k.preedit); });
+  area->setOnKeyDown([this](const InputArea::KeyData& k) {
+    revealCursor();
+    handleKey(k.sym, k.utf32, k.modifiers, k.preedit);
+  });
   m_inputArea = static_cast<InputArea*>(addChild(std::move(area)));
 
   // Optional clear button, kept above the full-field input area for hit-testing.
@@ -555,51 +742,43 @@ void Input::setEditRewriter(std::function<void(const EditSnapshot&, EditSnapshot
   m_editRewriter = std::move(rewriter);
 }
 
-void Input::setCaretStyle(CaretShape shape, CaretEffect effect, float durationMs, float strength) {
-  if (shape != CaretShape::Box && shape != CaretShape::Underline) shape = CaretShape::Line;
-  if (effect != CaretEffect::Trail && effect != CaretEffect::Comet &&
-      effect != CaretEffect::Ribbon && effect != CaretEffect::Pulse) effect = CaretEffect::Off;
-  const float duration = input_caret::duration(durationMs), amount = input_caret::strength(strength);
-  if (m_caretShape == shape && m_caretEffect == effect &&
-      m_caretDuration == duration && m_caretStrength == amount) {
-    if (!MotionService::instance().enabled()) {
-      m_cursorBlinkTimer.stop();
-      m_cursorBlinkVisible = true;
-      updateCursorVisibility();
-    }
+void Input::setCaretStyle(CaretShape shape, CaretBlink blink, bool trail, CaretTrailStyle style) {
+  if (m_caretShape == shape && m_caretBlink == blink && m_caretTrailEnabled == trail && m_caretTrailStyle == style)
     return;
-  }
   resetCaretEffects();
   const bool shapeChanged = m_caretShape != shape;
+  if (m_caretBlink != blink)
+    stopCursorBlink();
   m_caretShape = shape;
-  m_caretEffect = effect;
-  m_caretDuration = duration;
-  m_caretStrength = amount;
-  if (effect != CaretEffect::Off && m_caretStamps.front() == nullptr) {
-    for (auto& stamp : m_caretStamps) {
-      auto node = std::make_unique<RectNode>();
-      node->setVisible(false);
-      node->setHitTestVisible(false);
-      stamp = static_cast<RectNode*>(m_textViewport->addChild(std::move(node)));
-    }
+  m_caretBlink = blink;
+  m_caretTrailEnabled = trail;
+  m_caretTrailStyle = style;
+  if (trail && m_caretTrailNode == nullptr) {
+    auto node = std::make_unique<CaretTrailNode>(m_trailCorners);
+    m_caretTrailNode = static_cast<CaretTrailNode*>(m_textViewport->addChild(std::move(node)));
   }
-  if (shapeChanged) m_textMetricsDirty = true;
+  if (shapeChanged)
+    m_textMetricsDirty = true;
   applyVisualState();
   updateInteractiveGeometry();
-  markLayoutDirty();
+  revealCursor();
+  if (shapeChanged)
+    markLayoutDirty();
 }
 
 void Input::resetCaretEffects() {
-  if (m_caretAnimation != 0 && animationManager() != nullptr) animationManager()->cancel(m_caretAnimation);
-  m_caretAnimation = 0;
-  m_caretTrail.reset();
-  for (auto* stamp : m_caretStamps) if (stamp != nullptr) stamp->setVisible(false);
+  m_trailTimer.stop();
+  m_trailTarget.reset();
+  if (m_caretTrailNode != nullptr)
+    m_caretTrailNode->reset();
 }
 void Input::setWindowActive(bool active) {
   if (m_windowActive == active)
     return;
   m_windowActive = active;
   if (active) {
+    if (caretTrailEligible())
+      updateInteractiveGeometry();
     revealCursor();
   } else {
     stopCursorBlink();
@@ -1188,6 +1367,7 @@ void Input::textInputApplyEdit(const TextInputEdit& edit) {
       m_selectionAnchor != display.selectionAnchor ||
       m_preeditCaretHidden != (showPreedit && edit.preeditCursorBegin < 0);
   if (changed) pushUndoSnapshot(EditCoalesceKind::Discrete);
+  if (showPreedit || composing()) resetCaretEffects();
   m_preeditBase = showPreedit ? std::optional<EditSnapshot>(permanent) : std::nullopt;
   m_preeditCaretHidden = showPreedit && edit.preeditCursorBegin < 0;
   m_preeditStart = showPreedit ? start : 0;
@@ -1989,6 +2169,7 @@ void Input::notifyTextInputStateChanged(TextInputChangeCause cause) {
 }
 
 bool Input::removePreeditText() {
+  if (m_preeditBase || m_preeditLen != 0) resetCaretEffects();
   m_preeditCaretHidden = false;
   if (m_preeditBase) {
     m_value = std::move(m_preeditBase->value);
@@ -2215,7 +2396,7 @@ void Input::applyCaretStyle(Color color) {
       .noAa = true,
   };
   m_cursor->setStyle(style);
-  for (auto* stamp : m_caretStamps) if (stamp != nullptr) stamp->setStyle(style);
+  if (m_caretTrailNode != nullptr) m_caretTrailNode->color = color;
   if (m_caretText.label != nullptr)
     m_caretText.label->setColor(readableTextColorForBackground(color));
 }
@@ -2257,98 +2438,94 @@ void Input::updateCaretPaint(float cellX, float cellWidth) {
         m_label->x() + m_label->textOriginX() - m_caretText.label->textOriginX() - rect.x,
         m_label->y() + m_label->baselineOffset() - m_caretText.label->baselineOffset() - rect.y);
   }
-  auto* animations = animationManager();
-  const bool allowed = m_caretEffect != CaretEffect::Off && animations != nullptr &&
-                       MotionService::instance().enabled() && caretPaintEligible() && !composing();
-  if (!allowed) {
+  if (!caretTrailEligible() || rect.width <= 0.0F || rect.height <= 0.0F) {
     resetCaretEffects();
     return;
   }
-  // A restored/edited value is placed immediately, but trails only use freshly shaped cells.
-  if (m_textMetricsDirty) return;
-  if (rect.width <= 0.0F || rect.height <= 0.0F) {
-    resetCaretEffects();
+  if (!input_caret::equal(rect, m_caretTrailNode->mask)) {
+    m_caretTrailNode->mask = rect;
+    if (m_caretTrailNode->visible())
+      m_caretTrailNode->markPaintDirty();
+  }
+  if (m_textMetricsDirty)
+    return;
+
+  if (m_trailTarget && input_caret::equal(rect, m_trailPending))
+    return;
+  m_trailPending = rect;
+  if (!m_trailTarget) {
+    m_trailTarget = rect;
+    m_trailCorners = input_caret::corners(rect);
+    m_caretTrailNode->setFrameSize(viewport.width, viewport.height);
     return;
   }
-  if (!m_caretTrail.move(rect, true)) return;
-  if (m_caretAnimation != 0) animations->cancel(m_caretAnimation);
-  paintCaretTrail(0.0F);
-  m_caretAnimation = animations->animate(
-      // Display-calibrated milliseconds, retaining native reduced-motion completion.
-      0.0F, 1.0F, m_caretDuration * MotionService::instance().speed(), Easing::Linear,
-      [this](float progress) { paintCaretTrail(progress); }, {}, this
-  );
+  m_trailCellWidth = cellWidth > 0.0F ? cellWidth : m_fontSize * 0.6F;
+  m_trailMovedAt = std::chrono::steady_clock::now();
+  if (!m_trailTimer.active()) {
+    m_trailSampledAt = m_trailMovedAt;
+    m_trailTimer.start(kCursorTrailDwell, [this] {
+      updateCaretTrail();
+      if (m_trailTimer.active())
+        m_trailTimer.startRepeating(kCursorTrailSample, [this] { updateCaretTrail(); });
+    });
+  }
 }
 
-void Input::paintCaretTrail(float progress) {
-  const auto viewport = caretViewport();
-  const bool motion = MotionService::instance().enabled();
-  if (!motion || !caretPaintEligible() || composing() || m_caretEffect == CaretEffect::Off ||
-      !input_caret::equal(viewport, m_caretTrailViewport) ||
-      m_caretTrailScale != m_cursorRenderScale || m_caretTrailScrollX != m_scrollOffset ||
-      m_caretTrailScrollY != m_scrollOffsetY) m_caretTrail.reset();
-  if (!motion) {
-    m_cursorBlinkVisible = true;
-    m_cursor->setVisible(caretPaintEligible());
-    if (m_caretText.clip != nullptr)
-      m_caretText.clip->setVisible(m_cursor->visible() && m_caretShape == CaretShape::Box &&
-                                  !m_value.empty() && !passwordMasked() && !m_textMetricsDirty);
+bool Input::caretTrailEligible() const {
+  return m_caretTrailEnabled && MotionService::instance().enabled() && caretPaintEligible() && !composing();
+}
+
+void Input::updateCaretTrail() {
+  if (!m_trailTarget || !caretTrailEligible() || !input_caret::equal(caretViewport(), m_caretTrailViewport)) {
+    resetCaretEffects();
+    return;
   }
-  if (progress >= 1.0F) {
-    m_caretTrail.active = false;
-    m_caretAnimation = 0;
-  }
-  for (std::size_t i = 0; i < m_caretStamps.size(); ++i) {
-    auto* stamp = m_caretStamps[i];
-    if (stamp == nullptr) continue;
-    auto rect = m_caretTrail.sample(progress, i);
-    float rotation = 0.0F;
-    if (m_caretEffect == CaretEffect::Trail) {
-      rect.x += viewport.x;
-      rect.y += viewport.y;
-      rect = input_caret::clippedPixels(rect, viewport, m_cursorRenderScale);
-      rect.x -= viewport.x;
-      rect.y -= viewport.y;
-    } else {
-      // Six retained connected segments, clipped by the native text viewport.
-      const float p = std::clamp(progress, 0.0F, 1.0F);
-      const float a = static_cast<float>(i) / input_caret::Trail::count;
-      const float b = static_cast<float>(i + 1) / input_caret::Trail::count;
-      const auto start = m_caretTrail.sample(p, i);
-      const auto end = i + 1 == input_caret::Trail::count ? m_caretTrail.to
-                                                       : m_caretTrail.sample(p, i + 1);
-      float x1 = start.x + start.width * .5F, y1 = start.y + start.height * .5F;
-      float x2 = end.x + end.width * .5F, y2 = end.y + end.height * .5F;
-      float thickness = std::max(1.0F / m_cursorRenderScale, m_caretTrail.to.height * .10F);
-      if (m_caretEffect == CaretEffect::Pulse) {
-        constexpr float tau = 6.28318530718F;
-        const float radius = m_caretTrail.to.height * (.20F + .65F * p);
-        const float cx = m_caretTrail.to.x + m_caretTrail.to.width * .5F;
-        const float cy = m_caretTrail.to.y + m_caretTrail.to.height * .5F;
-        x1 = cx + std::cos(a * tau) * radius; y1 = cy + std::sin(a * tau) * radius;
-        x2 = cx + std::cos(b * tau) * radius; y2 = cy + std::sin(b * tau) * radius;
-      } else if (m_caretEffect == CaretEffect::Ribbon) {
-        const float wave = m_caretTrail.to.height * .16F * (1.0F - p);
-        y1 += std::sin(a * 6.28318530718F + p * 6.28318530718F) * wave;
-        y2 += std::sin(b * 6.28318530718F + p * 6.28318530718F) * wave;
-      } else {
-        thickness = std::max(thickness, m_caretTrail.to.height * (.08F + .55F * b));
-      }
-      rotation = std::atan2(y2 - y1, x2 - x1);
-      const float length = std::hypot(x2 - x1, y2 - y1);
-      // Position the unrotated segment around its starting center, not its top-left.
-      rect = {x1 + std::sin(rotation) * thickness * .5F,
-              y1 - std::cos(rotation) * thickness * .5F, length + .5F / m_cursorRenderScale, thickness};
+  const auto now = std::chrono::steady_clock::now();
+  const bool pending = !input_caret::equal(*m_trailTarget, m_trailPending);
+  const bool adopt = pending && now - m_trailMovedAt >= kCursorTrailDwell;
+  const bool classic = m_caretTrailStyle == CaretTrailStyle::Classic;
+  const bool blur = m_caretTrailStyle == CaretTrailStyle::MotionBlur;
+  const float pixel = 1.0F / m_cursorRenderScale;
+  if (adopt) {
+    const auto old = *m_trailTarget;
+    m_trailTarget = m_trailPending;
+    if (!m_caretTrailNode->visible()
+        && std::round(std::abs(old.x - m_trailPending.x) / m_trailCellWidth) <= 2.0F
+        && std::round(std::abs(old.y - m_trailPending.y) / currentLineHeight()) <= 2.0F) {
+      m_trailCorners = input_caret::corners(m_trailPending);
+      m_trailTimer.stop();
+      return;
     }
-    stamp->setTransformOrigin(0.0F, 0.0F);
-    stamp->setRotation(rotation);
-    stamp->setPosition(rect.x, rect.y);
-    stamp->setFrameSize(rect.width, rect.height);
-    stamp->setOpacity(m_caretEffect == CaretEffect::Trail
-        ? m_caretTrail.opacity(progress, i, m_caretStrength)
-        : m_caretStrength * (1.0F - std::clamp(progress, 0.0F, 1.0F)));
-    stamp->setVisible(m_caretTrail.active && rect.width > 0.0F && rect.height > 0.0F);
+    if (!classic && !blur)
+      m_caretTrailNode->effects().emit(old, m_trailPending, m_fontSize, pixel, m_trailMovedAt);
   }
+  const float elapsedMs = std::chrono::duration<float, std::milli>(now - m_trailSampledAt).count();
+  m_trailSampledAt = now;
+  bool visible;
+  if (classic) {
+    visible = input_caret::advance(m_trailCorners, *m_trailTarget, elapsedMs, m_cursorRenderScale);
+  } else {
+    auto& effects = m_caretTrailNode->effects();
+    auto& mesh = effects.mesh;
+    if (blur) {
+      mesh.vertices.clear();
+      const auto previous = m_trailCorners;
+      if (now - m_trailMovedAt < std::chrono::milliseconds(450)
+          && input_caret::advance(m_trailCorners, *m_trailTarget, elapsedMs, m_cursorRenderScale)) {
+        mesh.blur(previous, m_trailCorners, m_caretTrailNode->color, pixel, elapsedMs);
+      } else {
+        m_trailCorners = input_caret::corners(*m_trailTarget);
+      }
+    } else {
+      effects.sample(m_caretTrailStyle, now, pixel);
+    }
+    visible = !mesh.vertices.empty();
+  }
+  m_caretTrailNode->setVisible(visible);
+  if (visible)
+    m_caretTrailNode->markPaintDirty();
+  else if (!pending || adopt)
+    m_trailTimer.stop();
 }
 
 void Input::updateInteractiveGeometry() {
@@ -2370,9 +2547,9 @@ void Input::updateInteractiveGeometry() {
     const float bottom = std::round((viewportY + y + height) * pixelScale) / pixelScale;
     m_caretInsertionRect = {left - viewportX, top - viewportY, cursorWidth,
                            std::max(1.0F / pixelScale, bottom - top)};
-    float cellX = x, cellWidth = cursorWidth;
+    float cellX = x, cellWidth = 0.0F;
     const auto& cells = m_caretCells.empty() ? m_stopRect : m_caretCells;
-    if (m_caretShape != CaretShape::Line && cells.size() == m_stopByte.size() && !cells.empty()) {
+    if (cells.size() == m_stopByte.size() && !cells.empty()) {
       const auto& cell = cells[stopIndexForByte(m_cursorPos)];
       if (cell.cellWidth > 0.0F) {
         cellX += cell.cellX - cell.x;
@@ -2648,51 +2825,58 @@ void Input::updateInlineGhost() {
 
 void Input::updateCursorVisibility() {
   const bool eligible = caretPaintEligible();
-  const bool blinkVisible = !MotionService::instance().enabled() || m_cursorBlinkVisible;
-  m_cursor->setVisible(eligible && blinkVisible);
-  if (m_caretText.clip != nullptr)
+  const bool motion = MotionService::instance().enabled();
+  if (!eligible || !motion || m_caretBlink == CaretBlink::Off) stopCursorBlink();
+  m_cursor->setOpacity(m_cursorOpacity);
+  m_cursor->setVisible(eligible && m_cursorOpacity > 0.0F);
+  if (m_caretText.clip != nullptr) {
+    m_caretText.clip->setOpacity(m_cursorOpacity);
     m_caretText.clip->setVisible(m_cursor->visible() && m_caretShape == CaretShape::Box &&
                                 !m_value.empty() && !passwordMasked() && !m_textMetricsDirty);
-  if (!eligible || !MotionService::instance().enabled()) resetCaretEffects();
+  }
+  if (!eligible || !motion) resetCaretEffects();
   updateInlineGhost();
 }
 
 void Input::revealCursor() {
-  m_cursorBlinkVisible = true;
+  m_cursorOpacity = 1.0F;
+  m_cursorBlinkEpoch = std::chrono::steady_clock::now();
   updateCursorVisibility();
-  markPaintDirty();
-  if (caretPaintEligible() && MotionService::instance().enabled()) {
-    m_cursorBlinkTimer.start(kCursorBlinkResumeDelay, [this] { startCursorBlink(); });
-  } else {
-    m_cursorBlinkTimer.stop();
-  }
+  if (!m_cursor->visible() || !MotionService::instance().enabled() ||
+      m_caretBlink == CaretBlink::Off || m_cursorBlinkTimer.active()) return;
+  const auto first = m_caretBlink == CaretBlink::Smooth ? kCursorBlinkSample : kCursorBlinkInterval;
+  m_cursorBlinkTimer.start(first, [this] { updateCursorBlink(); });
 }
 
-void Input::startCursorBlink() {
-  if (!caretPaintEligible() || !MotionService::instance().enabled()) {
-    m_cursorBlinkTimer.stop();
-    m_cursorBlinkVisible = true;
+void Input::updateCursorBlink() {
+  using namespace std::chrono;
+  const auto now = steady_clock::now();
+  const auto elapsed = now - m_cursorBlinkEpoch;
+  if (m_caretBlink == CaretBlink::Off || elapsed >= kCursorBlinkIdle ||
+      !caretPaintEligible() || !MotionService::instance().enabled()) {
+    stopCursorBlink();
     updateCursorVisibility();
     return;
   }
-  m_cursorBlinkTimer.startRepeating(kCursorBlinkInterval, [this] {
-    if (!m_windowActive || m_inputArea == nullptr || !m_inputArea->focused()) {
-      stopCursorBlink();
-      return;
-    }
-    if (!MotionService::instance().enabled()) {
-      startCursorBlink();
-      return;
-    }
-    m_cursorBlinkVisible = !m_cursorBlinkVisible;
-    updateCursorVisibility();
-    markPaintDirty();
-  });
+  const auto half = elapsed / kCursorBlinkInterval;
+  const auto phase = elapsed - half * kCursorBlinkInterval;
+  const bool fadingOut = half % 2 == 0;
+  auto next = ceil<milliseconds>(kCursorBlinkInterval - phase);
+  if (m_caretBlink == CaretBlink::Smooth) {
+    const float t = duration<float, std::milli>(phase).count() / kCursorBlinkInterval.count();
+    const float eased = input_caret::easeInOut(t);
+    m_cursorOpacity = fadingOut ? 1.0F - eased : eased;
+    next = std::min(next, kCursorBlinkSample);
+  } else {
+    m_cursorOpacity = fadingOut ? 1.0F : 0.0F;
+  }
+  updateCursorVisibility();
+  m_cursorBlinkTimer.start(next, [this] { updateCursorBlink(); });
 }
 
 void Input::stopCursorBlink() {
   m_cursorBlinkTimer.stop();
-  m_cursorBlinkVisible = false;
+  m_cursorOpacity = 1.0F;
 }
 
 void Input::selectWordAtByteOffset(std::size_t offset) {

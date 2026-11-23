@@ -7,10 +7,9 @@
 #include <cmath>
 #include <core/application_identity.h>
 #include <core/input/key_modifiers.h>
+#include <core/timer_manager.h>
 #include <cstdio>
-#include <limits>
 #include <pango/pangocairo.h>
-#include <render/animation/animation_manager.h>
 #include <render/animation/motion_service.h>
 #include <render/gl_shared_context.h>
 #include <render/render_context.h>
@@ -32,6 +31,18 @@
 
 namespace {
 bool near(float a, float b) { return std::abs(a - b) < 0.02F; }
+
+using namespace std::chrono_literals;
+
+void tickCursorTimers(std::chrono::milliseconds elapsed) {
+    std::this_thread::sleep_for(elapsed);
+    TimerManager::instance().tick();
+}
+
+bool sameImeRect(const TextInputState &a, const TextInputState &b) {
+    return a.cursorRectX == b.cursorRectX && a.cursorRectY == b.cursorRectY &&
+           a.cursorRectWidth == b.cursorRectWidth && a.cursorRectHeight == b.cursorRectHeight;
+}
 
 void pixelPartitionCheck(wl_display *display, RenderContext &context) {
     wl_compositor *compositor = nullptr;
@@ -126,13 +137,18 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
                     }
                 }
         }
-        // Consumer rendering: every mode changes pixels without touching native text/IME state.
-        AnimationManager effects;
+        // Compare live trail and blink against the same native caret and text without effects.
+        using Shape = Input::CaretShape;
+        using Blink = Input::CaretBlink;
         Input editor;
-        editor.setAnimationManager(&effects);
         editor.setFrameVisible(false);
-        editor.setFontSize(14);
-        editor.setValue("abcd");
+        editor.setFontFamily("monospace");
+        editor.setFontSize(12);
+        editor.setValue("i  i  ");
+        editor.setCaretStyle(Shape::Box, Blink::Off);
+        // A translucent caret makes any trail paint leaking through the destination mask visible.
+        constexpr float caretAlpha = .65F;
+        editor.setTextColors({}, {}, {}, rgba(.9F, .2F, .5F, caretAlpha));
         editor.setSize(64, 48);
         InputDispatcher focus;
         focus.setSceneRoot(&editor);
@@ -140,98 +156,155 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
         ScaledRenderer renderer(context, 1.F);
         const bool motion = MotionService::instance().enabled();
         MotionService::instance().setEnabled(true);
-        std::array<std::vector<std::uint8_t>, 4> images;
-        std::size_t modeIndex = 0;
-        for (const auto mode : {Input::CaretEffect::Trail, Input::CaretEffect::Comet,
-                                Input::CaretEffect::Ribbon, Input::CaretEffect::Pulse}) {
+        const auto placeAtStart = [&] {
             auto state = editor.editingState();
-            state.current.cursorPos = state.current.selectionAnchor = 1;
+            state.current.cursorPos = state.current.selectionAnchor = 0;
             editor.restoreEditingState(state);
-            editor.setCaretStyle(Input::CaretShape::Box, mode, 240, .35F);
             editor.measure(renderer, LayoutConstraints::exact(64, 48));
             editor.layout(renderer);
-            editor.moveCaretRight();
-            const auto moved = editor.editingState();
-            const auto ime = editor.textInputState();
-            assert(effects.hasActive());
-            images[modeIndex] = capture(editor);
-            editor.setWindowActive(false);
-            assert(focus.focusedArea() == editor.inputArea() && !effects.hasActive());
-            const auto inactive = capture(editor);
-            assert(editor.editingStateMatches(moved));
-            assert(editor.textInputState().cursorRectX == ime.cursorRectX);
-            editor.layout(renderer);
-            assert(capture(editor) == inactive && !effects.hasActive());
-            editor.setWindowActive(true);
-            const auto plain = capture(editor);
-            assert(focus.focusedArea() == editor.inputArea());
-            assert(inactive != plain && images[modeIndex] != plain &&
-                   editor.editingStateMatches(moved));
-            assert(editor.textInputState().cursorRectX == ime.cursorRectX);
-            Node *viewport = nullptr;
-            for (const auto &child : editor.children())
-                if (child->clipChildren())
-                    viewport = child.get();
-            assert(viewport && viewport->clipChildren());
-            // Outside the viewport no effect pixel may leak, including the rotated/ring edges.
+        };
+        const auto moveRight = [&](int cells) {
+            for (int i = 0; i < cells; ++i)
+                editor.moveCaretRight();
+        };
+        placeAtStart();
+        moveRight(2);
+        const auto shortPlain = capture(editor);
+        moveRight(2);
+        const auto plain = capture(editor);
+        tickCursorTimers(2ms);
+        assert(capture(editor) == plain); // Trail is opt-in even for a long move.
+        const auto ime = editor.textInputState();
+        const auto moved = editor.editingState();
+
+        editor.setCaretStyle(Shape::Box, Blink::Off, true);
+        placeAtStart();
+        moveRight(2);
+        tickCursorTimers(2ms);
+        tickCursorTimers(15ms);
+        assert(capture(editor) == shortPlain); // Two measured cells from rest do not trail.
+        placeAtStart();
+        moveRight(4);
+        assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
+        assert(capture(editor) == plain); // Destination moves immediately, before trail dwell.
+        tickCursorTimers(2ms);
+        tickCursorTimers(50ms);
+        const auto trailing = capture(editor);
+        assert(trailing != plain);
+
+        Node *viewport = nullptr;
+        Node *caret = nullptr;
+        for (const auto &child : editor.children())
+            if (child->clipChildren()) {
+                viewport = child.get();
+                for (const auto &layer : child->children())
+                    if (layer->type() == NodeType::Rect && layer->zIndex() == 1)
+                        caret = layer.get();
+            }
+        assert(viewport && caret);
+        float cx = 0, cy = 0;
+        Node::absolutePosition(caret, cx, cy);
+        enum Tone { Accent = 1, Flame = 2, Electric = 4, Violet = 8, Aqua = 16, Glitter = 32 };
+        const auto checkPixels = [&](const auto &frame) {
+            bool translucentTrailPixel = false;
+            bool nativeOpacity = false;
+            unsigned tones = 0;
             for (int y = 0; y < 83; ++y)
                 for (int x = 0; x < 101; ++x) {
                     const float lx = (x + .5F) * 64.F / 101.F;
                     const float ly = (y + .5F) * 48.F / 83.F;
-                    if (lx >= viewport->x() - 1 && lx <= viewport->x() + viewport->width() + 1 &&
-                        ly >= viewport->y() - 1 && ly <= viewport->y() + viewport->height() + 1)
-                        continue;
                     const auto pixel = (std::size_t(82 - y) * 101 + x) * 4;
-                    for (std::size_t c = 0; c < 4; ++c)
-                        assert(images[modeIndex][pixel + c] == plain[pixel + c]);
+                    const bool outside = lx < viewport->x() || ly < viewport->y() ||
+                                         lx >= viewport->x() + viewport->width() ||
+                                         ly >= viewport->y() + viewport->height();
+                    const bool masked = lx > cx + 1 && lx < cx + caret->width() - 1 &&
+                                        ly > cy + 1 && ly < cy + caret->height() - 1;
+                    nativeOpacity |=
+                        masked && std::abs(plain[pixel + 3] / 255.F - caretAlpha) <= 1.F / 255.F;
+                    if (outside || masked)
+                        assert(std::equal(frame.begin() + pixel, frame.begin() + pixel + 4,
+                                          plain.begin() + pixel));
+                    translucentTrailPixel |=
+                        plain[pixel + 3] == 0 && frame[pixel + 3] > 0 && frame[pixel + 3] < 255;
+                    if (plain[pixel + 3] == 0 && frame[pixel + 3] >= 36) {
+                        const float a = frame[pixel + 3];
+                        const float r = frame[pixel] / a, g = frame[pixel + 1] / a,
+                                    b = frame[pixel + 2] / a;
+                        if (r > .83F && g < .32F && b > .43F && b < .60F)
+                            tones |= Accent;
+                        if (r > .85F && g > .26F && b < .38F)
+                            tones |= Flame;
+                        if (r < .25F && g > .36F && g < .65F && b > .9F)
+                            tones |= Electric;
+                        if (r > .8F && g > .39F && g < .58F && b > .9F)
+                            tones |= Violet;
+                        if (r < .5F && g > .81F && b > .86F)
+                            tones |= Aqua;
+                        if (r > .91F && g > .62F && b > .62F && b < .95F)
+                            tones |= Glitter;
+                    }
                 }
-            for (std::size_t prior = 0; prior < modeIndex; ++prior)
-                assert(images[prior] != images[modeIndex]);
-            ++modeIndex;
-            editor.layout(renderer); // First layout after reset only anchors.
-            editor.moveCaretLeft();
-            assert(effects.hasActive());
-            editor.setPosition(2, 0);
-            editor.layout(renderer);
-            assert(!effects.hasActive());
-            editor.setPosition(0, 0);
-            editor.layout(renderer);
-            editor.moveCaretRight();
-            assert(effects.hasActive());
-            editor.textInputApplyEdit({.commitText = {},
-                                       .preeditText = "猫",
-                                       .preeditCursorBegin = 0,
-                                       .preeditCursorEnd = 0,
-                                       .hasPreedit = true});
-            editor.layout(renderer);
-            assert(!effects.hasActive());
-            const auto composingState = editor.editingState();
+            assert(nativeOpacity && translucentTrailPixel);
+            return tones;
+        };
+        assert(checkPixels(trailing) & Accent);
+
+        editor.setWindowActive(false);
+        const auto inactive = capture(editor);
+        assert(inactive != plain && focus.focusedArea() == editor.inputArea());
+        assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
+        editor.layout(renderer);
+        assert(capture(editor) == inactive);
+        editor.setWindowActive(true);
+        assert(capture(editor) == plain && focus.focusedArea() == editor.inputArea());
+        assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
+
+        using Trail = Input::CaretTrailStyle;
+        constexpr std::array styles{
+            std::pair{Trail::MotionBlur, Accent},  std::pair{Trail::Blaze, Flame},
+            std::pair{Trail::Lightning, Electric}, std::pair{Trail::Railgun, Violet},
+            std::pair{Trail::Torpedo, Aqua},       std::pair{Trail::Pixiedust, Glitter}};
+        for (const auto &[style, tone] : styles) {
+            editor.setCaretStyle(Shape::Box, Blink::Off, true, style);
+            placeAtStart();
+            moveRight(2);
+            tickCursorTimers(5ms);
+            assert(capture(editor) == shortPlain);
+            placeAtStart();
             editor.setWindowActive(false);
-            editor.layout(renderer);
-            assert(editor.editingStateMatches(composingState) &&
-                   focus.focusedArea() == editor.inputArea());
             editor.setWindowActive(true);
-            assert(editor.editingStateMatches(composingState));
-            editor.textInputResetPreedit();
-            editor.layout(renderer);
-            editor.moveCaretLeft();
-            assert(effects.hasActive());
-            MotionService::instance().setEnabled(false);
-            effects.tick(0);
-            assert(!effects.hasActive());
-            MotionService::instance().setEnabled(true);
-            editor.layout(renderer);
-            editor.moveCaretRight();
-            assert(effects.hasActive());
-            focus.setFocus(nullptr);
-            assert(!effects.hasActive());
-            focus.setFocus(editor.inputArea());
-            editor.layout(renderer);
-            editor.moveCaretLeft();
-            assert(effects.hasActive());
-            editor.setCaretStyle(Input::CaretShape::Box, Input::CaretEffect::Off);
-            assert(!effects.hasActive());
+            moveRight(4);
+            assert(capture(editor) == plain);
+            tickCursorTimers(5ms);
+            tickCursorTimers(26ms);
+            const auto live = capture(editor);
+            assert(live != plain && live != trailing);
+            assert(checkPixels(live) & tone);
+            assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
+            tickCursorTimers(550ms);
+            assert(capture(editor) == plain);
         }
+
+        editor.setCaretStyle(Shape::Box, Blink::Step);
+        assert(capture(editor) == plain);
+        tickCursorTimers(525ms);
+        assert(capture(editor) == inactive);
+        assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
+        editor.moveCaretLeft();
+        moveRight(1);
+        assert(capture(editor) == plain); // Movement restarts a hidden step blink immediately.
+        focus.pointerEnter(20, 24, 402);
+        editor.setCaretStyle(Shape::Box, Blink::Smooth);
+        assert(capture(editor) == plain);
+        tickCursorTimers(250ms);
+        focus.syncPointerHover();
+        const auto faded = capture(editor);
+        assert(faded != plain && faded != inactive);
+        assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
+        focus.pointerMotion(21, 24, 403);
+        assert(capture(editor) == plain);
+        editor.setCaretStyle(Shape::Box, Blink::Off);
+        assert(capture(editor) == plain);
         for (const bool composing : {false, true}) {
             editor.selectAll();
             if (composing)
@@ -300,8 +373,10 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
 }
 
 // Run with --native inside the same isolated Wayland/EGL environment as the app captures.
-void nativeCheck() {
-    auto *display = wl_display_connect(nullptr);
+void nativeCheck(bool pixelsOnly) {
+    const std::unique_ptr<wl_display, decltype(&wl_display_disconnect)> connection(
+        wl_display_connect(nullptr), wl_display_disconnect);
+    auto *display = connection.get();
     assert(display);
     {
         GlSharedContext shared;
@@ -309,6 +384,8 @@ void nativeCheck() {
         RenderContext context;
         context.initialize(shared);
         pixelPartitionCheck(display, context);
+        if (pixelsOnly)
+            return;
         ScaledRenderer renderer(context, 1.F);
         // The block and inverse glyph use exactly the native cell/layout, never the IME edge.
         const bool initialMotion = MotionService::instance().enabled();
@@ -320,7 +397,7 @@ void nativeCheck() {
             block.setFontSize(16);
             block.setFontFamily("monospace");
             block.setValue("Wi猫👩‍💻 á אב");
-            block.setCaretStyle(Input::CaretShape::Box, Input::CaretEffect::Off);
+            block.setCaretStyle(Input::CaretShape::Box, Input::CaretBlink::Off);
             auto state = block.editingState();
             state.current.cursorPos = state.current.selectionAnchor = 0;
             block.restoreEditingState(state);
@@ -379,13 +456,13 @@ void nativeCheck() {
                 block.restoreEditingState(saved);
                 block.layout(scaled);
                 assert(caret->visible() && inverse->visible());
-                block.setCaretStyle(Input::CaretShape::Line, Input::CaretEffect::Off);
+                block.setCaretStyle(Input::CaretShape::Line, Input::CaretBlink::Off);
                 block.layout(scaled);
                 assert(!inverse->visible() && block.editingStateMatches(saved));
                 const auto lineIme = block.textInputState();
                 assert(lineIme.cursorRectWidth == imeEdge.cursorRectWidth &&
                        lineIme.cursorRectHeight == imeEdge.cursorRectHeight);
-                block.setCaretStyle(Input::CaretShape::Box, Input::CaretEffect::Off);
+                block.setCaretStyle(Input::CaretShape::Box, Input::CaretBlink::Off);
             }
             auto end = block.editingState();
             end.current.cursorPos = end.current.selectionAnchor = block.value().size();
@@ -476,12 +553,12 @@ void nativeCheck() {
             for (const bool clipped : {false, true}) {
                 block.setMultiline(!clipped);
                 block.setValue(clipped ? longRtl : "אב");
-                block.setCaretStyle(Input::CaretShape::Line, Input::CaretEffect::Off);
+                block.setCaretStyle(Input::CaretShape::Line, Input::CaretBlink::Off);
                 block.layout(scaled);
                 const auto insertion = block.textInputState();
                 const auto document = block.editingState();
                 for (const auto shape : {Input::CaretShape::Box, Input::CaretShape::Underline}) {
-                    block.setCaretStyle(shape, Input::CaretEffect::Off);
+                    block.setCaretStyle(shape, Input::CaretBlink::Off);
                     block.layout(scaled);
                     const auto shaped = block.textInputState();
                     assert(block.editingStateMatches(document) &&
@@ -535,7 +612,7 @@ void nativeCheck() {
                                         "אב\x1d "
                                         "á 👩‍💻\tZ\nlast";
                 rich.setValue(raw);
-                rich.setCaretStyle(Input::CaretShape::Box, Input::CaretEffect::Off);
+                rich.setCaretStyle(Input::CaretShape::Box, Input::CaretBlink::Off);
                 InputDispatcher focus;
                 focus.setSceneRoot(&rich);
                 focus.setFocus(rich.inputArea());
@@ -1185,9 +1262,7 @@ void nativeCheck() {
                 focus.setSceneRoot(nullptr);
             }
         MotionService::instance().setEnabled(initialMotion);
-        AnimationManager animations;
         Input input;
-        input.setAnimationManager(&animations);
         input.setMultiline(true);
         input.setValue(
             "Variable width Wiii 猫 👩‍💻 words wrap across several lines without "
@@ -1212,167 +1287,137 @@ void nativeCheck() {
         input.setFontSize(24);
         input.measure(renderer, constraints);
         assert(input.measuredMultilineHeight() > narrow && input.editingStateMatches(document));
-        // A body-font control height can be shorter than this font's padded native row.
-        // Measure the real empty control so the first move tests motion, not scroll rebasing.
-        Input emptyRow;
-        emptyRow.setMultiline(true);
-        emptyRow.setFontSize(24);
-        emptyRow.measure(renderer, constraints);
-        input.setSize(input.width(), emptyRow.measuredMultilineHeight());
+        // Keep the final ASCII word on one visible row so no move rebases the scroll.
+        input.setFontFamily("monospace");
+        constraints.setExactWidth(480);
+        input.measure(renderer, constraints);
+        input.setSize(480, input.measuredMultilineHeight());
         InputDispatcher dispatcher;
         dispatcher.setSceneRoot(&input);
         dispatcher.setFocus(input.inputArea());
-        input.layout(renderer);
         const bool motion = MotionService::instance().enabled();
         MotionService::instance().setEnabled(true);
-        input.setCaretStyle(Input::CaretShape::Box, Input::CaretEffect::Trail, 40, .20F);
-        input.measure(renderer, constraints);
+        using Shape = Input::CaretShape;
+        using Blink = Input::CaretBlink;
+        input.setCaretStyle(Shape::Box, Blink::Off, true);
         input.layout(renderer);
-        // Retain the non-interactive trail pool before selection adds unrelated rectangles.
-        std::array<const RectNode *, input_caret::Trail::count> trailNodes{};
-        Node *trailViewport = nullptr;
-        std::size_t captured = 0;
-        for (const auto &viewport : input.children())
-            if (viewport->clipChildren())
-                for (const auto &layer : viewport->children()) {
-                    if (layer->type() != NodeType::Rect || layer->zIndex() != 0)
-                        continue;
-                    const auto *rect = static_cast<const RectNode *>(layer.get());
-                    if (rect->hitTestVisible())
-                        continue;
-                    assert(captured < trailNodes.size());
-                    trailNodes[captured++] = rect;
-                    trailViewport = viewport.get();
+
+        const Node *viewport = nullptr;
+        const Node *trail = nullptr;
+        const Node *caret = nullptr;
+        for (const auto &child : input.children())
+            if (child->clipChildren()) {
+                viewport = child.get();
+                for (const auto &layer : child->children()) {
+                    if (layer->type() == NodeType::CustomDraw) {
+                        assert(!trail);
+                        trail = layer.get();
+                    }
+                    if (layer->type() == NodeType::Rect && layer->zIndex() == 1)
+                        caret = layer.get();
                 }
-        assert(captured == trailNodes.size() && trailViewport);
-        auto stamps = [&] {
-            std::size_t count = 0;
-            for (const auto *layer : trailNodes) {
-                assert(!layer->hitTestVisible());
-                if (!layer->visible())
-                    continue;
-                ++count;
-                assert(layer->x() >= -.01F && layer->y() >= -.01F);
-                assert(layer->x() + layer->width() <= trailViewport->width() + .01F);
-                assert(layer->y() + layer->height() <= trailViewport->height() + .01F);
-                float x = 0, y = 0;
-                Node::mapToScene(trailViewport, layer->x() + layer->width() / 2,
-                                 layer->y() + layer->height() / 2, x, y);
-                assert(Node::hitTest(&input, x, y) == input.inputArea());
             }
-            return count;
+        assert(viewport && caret && trail && !trail->hitTestVisible() && !trail->visible());
+        const auto start = input.editingState();
+        const auto placeAtStart = [&] {
+            input.restoreEditingState(start);
+            input.layout(renderer);
+        };
+        const auto moveLeft = [&] {
+            for (int i = 0; i < 4; ++i)
+                input.moveCaretLeft();
+        };
+        const auto beginTrail = [&] {
+            placeAtStart();
+            moveLeft();
+            assert(!trail->visible());
+            tickCursorTimers(2ms);
+            assert(trail->visible() && caret->visible());
         };
         const auto beforeMove = input.textInputState();
-        const auto beforeState = input.editingState();
-        LayoutRect beforeCaret{};
-        for (const auto &viewport : input.children())
-            if (viewport->clipChildren())
-                for (const auto &layer : viewport->children())
-                    if (layer->type() == NodeType::Rect && layer->zIndex() == 1)
-                        beforeCaret = {layer->x(), layer->y(), layer->width(), layer->height()};
-        input.moveCaretLeft();
+        beginTrail();
         const auto moved = input.textInputState();
+        const auto movedState = input.editingState();
         assert(moved.cursor < beforeMove.cursor &&
                moved.cursorRectWidth == beforeMove.cursorRectWidth);
         assert(moved.cursorRectX != beforeMove.cursorRectX ||
                moved.cursorRectY != beforeMove.cursorRectY);
-        if (!animations.hasActive() || stamps() == 0) {
-            const auto afterState = input.editingState();
-            std::fprintf(stderr,
-                         "native trail failure: active=%d stamps=%zu focus=%d motion=%d speed=%g "
-                         "manager=%p expected=%p history=%p/%p cursor=%d/%d scroll=(%g,%g)/(%g,%g) "
-                         "beforeCaret=(%g,%g,%g,%g) IME=(%d,%d,%d,%d)/(%d,%d,%d,%d)\n",
-                         animations.hasActive(), stamps(), input.inputArea()->focused(),
-                         MotionService::instance().enabled(), MotionService::instance().speed(),
-                         static_cast<void *>(input.animationManager()),
-                         static_cast<void *>(&animations),
-                         static_cast<void *>(beforeState.history.get()),
-                         static_cast<void *>(afterState.history.get()),
-                         static_cast<int>(beforeMove.cursor), static_cast<int>(moved.cursor),
-                         beforeState.scrollX, beforeState.scrollY, afterState.scrollX,
-                         afterState.scrollY, beforeCaret.x, beforeCaret.y, beforeCaret.width,
-                         beforeCaret.height, beforeMove.cursorRectX, beforeMove.cursorRectY,
-                         beforeMove.cursorRectWidth, beforeMove.cursorRectHeight, moved.cursorRectX,
-                         moved.cursorRectY, moved.cursorRectWidth, moved.cursorRectHeight);
-            for (const auto &viewport : input.children()) {
-                if (!viewport->clipChildren())
-                    continue;
-                float x = 0, y = 0;
-                Node::absolutePosition(viewport.get(), x, y);
-                std::fprintf(stderr, "viewport scene=(%g,%g,%g,%g) visible=%d\n", x, y,
-                             viewport->width(), viewport->height(), viewport->visible());
-                for (const auto &layer : viewport->children())
-                    if (layer->type() == NodeType::Rect)
-                        std::fprintf(stderr,
-                                     "rect z=%d frame=(%g,%g,%g,%g) visible=%d opacity=%g\n",
-                                     layer->zIndex(), layer->x(), layer->y(), layer->width(),
-                                     layer->height(), layer->visible(), layer->opacity());
-            }
-        }
-        assert(animations.hasActive() && stamps() > 0);
-        std::this_thread::sleep_for(std::chrono::milliseconds(70));
-        animations.tick(0);
-        assert(!animations.hasActive() && stamps() == 0);
-        animations.tick(0);
-        assert(!animations.hasActive()); // Stationary caret never schedules ambient trail work.
-        auto command = input.editingState();
-        --command.current.cursorPos; // Same-document model command, final word is ASCII.
-        command.current.selectionAnchor = command.current.cursorPos;
-        input.restoreEditingState(command, true);
-        input.measure(renderer, constraints);
+        float x = 0, y = 0;
+        Node::mapToScene(viewport, caret->x() + caret->width() / 2,
+                         caret->y() + caret->height() / 2, x, y);
+        assert(Node::hitTest(&input, x, y) == input.inputArea());
+        tickCursorTimers(425ms);
+        assert(!trail->visible() && caret->visible());
+        assert(input.editingStateMatches(movedState) && sameImeRect(input.textInputState(), moved));
+        tickCursorTimers(15ms);
+        assert(!trail->visible()); // Stationary caret never restarts the trail.
+
+        placeAtStart();
+        input.restoreEditingState(movedState, true); // Same-document model command.
         input.layout(renderer);
-        assert(animations.hasActive() && stamps() > 0);
-        auto selected = command;
-        selected.current.selectionAnchor = selected.current.cursorPos - 1;
+        tickCursorTimers(2ms);
+        assert(trail->visible());
+        auto selected = movedState;
+        --selected.current.selectionAnchor;
         input.restoreEditingState(selected, true);
-        assert(!animations.hasActive() && stamps() == 0);
-        input.restoreEditingState(command, true);
-        input.measure(renderer, constraints);
-        input.layout(renderer);
-        input.moveCaretLeft();
-        assert(animations.hasActive());
+        assert(!trail->visible() && !caret->visible());
+
         const TextInputEdit hiddenCaret{.commitText = {},
                                         .preeditText = "猫",
                                         .preeditCursorBegin = -1,
                                         .preeditCursorEnd = -1,
                                         .hasPreedit = true};
+        beginTrail();
         input.textInputApplyEdit(hiddenCaret);
+        assert(!trail->visible() && !caret->visible());
+        input.layout(renderer);
         const auto hiddenState = input.editingState();
-        assert(hiddenState.history == command.history && hiddenState.preeditCaretHidden);
-        assert(!animations.hasActive() && stamps() == 0);
-        input.restoreEditingState(command, true);
-        input.measure(renderer, constraints);
+        assert(hiddenState.history == start.history && hiddenState.preeditCaretHidden);
+        input.setWindowActive(false);
         input.layout(renderer);
-        input.moveCaretLeft();
-        assert(animations.hasActive());
+        assert(input.editingStateMatches(hiddenState) &&
+               dispatcher.focusedArea() == input.inputArea());
+        input.setWindowActive(true);
+        assert(input.editingStateMatches(hiddenState));
+
+        beginTrail();
         input.restoreEditingState(hiddenState, true);
-        assert(!animations.hasActive() &&
-               stamps() == 0);              // Same history never overrides IME hiding.
-        input.restoreEditingState(command); // A full restore must clear even the same history.
-        assert(!animations.hasActive() && stamps() == 0);
-        input.measure(renderer, constraints);
+        assert(!trail->visible() && !caret->visible()); // Same history never overrides IME hiding.
+        beginTrail();
+        input.restoreEditingState(movedState); // Full restore must clear even the same history.
+        tickCursorTimers(15ms);
+        assert(!trail->visible());
+
+        beginTrail();
+        input.setSize(input.width() + 1, input.height());
         input.layout(renderer);
-        input.moveCaretLeft();
-        assert(animations.hasActive() && stamps() > 0);
+        tickCursorTimers(15ms);
+        assert(!trail->visible());
+        input.setSize(input.width() - 1, input.height());
+        input.layout(renderer);
+
+        beginTrail();
         dispatcher.setFocus(nullptr);
-        assert(!animations.hasActive() && stamps() == 0);
+        assert(!trail->visible() && !caret->visible());
         dispatcher.setFocus(input.inputArea());
-        input.clearSelection();
-        input.moveCaretLeft();
-        assert(animations.hasActive() && stamps() > 0);
+        beginTrail();
         MotionService::instance().setEnabled(false);
-        assert(stamps() == 0); // The actual native animation receives reduced-motion completion.
-        input.setCaretStyle(Input::CaretShape::Box, Input::CaretEffect::Off);
-        animations.tick(0);
-        assert(!animations.hasActive());
+        tickCursorTimers(15ms);
+        assert(!trail->visible() && caret->visible());
+        placeAtStart();
+        moveLeft();
+        tickCursorTimers(2ms);
+        assert(!trail->visible());
+
         MotionService::instance().setEnabled(true);
-        input.setCaretStyle(Input::CaretShape::Underline, Input::CaretEffect::Trail);
-        input.measure(renderer, constraints);
+        const auto boxIme = input.textInputState();
+        const float boxHeight = caret->height();
+        input.setCaretStyle(Shape::Underline, Blink::Off, true);
         input.layout(renderer);
-        input.moveCaretLeft();
-        assert(animations.hasActive());
-        input.setCaretStyle(Input::CaretShape::Underline, Input::CaretEffect::Off);
-        assert(!animations.hasActive() && stamps() == 0);
+        assert(caret->height() < boxHeight && sameImeRect(input.textInputState(), boxIme));
+        beginTrail();
+        input.setCaretStyle(Shape::Underline, Blink::Off);
+        assert(!trail->visible() && caret->visible());
         input.resetCaretEffects();
         assert(input.value() == document.current.value &&
                input.editingState().history == document.history);
@@ -1380,48 +1425,22 @@ void nativeCheck() {
         dispatcher.setSceneRoot(nullptr);
         MotionService::instance().setEnabled(motion);
     }
-    wl_display_disconnect(display);
 }
 } // namespace
 
 int main(int argc, char **argv) {
     setApplicationIdentity({.name = "blastirc", .envPrefix = "BLASTIRC"});
-    using namespace input_caret;
-    assert(duration(-1) == 40 && duration(300) == 240);
-    assert(duration(std::numeric_limits<float>::quiet_NaN()) == 120);
-    assert(strength(-1) == .05F && strength(1) == .35F);
-    assert(strength(std::numeric_limits<float>::infinity()) == .20F);
-
-    // These are the production snap/clip and finite trail state, not a mock renderer.
+    // Verify production snap/clip geometry without a Wayland surface.
     for (float scale : {1.F, 1.25F, 1.5F, 2.F}) {
         const LayoutRect viewport{10.2F, 20.3F, 100.1F, 40.2F};
-        const auto rect = clippedPixels({-20, 0, 200, 200}, viewport, scale);
+        const auto rect = input_caret::clippedPixels({-20, 0, 200, 200}, viewport, scale);
         assert(rect.x >= viewport.x && rect.y >= viewport.y);
         assert(rect.x + rect.width <= viewport.x + viewport.width);
         assert(rect.y + rect.height <= viewport.y + viewport.height);
         for (float edge : {rect.x, rect.y, rect.x + rect.width, rect.y + rect.height})
             assert(near(edge * scale, std::round(edge * scale)));
-        const auto outside = clippedPixels({500, 500, 2, 20}, viewport, scale);
+        const auto outside = input_caret::clippedPixels({500, 500, 2, 20}, viewport, scale);
         assert(outside.width == 0 && outside.height == 0);
-    }
-    const LayoutRect old{2, 4, 2, 20}, next{82, 28, 18, 20};
-    Trail trail;
-    assert(!trail.move(old, true) && !trail.active); // First focus/layout only anchors.
-    assert(!trail.move(old, true));                  // Idle does not animate.
-    assert(trail.move(next, true) && trail.active);
-    assert(equal(trail.previous, next)); // Native destination is immediate, never interpolated.
-    assert(equal(trail.sample(0, 0), old) && equal(trail.sample(1, 0), next));
-    for (std::size_t i = 0; i < Trail::count; ++i) {
-        assert(trail.opacity(0, i, .20F) > 0 && trail.opacity(0, i, .20F) <= .20F);
-        assert(trail.opacity(1, i, .20F) == 0 && trail.opacity(2, i, .20F) == 0);
-    }
-    // Focus loss, selection, hidden composition, reduced motion and Off share the same gate.
-    for (int reason = 0; reason < 5; ++reason) {
-        assert(!trail.move(next, false) && !trail.active && !trail.anchored);
-        assert(!trail.move(old, true)); // Never bridge a hidden interval or another document.
-        assert(trail.move(next, true));
-        trail.reset();
-        assert(!trail.active && !trail.anchored && trail.opacity(0, 0, .20F) == 0);
     }
 
     // Exercise real Pango geometry without a Wayland surface or a GL/mock backend.
@@ -1559,7 +1578,7 @@ int main(int argc, char **argv) {
         g_object_unref(fontMap);
     }
 
-    // Shape/effect controls cannot alter real native editing/IME state or hide the selected shape.
+    // Caret appearance cannot alter real native editing/IME state.
     Input input;
     input.setMultiline(true);
     input.setValue("a猫z");
@@ -1575,7 +1594,7 @@ int main(int argc, char **argv) {
     InputDispatcher dispatcher;
     dispatcher.setSceneRoot(&input);
     dispatcher.setFocus(input.inputArea());
-    input.setCaretStyle(Input::CaretShape::Box, Input::CaretEffect::Trail);
+    input.setCaretStyle(Input::CaretShape::Box, Input::CaretBlink::Off, true);
     assert(input.editingStateMatches(saved));
     auto after = input.textInputState();
     assert(after.cursorRectX == ime.cursorRectX && after.cursorRectY == ime.cursorRectY);
@@ -1583,7 +1602,7 @@ int main(int argc, char **argv) {
            after.cursorRectHeight == ime.cursorRectHeight);
     const bool motion = MotionService::instance().enabled();
     MotionService::instance().setEnabled(false);
-    input.setCaretStyle(Input::CaretShape::Box, Input::CaretEffect::Off);
+    input.setCaretStyle(Input::CaretShape::Box, Input::CaretBlink::Off);
     assert(caret->visible());
     input.resetCaretEffects();
     assert(input.editingStateMatches(saved) && caret->visible());
@@ -1634,7 +1653,9 @@ int main(int argc, char **argv) {
         remote)); // Explicit identity changes restore the complete viewport.
     MotionService::instance().setEnabled(motion);
     if (argc > 1) {
-        assert(argc == 2 && std::string_view(argv[1]) == "--native");
-        nativeCheck();
+        assert(argc == 2);
+        const std::string_view mode(argv[1]);
+        assert(mode == "--native" || mode == "--native-caret");
+        nativeCheck(mode == "--native-caret");
     }
 }

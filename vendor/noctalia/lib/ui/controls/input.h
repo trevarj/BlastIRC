@@ -26,6 +26,7 @@ class GlyphNode;
 class Label;
 class RectNode;
 class TextNode;
+class CaretTrailNode;
 
 class Input : public Node, public TextInputClient {
 public:
@@ -38,9 +39,13 @@ public:
   ~Input() override;
 
   enum class CaretShape : std::uint8_t { Line = 0, Box = 1, Underline = 2 };
-  enum class CaretEffect : std::uint8_t { Off = 0, Trail = 1, Comet = 2, Ribbon = 3, Pulse = 4 };
+  enum class CaretBlink : std::uint8_t { Off, Step, Smooth };
+  enum class CaretTrailStyle : std::uint8_t { Classic, MotionBlur, Blaze, Lightning, Railgun, Torpedo, Pixiedust };
   // Box fills the native grapheme cell and repaints its shaped glyph in a contrasting color.
-  void setCaretStyle(CaretShape shape, CaretEffect effect, float durationMs = 120.0F, float strength = 0.20F);
+  void setCaretStyle(
+      CaretShape shape, CaretBlink blink = CaretBlink::Step, bool trail = false,
+      CaretTrailStyle style = CaretTrailStyle::Classic
+  );
   // Paint state only. Call on buffer identity changes, pane hiding and external geometry changes.
   void resetCaretEffects();
   void setWindowActive(bool active);
@@ -207,13 +212,14 @@ private:
   bool caretPaintEligible() const;
   LayoutRect caretViewport() const;
   void updateCaretPaint(float cellX, float cellWidth);
-  void paintCaretTrail(float progress);
+  bool caretTrailEligible() const;
+  void updateCaretTrail();
   void applyCaretStyle(Color color);
   void clearFromButton();
   void updateCursorVisibility();
   void updateInlineGhost();
   void revealCursor();
-  void startCursorBlink();
+  void updateCursorBlink();
   void stopCursorBlink();
   void ensureCursorVisible();
   void clampScrollOffset();
@@ -350,12 +356,17 @@ private:
   float m_cursorRenderScale = 1.0F;
   LayoutRect m_caretInsertionRect;
   CaretShape m_caretShape = CaretShape::Line;
-  CaretEffect m_caretEffect = CaretEffect::Off;
-  float m_caretDuration = 120.0F, m_caretStrength = 0.20F;
+  CaretBlink m_caretBlink = CaretBlink::Step;
+  bool m_caretTrailEnabled = false;
+  CaretTrailStyle m_caretTrailStyle = CaretTrailStyle::Classic;
   std::vector<TextCursorStop> m_caretCells;
-  std::array<RectNode*, input_caret::Trail::count> m_caretStamps{};
-  input_caret::Trail m_caretTrail;
-  std::uint32_t m_caretAnimation = 0;
+  CaretTrailNode* m_caretTrailNode = nullptr;
+  input_caret::Corners m_trailCorners{};
+  std::optional<LayoutRect> m_trailTarget;
+  LayoutRect m_trailPending{};
+  float m_trailCellWidth = 1.0F;
+  std::chrono::steady_clock::time_point m_trailMovedAt, m_trailSampledAt;
+  Timer m_trailTimer;
   LayoutRect m_caretTrailViewport;
   float m_caretTrailScale = 1.0F, m_caretTrailScrollX = 0.0F, m_caretTrailScrollY = 0.0F;
   void updateClippedText(Renderer& renderer, RectNode* rect, SelectionText& item, Color color);
@@ -367,7 +378,8 @@ private:
   bool m_revealCursorYPending = false;
   // Sticky caret column for Up/Down runs; negative = unset.
   float m_goalCaretX = -1.0F;
-  bool m_cursorBlinkVisible = true;
+  float m_cursorOpacity = 1.0F;
+  std::chrono::steady_clock::time_point m_cursorBlinkEpoch;
   bool m_windowActive = true;
   Timer m_cursorBlinkTimer;
 

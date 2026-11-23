@@ -1,18 +1,13 @@
 #pragma once
 
+#include "render/core/mat3.h"
 #include "render/scene/node.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <cstddef>
 
 namespace input_caret {
-inline float duration(float value) noexcept {
-  return std::isfinite(value) ? std::clamp(value, 40.0F, 240.0F) : 120.0F;
-}
-inline float strength(float value) noexcept {
-  return std::isfinite(value) ? std::clamp(value, 0.05F, 0.35F) : 0.20F;
-}
 inline bool equal(const LayoutRect& a, const LayoutRect& b) noexcept {
   return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
 }
@@ -29,40 +24,49 @@ inline LayoutRect clippedPixels(LayoutRect rect, LayoutRect viewport, float scal
           std::max(0.0F, bottom - top) / scale};
 }
 
-// Six retained stamps and one finite native animation; no history grows with typing.
-struct Trail {
-  static constexpr std::size_t count = 6;
-  LayoutRect previous{}, from{}, to{};
-  bool anchored = false, active = false;
+using Corners = std::array<Vec2, 4>;
 
-  void reset() noexcept { anchored = active = false; }
-  bool move(LayoutRect rect, bool allowed) noexcept {
-    if (!allowed) {
-      reset();
-      return false;
-    }
-    if (!anchored) {
-      previous = rect;
-      anchored = true;
-      return false;
-    }
-    if (equal(previous, rect)) return false;
-    from = previous;
-    to = previous = rect;
-    active = true;
-    return true;
+inline Corners corners(LayoutRect rect) noexcept {
+  const float right = rect.x + rect.width, bottom = rect.y + rect.height;
+  return {{{rect.x, rect.y}, {right, rect.y}, {rect.x, bottom}, {right, bottom}}};
+}
+
+inline bool advance(Corners& current, LayoutRect target, float elapsedMs, float scale) noexcept {
+  const auto end = corners(target);
+  const float centerX = target.x + target.width * 0.5F;
+  const float centerY = target.y + target.height * 0.5F;
+  Corners delta;
+  std::array<float, 4> alignment;
+  for (std::size_t i = 0; i < end.size(); ++i) {
+    const auto& p = end[i];
+    const Vec2 d{p.x - current[i].x, p.y - current[i].y};
+    const float length = std::sqrt(d.x * d.x + d.y * d.y);
+    delta[i] = d;
+    alignment[i] = length > 0.0F ? (d.x * (p.x - centerX) + d.y * (p.y - centerY)) / length : 0.0F;
   }
-  LayoutRect sample(float progress, std::size_t index) const noexcept {
-    const float fraction = static_cast<float>(index) / static_cast<float>(count);
-    const float t = std::clamp(progress, 0.0F, 1.0F) +
-                    (1.0F - std::clamp(progress, 0.0F, 1.0F)) * fraction;
-    return {from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t,
-            from.width + (to.width - from.width) * t,
-            from.height + (to.height - from.height) * t};
+  const auto [low, high] = std::minmax_element(alignment.begin(), alignment.end());
+  const float spread = *high - *low;
+  const float limit = 0.5F / scale;
+  bool moving = false;
+  for (std::size_t i = 0; i < end.size(); ++i) {
+    const float direction = spread > 0.0F ? (alignment[i] - *low) / spread : 0.0F;
+    const float decayMs = std::lerp(400.0F, 100.0F, direction);
+    const float remaining = std::exp2(-10.0F * elapsedMs / decayMs);
+    const Vec2 gap{delta[i].x * remaining, delta[i].y * remaining};
+    current[i] = {end[i].x - gap.x, end[i].y - gap.y};
+    moving |= std::abs(gap.x) >= limit || std::abs(gap.y) >= limit;
   }
-  float opacity(float progress, std::size_t index, float amount) const noexcept {
-    return active ? amount * (1.0F - std::clamp(progress, 0.0F, 1.0F)) *
-                       (1.0F - static_cast<float>(index) / static_cast<float>(count)) : 0.0F;
+  if (!moving) current = end;
+  return moving;
+}
+
+inline float easeInOut(float x) noexcept {
+  float t = x;
+  for (int i = 0; i < 4; ++i) {
+    const float dx = (0.52F * t - 0.78F) * t + 1.26F;
+    const float slope = (1.56F * t - 1.56F) * t + 1.26F;
+    t -= (t * dx - x) / slope;
   }
-};
+  return t * t * (3.0F - 2.0F * t);
+}
 } // namespace input_caret

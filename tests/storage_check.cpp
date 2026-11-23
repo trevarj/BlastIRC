@@ -2643,9 +2643,8 @@ int main() {
             assert(!fs::exists(config / "settings.toml")); // Loading never writes preferences.
             assert(expected.settings.fx == FxLevel::Subtle && expected.settings.sound);
             assert(expected.settings.cursorShape == "line" &&
-                   expected.settings.cursorEffect == "off" &&
-                   expected.settings.cursorTrailDurationMs == 120.f &&
-                   expected.settings.cursorTrailStrength == .20f);
+                   expected.settings.cursorBlink == "step" && !expected.settings.cursorTrail &&
+                   expected.settings.cursorTrailStyle == "classic");
             assert(expected.settings.peopleMode == SidebarMode::Hidden);
             assert(expected.settings.opacity == 1.f && !expected.settings.transparency &&
                    expected.settings.messageLayouts.empty());
@@ -3121,9 +3120,9 @@ int main() {
             assert(legacy.settings.sendMotion == SendMotion::Flight &&
                    legacy.settings.sendReveal == SendReveal::None);
             assert(legacy.settings.fx == FxLevel::Full && legacy.settings.sound);
-            assert(legacy.settings.cursorShape == "line" && legacy.settings.cursorEffect == "off" &&
-                   legacy.settings.cursorTrailDurationMs == 120.f &&
-                   legacy.settings.cursorTrailStrength == .20f);
+            assert(legacy.settings.cursorShape == "line" &&
+                   legacy.settings.cursorBlink == "step" && !legacy.settings.cursorTrail &&
+                   legacy.settings.cursorTrailStyle == "classic");
             assert(legacy.settings.peopleMode == SidebarMode::Hidden &&
                    legacy.settings.workspace == expected.settings.workspace);
             assert(legacy.identities[0].password == expected.identities[0].password);
@@ -3474,84 +3473,82 @@ int main() {
             assert(failed && contents(config / "settings.toml") == invalidSource &&
                    contents(config / "config.toml") == originalConfig);
         }
-        // Explicit levels, every native cursor shape and every cursor effect survive restart.
+        // Effects policy and each shape, blink mode and trail style survive restart.
         const FxLevel levels[] = {FxLevel::Off, FxLevel::Subtle, FxLevel::Full};
         const char *shapes[] = {"line", "box", "underline"};
-        const char *cursorEffects[] = {"off", "trail", "comet", "ribbon", "pulse"};
-        for (int index = 0; index < 5; ++index) {
+        const char *blinks[] = {"off", "step", "smooth"};
+        const char *trailStyles[] = {"classic", "motion-blur", "blaze", "lightning",
+                                     "railgun", "torpedo", "pixiedust"};
+        for (std::size_t index = 0; index < 2 * std::size(trailStyles); ++index) {
             Model configured = legacy;
             auto &s = configured.settings;
             s.fx = levels[index % 3];
             s.cursorShape = shapes[index % 3];
-            s.cursorEffect = cursorEffects[index];
-            s.cursorTrailDurationMs = 135.f;
-            s.cursorTrailStrength = .25f;
+            s.cursorBlink = blinks[index % 3];
+            s.cursorTrail = index >= std::size(trailStyles);
+            s.cursorTrailStyle = trailStyles[index % std::size(trailStyles)];
             s.reducedMotion = true;
             s.sound = true;
             Storage storage;
             storage.save(configured);
             const string saved = contents(config / "settings.toml");
+            const auto document = toml::parse(saved);
+            assert(document["cursor"]["trail_style"].value<string>() == s.cursorTrailStyle);
             Model actual;
             storage.load(actual);
             assert(actual.settings.fx == s.fx && actual.settings.cursorShape == s.cursorShape &&
-                   actual.settings.cursorEffect == s.cursorEffect &&
-                   actual.settings.cursorTrailDurationMs == s.cursorTrailDurationMs &&
-                   actual.settings.cursorTrailStrength == s.cursorTrailStrength);
+                   actual.settings.cursorBlink == s.cursorBlink &&
+                   actual.settings.cursorTrail == s.cursorTrail &&
+                   actual.settings.cursorTrailStyle == s.cursorTrailStyle);
             assert(actual.settings.reducedMotion && actual.settings.sound &&
                    contents(config / "settings.toml") == saved &&
                    contents(config / "config.toml") == originalConfig);
         }
-        // Numeric cursor input is bounded, including finite values larger than float can hold.
+        // Legacy movement modes migrate to Trail unless an explicit Trail key is present.
         struct CursorCase {
             const char *source;
-            float duration, strength;
+            const char *blink;
+            bool trail;
         };
         for (const auto &test :
-             {CursorCase{"", 120.f, .20f}, CursorCase{"[cursor]\n", 120.f, .20f},
-              CursorCase{"[cursor]\ntrail_duration_ms = 40\ntrail_strength = 0.05\n", 40.f, .05f},
-              CursorCase{"[cursor]\ntrail_duration_ms = 240\ntrail_strength = 0.35\n", 240.f, .35f},
-              CursorCase{"[cursor]\ntrail_duration_ms = -1e300\ntrail_strength = 1e300\n", 40.f,
-                         .35f},
-              CursorCase{"[cursor]\ntrail_duration_ms = 1e300\ntrail_strength = -1e300\n", 240.f,
-                         .05f},
-              CursorCase{"[cursor]\ntrail_duration_ms = nan\ntrail_strength = inf\n", 120.f, .20f},
-              CursorCase{"[cursor]\ntrail_duration_ms = -inf\ntrail_strength = nan\n", 120.f,
-                         .20f}}) {
-            {
-                std::ofstream output(config / "settings.toml");
-                output << test.source;
-            }
+             {CursorCase{"", "step", false},
+              CursorCase{"effect = 'off'\n", "step", false},
+              CursorCase{"effect = 'trail'\n", "step", true},
+              CursorCase{"effect = 'comet'\n", "step", true},
+              CursorCase{"effect = 'ribbon'\n", "step", true},
+              CursorCase{"effect = 'pulse'\n", "step", true},
+              CursorCase{"effect = 'comet'\nblink = 'off'\n", "off", true},
+              CursorCase{"effect = 'ribbon'\nblink = 'smooth'\ntrail = false\n", "smooth", false},
+              CursorCase{"effect = 'off'\ntrail = true\n", "step", true},
+              CursorCase{"effect = false\ntrail = true\n", "step", true}}) {
+            const auto file = config / "settings.toml";
+            const string source =
+                "[cursor]\nshape = 'underline'\ntrail_duration_ms = 'unused'\n"
+                "trail_strength = [0.2]\n" +
+                string(test.source);
+            std::ofstream(file) << source;
             Storage storage;
             Model actual;
             storage.load(actual);
-            assert(actual.settings.fx == FxLevel::Full && actual.settings.cursorShape == "line" &&
-                   actual.settings.cursorEffect == "off" &&
-                   actual.settings.cursorTrailDurationMs == test.duration &&
-                   actual.settings.cursorTrailStrength == test.strength &&
-                   contents(config / "settings.toml") == test.source);
+            assert(actual.settings.cursorShape == "underline" &&
+                   actual.settings.cursorBlink == test.blink &&
+                   actual.settings.cursorTrail == test.trail &&
+                   actual.settings.cursorTrailStyle == "classic" && contents(file) == source);
             storage.save(actual);
+            const auto saved = toml::parse_file(file.string());
+            const auto cursor = saved["cursor"];
+            assert(cursor["shape"].value<string>() == "underline" &&
+                   cursor["blink"].value<string>() == test.blink &&
+                   cursor["trail"].value<bool>() == test.trail &&
+                   cursor["trail_style"].value<string>() == "classic" &&
+                   !cursor["effect"] && !cursor["trail_duration_ms"] && !cursor["trail_strength"]);
             Model reopened;
             storage.load(reopened);
-            assert(reopened.settings.cursorTrailDurationMs == test.duration &&
-                   reopened.settings.cursorTrailStrength == test.strength);
-        }
-        struct SavedCursorCase {
-            float duration, strength, expectedDuration, expectedStrength;
-        };
-        for (const auto &test :
-             {SavedCursorCase{-100.f, 2.f, 40.f, .35f}, SavedCursorCase{10000.f, -1.f, 240.f, .05f},
-              SavedCursorCase{std::numeric_limits<float>::infinity(),
-                              std::numeric_limits<float>::quiet_NaN(), 120.f, .20f}}) {
-            Model configured = legacy;
-            configured.settings.cursorTrailDurationMs = test.duration;
-            configured.settings.cursorTrailStrength = test.strength;
-            Storage storage;
-            storage.save(configured);
-            Model actual;
-            storage.load(actual);
-            assert(actual.settings.cursorTrailDurationMs == test.expectedDuration &&
-                   actual.settings.cursorTrailStrength == test.expectedStrength);
-            assert(contents(config / "config.toml") == originalConfig);
+            assert(reopened.settings.cursorShape == "underline" &&
+                   reopened.settings.cursorBlink == test.blink &&
+                   reopened.settings.cursorTrail == test.trail &&
+                   reopened.settings.cursorTrailStyle == "classic" &&
+                   contents(config / "config.toml") == originalConfig);
         }
         // Invalid in-memory preferences must fail before either configuration file is replaced.
         const string validSettings = contents(config / "settings.toml");
@@ -3593,13 +3590,15 @@ int main() {
               "previews.max_height", "previews.media_max_mib", "previews.media_max_seconds",
               "presentation.channel_message_layout", "presentation.direct_message_layout",
               "presentation.message_layouts.Libera/#a",
-              "cursor.shape", "cursor.effect"}) {
+              "cursor.shape", "cursor.blink", "cursor.trail_style"}) {
             Storage storage;
             Model invalid = legacy;
             if (diagnostic == "cursor.shape")
                 invalid.settings.cursorShape = "block";
-            else if (diagnostic == "cursor.effect")
-                invalid.settings.cursorEffect = "particles";
+            else if (diagnostic == "cursor.blink")
+                invalid.settings.cursorBlink = "particles";
+            else if (diagnostic == "cursor.trail_style")
+                invalid.settings.cursorTrailStyle = "motion_blur";
             else if (diagnostic == "appearance.send_motion")
                 invalid.settings.sendMotion = static_cast<SendMotion>(-1);
             else if (diagnostic == "appearance.incoming_motion")
@@ -3894,8 +3893,16 @@ int main() {
             {"[cursor]\neffect = ''\n", "cursor.effect"},
             {"[cursor]\nshape = 1\n", "shape"},
             {"[cursor]\neffect = false\n", "effect"},
-            {"[cursor]\ntrail_duration_ms = '120'\n", "trail_duration_ms"},
-            {"[cursor]\ntrail_strength = [0.2]\n", "trail_strength"},
+            {"[cursor]\nblink = 'fade'\n", "cursor.blink"},
+            {"[cursor]\nblink = 'Smooth'\n", "cursor.blink"},
+            {"[cursor]\nblink = ''\n", "cursor.blink"},
+            {"[cursor]\nblink = true\n", "blink"},
+            {"[cursor]\ntrail = 'true'\n", "trail"},
+            {"[cursor]\neffect = 'trail'\ntrail = 1\n", "trail"},
+            {"[cursor]\ntrail_style = 'off'\n", "cursor.trail_style"},
+            {"[cursor]\ntrail_style = 'Motion Blur'\n", "cursor.trail_style"},
+            {"[cursor]\ntrail_style = ''\n", "cursor.trail_style"},
+            {"[cursor]\ntrail_style = false\n", "trail_style"},
             {"[appearance]\nsend_motion = 'fly'\n", "appearance.send_motion"},
             {"[appearance]\nsend_motion = 'Flight'\n", "appearance.send_motion"},
             {"[appearance]\nsend_motion = ''\n", "appearance.send_motion"},
@@ -3945,6 +3952,7 @@ int main() {
             Model untouched;
             untouched.activeBuffer = "sentinel";
             untouched.settings = expected.settings;
+            untouched.settings.cursorTrailStyle = "pixiedust";
             bool failed = false;
             try {
                 storage.load(untouched);
@@ -3955,10 +3963,9 @@ int main() {
             presentation(untouched.settings, expected.settings);
             assert(untouched.settings.fx == expected.settings.fx &&
                    untouched.settings.cursorShape == expected.settings.cursorShape &&
-                   untouched.settings.cursorEffect == expected.settings.cursorEffect &&
-                   untouched.settings.cursorTrailDurationMs ==
-                       expected.settings.cursorTrailDurationMs &&
-                   untouched.settings.cursorTrailStrength == expected.settings.cursorTrailStrength);
+                   untouched.settings.cursorBlink == expected.settings.cursorBlink &&
+                   untouched.settings.cursorTrail == expected.settings.cursorTrail &&
+                   untouched.settings.cursorTrailStyle == "pixiedust");
             assert(untouched.settings.peopleMode == expected.settings.peopleMode &&
                    untouched.settings.workspace == expected.settings.workspace &&
                    untouched.settings.opacity == expected.settings.opacity);

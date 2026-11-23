@@ -80,7 +80,7 @@ private:
   InputArea* findInputAreaAt(float x, float y);
   bool isAttachedToScene(const InputArea* area) const;
   void pruneDetachedAreas();
-  void updateHover(float x, float y, std::uint32_t serial);
+  void updateHover(float x, float y, std::uint32_t serial, bool notifyMotion = true);
   void updateCursor(std::uint32_t serial);
   void trackArea(InputArea* area);
   void clearTextInputFocus(InputArea* area);

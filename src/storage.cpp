@@ -472,9 +472,6 @@ void range(float value, float low, float high, const char *name) {
         invalid(name,
                 "a finite number in [" + std::to_string(low) + ", " + std::to_string(high) + "]");
 }
-float cursorValue(double value, double low, double high, float fallback) {
-    return std::isfinite(value) ? static_cast<float>(std::clamp(value, low, high)) : fallback;
-}
 void validate(const Settings &settings) {
     if (const auto error = validateUploadConfig(settings.uploads); !error.empty())
         invalid("uploads", error);
@@ -519,10 +516,13 @@ void validate(const Settings &settings) {
     if (settings.cursorShape != "line" && settings.cursorShape != "box" &&
         settings.cursorShape != "underline")
         invalid("cursor.shape", "line, box, or underline");
-    if (settings.cursorEffect != "off" && settings.cursorEffect != "trail" &&
-        settings.cursorEffect != "comet" && settings.cursorEffect != "ribbon" &&
-        settings.cursorEffect != "pulse")
-        invalid("cursor.effect", "off, trail, comet, ribbon, or pulse");
+    if (settings.cursorBlink != "off" && settings.cursorBlink != "step" &&
+        settings.cursorBlink != "smooth")
+        invalid("cursor.blink", "off, step, or smooth");
+    if (std::ranges::find(cursorTrailStyleIds, settings.cursorTrailStyle) ==
+        cursorTrailStyleIds.end())
+        invalid("cursor.trail_style",
+                "classic, motion-blur, blaze, lightning, railgun, torpedo, or pixiedust");
     range(settings.opacity, 0, 1, "appearance.opacity");
     range(settings.scale, .7f, 2.f, "appearance.scale");
     range(settings.messageScale, .7f, 2.f, "appearance.message_scale");
@@ -854,13 +854,18 @@ void parseSettings(const toml::table &document, Settings &settings) {
         exactField(*row, "word_prediction", settings.wordPrediction);
     }
     if (const auto *row = table(document, "cursor")) {
-        field(*row, "shape", settings.cursorShape);
-        field(*row, "effect", settings.cursorEffect);
-        double duration = settings.cursorTrailDurationMs, strength = settings.cursorTrailStrength;
-        field(*row, "trail_duration_ms", duration);
-        field(*row, "trail_strength", strength);
-        settings.cursorTrailDurationMs = cursorValue(duration, 40, 240, 120.f);
-        settings.cursorTrailStrength = cursorValue(strength, .05, .35, .20f);
+        exactField(*row, "shape", settings.cursorShape);
+        exactField(*row, "blink", settings.cursorBlink);
+        exactField(*row, "trail_style", settings.cursorTrailStyle);
+        if (row->contains("trail")) {
+            exactField(*row, "trail", settings.cursorTrail);
+        } else if (const auto *legacy = row->get("effect")) {
+            const auto effect = legacy->value<std::string_view>();
+            if (!effect || (*effect != "off" && *effect != "trail" && *effect != "comet" &&
+                            *effect != "ribbon" && *effect != "pulse"))
+                invalid("cursor.effect", "off, trail, comet, ribbon, or pulse");
+            settings.cursorTrail = *effect != "off";
+        }
     }
     if (const auto *row = table(document, "audio")) {
         field(*row, "enabled", settings.sound);
@@ -1109,12 +1114,10 @@ toml::table settingsDocument(const Settings &settings) {
         {"composer", toml::table{{"spellcheck", settings.spellcheck},
                                  {"spellcheck_language", settings.spellcheckLanguage},
                                  {"word_prediction", settings.wordPrediction}}},
-        {"cursor",
-         toml::table{
-             {"shape", settings.cursorShape},
-             {"effect", settings.cursorEffect},
-             {"trail_duration_ms", cursorValue(settings.cursorTrailDurationMs, 40, 240, 120.f)},
-             {"trail_strength", cursorValue(settings.cursorTrailStrength, .05, .35, .20f)}}},
+        {"cursor", toml::table{{"shape", settings.cursorShape},
+                               {"blink", settings.cursorBlink},
+                               {"trail", settings.cursorTrail},
+                               {"trail_style", settings.cursorTrailStyle}}},
         {"audio", toml::table{{"enabled", settings.sound},
                               {"master_volume", settings.masterVolume},
                               {"pitch_variation", settings.pitchVariation},

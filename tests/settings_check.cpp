@@ -1548,19 +1548,54 @@ void runSettingsCheck() {
     assert(model.settings.scale == .7f && model.settings.messageScale == 2.f);
     interfaceScale->setValue(previousInterfaceScale);
     messageScale->setValue(previousMessageScale);
-    named<Select>(dialogs, "Cursor shape")->setSelectedIndex(1);
-    auto *cursorAnimation = named<Select>(dialogs, "Cursor animation");
-    constexpr std::array cursorEffects{"off", "trail", "comet", "ribbon", "pulse"};
-    for (std::size_t index = 0; index < cursorEffects.size(); ++index) {
-        cursorAnimation->setSelectedIndex(index);
-        assert(model.settings.cursorEffect == cursorEffects[index]);
+    auto *cursorShape = named<Select>(dialogs, "Cursor shape");
+    auto *cursorBlink = named<Select>(dialogs, "Cursor blink");
+    auto *cursorTrail = named<Toggle>(dialogs, "Cursor trail");
+    auto *trailStyle = named<Select>(dialogs, "Trail style");
+    assert(cursorShape->selectedText() == "Line" && cursorBlink->selectedText() == "Step" &&
+           !model.settings.cursorTrail && trailStyle->selectedText() == "Classic" &&
+           model.settings.cursorTrailStyle == "classic");
+    constexpr std::array cursorBlinks{"off", "step", "smooth"};
+    for (std::size_t index = 0; index < cursorBlinks.size(); ++index) {
+        cursorBlink->setSelectedIndex(index);
+        assert(model.settings.cursorBlink == cursorBlinks[index] && !model.settings.cursorTrail);
     }
-    cursorAnimation->setSelectedIndex(1);
-    named<Slider>(dialogs, "Animation duration (40–240 ms)")->setValue(222);
-    named<Slider>(dialogs, "Animation strength (0.05–0.35)")->setValue(.31);
-    assert(model.settings.cursorShape == "box" && model.settings.cursorEffect == "trail");
-    assert(model.settings.cursorTrailDurationMs == 222 &&
-           std::abs(model.settings.cursorTrailStrength - .31f) < .001f);
+    const auto expectCursorStatus = [&](std::string_view text) {
+        assert(find<Label>(dialogs, [text](const Label &label) { return label.text() == text; }));
+    };
+    cursorBlink->setSelectedIndex(0);
+    constexpr std::array trailNames{"Classic", "Motion Blur", "Blaze", "Lightning",
+                                    "Railgun", "Torpedo",    "Pixiedust"};
+    constexpr std::array trailIds{"classic", "motion-blur", "blaze", "lightning",
+                                  "railgun", "torpedo",     "pixiedust"};
+    assert(dispatcher.firstTabFocusUnder(trailStyle));
+    for (std::size_t index = 0; index < trailIds.size(); ++index) {
+        trailStyle->setSelectedIndex(index);
+        assert(trailStyle->selectedText() == trailNames[index] &&
+               model.settings.cursorTrailStyle == trailIds[index] &&
+               !model.settings.cursorTrail && model.settings.cursorBlink == "off");
+    }
+    sync();
+    expectCursorStatus("Effective: cursor blink and trail are off.");
+    activate(dispatcher, *cursorTrail);
+    assert(model.settings.cursorTrail && model.settings.cursorBlink == "off" &&
+           model.settings.cursorTrailStyle == "pixiedust");
+    activate(dispatcher, *cursorTrail);
+    assert(!model.settings.cursorTrail && trailStyle->selectedText() == "Pixiedust" &&
+           model.settings.cursorTrailStyle == "pixiedust");
+    activate(dispatcher, *cursorTrail);
+    cursorBlink->setSelectedIndex(2);
+    cursorShape->setSelectedIndex(1);
+    sync();
+    expectCursorStatus("Effective: selected blink and trail settings apply in the focused composer.");
+    assert(cursorBlink->selectedText() == "Smooth" && model.settings.cursorShape == "box" &&
+           model.settings.cursorBlink == "smooth" && model.settings.cursorTrail &&
+           model.settings.cursorTrailStyle == "pixiedust");
+    assert(!find<Label>(dialogs, [](const Label &label) {
+        return label.text() == "Cursor animation" ||
+               label.text() == "Animation duration (40–240 ms)" ||
+               label.text() == "Animation strength (0.05–0.35)";
+    }));
     auto *uiWeight = named<Select>(dialogs, "UI font weight");
     auto *messageWeight = named<Select>(dialogs, "Message font weight");
     assert(uiWeight && messageWeight && uiWeight->selectedText() == "400" &&
@@ -1782,9 +1817,16 @@ void runSettingsCheck() {
                label.text() == "Traveling underline glint";
     }));
     sliderInput(dialogs, dispatcher);
+    activate(dispatcher, *named<Toggle>(dialogs, "Reduced motion"));
+    category(0);
+    expectCursorStatus("Effective: cursor blink and trail suppressed by Reduced motion.");
+    assert(named<Select>(dialogs, "Trail style")->selectedText() == "Pixiedust");
+    category(3);
     named<Select>(dialogs, "Effects")->setSelectedIndex(0);
     assert(model.settings.fx == FxLevel::Off);
-    activate(dispatcher, *named<Toggle>(dialogs, "Reduced motion"));
+    category(0);
+    expectCursorStatus("Effective: cursor blink and trail suppressed by Effects Off.");
+    category(3);
     named<Slider>(dialogs, "Gravity")->setValue(150);
     named<Slider>(dialogs, "Particle drag")->setValue(2);
     named<Slider>(dialogs, "Overlay shake")->setValue(.5);
@@ -1797,7 +1839,8 @@ void runSettingsCheck() {
            model.settings.incomingDurationMs == 900);
     assert(model.settings.gravity == 150 && model.settings.drag == 2 &&
            model.settings.shake == .5f);
-    assert(model.settings.sound && model.settings.cursorEffect == "trail" &&
+    assert(model.settings.sound && model.settings.cursorBlink == "smooth" &&
+           model.settings.cursorTrail && model.settings.cursorTrailStyle == "pixiedust" &&
            model.settings.cursorShape == "box");
 
     category(4);
@@ -1922,9 +1965,8 @@ void runSettingsCheck() {
     assert(loaded.settings.channelMessageLayout == MessageLayout::Bubbles &&
            loaded.settings.directMessageLayout == MessageLayout::Stacked);
     assert(fileText(preferences).find("word_prediction = true") != std::string::npos);
-    assert(loaded.settings.cursorShape == "box" && loaded.settings.cursorEffect == "trail" &&
-           loaded.settings.cursorTrailDurationMs == 222 &&
-           std::abs(loaded.settings.cursorTrailStrength - .31f) < .001f);
+    assert(loaded.settings.cursorShape == "box" && loaded.settings.cursorBlink == "smooth" &&
+           loaded.settings.cursorTrail && loaded.settings.cursorTrailStyle == "pixiedust");
     assert(loaded.settings.sendMotion == model.settings.sendMotion &&
            loaded.settings.sendReveal == model.settings.sendReveal);
     assert(loaded.settings.incomingMotion == model.settings.incomingMotion &&
@@ -2329,6 +2371,7 @@ void runSettingsCheck() {
            model.buffers.contains(retiredKey + "/#history"));
     press(dispatcher, *button(dialogs, "Close"));
     assert(!dialogs.active() && model.settings.cursorShape == "box" &&
-           model.settings.cursorEffect == "trail" && model.identities[0].nick == "RenamedNick");
+           model.settings.cursorBlink == "smooth" && model.settings.cursorTrail &&
+           model.identities[0].nick == "RenamedNick");
     whoisProfileControls();
 }

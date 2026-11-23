@@ -15,6 +15,7 @@
 #include <core/input/key_symbols.h>
 #include <cstdint>
 #include <map>
+#include <render/animation/animation_manager.h>
 #include <render/scene/input_area.h>
 #include <render/scene/rect_node.h>
 #include <ui/controls/button.h>
@@ -1175,6 +1176,10 @@ struct Sidebar::Impl {
     LucideIcon *searchIcon = nullptr;
     Button *all = nullptr, *unread = nullptr, *dms = nullptr, *archived = nullptr, *clear = nullptr;
     ScrollView *scroll = nullptr;
+    Scrollbar *scrollbar = nullptr;
+    LucideIcon *moreBelow = nullptr;
+    AnimationManager::Id scrollbarIdle = 0;
+    bool layingOutScroll = false, scrollActivity = false;
     Node *canvas = nullptr, *filterHeader = nullptr;
     Label *empty = nullptr;
     std::map<std::string, Group> groups;
@@ -1224,6 +1229,7 @@ struct Sidebar::Impl {
             scroll->requestScrollIntoView(nullptr);
             scroll->setScrollOffset(0);
             scroll->requestScrollToOffset(0);
+            resetScrollbar();
         }
     }
 
@@ -1292,7 +1298,23 @@ struct Sidebar::Impl {
         scroll->setViewportPaddingH(0);
         scroll->setViewportPaddingV(0);
         scroll->setReserveScrollbarGutter(true);
-        scroll->setOnScrollChanged([this](float) { refreshPreviews(); });
+        for (const auto &node : scroll->children())
+            if (auto *bar = dynamic_cast<Scrollbar *>(node.get())) {
+                scrollbar = bar;
+                break;
+            }
+        setScrollbarShown(false);
+        scroll->setOnScrollChanged([this](float) {
+            refreshPreviews();
+            updateScrollCue();
+            if (!layingOutScroll && expandedInteractive && !hintsActive && !scrollActivity) {
+                scrollActivity = true;
+                owner.markLayoutDirty();
+            }
+        });
+        moreBelow = child<LucideIcon>(owner, "chevron-down");
+        moreBelow->setHitTestVisible(false);
+        moreBelow->setVisible(false);
         canvas = child<Node>(*scroll->content());
         empty = child<Label>(*canvas);
         empty->setUseMarkup(false);
@@ -1305,6 +1327,56 @@ struct Sidebar::Impl {
             filter = ui_logic::SidebarFilter::All;
             resetViewScroll();
         });
+    }
+
+    void updateScrollCue() {
+        moreBelow->setVisible(!hintsActive && viewportHeight > 0 &&
+                              scroll->maxScrollOffset() - scroll->scrollOffset() > 1);
+    }
+
+    void setScrollbarShown(bool shown) {
+        scrollbar->setOpacity(shown ? 1.f : 0.f);
+        scrollbar->setHitTestVisible(shown);
+        scrollbar->setExcludeSubtreeFromTabOrder(!shown);
+    }
+
+    void resetScrollbar() {
+        if (auto *manager = owner.animationManager(); manager && scrollbarIdle)
+            manager->cancel(scrollbarIdle);
+        scrollbarIdle = 0;
+        scrollActivity = false;
+        setScrollbarShown(false);
+    }
+
+    void armScrollbarIdle(AnimationManager &manager) {
+        if (scrollbarIdle)
+            manager.cancel(scrollbarIdle);
+        scrollbarIdle = manager.animateTimer(
+            0, 1, 600, Easing::Linear, {},
+            [this, &manager] {
+                scrollbarIdle = 0;
+                for (const auto &node : scrollbar->children())
+                    if (auto *area = dynamic_cast<InputArea *>(node.get());
+                        area && area->pressed()) {
+                        armScrollbarIdle(manager);
+                        return;
+                    }
+                setScrollbarShown(false);
+            },
+            scrollbar);
+    }
+
+    void updateScrollbar() {
+        if (!expandedInteractive || mode != SidebarMode::Expanded || hintsActive ||
+            scroll->maxScrollOffset() <= 1) {
+            resetScrollbar();
+        } else if (scrollActivity) {
+            scrollActivity = false;
+            if (auto *manager = owner.animationManager()) {
+                setScrollbarShown(true);
+                armScrollbarIdle(*manager);
+            }
+        }
     }
 
     Group &group(const std::string &name) {
@@ -1670,17 +1742,14 @@ struct Sidebar::Impl {
         owner.setVisible(mode != SidebarMode::Hidden);
         owner.setExcludeSubtreeFromTabOrder(mode == SidebarMode::Hidden);
         if (selectedServer != selected) {
-            hintScrollRestorePending = false;
-            hintNormalGeometryReady = false;
-            restoringHintFocus = false;
+            resetViewScroll();
             hintScroll = hintScrollPosition = 0;
             selectedServer.assign(selected);
-            scroll->setScrollOffset(0);
-            scroll->requestScrollIntoView(nullptr);
-            scroll->requestScrollToOffset(0);
         }
-        if (mode == SidebarMode::Hidden)
+        if (mode == SidebarMode::Hidden) {
+            resetScrollbar();
             return;
+        }
         ++epoch;
         const bool shortHeader = height < 360 * scale;
         int unreadInArchive = 0;
@@ -1704,7 +1773,11 @@ struct Sidebar::Impl {
         const float headerHeight =
             expanded ? (shortHeader ? searchHeight : filterTop + filterHeight) : searchHeight;
         const float listTop = verticalPadding + headerHeight + 8 * scale;
-        viewportHeight = std::max(0.f, height - verticalPadding - listTop);
+        const float cueSize = 12 * scale;
+        viewportHeight = std::max(0.f, height - cueSize - listTop);
+        moreBelow->setPosition((width - cueSize) / 2, height - cueSize);
+        moreBelow->setSize(cueSize, cueSize);
+        moreBelow->setColor(withAlpha(themeForegroundColor("on_surface_variant"), .68f));
         scroll->setPosition(padding, listTop);
         scroll->setSize(inner, viewportHeight);
         scroll->setScrollbarVisible(expanded);
@@ -2035,7 +2108,11 @@ Sidebar::~Sidebar() = default;
 void Sidebar::doLayout(Renderer &renderer) {
     impl_->layoutFilters(renderer);
     impl_->layoutRows(renderer);
+    impl_->layingOutScroll = true;
     Node::doLayout(renderer);
+    impl_->layingOutScroll = false;
+    impl_->updateScrollCue();
+    impl_->updateScrollbar();
     if (impl_->hintsActive) {
         impl_->hintMaxScroll = impl_->scroll->maxScrollOffset();
         impl_->hintScrollPosition =
@@ -2059,9 +2136,10 @@ void Sidebar::setInteractionMode(SidebarMode mode, const std::function<void(Node
     for (auto &[name, group] : s.groups)
         for (auto *control : {group.header, group.error})
             expandedInteraction(*control, s.expandedInteractive, retire);
-    for (const auto &child : s.scroll->children())
-        if (auto *scrollbar = dynamic_cast<Scrollbar *>(child.get()))
-            expandedInteraction(*scrollbar, s.expandedInteractive, retire);
+    if (!s.expandedInteractive) {
+        expandedInteraction(*s.scrollbar, false, retire);
+        s.resetScrollbar();
+    }
 }
 void Sidebar::setHintCandidates(std::span<const std::string_view> buffers) {
     auto &s = *impl_;

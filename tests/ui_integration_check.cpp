@@ -1635,6 +1635,59 @@ void nativePanelResizeCheck() {
     }
 }
 
+void sidebarScrollCueCheck() {
+    using namespace blast;
+    auto model = edgeModel();
+    for (int i = 0; i < 40; ++i) {
+        const auto nick = "person" + std::to_string(i);
+        const auto id = "test/" + nick;
+        auto &buffer = model.buffers[id];
+        buffer.id = id;
+        buffer.server = "test";
+        buffer.target = nick;
+        buffer.kind = "query";
+    }
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    PangoRenderer renderer;
+    AnimationManager animations;
+    Ui ui(model, clipboard);
+    ui.root().setAnimationManager(&animations);
+    const auto frame = [&] {
+        ui.update(1280, 800, 1);
+        ui.root().layout(renderer);
+    };
+    frame();
+    auto *sidebar = visibleNode<Sidebar>(ui.root());
+    assert(sidebar);
+    auto *scroll = visibleNode<ScrollView>(*sidebar);
+    LucideIcon *cue = nullptr;
+    for (const auto &node : sidebar->children())
+        if (auto *icon = dynamic_cast<LucideIcon *>(node.get()))
+            cue = icon;
+    assert(scroll && cue && visible(*cue) && !cue->hitTestVisible() && scroll->scrollable());
+    auto *bar = visibleNode<Scrollbar>(*scroll);
+    assert(bar && bar->opacity() == 0 && !bar->hitTestVisible());
+    const float contentWidth = scroll->contentViewportWidth();
+    scroll->setScrollOffset(scroll->maxScrollOffset());
+    frame();
+    assert(!visible(*cue) && bar->opacity() == 1 && bar->hitTestVisible());
+    g_usleep(625000);
+    animations.tick(0);
+    assert(bar->opacity() == 0 && !bar->hitTestVisible());
+    assert(scroll->contentViewportWidth() == contentWidth);
+    scroll->setScrollOffset(0);
+    frame();
+    assert(visible(*cue));
+    ui.execute("toggle-navigation");
+    frame();
+    assert(visible(*cue) && bar->opacity() == 0);
+    ui.execute("toggle-navigation");
+    frame();
+    assert(!visible(*cue));
+}
+
 void sidebarConversationFilterCheck() {
     using namespace blast;
     const std::string firstLog = "one/*server*", secondLog = "two/*server*";
@@ -11098,6 +11151,7 @@ void runUiIntegrationCheck() {
     conversationHistoryMissingBindingsCheck();
     minimumWindowHeightCheck();
     sidebarConversationFilterCheck();
+    sidebarScrollCueCheck();
     sidebarArchiveControlsCheck();
     sidebarActivityPinsCheck();
     peopleFriendOrderingCheck();

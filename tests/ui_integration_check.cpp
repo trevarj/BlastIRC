@@ -623,7 +623,7 @@ void shellMotionCheck() {
     for (const auto &child : ui.root().children())
         if (auto *panel = dynamic_cast<ServerRail *>(child.get()))
             serverRail = panel;
-    assert(serverRail && serverRail->x() == 0);
+    assert(serverRail);
     const float fullRailWidth = serverRail->width();
     const auto navigationPreference = model.settings.workspace.at("native_navigation_mode");
     ui.execute("toggle-networks");
@@ -642,7 +642,6 @@ void shellMotionCheck() {
     model.settings.reducedMotion = true;
     frame();
     assert(!visible(*serverRail) && serverRail->width() == 0);
-    assert(sidebar->x() == 0);
     ui.execute("toggle-networks");
     assert(visible(*serverRail) && serverRail->width() == fullRailWidth);
     assert(model.settings.workspace.at("native_navigation_mode") == navigationPreference);
@@ -2855,7 +2854,7 @@ void titlebarGeometryCheck() {
         const float right = close->x() + close->width();
         assert(right <= width && right >= width - 12 * scale);
     };
-    for (const float scale : {1.f, 2.f}) {
+    for (const float scale : {1.f, 1.33f, 2.f}) {
         model.settings.scale = scale;
         theme.update(model);
         ui.update(1600, 1000, 1);
@@ -2879,8 +2878,18 @@ void titlebarGeometryCheck() {
         assert(application && visible(*application));
         auto *composer = inputWithText(ui.root(), edgeDrafts[0]);
         assert(composer);
-        assert(logoX == 0 && application->x() == 0 && paneFor(*composer)->x() == 0 &&
+        assert(application->x() == paneFor(*composer)->x() && logoX == application->x() &&
                headerFor(*composer)->x() == 0);
+        const float paneY = paneFor(*composer)->y();
+        const bool compact = 1600 < 1000 * scale || 1000 < 600 * scale;
+        assert(std::abs(paneY - (compact ? 57.f : 63.f) * scale) < .1f);
+        assert(headerFor(*composer)->height() >= 32 * scale &&
+               headerFor(*composer)->height() <= 36 * scale);
+        const auto *status = areaWithKey(ui.root(), "status-nick");
+        assert(status && visible(*status));
+        const float footerTop = 1000 - (compact ? 32.f : 40.f) * scale;
+        assert(std::abs(paneY + paneFor(*composer)->height() - (footerTop - 10 * scale)) < .1f);
+        assert(std::abs(pointerPoint(*status)[1] - (footerTop + 1000) / 2) < .5f);
         const auto naturalTitle =
             renderer.measureText(title->text(), title->fontSize(), title->font(), 0, 1,
                                  title->textAlign(), title->ellipsize(), false);

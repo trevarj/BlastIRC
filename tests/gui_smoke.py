@@ -666,13 +666,14 @@ def read_layout(path):
     compact = height < 600 * scale or width < 1000 * scale
     tight = height < 360 * scale
     extent = max(32, (32 if compact else 34) * scale)
-    title_height = max(extent, 44 * scale) + (10 if tight else 12 if compact else 14) * scale
-    status_height = (22 if tight else 26 if compact else 30) * scale
+    title_height = max(extent, 44 * scale) + (4 if tight else 5 if compact else 7) * scale
     outer = (4 if tight else 8 if compact else 12) * scale
+    footer_height = outer + (22 if tight else 24 if compact else 28) * scale
+    footer_top = height - footer_height
     rail_width = float(workspace.get("server_rail_width", 76)) * scale
     rail_visible = workspace.get("native_server_rail_visible", "true") == "true"
     top = title_height + outer
-    content_height = max(1, height - top - status_height - outer)
+    content_height = max(1, footer_top - (4 if tight else 10) * scale - top)
     navigation_intent = workspace["native_navigation_mode"]
     navigation = navigation_intent
     database_path = next(reversed(GUI_DEBUG.values()))[0].native_database_path
@@ -683,15 +684,15 @@ def read_layout(path):
     compact_width = float(workspace.get("compact_channel_sidebar_width", 56)) * scale
     if "server_rail_width" in workspace:
         rail_width = min(rail_width, max(56 * scale,
-            width - 3 * outer - compact_width - chat_minimum))
-    rail_width = min(rail_width, max(0, width - outer))
+            width - 4 * outer - compact_width - chat_minimum))
+    rail_width = min(rail_width, max(0, width - 2 * outer))
     if not rail_visible:
         rail_width = 0
     widths = {"expanded": float(workspace.get("channel_sidebar_width", 250)) * scale,
               "compact": compact_width, "hidden": 0}
     people_widths = {"expanded": 220 * scale, "compact": 56 * scale, "hidden": 0}
     rail_gap = outer if rail_visible else 0
-    remaining = max(1, width - outer - rail_width - rail_gap)
+    remaining = max(1, width - 2 * outer - rail_width - rail_gap)
 
     def available():
         return (remaining - widths[navigation] - (outer if navigation != "hidden" else 0)
@@ -704,7 +705,7 @@ def read_layout(path):
     if available() < chat_minimum and people == "compact":
         people = "hidden"
     sidebar_width, people_width = widths[navigation], people_widths[people]
-    sidebar_x = rail_width + rail_gap
+    sidebar_x = outer + rail_width + rail_gap
     left = sidebar_x + sidebar_width + (outer if navigation != "hidden" else 0)
     right = width - outer - people_width - (outer if people != "hidden" else 0)
     chat = (left, top, max(1, right - left), content_height)
@@ -712,10 +713,11 @@ def read_layout(path):
               "outer_padding": outer,
               "rail_visible": rail_visible,
               "topbar": {"rect": (0, 0, width, title_height)},
+              "footer": {"rect": (outer, footer_top, width - 2 * outer, footer_height)},
               "navigation_intent": navigation_intent,
               "active_buffer": active_buffer,
               "conversation": {"rect": chat, "buffer": active_buffer},
-              "rail": {"rect": (0, top, rail_width, content_height)},
+              "rail": {"rect": (outer, top, rail_width, content_height)},
               "channels": {"rect": (sidebar_x, top, sidebar_width, content_height),
                            "mode": navigation},
               "people": {"rect": (right + (outer if people != "hidden" else 0),
@@ -745,7 +747,7 @@ def shell_actions(layout):
     return {"navigation": (left + extent / 2, height / 2),
             "palette": (left + 1.5 * extent + gap, height / 2),
             "settings": (width - outer - extra - extent / 2, height / 2),
-            "application": (60 * zoom, height / 2),
+            "application": (outer + 60 * zoom, height / 2),
             "networks": (left - (3 if unread and not folded else 2) * extra + extent / 2, height / 2),
             "mentions": (left - (2 if unread and not folded else 1) * extra + extent / 2, height / 2),
             "mark_all_read": ((left - extra + extent / 2, height / 2)
@@ -1395,7 +1397,7 @@ def pane_metrics(layout, zoom):
     extent = max(32, 32 * zoom)
     card_width = width
     header_y = 0
-    header_minimum = min(extent + (0 if short else 12 * zoom), max(0, height))
+    header_minimum = min(extent + (0 if short else 2 * zoom), max(0, height))
     top = header_minimum + panel_gap
     return {"x": x, "y": y, "left": left, "inset": inset, "padding_y": padding_y,
             "gap": panel_gap, "inner_width": max(0, width - 2 * left), "top": top,
@@ -6080,11 +6082,10 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
 
     layout = read_layout(preferences)
     zoom = layout["scale"]
-    width, height = GUI_SIZE
-    _, pane_top, _, pane_height = layout["conversation"]["rect"]
+    width, _ = GUI_SIZE
     outer = layout["outer_padding"]
-    bottom = round(height - (outer + pane_metrics(layout, zoom)["padding_y"]) / 2)
-    top = bottom - round(height - pane_top - pane_height - outer)
+    _, footer_top, _, footer_height = layout["footer"]["rect"]
+    top, bottom = round(footer_top), round(footer_top + footer_height)
     # Include the Connected caption and plug, including the exposed gap between them.
     right = width - outer - 8 * zoom
     x = round(right - 40 * zoom)

@@ -368,7 +368,7 @@ struct BufferTitleLine::Impl {
         const float identityHeight =
             std::max(renderer.fontRowExtent(14 * scale, themeUiFont()),
                      renderer.fontRowExtent(11 * scale, themeUiFont()) + 8 * scale);
-        return std::max(hitExtent(scale) + (shortTitle ? 0.f : 12 * scale),
+        return std::max(hitExtent(scale) + (shortTitle ? 0.f : 2 * scale),
                         identityHeight + 4 * scale);
     }
     void layout(Renderer &renderer) {

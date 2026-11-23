@@ -131,12 +131,12 @@ float fittedRailWidth(const Workspace &workspace, float width, float outer, floa
         preferred = std::min(
             preferred,
             std::max(Workspace::minServerRailWidth * scale,
-                     width - 3 * outer -
+                     width - 4 * outer -
                          workspace.compactChannelSidebarWidth().value_or(compactPanelExtent) *
                              scale -
                          minimumChat));
     }
-    return std::min(preferred, std::max(0.f, width - outer));
+    return std::min(preferred, std::max(0.f, width - 2 * outer));
 }
 std::pair<SidebarMode, SidebarMode> fitSidebarModes(SidebarMode navigation, SidebarMode people,
                                                     float remaining, float boundary, float scale,
@@ -816,6 +816,7 @@ struct Ui::Impl {
     std::uint64_t sourceJumpRevision = 0;
     std::string mediaBuffer;
     MaterialNode *backdrop = nullptr, *peopleMaterial = nullptr;
+    Box *topbarDivider = nullptr, *footerDivider = nullptr;
     AppLogo *logo = nullptr;
     InputArea *titleMove = nullptr;
     InputArea *applicationMenu = nullptr;
@@ -1067,6 +1068,10 @@ struct Ui::Impl {
         backdrop = static_cast<MaterialNode *>(
             scene->addChild(std::make_unique<MaterialNode>(MaterialKind::Backdrop)));
         backdrop->setHitTestVisible(false);
+        topbarDivider = static_cast<Box *>(scene->addChild(std::make_unique<Box>()));
+        topbarDivider->setHitTestVisible(false);
+        footerDivider = static_cast<Box *>(scene->addChild(std::make_unique<Box>()));
+        footerDivider->setHitTestVisible(false);
         titleMove = static_cast<InputArea *>(scene->addChild(std::make_unique<InputArea>()));
         titleMove->setOnPress([this](const InputArea::PointerData &event) {
             if (!event.pressed || event.button != BTN_LEFT)
@@ -1731,7 +1736,7 @@ void Ui::Impl::updateRegularPanelModes() {
     const float rail = workspace.serverRailVisible
                            ? fittedRailWidth(workspace, width, outer, currentScale) + outer
                            : 0.f;
-    const float remaining = std::max(1.f, width - outer - rail);
+    const float remaining = std::max(1.f, width - 2 * outer - rail);
     const float minimum =
         std::max(360 * currentScale,
                  EditorStore::minimumComposerWidth(currentScale) + 2 * panePaddingX * currentScale);
@@ -4020,17 +4025,21 @@ void Ui::Impl::refresh(bool panelResize) {
     const float logoExtent = avatarBox.width;
     const float extent = std::max(32.f, (compact ? 32.f : 34.f) * scale);
     const float gap = 6 * scale;
-    const float titlePadding = (tight ? 5.f : compact ? 6.f : 7.f) * scale;
+    const float titlePadding = (tight ? 2.f : compact ? 2.5f : 3.5f) * scale;
     const float titleHeight = std::max(extent, logoExtent) + 2 * titlePadding;
+    place(*topbarDivider, 0, titleHeight - 1.f, width, 1.f);
+    const auto chromeDivider = withAlpha(themeColor("outline_variant"), .25f * themeSurfaceAlpha());
+    topbarDivider->setFill(chromeDivider);
     foldReadAll = width < 760 * scale;
     const bool showReadAll = !foldReadAll && hasUnread();
     const std::size_t controlCount = windowButtons.size() + 2 + (showReadAll ? 1 : 0);
     const float controls = controlCount * extent + (controlCount - 1) * gap;
     const float controlsLeft = width - outer - controls;
-    const float titleLeft = logoExtent + gap;
+    const float titleLeft = outer + logoExtent + gap;
     const float titleWidth = std::max(0.f, controlsLeft - gap - titleLeft - 64 * scale);
-    place(*logo, 0, (titleHeight - logoExtent) / 2, logoExtent, logoExtent);
-    place(*applicationMenu, 0, (titleHeight - extent) / 2, titleLeft + titleWidth, extent);
+    place(*logo, outer, (titleHeight - logoExtent) / 2, logoExtent, logoExtent);
+    place(*applicationMenu, outer, (titleHeight - extent) / 2, titleLeft + titleWidth - outer,
+          extent);
     place(*titleMove, titleLeft + titleWidth, 0,
           std::max(0.f, controlsLeft - gap - titleLeft - titleWidth), titleHeight);
     // The rounded body spans approximately y=340..1074 in the 1254px master; exclude collar,
@@ -4134,9 +4143,13 @@ void Ui::Impl::refresh(bool panelResize) {
     const auto previousNavigation = navigationMode, previousPeople = peopleMode;
     navigationRegularMode = workspace.navigationMode;
     peopleRegularMode = channel ? model.settings.peopleMode : SidebarMode::Hidden;
-    const float statusHeight = (tight ? 22.f : compact ? 26.f : 30.f) * scale;
+    const float footerHeight = outer + (tight ? 22.f : compact ? 24.f : 28.f) * scale;
+    const float footerTop = height - footerHeight;
+    const float footerGap = (tight ? 4.f : 10.f) * scale;
+    place(*footerDivider, 0, footerTop, width, 1.f);
+    footerDivider->setFill(chromeDivider);
     const float contentTop = titleHeight + outer;
-    const float contentHeight = std::max(1.f, height - contentTop - statusHeight - outer);
+    const float contentHeight = std::max(1.f, footerTop - footerGap - contentTop);
     const float expandedWidth =
         workspace.channelSidebarWidth().value_or(navigationExpandedExtent) * scale;
     const float compactWidth = compactPanelExtent * scale;
@@ -4146,7 +4159,7 @@ void Ui::Impl::refresh(bool panelResize) {
     const float chatMinimum =
         std::max(360 * scale, EditorStore::minimumComposerWidth(scale) + 2 * panePaddingX * scale);
     const float targetRail = workspace.serverRailVisible ? preferredRailWidth + boundary : 0.f;
-    const float remaining = std::max(1.f, width - outer - targetRail);
+    const float remaining = std::max(1.f, width - 2 * outer - targetRail);
     const auto regularModes =
         fitSidebarModes(navigationRegularMode, peopleRegularMode, remaining, boundary, scale,
                         chatMinimum, expandedWidth, compactNavigationWidth);
@@ -4203,14 +4216,14 @@ void Ui::Impl::refresh(bool panelResize) {
                 replacement = input;
         retirePanel(control, replacement, true);
     };
-    const WorkspaceRect railRect{0, contentTop, railWidth, contentHeight};
+    const WorkspaceRect railRect{outer, contentTop, railWidth, contentHeight};
     place(*rail, railRect);
     if (railWidth > 0)
         rail->sync(selectedServer, railRect.width, railRect.height, scale);
     rail->setVisible(panelExtent[2] > 0);
     rail->setHitTestVisible(workspace.serverRailVisible);
     rail->setExcludeSubtreeFromTabOrder(!workspace.serverRailVisible);
-    float left = panelExtent[2];
+    float left = outer + panelExtent[2];
     const WorkspaceRect navigationRect{left, contentTop, navigationWidth, contentHeight};
     place(*sidebar, navigationRect);
     sidebar->sync(selectedServer, lastBuffer, navigationRect.width, navigationRect.height, scale,
@@ -4219,7 +4232,7 @@ void Ui::Impl::refresh(bool panelResize) {
     sidebar->setHitTestVisible(navigationMode != SidebarMode::Hidden);
     sidebar->setExcludeSubtreeFromTabOrder(navigationMode == SidebarMode::Hidden);
     const auto dividerColor = withAlpha(themeColor("outline_variant"), .18f * themeSurfaceAlpha());
-    const float dividerX = railWidth + (railGap - 1.f) / 2;
+    const float dividerX = outer + railWidth + (railGap - 1.f) / 2;
     place(*navigationDividers[0], dividerX, contentTop, 1.f, contentHeight);
     navigationDividers[0]->setVisible(panelExtent[2] > 0);
     place(*navigationDividers[1], left + navigationWidth + (navigationGap - 1.f) / 2, contentTop,
@@ -4333,12 +4346,7 @@ void Ui::Impl::refresh(bool panelResize) {
     restoreJumpFocus(false);
     syncUploadPanel();
     modeLine->sync(scale, navigationMode, chord, statusControlsAvailable());
-    const auto activeView = views.find(workspace.focused);
-    const float composerInset = activeView != views.end() && activeView->second->composer->visible()
-                                    ? conversationPaddingY(conversationRect.height, scale)
-                                    : 0.f;
-    place(*modeLine, outer, height - statusHeight - (outer + composerInset) / 2,
-          std::max(0.f, width - 2 * outer), statusHeight);
+    place(*modeLine, outer, footerTop, std::max(0.f, width - 2 * outer), footerHeight);
     if (windowActive)
         repairFocus();
     if (paletteOpen && !commandMode) {

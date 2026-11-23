@@ -9,7 +9,6 @@
 #include <core/timer_manager.h>
 #include <map>
 #include <optional>
-#include <render/animation/animation_manager.h>
 #include <render/scene/input_area.h>
 #include <string>
 #include <ui/controls/box.h>
@@ -39,14 +38,13 @@ bool historyEligible(const Buffer &chat) {
     return (chat.kind == "channel" || chat.kind == "query") && !chat.archived && !chat.muted &&
            chat.initialHistorySync != HistorySyncState::Idle;
 }
-void style(Label &label, const TextFont &font, float scale, Color ink) {
+void style(Label &label, const TextFont &font, float scale) {
     if (label.font().family != font.family)
         label.setFontFamily(font.family);
     if (label.font().features != font.features)
         label.setFontFeatures(font.features);
     label.setFontWeight(font.weight);
     label.setFontSize(12 * scale);
-    label.setColor(ink);
 }
 float textWidth(Renderer &renderer, std::string_view value, float scale, const TextFont &font) {
     return value.empty() ? 0 : std::ceil(renderer.measureText(value, 12 * scale, font, 0, 1).width);
@@ -82,51 +80,6 @@ ContextMenuEntry menuEntry(size_t value, std::string label, std::string_view ico
     return entry;
 }
 
-class HoverGlow final : public Node {
-  public:
-    explicit HoverGlow(const Node &source) {
-        setHitTestVisible(false);
-        setParticipatesInLayout(false);
-        auto proxy = std::make_unique<RenderProxyNode>(&source);
-        halo_ = static_cast<RenderProxyNode *>(addChild(std::move(proxy)));
-        applyOpacity(0);
-    }
-
-    void setGeometry(float width, float height, float scale, Color tint) {
-        setFrameSize(width, height);
-        halo_->setFrameSize(width, height);
-        halo_->setForegroundBlurRadius(2 * scale);
-        halo_->setBlurTint(tint);
-    }
-
-    void setHovered(bool hovered, bool animated) {
-        const float target = hovered ? 1.f : 0.f;
-        if (target_ == hovered && (animated || opacity() == target))
-            return;
-        target_ = hovered;
-        auto *manager = animationManager();
-        if (manager && animation_)
-            manager->cancel(std::exchange(animation_, 0));
-        if (manager && animated && opacity() != target) {
-            animation_ = manager->animate(
-                opacity(), target, hovered ? 100 : 140, Easing::EaseOutCubic,
-                [this](float value) { applyOpacity(value); }, {}, this);
-            markPaintDirty();
-        } else {
-            applyOpacity(target);
-        }
-    }
-
-  private:
-    void applyOpacity(float value) {
-        setOpacity(value);
-        setVisible(value > 0);
-    }
-
-    RenderProxyNode *halo_;
-    AnimationManager::Id animation_ = 0;
-    bool target_ = false;
-};
 } // namespace
 
 struct ModeLine::Impl {
@@ -149,12 +102,13 @@ struct ModeLine::Impl {
         InputArea *area;
         Node *content;
         Label *title;
-        HoverGlow *glow;
+        Box *highlight;
         Box *focus;
+        std::optional<Group> group;
+        Label *marker = nullptr, *suffix = nullptr;
     };
     struct Slot {
         Button button;
-        Label *marker, *suffix;
         std::string id;
     };
     struct Scope {
@@ -205,6 +159,8 @@ struct ModeLine::Impl {
     bool healthy = false, failureFeedback = false;
     float scale = 1;
     Color activityInk{}, mentionInk{}, focusInk{};
+    Color hoverFill{};
+    std::array<Color, GroupCount> controlInks{};
     std::string shownBuffer, shownServer, shownState;
     uint64_t shownSession = 0;
     bool shownProfile = false, shownWritable = false;
@@ -287,9 +243,25 @@ struct ModeLine::Impl {
     void updateHover(const Button &button) const {
         const auto &area = *button.area;
         const bool available = allowed && !popupButton && area.visible() && area.enabled();
-        const auto &settings = model.settings;
-        const bool animated = !settings.reducedMotion && settings.fx != FxLevel::Off;
-        button.glow->setHovered(available && area.hovered(), available && animated);
+        const bool shown = available && area.hovered();
+        if (button.highlight->visible() != shown) {
+            button.highlight->setVisible(shown);
+            updateInk(button);
+        }
+    }
+    void updateInk(const Button &button) const {
+        const auto ink = [&](Color normal) {
+            return button.highlight->visible() ? themePairedForeground(hoverFill, normal) : normal;
+        };
+        const auto normal = button.group ? controlInks[*button.group] : activityInk;
+        const auto foreground = ink(normal);
+        button.title->setColor(foreground);
+        if (button.group)
+            icons[*button.group]->setColor(foreground);
+        if (button.marker)
+            button.marker->setColor(ink(mentionInk));
+        if (button.suffix)
+            button.suffix->setColor(foreground);
     }
     std::string_view caption(Group group) const { return controls[group].title->text(); }
     void updateTipText(Group group) {
@@ -357,7 +329,7 @@ struct ModeLine::Impl {
         shownProfile = bool(current.profile);
         shownWritable = current.writable();
     }
-    Button makeButton(std::optional<Group> group = {}) {
+    Button makeButton(std::optional<Group> group = {}, bool activityChip = false) {
         auto *area = static_cast<InputArea *>(
             owner.insertChildAt(slots.size(), std::make_unique<InputArea>()));
         area->setVisible(false);
@@ -365,14 +337,17 @@ struct ModeLine::Impl {
         area->setRetainsFocusOnPointerRelease(true);
         area->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));
         area->setClipChildren(true);
+        auto *highlight = child<Box>(*area);
+        highlight->setHitTestVisible(false);
+        highlight->setVisible(false);
         auto *content = child<Node>(*area);
         content->setHitTestVisible(false);
-        auto *glow =
-            static_cast<HoverGlow *>(area->insertChildAt(0, std::make_unique<HoverGlow>(*content)));
         auto *focus = child<Box>(*area);
         focus->setHitTestVisible(false);
         focus->setVisible(false);
-        const Button button{area, content, lineLabel(*content), glow, focus};
+        const Button button{area, content, lineLabel(*content), highlight, focus, group,
+                            activityChip ? lineLabel(*content) : nullptr,
+                            activityChip ? lineLabel(*content) : nullptr};
         area->setOnFocusGain([this, button] {
             pointerFocused = nullptr;
             updateFocus(button);
@@ -406,7 +381,13 @@ struct ModeLine::Impl {
         area.setSize(width, height);
         area.setVisible(true);
         button.content->setFrameSize(width, height);
-        button.glow->setGeometry(width, height, scale, focusInk);
+        const float inset = std::min(scale * 2, height / 4);
+        const float highlightHeight = height - 2 * inset;
+        button.highlight->setPosition(0, inset);
+        button.highlight->setFrameSize(width, highlightHeight);
+        button.highlight->setRadius(
+            std::min(themeCornerRadius(), std::min(width, highlightHeight) / 2));
+        button.highlight->setFill(hoverFill);
         button.focus->setFill(focusInk);
         const float rule = std::max(1.f, scale);
         button.focus->setPosition(0, height - rule);
@@ -437,19 +418,20 @@ struct ModeLine::Impl {
     }
     Slot &slotAt(size_t index) {
         if (index == slots.size()) {
-            auto button = makeButton();
+            auto button = makeButton(std::nullopt, true);
             button.area->setOnClick(
                 [this, index](const InputArea::PointerData &) { activateSlot(index); });
             button.area->setOnKeyDown([this, index](const InputArea::KeyData &key) {
                 if (activateKey(key))
                     activateSlot(index);
             });
-            slots.push_back({button, lineLabel(*button.content), lineLabel(*button.content), {}});
+            slots.push_back({button, {}});
         }
         return slots[index];
     }
     void styleButton(Button &button, const TextFont &font) {
-        style(*button.title, font, scale, activityInk);
+        style(*button.title, font, scale);
+        updateInk(button);
     }
     static std::array<int, 4> anchor(const Button &button) {
         float left, top, rightEdge, bottom;
@@ -747,6 +729,10 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     };
     p.activityInk = ink("primary");
     p.mentionInk = ink("error");
+    if (const auto hover = themeForegroundColor("hover"); p.hoverFill != hover) {
+        p.hoverFill = hover;
+        markLayoutDirty();
+    }
     if (const auto secondary = ink("secondary"); p.focusInk != secondary) {
         p.focusInk = secondary;
         markLayoutDirty();
@@ -764,8 +750,9 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
                            : i == Feedback && p.failureFeedback ? p.mentionInk
                            : i == Chord || i == Nick            ? contextInk
                                                                 : contextualInk;
-        style(*button.title, font, p.scale, color);
-        p.icons[i]->setColor(color);
+        p.controlInks[i] = color;
+        style(*button.title, font, p.scale);
+        p.updateInk(button);
         p.icons[i]->setGlyphSize(14 * p.scale);
     }
     if (!ledgerVisible) {
@@ -853,9 +840,9 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     bold.weight = FontWeight::Bold;
     for (auto &slot : p.slots) {
         p.enableButton(slot.button, allowActivityMenu);
+        style(*slot.button.marker, bold, p.scale);
+        style(*slot.button.suffix, font, p.scale);
         p.styleButton(slot.button, font);
-        style(*slot.marker, bold, p.scale, p.mentionInk);
-        style(*slot.suffix, font, p.scale, p.activityInk);
     }
 }
 
@@ -967,20 +954,21 @@ void ModeLine::doLayout(Renderer &renderer) {
             slot.id = id;
             slot.button.area->setTabFocusKey("buffer:" + id);
         }
-        if (slot.button.title->setText(entry.title()) || slot.suffix->text() != entry.suffix() ||
-            slot.marker->visible() != entry.mentioned)
+        if (slot.button.title->setText(entry.title()) ||
+            slot.button.suffix->text() != entry.suffix() ||
+            slot.button.marker->visible() != entry.mentioned)
             slot.button.area->setTooltip(entry.caption);
-        slot.marker->setText("@");
-        slot.suffix->setText(entry.suffix());
+        slot.button.marker->setText("@");
+        slot.button.suffix->setText(entry.suffix());
         p.enableButton(slot.button, p.allowed);
+        style(*slot.button.marker, bold, p.scale);
+        style(*slot.button.suffix, font, p.scale);
         p.styleButton(slot.button, font);
-        style(*slot.marker, bold, p.scale, p.mentionInk);
-        style(*slot.suffix, font, p.scale, p.activityInk);
         const float chipWidth = title + fixed;
         p.moveButton(slot.button, x, chipWidth, height());
-        placeLabel(*slot.marker, renderer, inset, mark, height());
+        placeLabel(*slot.button.marker, renderer, inset, mark, height());
         placeLabel(*slot.button.title, renderer, inset + mark, title, height());
-        placeLabel(*slot.suffix, renderer, inset + mark + title, suffix, height());
+        placeLabel(*slot.button.suffix, renderer, inset + mark + title, suffix, height());
         x += chipWidth;
         remaining -= chipWidth;
     }
@@ -1028,13 +1016,14 @@ void ModeLine::doLayout(Renderer &renderer) {
             continue;
         }
         const float buttonWidth = labelWidths[i] + iconWidths[i];
-        p.moveButton(button, x - buttonWidth, buttonWidth, height());
-        placeLabel(*button.title, renderer, iconWidths[i], labelWidths[i], height());
+        const float side = (used[i] - buttonWidth) / 2;
+        p.moveButton(button, x - used[i], used[i], height());
+        placeLabel(*button.title, renderer, side + iconWidths[i], labelWidths[i], height());
         auto &icon = *p.icons[i];
         icon.setVisible(iconWidths[i] > 0);
         if (icon.visible()) {
             icon.measure(renderer);
-            icon.setPosition(0, (height() - icon.height()) / 2);
+            icon.setPosition(side, (height() - icon.height()) / 2);
         }
         x -= used[i];
     }
@@ -1053,8 +1042,8 @@ void ModeLine::doLayout(Renderer &renderer) {
         p.tip->setBorder(themeForegroundColor("outline_variant"), 1.f);
         p.tip->setRadius(inset);
         auto &label = *p.tipText;
-        style(label, font, p.scale,
-              themePairedForeground(fill, themeForegroundColor("on_surface")));
+        style(label, font, p.scale);
+        label.setColor(themePairedForeground(fill, themeForegroundColor("on_surface")));
         label.setMaxWidth(std::min(width(), 420 * p.scale) - 2 * inset);
         label.measure(renderer);
         label.setPosition(inset, inset);

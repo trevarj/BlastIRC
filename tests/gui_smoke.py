@@ -2524,10 +2524,11 @@ def set_native_cursor_preferences(proc, window, prefs, db, args, dest, *,
     saved = save_settings_footer(window, saved_path=prefs, destination=dest, label=label + "-saved")
     cursor = saved["cursor"]
     assert cursor == {"shape": shape, "blink": blink, "trail": trail,
-                      "trail_style": style or baseline["cursor"]["trail_style"]}, cursor
+                      "trail_style": style or baseline["cursor"]["trail_style"],
+                      "smooth_blink_ms": baseline["cursor"]["smooth_blink_ms"]}, cursor
     for section in ("appearance", "audio"):
         assert saved[section] == baseline[section], f"Cursor controls changed {section} suppression preferences"
-    framed_keys(window, *(["Tab"] * (shape_stop + 4)), "Return")  # Try in conversation.
+    framed_keys(window, *(["Tab"] * (shape_stop + 5)), "Return")  # Try in conversation.
     SETTINGS_OPEN[window] = False
     save_state(proc, prefs, db)
     wait_layout(proc, prefs, predicate=lambda layout: "settings" not in layout)
@@ -5000,7 +5001,7 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
     baseline = tomllib.loads(prefs.read_text())
     bindings = baseline['bindings'].copy()
     for name, value in (('execute-command', 'M-x'), ('backward-char', 'C-b'),
-                        ('forward-char', 'C-f'), ('set-mark', 'C-S-SPC'),
+                        ('forward-char', 'C-f'), ('set-mark', 'C-SPC'),
                         ('beginning-of-buffer', 'M-<'), ('end-of-buffer', 'M->'),
                         ('settings', 'C-,')):
         assert bindings[name] == value, (name, bindings[name], value)
@@ -6519,6 +6520,7 @@ def run_advanced_scope(*, proc, window, binary, env, screenshot, logs, preferenc
             assert before_cursor == baseline_settings["cursor"], (before_cursor, baseline_settings["cursor"])
             assert selected_cursor == {
                 "shape": "box", "blink": "off", "trail": True, "trail_style": "pixiedust",
+                "smooth_blink_ms": before_cursor["smooth_blink_ms"],
             }, selected_cursor
             assert tomllib.loads(preferences.read_text())["cursor"] == selected_cursor
             cursor_history = database.execute(

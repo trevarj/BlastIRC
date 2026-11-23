@@ -519,6 +519,9 @@ void validate(const Settings &settings) {
     if (settings.cursorBlink != "off" && settings.cursorBlink != "step" &&
         settings.cursorBlink != "smooth")
         invalid("cursor.blink", "off, step, or smooth");
+    if (settings.cursorSmoothBlinkMs < cursorSmoothBlinkMinMs ||
+        settings.cursorSmoothBlinkMs > cursorSmoothBlinkMaxMs)
+        invalid("cursor.smooth_blink_ms", "an integer from 200 through 1000");
     if (std::ranges::find(cursorTrailStyleIds, settings.cursorTrailStyle) ==
         cursorTrailStyleIds.end())
         invalid("cursor.trail_style",
@@ -856,6 +859,7 @@ void parseSettings(const toml::table &document, Settings &settings) {
     if (const auto *row = table(document, "cursor")) {
         exactField(*row, "shape", settings.cursorShape);
         exactField(*row, "blink", settings.cursorBlink);
+        exactField(*row, "smooth_blink_ms", settings.cursorSmoothBlinkMs);
         exactField(*row, "trail_style", settings.cursorTrailStyle);
         if (row->contains("trail")) {
             exactField(*row, "trail", settings.cursorTrail);
@@ -1116,6 +1120,7 @@ toml::table settingsDocument(const Settings &settings) {
                                  {"word_prediction", settings.wordPrediction}}},
         {"cursor", toml::table{{"shape", settings.cursorShape},
                                {"blink", settings.cursorBlink},
+                               {"smooth_blink_ms", settings.cursorSmoothBlinkMs},
                                {"trail", settings.cursorTrail},
                                {"trail_style", settings.cursorTrailStyle}}},
         {"audio", toml::table{{"enabled", settings.sound},

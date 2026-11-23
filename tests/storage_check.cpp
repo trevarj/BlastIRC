@@ -1229,7 +1229,7 @@ static void conversationBindingPreferences(const fs::path &config) {
         assert(defaults.at("conversation-back") == "C-o");
         assert(defaults.at("conversation-forward") == "C-i");
         assert(defaults.at("next-activity") == "C-x C-SPC");
-        assert(defaults.at("set-mark") == "C-S-SPC");
+        assert(defaults.at("set-mark") == "C-SPC");
         assert(defaults.at("/join").empty() && defaults.at("mark-read").empty());
     }
     struct Case {
@@ -1258,19 +1258,21 @@ static void conversationBindingPreferences(const fs::path &config) {
         {"conversation-back = 'C-i x'\n", "C-i x", "", {}},
         {"conversation-forward = 'C-o x'\n", "", "C-o x", {}},
         {"conversation-back = 'C-i'\nconversation-forward = 'C-o'\n", "C-i", "C-o", {}},
-        {"set-mark = ' c-SpC '\n", "C-o", "C-i", {}},
+        {"set-mark = ' c-SpC '\n", "C-o", "C-i", {{"set-mark", " c-SpC "}}},
+        {"set-mark = 'C-S-SPC'\nnext-activity = 'C-x C-SPC'\n", "C-o", "C-i", {}},
+        {"set-mark = 'C-S-SPC'\nnext-activity = 'C-SPC'\n", "C-o", "C-i", {}},
         {"set-mark = 'C-SPC x'\n", "C-o", "C-i", {{"set-mark", "C-SPC x"}}},
         {"set-mark = 'M-SPC'\n", "C-o", "C-i", {{"set-mark", "M-SPC"}}},
         {"set-mark = ''\n", "C-o", "C-i", {{"set-mark", ""}}},
-        {"set-mark = 'C-SPC'\ntoggle-navigation = ' c-S-SPC x '\n",
+        {"set-mark = 'C-S-SPC'\ntoggle-navigation = ' c-SPC x '\n",
          "C-o",
          "C-i",
-         {{"set-mark", ""}, {"toggle-navigation", " c-S-SPC x "}}},
-        {"next-activity = 'C-S-SPC'\n",
+         {{"set-mark", "C-S-SPC"}, {"toggle-navigation", " c-SPC x "}}},
+        {"next-activity = 'C-S-SPC'\n", "C-o", "C-i", {{"next-activity", "C-S-SPC"}}},
+        {"toggle-navigation = 'C-SPC x'\n",
          "C-o",
          "C-i",
-         {{"set-mark", ""}, {"next-activity", "C-S-SPC"}}},
-        {"toggle-navigation = 'C-SPC x'\n", "C-o", "C-i", {{"toggle-navigation", "C-SPC x"}}},
+         {{"set-mark", ""}, {"toggle-navigation", "C-SPC x"}}},
         {"toggle-navigation = 'C-x'\n",
          "C-o",
          "C-i",
@@ -1281,8 +1283,10 @@ static void conversationBindingPreferences(const fs::path &config) {
          "C-o",
          "C-i",
          {{"next-activity", ""}, {"toggle-navigation", " c-X  c-SpC k "}}},
-        {"next-activity = ' c-SpC '\n", "C-o", "C-i", {{"next-activity", " c-SpC "}}},
-        {"next-activity = 'C-SPC x'\n", "C-o", "C-i", {{"next-activity", "C-SPC x"}}},
+        {"next-activity = ' c-SpC '\n", "C-o", "C-i",
+         {{"set-mark", ""}, {"next-activity", " c-SpC "}}},
+        {"next-activity = 'C-SPC x'\n", "C-o", "C-i",
+         {{"set-mark", ""}, {"next-activity", "C-SPC x"}}},
         {"set-mark = 'C-SPC'\nnext-activity = ''\n",
          "C-o",
          "C-i",
@@ -2644,7 +2648,8 @@ int main() {
             assert(expected.settings.fx == FxLevel::Subtle && expected.settings.sound);
             assert(expected.settings.cursorShape == "line" &&
                    expected.settings.cursorBlink == "step" && !expected.settings.cursorTrail &&
-                   expected.settings.cursorTrailStyle == "classic");
+                   expected.settings.cursorTrailStyle == "classic" &&
+                   expected.settings.cursorSmoothBlinkMs == 500);
             assert(expected.settings.peopleMode == SidebarMode::Hidden);
             assert(expected.settings.opacity == 1.f && !expected.settings.transparency &&
                    expected.settings.messageLayouts.empty());
@@ -3122,7 +3127,8 @@ int main() {
             assert(legacy.settings.fx == FxLevel::Full && legacy.settings.sound);
             assert(legacy.settings.cursorShape == "line" &&
                    legacy.settings.cursorBlink == "step" && !legacy.settings.cursorTrail &&
-                   legacy.settings.cursorTrailStyle == "classic");
+                   legacy.settings.cursorTrailStyle == "classic" &&
+                   legacy.settings.cursorSmoothBlinkMs == 500);
             assert(legacy.settings.peopleMode == SidebarMode::Hidden &&
                    legacy.settings.workspace == expected.settings.workspace);
             assert(legacy.identities[0].password == expected.identities[0].password);
@@ -3473,10 +3479,11 @@ int main() {
             assert(failed && contents(config / "settings.toml") == invalidSource &&
                    contents(config / "config.toml") == originalConfig);
         }
-        // Effects policy and each shape, blink mode and trail style survive restart.
+        // Effects policy and all cursor preferences survive restart.
         const FxLevel levels[] = {FxLevel::Off, FxLevel::Subtle, FxLevel::Full};
         const char *shapes[] = {"line", "box", "underline"};
         const char *blinks[] = {"off", "step", "smooth"};
+        const int fades[] = {200, 333, 625, 1000};
         const char *trailStyles[] = {"classic", "motion-blur", "blaze", "lightning",
                                      "railgun", "torpedo", "pixiedust"};
         for (std::size_t index = 0; index < 2 * std::size(trailStyles); ++index) {
@@ -3485,6 +3492,7 @@ int main() {
             s.fx = levels[index % 3];
             s.cursorShape = shapes[index % 3];
             s.cursorBlink = blinks[index % 3];
+            s.cursorSmoothBlinkMs = fades[index % std::size(fades)];
             s.cursorTrail = index >= std::size(trailStyles);
             s.cursorTrailStyle = trailStyles[index % std::size(trailStyles)];
             s.reducedMotion = true;
@@ -3494,10 +3502,13 @@ int main() {
             const string saved = contents(config / "settings.toml");
             const auto document = toml::parse(saved);
             assert(document["cursor"]["trail_style"].value<string>() == s.cursorTrailStyle);
+            assert(document["cursor"]["smooth_blink_ms"].value_exact<int64_t>() ==
+                   s.cursorSmoothBlinkMs);
             Model actual;
             storage.load(actual);
             assert(actual.settings.fx == s.fx && actual.settings.cursorShape == s.cursorShape &&
                    actual.settings.cursorBlink == s.cursorBlink &&
+                   actual.settings.cursorSmoothBlinkMs == s.cursorSmoothBlinkMs &&
                    actual.settings.cursorTrail == s.cursorTrail &&
                    actual.settings.cursorTrailStyle == s.cursorTrailStyle);
             assert(actual.settings.reducedMotion && actual.settings.sound &&
@@ -3532,6 +3543,7 @@ int main() {
             storage.load(actual);
             assert(actual.settings.cursorShape == "underline" &&
                    actual.settings.cursorBlink == test.blink &&
+                   actual.settings.cursorSmoothBlinkMs == 500 &&
                    actual.settings.cursorTrail == test.trail &&
                    actual.settings.cursorTrailStyle == "classic" && contents(file) == source);
             storage.save(actual);
@@ -3539,6 +3551,7 @@ int main() {
             const auto cursor = saved["cursor"];
             assert(cursor["shape"].value<string>() == "underline" &&
                    cursor["blink"].value<string>() == test.blink &&
+                   cursor["smooth_blink_ms"].value_exact<int64_t>() == 500 &&
                    cursor["trail"].value<bool>() == test.trail &&
                    cursor["trail_style"].value<string>() == "classic" &&
                    !cursor["effect"] && !cursor["trail_duration_ms"] && !cursor["trail_strength"]);
@@ -3546,6 +3559,7 @@ int main() {
             storage.load(reopened);
             assert(reopened.settings.cursorShape == "underline" &&
                    reopened.settings.cursorBlink == test.blink &&
+                   reopened.settings.cursorSmoothBlinkMs == 500 &&
                    reopened.settings.cursorTrail == test.trail &&
                    reopened.settings.cursorTrailStyle == "classic" &&
                    contents(config / "config.toml") == originalConfig);
@@ -3590,7 +3604,7 @@ int main() {
               "previews.max_height", "previews.media_max_mib", "previews.media_max_seconds",
               "presentation.channel_message_layout", "presentation.direct_message_layout",
               "presentation.message_layouts.Libera/#a",
-              "cursor.shape", "cursor.blink", "cursor.trail_style"}) {
+              "cursor.shape", "cursor.blink", "cursor.trail_style", "cursor.smooth_blink_ms"}) {
             Storage storage;
             Model invalid = legacy;
             if (diagnostic == "cursor.shape")
@@ -3599,6 +3613,8 @@ int main() {
                 invalid.settings.cursorBlink = "particles";
             else if (diagnostic == "cursor.trail_style")
                 invalid.settings.cursorTrailStyle = "motion_blur";
+            else if (diagnostic == "cursor.smooth_blink_ms")
+                invalid.settings.cursorSmoothBlinkMs = 1001;
             else if (diagnostic == "appearance.send_motion")
                 invalid.settings.sendMotion = static_cast<SendMotion>(-1);
             else if (diagnostic == "appearance.incoming_motion")
@@ -3897,6 +3913,11 @@ int main() {
             {"[cursor]\nblink = 'Smooth'\n", "cursor.blink"},
             {"[cursor]\nblink = ''\n", "cursor.blink"},
             {"[cursor]\nblink = true\n", "blink"},
+            {"[cursor]\nsmooth_blink_ms = 199\n", "cursor.smooth_blink_ms"},
+            {"[cursor]\nsmooth_blink_ms = 1001\n", "cursor.smooth_blink_ms"},
+            {"[cursor]\nsmooth_blink_ms = 500.0\n", "smooth_blink_ms"},
+            {"[cursor]\nsmooth_blink_ms = '500'\n", "smooth_blink_ms"},
+            {"[cursor]\nsmooth_blink_ms = true\n", "smooth_blink_ms"},
             {"[cursor]\ntrail = 'true'\n", "trail"},
             {"[cursor]\neffect = 'trail'\ntrail = 1\n", "trail"},
             {"[cursor]\ntrail_style = 'off'\n", "cursor.trail_style"},

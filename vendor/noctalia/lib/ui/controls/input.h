@@ -44,7 +44,8 @@ public:
   // Box fills the native grapheme cell and repaints its shaped glyph in a contrasting color.
   void setCaretStyle(
       CaretShape shape, CaretBlink blink = CaretBlink::Step, bool trail = false,
-      CaretTrailStyle style = CaretTrailStyle::Classic
+      CaretTrailStyle style = CaretTrailStyle::Classic,
+      std::chrono::milliseconds smoothBlinkInterval = std::chrono::milliseconds(500)
   );
   // Paint state only. Call on buffer identity changes, pane hiding and external geometry changes.
   void resetCaretEffects();
@@ -379,6 +380,7 @@ private:
   // Sticky caret column for Up/Down runs; negative = unset.
   float m_goalCaretX = -1.0F;
   float m_cursorOpacity = 1.0F;
+  std::chrono::milliseconds m_smoothBlinkInterval{500};
   std::chrono::steady_clock::time_point m_cursorBlinkEpoch;
   bool m_windowActive = true;
   Timer m_cursorBlinkTimer;

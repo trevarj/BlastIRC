@@ -76,7 +76,7 @@ inline const auto &bindingCommands() {
             {"select-all", {"Select all", "", Editing}},
             {"transpose-chars", {"Transpose characters", "C-t", Editing}},
             {"backward-kill-line", {"Cut to beginning of line", "", Editing}},
-            {"set-mark", {"Set selection mark", "C-S-SPC", Editing}},
+            {"set-mark", {"Set selection mark", "C-SPC", Editing}},
             {"history-previous", {"Previous sent message", "M-p", Messaging}},
             {"history-next", {"Next sent message", "M-n", Messaging}},
             {"complete", {"Complete nickname or command", "TAB", Messaging}},

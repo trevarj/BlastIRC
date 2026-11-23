@@ -285,7 +285,8 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
             assert(capture(editor) == plain);
         }
 
-        editor.setCaretStyle(Shape::Box, Blink::Step);
+        using TrailStyle = Input::CaretTrailStyle;
+        editor.setCaretStyle(Shape::Box, Blink::Step, false, TrailStyle::Classic, 200ms);
         assert(capture(editor) == plain);
         tickCursorTimers(525ms);
         assert(capture(editor) == inactive);
@@ -303,6 +304,20 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
         assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
         focus.pointerMotion(21, 24, 403);
         assert(capture(editor) == plain);
+        const auto smoothOpacity = [&](std::chrono::milliseconds fade) {
+            editor.setCaretStyle(Shape::Box, Blink::Smooth, false, TrailStyle::Classic, fade);
+            assert(capture(editor) == plain);
+            tickCursorTimers(220ms);
+            const auto frame = capture(editor);
+            int alpha = 0;
+            for (std::size_t i = 3; i < frame.size(); i += 4)
+                if (plain[i] > inactive[i])
+                    alpha += int(frame[i]) - int(inactive[i]);
+            return alpha;
+        };
+        const int fast = smoothOpacity(200ms);
+        const int slow = smoothOpacity(1000ms);
+        assert(slow > 2 * fast && slow > 0);
         editor.setCaretStyle(Shape::Box, Blink::Off);
         assert(capture(editor) == plain);
         for (const bool composing : {false, true}) {

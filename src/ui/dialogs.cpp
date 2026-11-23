@@ -1705,10 +1705,13 @@ struct Dialogs::Impl {
                    if (index < cursorTrailStyleIds.size())
                        model.settings.cursorTrailStyle = cursorTrailStyleIds[index];
                });
+        slider(*cursor, "Smooth blink fade (ms)", model.settings.cursorSmoothBlinkMs,
+               cursorSmoothBlinkMinMs, cursorSmoothBlinkMaxMs, 25,
+               [this](float value) { model.settings.cursorSmoothBlinkMs = int(value); });
         cursorStatus = label(*cursor, "");
         label(*cursor,
-              "Step blinks on and off; Smooth fades. Trail follows cursor movement and remembers "
-              "its style when turned off. "
+              "Step blinks on and off; Smooth uses milliseconds per fade (lower is faster). "
+              "Trail follows cursor movement and remembers its style when turned off. "
               "Effects Off or Reduced motion suppresses both without changing the shape.");
         button(*cursor, "Try in conversation", [this] { dismiss(); });
         auto *messages = section("appearance.messages", "Messages");

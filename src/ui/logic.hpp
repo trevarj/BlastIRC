@@ -384,13 +384,6 @@ inline void migrateActivityBinding(Bindings &bindings, HasSavedBinding hasSavedB
             return entry.first != name && bindingConflicts(stock, entry.second);
         });
     };
-    const auto mark = bindings.find("set-mark");
-    // C-SPC was the stock mark until the activity command was introduced.
-    if (mark == bindings.end() || !hasSavedBinding("set-mark") ||
-        (!savedActivity && canonical(mark->second) == "c-spc")) {
-        constexpr auto stock = "C-S-SPC";
-        bindings.insert_or_assign("set-mark", conflicts("set-mark", stock) ? "" : stock);
-    }
     const auto activity = bindings.find("next-activity");
     // Only the exact old default was written automatically; keep custom and empty chords.
     if (!savedActivity || (activity != bindings.end() && activity->second == "C-SPC")) {
@@ -398,6 +391,16 @@ inline void migrateActivityBinding(Bindings &bindings, HasSavedBinding hasSavedB
         bindings.insert_or_assign("next-activity",
                                   conflicts("next-activity", stock) ? std::string_view{} : stock);
     }
+    const auto mark = bindings.find("set-mark");
+    const bool savedMark = mark != bindings.end() && hasSavedBinding("set-mark");
+    // Restore the exact old default only if the bare chord is free after activity moves.
+    if (savedMark && mark->second != "C-S-SPC")
+        return;
+    const std::string_view stock = defaultBindings().at("set-mark");
+    if (!conflicts("set-mark", stock))
+        bindings.insert_or_assign("set-mark", stock);
+    else if (!savedMark)
+        bindings.insert_or_assign("set-mark", "");
 }
 template <class Bindings, class HasSavedBinding>
 inline void migrateMessageBindings(Bindings &bindings, HasSavedBinding hasSavedBinding) {

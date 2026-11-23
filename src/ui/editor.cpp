@@ -3513,7 +3513,8 @@ void EditorStore::Impl::Composer::sync() {
         if (selected != cursorTrailStyleIds.end())
             style = trailStyles[selected - cursorTrailStyleIds.begin()];
     }
-    input->setCaretStyle(shape, blink, trail, style);
+    input->setCaretStyle(shape, blink, trail, style,
+                         std::chrono::milliseconds(settings.cursorSmoothBlinkMs));
     if (!visibleInScene(*this))
         input->resetCaretEffects();
     replyScratch.clear();

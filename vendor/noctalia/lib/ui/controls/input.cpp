@@ -742,13 +742,23 @@ void Input::setEditRewriter(std::function<void(const EditSnapshot&, EditSnapshot
   m_editRewriter = std::move(rewriter);
 }
 
-void Input::setCaretStyle(CaretShape shape, CaretBlink blink, bool trail, CaretTrailStyle style) {
-  if (m_caretShape == shape && m_caretBlink == blink && m_caretTrailEnabled == trail && m_caretTrailStyle == style)
+void Input::setCaretStyle(
+    CaretShape shape, CaretBlink blink, bool trail, CaretTrailStyle style,
+    std::chrono::milliseconds smoothBlinkInterval
+) {
+  smoothBlinkInterval = std::max(smoothBlinkInterval, kCursorBlinkSample);
+  const bool blinkChanged =
+      m_caretBlink != blink || (blink == CaretBlink::Smooth && m_smoothBlinkInterval != smoothBlinkInterval);
+  m_smoothBlinkInterval = smoothBlinkInterval;
+  if (blinkChanged)
+    stopCursorBlink();
+  if (m_caretShape == shape && m_caretBlink == blink && m_caretTrailEnabled == trail && m_caretTrailStyle == style) {
+    if (blinkChanged)
+      revealCursor();
     return;
+  }
   resetCaretEffects();
   const bool shapeChanged = m_caretShape != shape;
-  if (m_caretBlink != blink)
-    stopCursorBlink();
   m_caretShape = shape;
   m_caretBlink = blink;
   m_caretTrailEnabled = trail;
@@ -2858,12 +2868,13 @@ void Input::updateCursorBlink() {
     updateCursorVisibility();
     return;
   }
-  const auto half = elapsed / kCursorBlinkInterval;
-  const auto phase = elapsed - half * kCursorBlinkInterval;
+  const auto interval = m_caretBlink == CaretBlink::Smooth ? m_smoothBlinkInterval : kCursorBlinkInterval;
+  const auto half = elapsed / interval;
+  const auto phase = elapsed - half * interval;
   const bool fadingOut = half % 2 == 0;
-  auto next = ceil<milliseconds>(kCursorBlinkInterval - phase);
+  auto next = ceil<milliseconds>(interval - phase);
   if (m_caretBlink == CaretBlink::Smooth) {
-    const float t = duration<float, std::milli>(phase).count() / kCursorBlinkInterval.count();
+    const float t = duration<float, std::milli>(phase).count() / static_cast<float>(interval.count());
     const float eased = input_caret::easeInOut(t);
     m_cursorOpacity = fadingOut ? 1.0F - eased : eased;
     next = std::min(next, kCursorBlinkSample);

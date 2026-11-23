@@ -1552,9 +1552,11 @@ void runSettingsCheck() {
     auto *cursorBlink = named<Select>(dialogs, "Cursor blink");
     auto *cursorTrail = named<Toggle>(dialogs, "Cursor trail");
     auto *trailStyle = named<Select>(dialogs, "Trail style");
+    auto *smoothBlinkFade = named<Slider>(dialogs, "Smooth blink fade (ms)");
     assert(cursorShape->selectedText() == "Line" && cursorBlink->selectedText() == "Step" &&
            !model.settings.cursorTrail && trailStyle->selectedText() == "Classic" &&
-           model.settings.cursorTrailStyle == "classic");
+           model.settings.cursorTrailStyle == "classic" && smoothBlinkFade->value() == 500 &&
+           model.settings.cursorSmoothBlinkMs == 500);
     constexpr std::array cursorBlinks{"off", "step", "smooth"};
     for (std::size_t index = 0; index < cursorBlinks.size(); ++index) {
         cursorBlink->setSelectedIndex(index);
@@ -1564,6 +1566,15 @@ void runSettingsCheck() {
         assert(find<Label>(dialogs, [text](const Label &label) { return label.text() == text; }));
     };
     cursorBlink->setSelectedIndex(0);
+    dispatcher.setFocus(dispatcher.firstTabFocusUnder(smoothBlinkFade));
+    dispatcher.keyEvent(XKB_KEY_Home, 0, 0, true);
+    assert(model.settings.cursorSmoothBlinkMs == 200);
+    dispatcher.keyEvent(XKB_KEY_Right, 0, 0, true);
+    assert(model.settings.cursorSmoothBlinkMs == 225);
+    dispatcher.keyEvent(XKB_KEY_End, 0, 0, true);
+    assert(model.settings.cursorSmoothBlinkMs == 1000);
+    smoothBlinkFade->setValue(625);
+    assert(model.settings.cursorSmoothBlinkMs == 625 && model.settings.cursorBlink == "off");
     constexpr std::array trailNames{"Classic", "Motion Blur", "Blaze", "Lightning",
                                     "Railgun", "Torpedo",    "Pixiedust"};
     constexpr std::array trailIds{"classic", "motion-blur", "blaze", "lightning",
@@ -1590,7 +1601,8 @@ void runSettingsCheck() {
     expectCursorStatus("Effective: selected blink and trail settings apply in the focused composer.");
     assert(cursorBlink->selectedText() == "Smooth" && model.settings.cursorShape == "box" &&
            model.settings.cursorBlink == "smooth" && model.settings.cursorTrail &&
-           model.settings.cursorTrailStyle == "pixiedust");
+           model.settings.cursorTrailStyle == "pixiedust" &&
+           model.settings.cursorSmoothBlinkMs == 625);
     assert(!find<Label>(dialogs, [](const Label &label) {
         return label.text() == "Cursor animation" ||
                label.text() == "Animation duration (40–240 ms)" ||
@@ -1821,6 +1833,7 @@ void runSettingsCheck() {
     category(0);
     expectCursorStatus("Effective: cursor blink and trail suppressed by Reduced motion.");
     assert(named<Select>(dialogs, "Trail style")->selectedText() == "Pixiedust");
+    assert(named<Slider>(dialogs, "Smooth blink fade (ms)")->value() == 625);
     category(3);
     named<Select>(dialogs, "Effects")->setSelectedIndex(0);
     assert(model.settings.fx == FxLevel::Off);
@@ -1841,7 +1854,7 @@ void runSettingsCheck() {
            model.settings.shake == .5f);
     assert(model.settings.sound && model.settings.cursorBlink == "smooth" &&
            model.settings.cursorTrail && model.settings.cursorTrailStyle == "pixiedust" &&
-           model.settings.cursorShape == "box");
+           model.settings.cursorShape == "box" && model.settings.cursorSmoothBlinkMs == 625);
 
     category(4);
     activate(dispatcher, *named<Toggle>(dialogs, "Sound enabled"));
@@ -1966,7 +1979,8 @@ void runSettingsCheck() {
            loaded.settings.directMessageLayout == MessageLayout::Stacked);
     assert(fileText(preferences).find("word_prediction = true") != std::string::npos);
     assert(loaded.settings.cursorShape == "box" && loaded.settings.cursorBlink == "smooth" &&
-           loaded.settings.cursorTrail && loaded.settings.cursorTrailStyle == "pixiedust");
+           loaded.settings.cursorTrail && loaded.settings.cursorTrailStyle == "pixiedust" &&
+           loaded.settings.cursorSmoothBlinkMs == 625);
     assert(loaded.settings.sendMotion == model.settings.sendMotion &&
            loaded.settings.sendReveal == model.settings.sendReveal);
     assert(loaded.settings.incomingMotion == model.settings.incomingMotion &&

@@ -855,7 +855,7 @@ struct Ui::Impl {
     std::uint32_t reactionActivationKey = 0;
     std::vector<std::string_view> jumpCandidates;
     std::string jumpPrefix, jumpServer, jumpCancelBinding, jumpCancelChord;
-    WorkspaceRect conversationRect;
+    WorkspaceRect panelArea, conversationRect;
     int savedUnread = -1;
     Node *palette = nullptr;
     Box *palettePanel = nullptr;
@@ -1020,10 +1020,8 @@ struct Ui::Impl {
                 model.settings.bindings.try_emplace(name, binding);
         }
         scene->beforeChildrenLayout = [this](Renderer &renderer) {
-            if (panelFramePending) {
-                panelFramePending = false;
-                refresh();
-            }
+            if (panelFramePending)
+                layoutPanels(false);
             const float naturalWidth =
                 renderer
                     .measureText(title->text(), title->fontSize(), title->font(), 0, 1,
@@ -1320,6 +1318,7 @@ struct Ui::Impl {
     bool synchronizePointerInput(float x, float y, bool targetInput, bool pendingReplay = true);
     void updateRegularPanelModes();
     void updatePanelMotion(std::array<float, 3> target);
+    void layoutPanels(bool syncModel, bool panelResize = false);
     bool hasUnread() const {
         return std::any_of(model.buffers.begin(), model.buffers.end(), [](const auto &entry) {
             return entry.second.kind != "search" && !entry.second.muted && entry.second.unread > 0;
@@ -3977,6 +3976,109 @@ void Ui::Impl::syncViews() {
     for (const auto &[id, view] : views)
         view->sync(conversationRect, id == workspace.focused);
 }
+void Ui::Impl::layoutPanels(bool syncModel, bool panelResize) {
+    const auto previousPresentation = panelPresentation;
+    if (!syncModel && panelAnimation && (!motionEnabled() || !MotionService::instance().enabled()))
+        updatePanelMotion(panelTarget);
+    panelFramePending = false;
+    if (!panelAnimation)
+        panelPresentation = {navigationMode, peopleMode};
+    const auto [outer, top, shellWidth, contentHeight] = panelArea;
+    const float navigationGap = std::min(outer, panelExtent[0]);
+    const float peopleGap = std::min(outer, panelExtent[1]);
+    const float railGap = std::min(outer, panelExtent[2]);
+    const float railWidth = panelExtent[2] - railGap;
+    const float navigationWidth = panelExtent[0] - navigationGap;
+    const float peopleWidth = panelExtent[1] - peopleGap;
+    if (panelResize && (rail->width() != railWidth || sidebar->width() != navigationWidth)) {
+        // Only moving effective geometry retires content; the handle keeps its capture.
+        for (auto *node :
+             {static_cast<Node *>(rail), static_cast<Node *>(sidebar), static_cast<Node *>(people)})
+            retireSubtreePointerCapture(*node);
+        for (auto &[id, view] : views)
+            retireSubtreePointerCapture(*view);
+        inputGeometryPending = true;
+    }
+    const auto retireExpandedControl = [this](Node &control) {
+        InputArea *replacement = windowButtons[0];
+        if (const auto view = views.find(workspace.focused); dispatcher && view != views.end())
+            if (auto *input = dispatcher->firstTabFocusUnder(view->second->composer))
+                replacement = input;
+        retirePanel(control, replacement, true);
+    };
+    const bool syncRail = syncModel || rail->width() != railWidth;
+    place(*rail, outer, top, railWidth, contentHeight);
+    if (syncRail && railWidth > 0)
+        rail->sync(selectedServer, railWidth, contentHeight, scale);
+    rail->setVisible(panelExtent[2] > 0);
+    rail->setHitTestVisible(workspace.serverRailVisible);
+    rail->setExcludeSubtreeFromTabOrder(!workspace.serverRailVisible);
+    const float left = outer + panelExtent[2];
+    const bool syncSidebar = syncModel || sidebar->width() != navigationWidth ||
+                             previousPresentation[0] != panelPresentation[0];
+    place(*sidebar, left, top, navigationWidth, contentHeight);
+    if (syncSidebar) {
+        sidebar->sync(selectedServer, lastBuffer, navigationWidth, contentHeight, scale,
+                      panelPresentation[0]);
+        sidebar->setInteractionMode(navigationMode, retireExpandedControl);
+        sidebar->setHitTestVisible(navigationMode != SidebarMode::Hidden);
+        sidebar->setExcludeSubtreeFromTabOrder(navigationMode == SidebarMode::Hidden);
+    }
+    const float dividerX = outer + railWidth + (railGap - 1.f) / 2;
+    place(*navigationDividers[0], dividerX, top, 1.f, contentHeight);
+    navigationDividers[0]->setVisible(panelExtent[2] > 0);
+    place(*navigationDividers[1], left + navigationWidth + (navigationGap - 1.f) / 2, top,
+          1.f, contentHeight);
+    navigationDividers[1]->setVisible(panelExtent[0] > 0);
+    if (syncModel) {
+        const auto dividerColor =
+            withAlpha(themeColor("outline_variant"), .18f * themeSurfaceAlpha());
+        for (std::size_t i = 0; i < navigationDividers.size(); ++i)
+            navigationDividers[i]->setFill(
+                widthHandles[i]->focused() ? themeForegroundColor("secondary") : dividerColor);
+        const bool railHandleVisible =
+            workspace.serverRailVisible && !jumpOpen && !paletteOpen && !dialogs->active();
+        if (!railHandleVisible && widthHandles[0]->visible())
+            retirePanel(*widthHandles[0], networksButton, true);
+        widthHandles[0]->setVisible(railHandleVisible);
+        widthHandles[0]->setExcludeSubtreeFromTabOrder(!railHandleVisible);
+        widthHandles[1]->setVisible(navigationMode != SidebarMode::Hidden && !jumpOpen &&
+                                    !paletteOpen && !dialogs->active());
+    }
+    const float handleWidth = 8 * scale;
+    place(*widthHandles[0], dividerX - handleWidth / 2, top, handleWidth, contentHeight);
+    place(*widthHandles[1], left + navigationWidth + navigationGap / 2 - handleWidth / 2, top,
+          handleWidth, contentHeight);
+    const float chatLeft = left + panelExtent[0];
+    const float right = outer + shellWidth - panelExtent[1];
+    const float chatWidth = std::max(1.f, right - chatLeft);
+    if (conversationRect.x != chatLeft || conversationRect.y != top ||
+        conversationRect.width != chatWidth || conversationRect.height != contentHeight) {
+        inputGeometryPending = true;
+        conversationRect = {chatLeft, top, chatWidth, contentHeight};
+        if (!syncModel)
+            if (const auto view = views.find(workspace.focused); view != views.end())
+                place(*view->second, conversationRect);
+    }
+    const bool syncPeople = syncModel || people->width() != peopleWidth ||
+                            previousPresentation[1] != panelPresentation[1];
+    const WorkspaceRect peopleRect{right + peopleGap, top, peopleWidth, contentHeight};
+    place(*people, peopleRect);
+    if (syncPeople) {
+        people->sync(lastBuffer, peopleWidth, contentHeight, scale, panelPresentation[1]);
+        people->setInteractionMode(peopleMode, retireExpandedControl);
+        people->setHitTestVisible(peopleMode != SidebarMode::Hidden);
+        people->setExcludeSubtreeFromTabOrder(peopleMode == SidebarMode::Hidden);
+    }
+    peopleMaterial->setVisible(panelExtent[1] > 0);
+    if (panelExtent[1] > 0)
+        place(*peopleMaterial, peopleRect);
+    if (syncModel)
+        peopleMaterial->sync();
+    if (!syncModel && !panelAnimation && windowActive)
+        repairFocus();
+}
+
 void Ui::Impl::drainPending() {
     while (!pending.empty()) {
         auto command = std::move(pending.front());
@@ -4187,21 +4289,6 @@ void Ui::Impl::refresh(bool panelResize) {
     updatePanelMotion({targetNavigation + (navigationMode != SidebarMode::Hidden ? boundary : 0.f),
                        targetPeople + (peopleMode != SidebarMode::Hidden ? boundary : 0.f),
                        targetRail});
-    const float navigationGap = std::min(boundary, panelExtent[0]);
-    const float peopleGap = std::min(boundary, panelExtent[1]);
-    const float railGap = std::min(boundary, panelExtent[2]);
-    const float railWidth = panelExtent[2] - railGap;
-    const float navigationWidth = panelExtent[0] - navigationGap;
-    const float peopleWidth = panelExtent[1] - peopleGap;
-    if (panelResize && (rail->width() != railWidth || sidebar->width() != navigationWidth)) {
-        // Only moving effective geometry retires content; the handle keeps its capture.
-        for (auto *node :
-             {static_cast<Node *>(rail), static_cast<Node *>(sidebar), static_cast<Node *>(people)})
-            retireSubtreePointerCapture(*node);
-        for (auto &[id, view] : views)
-            retireSubtreePointerCapture(*view);
-        inputGeometryPending = true;
-    }
     if (previousNavigation != navigationMode)
         retirePanel(*sidebar, windowButtons[0], navigationMode == SidebarMode::Hidden);
     if (previousPeople != peopleMode) {
@@ -4210,68 +4297,8 @@ void Ui::Impl::refresh(bool panelResize) {
             replacement = dispatcher->firstTabFocusUnder(view->second->titleLine);
         retirePanel(*people, replacement, peopleMode == SidebarMode::Hidden);
     }
-    const auto retireExpandedControl = [this](Node &control) {
-        InputArea *replacement = windowButtons[0];
-        if (const auto view = views.find(workspace.focused); dispatcher && view != views.end())
-            if (auto *input = dispatcher->firstTabFocusUnder(view->second->composer))
-                replacement = input;
-        retirePanel(control, replacement, true);
-    };
-    const WorkspaceRect railRect{outer, contentTop, railWidth, contentHeight};
-    place(*rail, railRect);
-    if (railWidth > 0)
-        rail->sync(selectedServer, railRect.width, railRect.height, scale);
-    rail->setVisible(panelExtent[2] > 0);
-    rail->setHitTestVisible(workspace.serverRailVisible);
-    rail->setExcludeSubtreeFromTabOrder(!workspace.serverRailVisible);
-    float left = outer + panelExtent[2];
-    const WorkspaceRect navigationRect{left, contentTop, navigationWidth, contentHeight};
-    place(*sidebar, navigationRect);
-    sidebar->sync(selectedServer, lastBuffer, navigationRect.width, navigationRect.height, scale,
-                  panelPresentation[0]);
-    sidebar->setInteractionMode(navigationMode, retireExpandedControl);
-    sidebar->setHitTestVisible(navigationMode != SidebarMode::Hidden);
-    sidebar->setExcludeSubtreeFromTabOrder(navigationMode == SidebarMode::Hidden);
-    const auto dividerColor = withAlpha(themeColor("outline_variant"), .18f * themeSurfaceAlpha());
-    const float dividerX = outer + railWidth + (railGap - 1.f) / 2;
-    place(*navigationDividers[0], dividerX, contentTop, 1.f, contentHeight);
-    navigationDividers[0]->setVisible(panelExtent[2] > 0);
-    place(*navigationDividers[1], left + navigationWidth + (navigationGap - 1.f) / 2, contentTop,
-          1.f, contentHeight);
-    navigationDividers[1]->setVisible(panelExtent[0] > 0);
-    for (std::size_t i = 0; i < navigationDividers.size(); ++i)
-        navigationDividers[i]->setFill(
-            widthHandles[i]->focused() ? themeForegroundColor("secondary") : dividerColor);
-    const float handleWidth = 8 * scale;
-    place(*widthHandles[0], dividerX - handleWidth / 2, contentTop, handleWidth, contentHeight);
-    place(*widthHandles[1], left + navigationWidth + navigationGap / 2 - handleWidth / 2,
-          contentTop, handleWidth, contentHeight);
-    const bool railHandleVisible =
-        workspace.serverRailVisible && !jumpOpen && !paletteOpen && !dialogs->active();
-    if (!railHandleVisible && widthHandles[0]->visible())
-        retirePanel(*widthHandles[0], networksButton, true);
-    widthHandles[0]->setVisible(railHandleVisible);
-    widthHandles[0]->setExcludeSubtreeFromTabOrder(!railHandleVisible);
-    widthHandles[1]->setVisible(navigationMode != SidebarMode::Hidden && !jumpOpen &&
-                                !paletteOpen && !dialogs->active());
-    left += panelExtent[0];
-    const float right = width - outer - panelExtent[1];
-    const float chatWidth = std::max(1.f, right - left);
-    if (conversationRect.x != left || conversationRect.y != contentTop ||
-        conversationRect.width != chatWidth || conversationRect.height != contentHeight)
-        inputGeometryPending = true;
-    conversationRect = {left, contentTop, chatWidth, contentHeight};
-    const WorkspaceRect peopleRect{right + peopleGap, contentTop, peopleWidth, contentHeight};
-    place(*people, peopleRect);
-    people->sync(lastBuffer, peopleRect.width, peopleRect.height, scale, panelPresentation[1]);
-    people->setInteractionMode(peopleMode, retireExpandedControl);
-    people->setHitTestVisible(peopleMode != SidebarMode::Hidden);
-    people->setExcludeSubtreeFromTabOrder(peopleMode == SidebarMode::Hidden);
-    peopleMaterial->setVisible(panelExtent[1] > 0);
-    if (panelExtent[1] > 0) {
-        place(*peopleMaterial, peopleRect);
-        peopleMaterial->sync();
-    }
+    panelArea = {outer, contentTop, width - 2 * outer, contentHeight};
+    layoutPanels(true, panelResize);
     const auto navigationBinding = model.settings.bindings.find("toggle-navigation");
     const std::string_view navigationValue = navigationBinding == model.settings.bindings.end()
                                                  ? std::string_view{}

@@ -9845,6 +9845,58 @@ void smartPresenceRedactionInvalidation(TranscriptTestRenderer &renderer) {
     assert(model.actions.empty());
 }
 
+void smartPresenceResizeInvalidation(TranscriptTestRenderer &renderer) {
+    blast::Model model;
+    model.settings.timestamps = model.settings.avatars = false;
+    model.settings.reducedMotion = true;
+    model.settings.presence = blast::PresenceMode::Smart;
+    blast::Theme theme;
+    theme.update(model);
+    auto &buffer = model.buffers["smart-resize"];
+    buffer.id = buffer.target = "smart-resize";
+    buffer.kind = "channel";
+    buffer.server = "network";
+    auto &mapping = model.networks[buffer.server].caseMapping;
+    mapping = "rfc1459";
+    blast::Message chat;
+    chat.id = "known-chat";
+    chat.nick = "[Peer]";
+    chat.text = "Retained participant chat";
+    chat.timestamp = 100000;
+    buffer.messages.push_back(chat);
+    blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = {}};
+    Clipboard clipboard;
+    blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+    view.setReadEligible(false);
+    const auto arrange = [&](float width) {
+        view.sync();
+        view.arrange(renderer, {17, 23, width, 1000});
+    };
+    arrange(900);
+    blast::Message event;
+    event.id = "known-part";
+    event.nick = "{peer}";
+    event.text = "Participant departed";
+    event.timestamp = 100100;
+    event.presence = true;
+    event.activity = blast::ActivityKind::Part;
+    buffer.messages.push_back(event);
+    arrange(420);
+    assert(bodyText(view, event.text));
+    arrange(900);
+    assert(bodyText(view, event.text));
+    mapping = "ascii";
+    arrange(900);
+    assert(!bodyText(view, event.text));
+    mapping = "rfc1459";
+    arrange(420);
+    assert(bodyText(view, event.text));
+    buffer.messages.front().nick = "Other";
+    ++buffer.messagesRevision;
+    arrange(420);
+    assert(!bodyText(view, event.text));
+}
+
 void contentFitAndConsecutiveGroups(TranscriptTestRenderer &renderer) {
     blast::Model model;
     model.settings.channelMessageLayout = blast::MessageLayout::Bubbles;
@@ -11238,6 +11290,7 @@ void runTranscriptCheck() {
     blurredBodyAndReplyPrivacy(renderer);
     smartPresenceNickTransfer(renderer);
     smartPresenceRedactionInvalidation(renderer);
+    smartPresenceResizeInvalidation(renderer);
     contentFitAndConsecutiveGroups(renderer);
     inlineNicknameChips(renderer);
     for (const float zoom : {1.f, 2.f})

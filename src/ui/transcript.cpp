@@ -1014,6 +1014,7 @@ struct TranscriptView::Impl {
         uint64_t gapNavigation = 0;
         PresenceMode projectedPresence = PresenceMode::Smart;
         uint64_t participationRevision = 0;
+        std::string smartCaseMapping = "rfc1459";
         uint64_t mediaParticipationRevision = 0;
         size_t projectionFrom = 0;
         // Arrivals observed before a focus reveal settles are resolved against its final offset.
@@ -3352,51 +3353,44 @@ struct TranscriptView::Impl {
         estimateHeight(row, buffer, index, g, width);
         return row;
     }
-    void projectActivities(const Buffer &buffer, const Geometry &g, float width, size_t first,
-                           bool reflow, size_t appendFrom = absent) {
+    void extendSmartPresence(const Buffer &buffer, std::string_view mapping) {
         auto &c = *cache;
-        const auto mode = effectivePresenceMode(model.settings, buffer.id, buffer.target);
-        if (first == 0 || c.smartEligible.size() > buffer.messages.size()) {
-            c.smartEligible.clear();
-            c.smartActivity.clear();
-        }
-        auto &smartEligible = c.smartEligible;
-        if (mode == PresenceMode::Smart) {
-            const auto network = model.networks.find(buffer.server);
-            const auto mapping =
-                network == model.networks.end() ? "rfc1459" : network->second.caseMapping;
-            const size_t processed = smartEligible.size();
-            smartEligible.resize(buffer.messages.size());
-            for (size_t i = processed; i < buffer.messages.size(); ++i) {
-                const auto &entry = buffer.messages[i];
-                auto &times = c.smartActivity[irc::casefold(entry.nick, mapping)];
-                if (!entry.presence && !entry.deleted) {
-                    times.push_back(entry.timestamp);
-                    if (times.size() > 5)
-                        times.pop_front();
+        const size_t processed = c.smartEligible.size();
+        c.smartEligible.resize(buffer.messages.size());
+        for (size_t i = processed; i < buffer.messages.size(); ++i) {
+            const auto &entry = buffer.messages[i];
+            const auto old = irc::casefold(entry.nick, mapping);
+            auto &times = c.smartActivity[old];
+            if (!entry.presence && !entry.deleted) {
+                times.push_back(entry.timestamp);
+                if (times.size() > 5)
+                    times.pop_front();
+            }
+            size_t recent = 0;
+            bool live = false;
+            for (const auto at : times)
+                if (at <= entry.timestamp) {
+                    live = live || entry.timestamp - at <= 300;
+                    recent += entry.timestamp - at <= 7 * 86400;
                 }
-                size_t recent = 0;
-                bool live = false;
-                for (const auto at : times)
-                    if (at <= entry.timestamp) {
-                        live = live || entry.timestamp - at <= 300;
-                        recent += entry.timestamp - at <= 7 * 86400;
-                    }
-                smartEligible[i] = entry.own || live || recent >= 5;
-                if (entry.activity == ActivityKind::Nick && !entry.activityTarget.empty()) {
-                    const auto old = irc::casefold(entry.nick, mapping);
-                    const auto replacement = irc::casefold(entry.activityTarget, mapping);
-                    if (old != replacement) {
-                        auto &destination = c.smartActivity[replacement];
-                        destination.insert(destination.end(), times.begin(), times.end());
-                        std::sort(destination.begin(), destination.end());
-                        while (destination.size() > 5)
-                            destination.pop_front();
-                        c.smartActivity.erase(old);
-                    }
+            c.smartEligible[i] = entry.own || live || recent >= 5;
+            if (entry.activity == ActivityKind::Nick && !entry.activityTarget.empty()) {
+                const auto replacement = irc::casefold(entry.activityTarget, mapping);
+                if (old != replacement) {
+                    auto &destination = c.smartActivity[replacement];
+                    destination.insert(destination.end(), times.begin(), times.end());
+                    std::sort(destination.begin(), destination.end());
+                    while (destination.size() > 5)
+                        destination.pop_front();
+                    c.smartActivity.erase(old);
                 }
             }
         }
+    }
+    void projectActivities(const Buffer &buffer, const Geometry &g, float width, PresenceMode mode,
+                           size_t first, bool reflow, size_t appendFrom) {
+        auto &c = *cache;
+        const auto &smartEligible = c.smartEligible;
         first = std::min(first, c.rows.size());
         if (first == c.rows.size()) {
             c.projectedPresence = mode;
@@ -3600,10 +3594,14 @@ struct TranscriptView::Impl {
             clearTextSelection();
             closePopup();
         }
-        const bool participationChanged =
-            mode == PresenceMode::Smart && c.participationRevision != buffer.participationRevision;
-        const bool modeChanged =
-            c.projectedPresence != mode || policyChanged || participationChanged;
+        const auto network = model.networks.find(buffer.server);
+        const std::string_view mapping =
+            network == model.networks.end() ? std::string_view("rfc1459")
+                                            : std::string_view(network->second.caseMapping);
+        const bool smartInputsChanged = c.participationRevision != buffer.participationRevision ||
+                                        c.smartCaseMapping != mapping;
+        const bool modeChanged = c.projectedPresence != mode || policyChanged ||
+                                 (mode == PresenceMode::Smart && smartInputsChanged);
         const bool reflow = c.width != width || c.geometry.key != g.key || policyChanged;
         if (reflow) {
             const float widthRatio =
@@ -3806,6 +3804,13 @@ struct TranscriptView::Impl {
                     }
                 }
         }
+        if (!appendOnly || smartInputsChanged) {
+            c.smartEligible.clear();
+            c.smartActivity.clear();
+            c.smartCaseMapping = mapping;
+        }
+        if (mode == PresenceMode::Smart && c.smartEligible.size() < buffer.messages.size())
+            extendSmartPresence(buffer, mapping);
         if (changed || reflow || markerChanged || modeChanged || c.projectionFrom != absent) {
             size_t first = 0;
             if (!reflow && !markerChanged && !modeChanged && appendOnly) {
@@ -3822,7 +3827,7 @@ struct TranscriptView::Impl {
                                               !modeChanged && c.projectionFrom == absent
                                           ? previousCount
                                           : absent;
-            projectActivities(buffer, g, width, first, reflow, appendFrom);
+            projectActivities(buffer, g, width, mode, first, reflow, appendFrom);
             c.gapKey.clear();
         }
         std::string gapKey = g.key + ":" + c.foolPolicy + ":" + std::to_string(int(mode)) + ":" +

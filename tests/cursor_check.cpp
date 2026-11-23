@@ -297,26 +297,52 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
         focus.pointerEnter(20, 24, 402);
         editor.setCaretStyle(Shape::Box, Blink::Smooth);
         assert(capture(editor) == plain);
-        tickCursorTimers(250ms);
+        for (int i = 0; i < 4; ++i) {
+            focus.keyEvent(XKB_KEY_x, 'x', 0, true);
+            focus.keyEvent(XKB_KEY_BackSpace, 0, 0, true);
+            editor.layout(renderer);
+            tickCursorTimers(140ms);
+            assert(capture(editor) == plain);
+        }
+        editor.restoreEditingState(moved);
+        editor.layout(renderer);
+        tickCursorTimers(750ms);
         focus.syncPointerHover();
         const auto faded = capture(editor);
         assert(faded != plain && faded != inactive);
         assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
         focus.pointerMotion(21, 24, 403);
         assert(capture(editor) == plain);
-        const auto smoothOpacity = [&](std::chrono::milliseconds fade) {
-            editor.setCaretStyle(Shape::Box, Blink::Smooth, false, TrailStyle::Classic, fade);
-            assert(capture(editor) == plain);
-            tickCursorTimers(220ms);
-            const auto frame = capture(editor);
+        const auto opacity = [&](const auto &frame) {
             int alpha = 0;
             for (std::size_t i = 3; i < frame.size(); i += 4)
                 if (plain[i] > inactive[i])
                     alpha += int(frame[i]) - int(inactive[i]);
             return alpha;
         };
+        const int solid = opacity(plain);
+        editor.setCaretStyle(Shape::Box, Blink::Smooth, false, TrailStyle::Classic, 250ms);
+        tickCursorTimers(625ms);
+        const int fadingOut = opacity(capture(editor));
+        tickCursorTimers(125ms);
+        const int trough = opacity(capture(editor));
+        tickCursorTimers(125ms);
+        const int fadingIn = opacity(capture(editor));
+        tickCursorTimers(100ms);
+        const int recovered = opacity(capture(editor));
+        assert(trough > solid / 10 && trough < solid / 3);
+        assert(fadingOut > trough && fadingOut < solid * 4 / 5);
+        assert(fadingIn > trough && fadingIn < solid * 4 / 5);
+        assert(recovered > solid * 9 / 10);
+
+        const auto smoothOpacity = [&](std::chrono::milliseconds fade) {
+            editor.setCaretStyle(Shape::Box, Blink::Smooth, false, TrailStyle::Classic, fade);
+            assert(capture(editor) == plain);
+            tickCursorTimers(720ms);
+            return opacity(capture(editor));
+        };
         const int fast = smoothOpacity(200ms);
-        const int slow = smoothOpacity(1000ms);
+        const int slow = smoothOpacity(5000ms);
         assert(slow > 2 * fast && slow > 0);
         editor.setCaretStyle(Shape::Box, Blink::Off);
         assert(capture(editor) == plain);

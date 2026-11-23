@@ -68,7 +68,7 @@ struct Cue {
 // Ordered like Input::CaretTrailStyle.
 inline constexpr std::array<std::string_view, 7> cursorTrailStyleIds{
     "classic", "motion-blur", "blaze", "lightning", "railgun", "torpedo", "pixiedust"};
-inline constexpr int cursorSmoothBlinkMinMs = 200, cursorSmoothBlinkMaxMs = 1000;
+inline constexpr int cursorSmoothBlinkMinMs = 200, cursorSmoothBlinkMaxMs = 5000;
 struct Settings {
     UploadConfig uploads;
     FxLevel fx = FxLevel::Subtle;
@@ -97,7 +97,7 @@ struct Settings {
     string spellcheckLanguage = "auto";
     bool wordPrediction = false;
     string cursorShape = "line", cursorBlink = "step";
-    int cursorSmoothBlinkMs = 500;
+    int cursorSmoothBlinkMs = 1500;
     bool cursorTrail = false;
     string cursorTrailStyle = "classic";
     SidebarMode peopleMode = SidebarMode::Hidden;

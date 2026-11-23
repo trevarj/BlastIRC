@@ -2649,7 +2649,7 @@ int main() {
             assert(expected.settings.cursorShape == "line" &&
                    expected.settings.cursorBlink == "step" && !expected.settings.cursorTrail &&
                    expected.settings.cursorTrailStyle == "classic" &&
-                   expected.settings.cursorSmoothBlinkMs == 500);
+                   expected.settings.cursorSmoothBlinkMs == 1500);
             assert(expected.settings.peopleMode == SidebarMode::Hidden);
             assert(expected.settings.opacity == 1.f && !expected.settings.transparency &&
                    expected.settings.messageLayouts.empty());
@@ -3128,7 +3128,7 @@ int main() {
             assert(legacy.settings.cursorShape == "line" &&
                    legacy.settings.cursorBlink == "step" && !legacy.settings.cursorTrail &&
                    legacy.settings.cursorTrailStyle == "classic" &&
-                   legacy.settings.cursorSmoothBlinkMs == 500);
+                   legacy.settings.cursorSmoothBlinkMs == 1500);
             assert(legacy.settings.peopleMode == SidebarMode::Hidden &&
                    legacy.settings.workspace == expected.settings.workspace);
             assert(legacy.identities[0].password == expected.identities[0].password);
@@ -3483,7 +3483,7 @@ int main() {
         const FxLevel levels[] = {FxLevel::Off, FxLevel::Subtle, FxLevel::Full};
         const char *shapes[] = {"line", "box", "underline"};
         const char *blinks[] = {"off", "step", "smooth"};
-        const int fades[] = {200, 333, 625, 1000};
+        const int fades[] = {200, 333, 500, 625, 1000, 5000};
         const char *trailStyles[] = {"classic", "motion-blur", "blaze", "lightning",
                                      "railgun", "torpedo", "pixiedust"};
         for (std::size_t index = 0; index < 2 * std::size(trailStyles); ++index) {
@@ -3543,7 +3543,7 @@ int main() {
             storage.load(actual);
             assert(actual.settings.cursorShape == "underline" &&
                    actual.settings.cursorBlink == test.blink &&
-                   actual.settings.cursorSmoothBlinkMs == 500 &&
+                   actual.settings.cursorSmoothBlinkMs == 1500 &&
                    actual.settings.cursorTrail == test.trail &&
                    actual.settings.cursorTrailStyle == "classic" && contents(file) == source);
             storage.save(actual);
@@ -3551,7 +3551,7 @@ int main() {
             const auto cursor = saved["cursor"];
             assert(cursor["shape"].value<string>() == "underline" &&
                    cursor["blink"].value<string>() == test.blink &&
-                   cursor["smooth_blink_ms"].value_exact<int64_t>() == 500 &&
+                   cursor["smooth_blink_ms"].value_exact<int64_t>() == 1500 &&
                    cursor["trail"].value<bool>() == test.trail &&
                    cursor["trail_style"].value<string>() == "classic" &&
                    !cursor["effect"] && !cursor["trail_duration_ms"] && !cursor["trail_strength"]);
@@ -3559,7 +3559,7 @@ int main() {
             storage.load(reopened);
             assert(reopened.settings.cursorShape == "underline" &&
                    reopened.settings.cursorBlink == test.blink &&
-                   reopened.settings.cursorSmoothBlinkMs == 500 &&
+                   reopened.settings.cursorSmoothBlinkMs == 1500 &&
                    reopened.settings.cursorTrail == test.trail &&
                    reopened.settings.cursorTrailStyle == "classic" &&
                    contents(config / "config.toml") == originalConfig);
@@ -3614,7 +3614,7 @@ int main() {
             else if (diagnostic == "cursor.trail_style")
                 invalid.settings.cursorTrailStyle = "motion_blur";
             else if (diagnostic == "cursor.smooth_blink_ms")
-                invalid.settings.cursorSmoothBlinkMs = 1001;
+                invalid.settings.cursorSmoothBlinkMs = 5001;
             else if (diagnostic == "appearance.send_motion")
                 invalid.settings.sendMotion = static_cast<SendMotion>(-1);
             else if (diagnostic == "appearance.incoming_motion")
@@ -3914,7 +3914,7 @@ int main() {
             {"[cursor]\nblink = ''\n", "cursor.blink"},
             {"[cursor]\nblink = true\n", "blink"},
             {"[cursor]\nsmooth_blink_ms = 199\n", "cursor.smooth_blink_ms"},
-            {"[cursor]\nsmooth_blink_ms = 1001\n", "cursor.smooth_blink_ms"},
+            {"[cursor]\nsmooth_blink_ms = 5001\n", "cursor.smooth_blink_ms"},
             {"[cursor]\nsmooth_blink_ms = 500.0\n", "smooth_blink_ms"},
             {"[cursor]\nsmooth_blink_ms = '500'\n", "smooth_blink_ms"},
             {"[cursor]\nsmooth_blink_ms = true\n", "smooth_blink_ms"},

@@ -55,8 +55,9 @@ namespace {
   constexpr float kCursorRevealPadding = 2.0F;
   constexpr float kClearGlyphScale = 0.85F;
   constexpr auto kCursorBlinkInterval = std::chrono::milliseconds(500);
+  constexpr auto kCursorSmoothBlinkDelay = std::chrono::milliseconds(500);
   constexpr auto kCursorBlinkIdle = std::chrono::seconds(15);
-  constexpr auto kCursorBlinkSample = std::chrono::milliseconds(50);
+  constexpr auto kCursorBlinkSample = std::chrono::milliseconds(16);
   constexpr auto kCursorTrailDwell = std::chrono::milliseconds(1);
   constexpr auto kCursorTrailSample = std::chrono::milliseconds(10);
   constexpr float kTextInnerInset = 3.0F;
@@ -2854,7 +2855,7 @@ void Input::revealCursor() {
   updateCursorVisibility();
   if (!m_cursor->visible() || !MotionService::instance().enabled() ||
       m_caretBlink == CaretBlink::Off || m_cursorBlinkTimer.active()) return;
-  const auto first = m_caretBlink == CaretBlink::Smooth ? kCursorBlinkSample : kCursorBlinkInterval;
+  const auto first = m_caretBlink == CaretBlink::Smooth ? kCursorSmoothBlinkDelay : kCursorBlinkInterval;
   m_cursorBlinkTimer.start(first, [this] { updateCursorBlink(); });
 }
 
@@ -2862,21 +2863,35 @@ void Input::updateCursorBlink() {
   using namespace std::chrono;
   const auto now = steady_clock::now();
   const auto elapsed = now - m_cursorBlinkEpoch;
-  if (m_caretBlink == CaretBlink::Off || elapsed >= kCursorBlinkIdle ||
-      !caretPaintEligible() || !MotionService::instance().enabled()) {
+  const bool smooth = m_caretBlink == CaretBlink::Smooth;
+  if (m_caretBlink == CaretBlink::Off
+      || (!smooth && elapsed >= kCursorBlinkIdle)
+      || !caretPaintEligible()
+      || !MotionService::instance().enabled()) {
     stopCursorBlink();
     updateCursorVisibility();
     return;
   }
-  const auto interval = m_caretBlink == CaretBlink::Smooth ? m_smoothBlinkInterval : kCursorBlinkInterval;
-  const auto half = elapsed / interval;
-  const auto phase = elapsed - half * interval;
+  const auto interval = smooth ? m_smoothBlinkInterval : kCursorBlinkInterval;
+  const auto delay = smooth ? kCursorSmoothBlinkDelay : milliseconds::zero();
+  if (elapsed < delay) {
+    m_cursorBlinkTimer.start(ceil<milliseconds>(delay - elapsed), [this] { updateCursorBlink(); });
+    return;
+  }
+  const auto age = elapsed - delay;
+  const auto half = age / interval;
+  const auto phase = age - half * interval;
   const bool fadingOut = half % 2 == 0;
   auto next = ceil<milliseconds>(interval - phase);
-  if (m_caretBlink == CaretBlink::Smooth) {
+  if (smooth) {
+    const auto cycleStart = elapsed - phase - (fadingOut ? milliseconds::zero() : interval);
+    if (cycleStart >= kCursorBlinkIdle) {
+      stopCursorBlink();
+      updateCursorVisibility();
+      return;
+    }
     const float t = duration<float, std::milli>(phase).count() / static_cast<float>(interval.count());
-    const float eased = input_caret::easeInOut(t);
-    m_cursorOpacity = fadingOut ? 1.0F - eased : eased;
+    m_cursorOpacity = 0.60F + (fadingOut ? 0.40F : -0.40F) * std::cos(std::numbers::pi_v<float> * t);
     next = std::min(next, kCursorBlinkSample);
   } else {
     m_cursorOpacity = fadingOut ? 1.0F : 0.0F;

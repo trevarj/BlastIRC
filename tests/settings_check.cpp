@@ -1555,8 +1555,8 @@ void runSettingsCheck() {
     auto *smoothBlinkFade = named<Slider>(dialogs, "Smooth blink fade (ms)");
     assert(cursorShape->selectedText() == "Line" && cursorBlink->selectedText() == "Step" &&
            !model.settings.cursorTrail && trailStyle->selectedText() == "Classic" &&
-           model.settings.cursorTrailStyle == "classic" && smoothBlinkFade->value() == 500 &&
-           model.settings.cursorSmoothBlinkMs == 500);
+           model.settings.cursorTrailStyle == "classic" && smoothBlinkFade->value() == 1500 &&
+           model.settings.cursorSmoothBlinkMs == 1500);
     constexpr std::array cursorBlinks{"off", "step", "smooth"};
     for (std::size_t index = 0; index < cursorBlinks.size(); ++index) {
         cursorBlink->setSelectedIndex(index);
@@ -1572,7 +1572,7 @@ void runSettingsCheck() {
     dispatcher.keyEvent(XKB_KEY_Right, 0, 0, true);
     assert(model.settings.cursorSmoothBlinkMs == 225);
     dispatcher.keyEvent(XKB_KEY_End, 0, 0, true);
-    assert(model.settings.cursorSmoothBlinkMs == 1000);
+    assert(model.settings.cursorSmoothBlinkMs == 5000);
     smoothBlinkFade->setValue(625);
     assert(model.settings.cursorSmoothBlinkMs == 625 && model.settings.cursorBlink == "off");
     constexpr std::array trailNames{"Classic", "Motion Blur", "Blaze", "Lightning",

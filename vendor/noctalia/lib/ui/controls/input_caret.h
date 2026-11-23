@@ -59,14 +59,4 @@ inline bool advance(Corners& current, LayoutRect target, float elapsedMs, float 
   if (!moving) current = end;
   return moving;
 }
-
-inline float easeInOut(float x) noexcept {
-  float t = x;
-  for (int i = 0; i < 4; ++i) {
-    const float dx = (0.52F * t - 0.78F) * t + 1.26F;
-    const float slope = (1.56F * t - 1.56F) * t + 1.26F;
-    t -= (t * dx - x) / slope;
-  }
-  return t * t * (3.0F - 2.0F * t);
-}
 } // namespace input_caret

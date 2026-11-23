@@ -521,7 +521,7 @@ void validate(const Settings &settings) {
         invalid("cursor.blink", "off, step, or smooth");
     if (settings.cursorSmoothBlinkMs < cursorSmoothBlinkMinMs ||
         settings.cursorSmoothBlinkMs > cursorSmoothBlinkMaxMs)
-        invalid("cursor.smooth_blink_ms", "an integer from 200 through 1000");
+        invalid("cursor.smooth_blink_ms", "an integer from 200 through 5000");
     if (std::ranges::find(cursorTrailStyleIds, settings.cursorTrailStyle) ==
         cursorTrailStyleIds.end())
         invalid("cursor.trail_style",

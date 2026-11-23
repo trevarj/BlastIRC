@@ -476,9 +476,9 @@ struct EditorStore::Impl {
 EditorStore::Impl::Draft &EditorStore::Impl::draft(const std::string &id) {
     auto [entry, fresh] = drafts.try_emplace(id);
     if (!fresh && !entry->second.identity && model.buffers.contains(id)) {
-        const auto revision = entry->second.revision;
-        entry->second = Draft{};
-        entry->second.revision = revision + 1;
+        Draft replacement;
+        replacement.revision = entry->second.revision + 1;
+        entry->second = std::move(replacement);
         fresh = true;
     }
     if (fresh) {

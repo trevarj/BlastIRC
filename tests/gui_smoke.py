@@ -5142,7 +5142,7 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
         return [line for line in data.decode('utf-8', errors='replace').splitlines()
                 if any(pattern.search(line) for pattern in patterns)]
 
-    def blink_pixels(label, expected):
+    def blink_pixels(label, expected, *, smooth_fade_ms=0):
         caret = state(len(encoded), len(encoded))
         x, y, width, height = caret['caret']
         geometry = window_geometry(window)
@@ -5150,8 +5150,8 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
         variants = {}
         started = time.monotonic_ns()
         samples = 0
-        # Cover more than two Kitty 500ms half-cycles without touching the input.
-        while time.monotonic_ns() - started < 1_250_000_000:
+        duration_ms = max(1250, 500 + 2 * smooth_fade_ms) if expected == 'smooth' else 1250
+        while time.monotonic_ns() - started < duration_ms * 1_000_000:
             image = native_rgb_capture(window, geometry=region)
             variants.setdefault(image['pixels'], time.monotonic_ns() - started)
             samples += 1
@@ -5389,7 +5389,8 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
                 if shape == 'line':
                     if trail:
                         time.sleep(.75)  # Leave only blink changing during the opacity probe.
-                    item['blink_pixels'] = blink_pixels(label, blink)
+                    item['blink_pixels'] = blink_pixels(
+                        label, blink, smooth_fade_ms=item['saved_cursor_preferences']['smooth_blink_ms'])
                     blink_checks[blink] = item['blink_pixels']['pixel_variants']
                 item['movement'] = movement(label)
             steady_line = blink_checks['off'][0]['pixel_sha256']

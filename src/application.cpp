@@ -134,6 +134,12 @@ string sojuSessionKey(const ServerConfig &config, const Identity &identity) {
         field(*value);
     field(std::to_string(config.port));
     field(config.tls ? "tls" : "plain");
+    if (config.trustedCertificate) {
+        const auto &certificate = *config.trustedCertificate;
+        field(certificate.host);
+        field(std::to_string(certificate.port));
+        field(certificate.sha256);
+    }
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char *>(serialized.data()), serialized.size(), digest);
     return string(reinterpret_cast<const char *>(digest), sizeof(digest));
@@ -163,6 +169,7 @@ std::optional<SojuFileHostContext> sojuFileHostContext(const Model &model, const
     resolved.host = parent->host;
     resolved.port = parent->port;
     resolved.tls = parent->tls;
+    resolved.trustedCertificate = parent->trustedCertificate;
     resolved.identity = parent->identity;
     resolved.sasl = parent->sasl;
     resolved.password = parent->password;
@@ -829,7 +836,7 @@ void Application::adoptSojuProfiles() {
             s.sojuAccount = true;
     }
     for (auto &s : model.servers) {
-        if (!s.sojuParent.empty() || !s.bouncer.starts_with("soju:"))
+        if (!s.sojuParent.empty() || !s.bouncer.starts_with("soju:") || s.trustedCertificate)
             continue;
         vector<string> matches;
         for (const auto &parent : model.servers)
@@ -875,6 +882,7 @@ void Application::disconnect(string server) {
             auto &n = runtime->second;
             n.state = "Disconnected";
             n.error.clear();
+            n.certificateChallenge.reset();
             n.retrying = false;
             n.firstChannel.clear();
             n.firstChannelError.clear();
@@ -1006,6 +1014,7 @@ void Application::connect(string name, string origin) {
         resolved.host = parent->host;
         resolved.port = parent->port;
         resolved.tls = parent->tls;
+        resolved.trustedCertificate = parent->trustedCertificate;
         resolved.identity = parent->identity;
         resolved.sasl = parent->sasl;
         resolved.password.clear();
@@ -1025,6 +1034,7 @@ void Application::connect(string name, string origin) {
     n.name = name;
     n.nick = identity->nick;
     n.error.clear();
+    n.certificateChallenge.reset();
     n.state = "Connecting";
     n.retrying = false;
     n.firstChannel.clear();
@@ -2042,6 +2052,16 @@ void Application::reduce(const Event &input) {
         const string old = n.state;
         n.state = e.text;
         n.error = tag(e, "error");
+        n.certificateChallenge.reset();
+        if (n.state == "Failed" && e.tags.contains("tls-sha256")) {
+            const auto port = tag(e, "tls-port");
+            TlsCertificate certificate{tag(e, "tls-host"), 0, tag(e, "tls-sha256")};
+            const auto [end, error] =
+                std::from_chars(port.data(), port.data() + port.size(), certificate.port);
+            if (error == std::errc{} && end == port.data() + port.size() && certificate.port > 0 &&
+                certificate.port <= 65535 && !certificate.host.empty())
+                n.certificateChallenge = std::move(certificate);
+        }
         n.retrying = false;
         if (n.state != "Ready" && !n.firstChannel.empty()) {
             n.firstChannelError = "Connection ended before joining " + n.firstChannel + ".";
@@ -3978,6 +3998,40 @@ void Application::action(const Action &a) {
         setupConnection(a);
         return;
     }
+    if (a.type == "trust-certificate") {
+        const auto network = model.networks.find(a.buffer);
+        const auto profile = std::ranges::find(model.servers, a.buffer, &ServerConfig::name);
+        if (network == model.networks.end() || profile == model.servers.end())
+            return;
+        auto &n = network->second;
+        const auto endpoint =
+            profile->sojuParent.empty()
+                ? profile
+                : std::ranges::find(model.servers, profile->sojuParent, &ServerConfig::name);
+        if (n.state != "Failed" || n.sessionGeneration != a.requestId || !n.certificateChallenge ||
+            n.certificateChallenge->sha256 != a.text || endpoint == model.servers.end() ||
+            (endpoint != profile && !endpoint->sojuAccount) || !endpoint->tls ||
+            !n.certificateChallenge->matches(endpoint->host, endpoint->port)) {
+            report("The connection changed. Retry before reviewing its certificate.", a.buffer);
+            return;
+        }
+        if (!savingAllowed_) {
+            n.error = "Configuration cannot be written. Certificate trust was not saved.";
+            report(n.error, a.buffer);
+            return;
+        }
+        auto previous = std::exchange(endpoint->trustedCertificate, n.certificateChallenge);
+        try {
+            storage_.saveProfiles(model);
+        } catch (const std::exception &error) {
+            endpoint->trustedCertificate = std::move(previous);
+            n.error = error.what();
+            report(n.error, a.buffer);
+            return;
+        }
+        connect(endpoint->name);
+        return;
+    }
     if (a.type == "onboarding-join") {
         firstJoin(a);
         return;
@@ -4130,6 +4184,7 @@ void Application::action(const Action &a) {
         profile->sojuNetworkId = a.extra;
         profile->bouncer = "soju:" + a.extra;
         profile->password.clear();
+        profile->trustedCertificate.reset();
         const string name = profile->name;
         save();
         connect(name);

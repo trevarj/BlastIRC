@@ -3972,9 +3972,9 @@ int main() {
             invalid.servers[0].port = port;
             rejectProfile(invalid, false);
         }
-        for (const string mechanism : {"PLAIN", "EXTERNAL"}) {
+        {
             Model invalid = legacy;
-            invalid.servers[0].sasl = mechanism;
+            invalid.servers[0].sasl = "EXTERNAL";
             invalid.servers[0].tls = false;
             rejectProfile(invalid, false);
         }
@@ -3982,6 +3982,12 @@ int main() {
             Model invalid = legacy;
             invalid.servers[0].sasl = "EXTERNAL";
             invalid.identities[0].certificate.clear();
+            rejectProfile(invalid, false);
+        }
+        {
+            Model invalid = legacy;
+            auto &server = invalid.servers[0];
+            server.trustedCertificate = TlsCertificate{server.host, server.port, string(64, 'A')};
             rejectProfile(invalid, false);
         }
         for (const string &channel :
@@ -4002,7 +4008,7 @@ int main() {
             assert(!validateServerProfile(invalid, 1).empty());
             rejectProfile(invalid, false);
         }
-        auto roundTripProfile = [&](const Model &configured) {
+        auto roundTripProfile = [&](const Model &configured, bool expectPin = false) {
             assert(validateIdentityProfile(configured, 0).empty() &&
                    validateServerProfile(configured, 0).empty());
             {
@@ -4023,6 +4029,14 @@ int main() {
             assert(s.name == t.name && s.host == t.host && s.port == t.port && s.tls == t.tls &&
                    s.identity == t.identity && s.sasl == t.sasl && s.password == t.password &&
                    s.bouncer == t.bouncer && s.channels == t.channels);
+            assert(s.trustedCertificate.has_value() == expectPin);
+            if (expectPin) {
+                assert(t.trustedCertificate && s.trustedCertificate->matches(t.host, t.port) &&
+                       s.trustedCertificate->sha256 == t.trustedCertificate->sha256);
+            } else {
+                assert(contents(config / "config.toml").find("trusted_certificate") ==
+                       string::npos);
+            }
             assert(validateIdentityProfile(actual, 0).empty() &&
                    validateServerProfile(actual, 0).empty());
         };
@@ -4060,6 +4074,38 @@ int main() {
             valid.servers[0].tls = false;
             roundTripProfile(valid);
         }
+        {
+            const string fingerprint(64, 'a');
+            Model configured = legacy;
+            auto &server = configured.servers[0];
+            server.tls = true;
+            server.sasl = "PLAIN";
+            server.bouncer = "none";
+            server.trustedCertificate = TlsCertificate{server.host, server.port, fingerprint};
+            roundTripProfile(configured, true);
+            ++server.port;
+            roundTripProfile(configured);
+            --server.port;
+            server.tls = false;
+            roundTripProfile(configured);
+
+            for (const string endpoint :
+                 {"address = 'changed.example'\nport = 6697\ntls = true\n",
+                  "address = 'irc.libera.chat'\nport = 7000\ntls = true\n",
+                  "address = 'irc.libera.chat'\nport = 6697\ntls = false\n"}) {
+                std::ofstream(config / "config.toml")
+                    << "[[server]]\nsasl = 'PLAIN'\n"
+                    << endpoint
+                    << "[server.trusted_certificate]\nhost = 'irc.libera.chat'\nport = 6697\n"
+                       "sha256 = '"
+                    << fingerprint << "'\n";
+                Storage storage;
+                Model loaded;
+                storage.load(loaded);
+                assert(!loaded.firstRun && loaded.servers.size() == 1 &&
+                       !loaded.servers.front().trustedCertificate);
+            }
+        }
         // Restore the exact fixture, including preferences, for the remaining failure loops.
         {
             std::ofstream profiles(config / "config.toml");
@@ -4075,7 +4121,7 @@ int main() {
                  "[[identity]]\nname = 'second'\nnick = 'valid'\nusername = 'bad user'\n",
                  "[[identity]]\nname = 'first'\nnick = 'valid'\nusername = 'valid'\n"
                  "[[server]]\nname = 'network'\naddress = '2001:db8::1'\n"
-                 "identity = 'first'\nsasl = 'PLAIN'\ntls = false\n"}) {
+                 "identity = 'first'\nsasl = 'EXTERNAL'\ntls = false\n"}) {
             {
                 std::ofstream output(config / "config.toml");
                 output << source;
@@ -4254,6 +4300,10 @@ int main() {
             parent.name = "Account stable key";
             parent.bouncer = "soju";
             parent.sojuAccount = true;
+            parent.tls = false;
+            parent.sasl = "PLAIN";
+            parent.password.clear();
+            configured.identities.front().password = "soju SASL password";
             parent.sojuTrustedFileHost = "files.example";
             ServerConfig child = parent;
             child.name = "Legacy display selector";
@@ -4282,7 +4332,10 @@ int main() {
                    actual.litterboxExpiry == "72h" && !actual.secret &&
                    actual.maxBytes == upload.maxBytes && actual.username == upload.username &&
                    actual.password == upload.password);
-            assert(reopened.servers[reopened.servers.size() - 2].sojuAccount);
+            const auto &restoredParent = reopened.servers[reopened.servers.size() - 2];
+            assert(restoredParent.sojuAccount && !restoredParent.tls &&
+                   restoredParent.sasl == "PLAIN" && restoredParent.password.empty() &&
+                   reopened.identities.front().password == "soju SASL password");
             const auto &restored = reopened.servers.back();
             assert(restored.name == child.name && restored.sojuParent == parent.name &&
                    restored.sojuNetworkId == "42" && !restored.sojuEnabled &&
@@ -4375,7 +4428,19 @@ int main() {
               "soju_parent = 'Absent account'\nsoju_network_id = 'x'\n",
               "[[server]]\nname = 'Partial association'\nsoju_parent = 'Account stable key'\n",
               "[[server]]\nname = 'Bad trusted host'\nsoju_trusted_file_host = "
-              "'https://evil.example'\n"}) {
+              "'https://evil.example'\n",
+              "[[server]]\nname = 'Bad certificate shape'\ntrusted_certificate = 'not a table'\n",
+              "[[server]]\nname = 'Incomplete certificate'\n"
+              "trusted_certificate = { host = 'irc.libera.chat', port = 6697 }\n",
+              "[[server]]\nname = 'Bad certificate port'\n"
+              "trusted_certificate = { host = 'irc.libera.chat', port = 6697.0, sha256 = "
+              "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }\n",
+              "[[server]]\nname = 'Bad certificate fingerprint'\n"
+              "trusted_certificate = { host = 'irc.libera.chat', port = 6697, sha256 = 'abc' }\n",
+              "[[server]]\nname = 'Child with certificate'\nbouncer = 'soju:43'\n"
+              "soju_parent = 'Account stable key'\nsoju_network_id = '43'\n"
+              "trusted_certificate = { host = 'irc.libera.chat', port = 6697, sha256 = "
+              "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }\n"}) {
             std::ofstream(config / "config.toml") << sojuProfiles << extra;
             Storage storage;
             Model untouched;

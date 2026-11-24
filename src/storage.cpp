@@ -607,6 +607,10 @@ bool profileToken(std::string_view value) {
            std::none_of(value.begin(), value.end(),
                         [](unsigned char c) { return c <= 32 || c == 127; });
 }
+bool profileAddress(std::string_view value) {
+    return value.size() <= 253 && std::none_of(value.begin(), value.end(),
+                                               [](unsigned char c) { return c <= 32 || c == 127; });
+}
 bool profileFraming(std::string_view value) {
     return value.find_first_of(std::string_view("\r\n\0", 3)) != std::string_view::npos;
 }
@@ -632,12 +636,14 @@ std::string_view identityFieldsError(const Identity &identity) {
         return "Certificate and private-key file paths cannot contain NUL.";
     return {};
 }
+const TlsCertificate *matchedCertificate(const ServerConfig &server) {
+    const auto &pin = server.trustedCertificate;
+    return server.tls && pin && pin->matches(server.host, server.port) ? &*pin : nullptr;
+}
 std::string_view serverFieldsError(const ServerConfig &server, const Identity *identity) {
     if (server.name.empty() || (server.host.empty() && server.sojuParent.empty()))
         return "Network name and address are required.";
-    if (server.host.size() > 253 ||
-        std::any_of(server.host.begin(), server.host.end(),
-                    [](unsigned char c) { return c <= 32 || c == 127; }))
+    if (!profileAddress(server.host))
         return "The server address cannot contain spaces or controls, or exceed 253 bytes.";
     if (server.port < 1 || server.port > 65535)
         return "Port must be between 1 and 65535.";
@@ -647,8 +653,6 @@ std::string_view serverFieldsError(const ServerConfig &server, const Identity *i
         return "A soju control account requires a base username without a /network selector.";
     if (server.sasl != "" && server.sasl != "PLAIN" && server.sasl != "EXTERNAL")
         return "server.sasl must be empty, PLAIN, or EXTERNAL.";
-    if (server.sasl == "PLAIN" && !server.tls)
-        return "SASL PLAIN requires TLS to keep your password private.";
     if (server.sasl == "EXTERNAL" && (!server.tls || identity->certificate.empty()))
         return "EXTERNAL requires TLS and a certificate; its PEM may also contain the private key.";
     if (profileFraming(server.password) || server.password.size() > 16384)
@@ -671,6 +675,15 @@ std::string_view serverFieldsError(const ServerConfig &server, const Identity *i
         (server.bouncer != "soju:" + server.sojuNetworkId || !server.password.empty()))
         return "Soju children must bind their remote ID and inherit credentials without stored "
                "passwords.";
+    if (const auto &pin = server.trustedCertificate) {
+        if (!server.sojuParent.empty())
+            return "Soju children cannot store server.trusted_certificate.";
+        if (pin->host.empty() || !profileAddress(pin->host) || pin->port < 1 || pin->port > 65535)
+            return "server.trusted_certificate requires a host and port from 1 through 65535.";
+        if (pin->sha256.size() != 64 ||
+            pin->sha256.find_first_not_of("0123456789abcdef") != string::npos)
+            return "server.trusted_certificate.sha256 must be 64 lowercase hexadecimal digits.";
+    }
     if (!server.sojuTrustedFileHost.empty() &&
         (server.sojuTrustedFileHost.find_first_not_of(
              "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") != string::npos ||
@@ -769,11 +782,22 @@ void parseProfiles(const toml::table &document, Model &model) {
         exactField(row, "soju_network_id", server.sojuNetworkId);
         exactField(row, "soju_enabled", server.sojuEnabled);
         exactField(row, "soju_trusted_file_host", server.sojuTrustedFileHost);
+        if (const auto *pin = table(row, "trusted_certificate")) {
+            if (pin->size() != 3)
+                invalid("server.trusted_certificate", "a table with host, port, and sha256");
+            auto &certificate = server.trustedCertificate.emplace();
+            exactField(*pin, "host", certificate.host);
+            exactField(*pin, "port", certificate.port);
+            exactField(*pin, "sha256", certificate.sha256);
+        }
         if (const auto *channels = row.get("channels"))
             server.channels = stringArray(*channels, "server.channels");
         model.servers.push_back(std::move(server));
     });
     validateProfiles(model);
+    for (auto &server : model.servers)
+        if (!matchedCertificate(server))
+            server.trustedCertificate.reset();
 }
 void parseSettings(const toml::table &document, Settings &settings) {
     schemaVersion(document);
@@ -1056,23 +1080,29 @@ toml::table profileDocument(const Model &model) {
                                          {"password", identity.password},
                                          {"certificate", identity.certificate},
                                          {"key", identity.key}});
-    for (const auto &server : model.servers)
-        servers.push_back(toml::table{{"name", server.name},
-                                      {"alias", server.alias},
-                                      {"avatar", server.avatar},
-                                      {"address", server.host},
-                                      {"port", server.port},
-                                      {"tls", server.tls},
-                                      {"identity", server.identity},
-                                      {"sasl", server.sasl},
-                                      {"password", server.password},
-                                      {"bouncer", server.bouncer},
-                                      {"soju_account", server.sojuAccount},
-                                      {"soju_parent", server.sojuParent},
-                                      {"soju_network_id", server.sojuNetworkId},
-                                      {"soju_enabled", server.sojuEnabled},
-                                      {"soju_trusted_file_host", server.sojuTrustedFileHost},
-                                      {"channels", array(server.channels)}});
+    for (const auto &server : model.servers) {
+        toml::table row{{"name", server.name},
+                        {"alias", server.alias},
+                        {"avatar", server.avatar},
+                        {"address", server.host},
+                        {"port", server.port},
+                        {"tls", server.tls},
+                        {"identity", server.identity},
+                        {"sasl", server.sasl},
+                        {"password", server.password},
+                        {"bouncer", server.bouncer},
+                        {"soju_account", server.sojuAccount},
+                        {"soju_parent", server.sojuParent},
+                        {"soju_network_id", server.sojuNetworkId},
+                        {"soju_enabled", server.sojuEnabled},
+                        {"soju_trusted_file_host", server.sojuTrustedFileHost},
+                        {"channels", array(server.channels)}};
+        if (const auto *pin = matchedCertificate(server))
+            row.insert(
+                "trusted_certificate",
+                toml::table{{"host", pin->host}, {"port", pin->port}, {"sha256", pin->sha256}});
+        servers.push_back(std::move(row));
+    }
     return toml::table{
         {"schema_version", 1}, {"identity", std::move(identities)}, {"server", std::move(servers)}};
 }

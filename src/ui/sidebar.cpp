@@ -4,6 +4,7 @@
 #include "../render/graphics.hpp"
 #include "../theme/theme.hpp"
 #include "channel_avatar.hpp"
+#include "dialogs.hpp"
 #include "foundry_avatar.hpp"
 #include "logic.hpp"
 #include "transcript.hpp"
@@ -631,7 +632,7 @@ void serverMenu(Model &model, Popup &popup, Node &anchor, float scale, const std
     const bool account = profile != model.servers.end() && profile->sojuAccount;
     const bool childNetwork = profile != model.servers.end() && !profile->sojuParent.empty();
     auto connection = menuEntry("Connection", "plug");
-    connection.children.reserve(connected ? 2 : 1);
+    connection.children.reserve(3);
     connection.children.push_back(menuEntry(retrying    ? "Retry now"
                                             : connected ? "Reconnect"
                                                         : "Connect",
@@ -639,6 +640,8 @@ void serverMenu(Model &model, Popup &popup, Node &anchor, float scale, const std
     if (connected)
         connection.children.push_back(
             menuEntry(retrying ? "Stop retrying" : "Disconnect", "plug-off", 1));
+    if (!Dialogs::certificateReviewNetwork(model, name).empty())
+        connection.children.push_back(menuEntry("Review certificate…", "certificate", 8));
     std::vector<ContextMenuEntry> menu;
     menu.reserve(4);
     menu.push_back(menuEntry("Open server log", "terminal", 3));
@@ -669,6 +672,8 @@ void serverMenu(Model &model, Popup &popup, Node &anchor, float scale, const std
                 execute("soju-edit:" + name);
             else if (index == 7)
                 execute("soju-delete:" + name);
+            else if (index == 8)
+                execute("review-certificate:" + name);
             else if (index <= (connected ? 1u : 0u))
                 model.actions.push_back({index == 1 ? "disconnect" : "connect", {}, name, {}});
         },

@@ -179,6 +179,7 @@ if get_option('tests')
     dependencies: [irc_dep, avatar_dep], cpp_args: check_args)
   test('network', network_check, timeout: 180)
   test('soju-wire', network_check, args: ['--soju'])
+  test('tls-pin', network_check, args: ['--tls-pin'])
 
   avatar_check = executable('blastirc-avatar-check', 'tests/avatar_check.cpp',
     dependencies: avatar_dep, cpp_args: check_args)

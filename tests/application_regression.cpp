@@ -7276,8 +7276,61 @@ struct ApplicationRegression {
         }
     }
 
+    static void sojuCertificateApproval() {
+        namespace fs = std::filesystem;
+        RenameDrainPeer peer;
+        Application app(true);
+        auto &account = app.model.servers.emplace_back();
+        account.name = "trust-account";
+        account.host = "127.0.0.1";
+        account.port = peer.port;
+        account.bouncer = "soju";
+        account.sojuAccount = true;
+        const auto accountName = account.name;
+        auto &child = app.model.servers.emplace_back();
+        child.name = "trust-child";
+        child.sojuParent = accountName;
+        child.sojuNetworkId = "remote";
+        child.bouncer = "soju:remote";
+        app.model.identities.emplace_back();
+        const string digest(64, 'a');
+        Event failure;
+        failure.type = "state";
+        failure.server = child.name;
+        failure.text = "Failed";
+        failure.tags = {{"tls-host", "127.0.0.1"},
+                        {"tls-port", std::to_string(peer.port)},
+                        {"tls-sha256", digest}};
+        app.reduce(failure);
+        Action trust{"trust-certificate",
+                     child.name,
+                     digest,
+                     {},
+                     app.model.networks.at(child.name).sessionGeneration};
+        app.reduce(failure);
+        app.action(trust);
+        assert(app.clients_.empty() && !app.model.servers.front().trustedCertificate);
+        ++trust.requestId;
+        const auto profile = fs::path(std::getenv("XDG_CONFIG_HOME")) / "blastirc" / "config.toml";
+        assert(fs::create_directory(profile));
+        app.action(trust);
+        assert(app.clients_.empty() && !app.model.servers.front().trustedCertificate &&
+               app.model.networks.at(child.name).certificateChallenge);
+        fs::remove(profile);
+        app.action(trust);
+        assert(app.client(accountName) && !app.client(child.name));
+        Model reloaded;
+        app.storage_.load(reloaded);
+        assert(reloaded.servers.size() == 2 && reloaded.servers[0].trustedCertificate &&
+               reloaded.servers[0].trustedCertificate->sha256 == digest &&
+               !reloaded.servers[1].trustedCertificate);
+        app.action({"clear-local-data", {}, "connections", {}});
+        assert(!fs::exists(profile));
+    }
+
     static void run() {
         onboardingAndLocalData();
+        sojuCertificateApproval();
         localHistorySkipsProvisionalWindowEdge();
         preloadActiveScrollback();
         commandArgumentContext();

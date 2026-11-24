@@ -286,7 +286,45 @@ void refreshFonts(Node &node) {
     for (const auto &child : node.children())
         refreshFonts(*child);
 }
+
+std::string certificateEndpoint(const TlsCertificate &certificate) {
+    return (certificate.host.find(':') == std::string::npos ? certificate.host
+                                                            : "[" + certificate.host + "]") +
+           ":" + std::to_string(certificate.port);
+}
+
+std::pair<std::string_view, const ServerConfig *> findCertificateReview(const Model &model,
+                                                                        std::string_view name) {
+    const auto profile = std::find_if(model.servers.begin(), model.servers.end(),
+                                      [&](const auto &entry) { return entry.name == name; });
+    if (profile == model.servers.end())
+        return {};
+    auto endpoint = profile;
+    if (!profile->sojuParent.empty()) {
+        endpoint = std::find_if(model.servers.begin(), model.servers.end(), [&](const auto &entry) {
+            return entry.name == profile->sojuParent && entry.sojuAccount;
+        });
+    }
+    if (endpoint == model.servers.end() || !endpoint->tls)
+        return {};
+    const auto failed = [&](const std::string &key) -> std::string_view {
+        const auto runtime = model.networks.find(key);
+        if (runtime == model.networks.end() || runtime->second.state != "Failed" ||
+            runtime->second.retrying)
+            return {};
+        const auto &certificate = runtime->second.certificateChallenge;
+        return certificate && certificate->matches(endpoint->host, endpoint->port)
+                   ? std::string_view(runtime->first)
+                   : std::string_view{};
+    };
+    const auto review = failed(profile->name);
+    return {!review.empty() || endpoint == profile ? review : failed(endpoint->name), &*endpoint};
+}
 } // namespace
+
+std::string_view Dialogs::certificateReviewNetwork(const Model &model, std::string_view name) {
+    return findCertificateReview(model, name).first;
+}
 
 struct Dialogs::Impl {
     enum class Tab { Appearance, Keys, Chat, Fx, Sounds, Servers, Identities, Data };
@@ -392,6 +430,10 @@ struct Dialogs::Impl {
     Label *cursorStatus = nullptr;
     Label *identityScope = nullptr;
     Button *connectButton = nullptr;
+    Button *certificateReview = nullptr;
+    Input *certificatePort = nullptr;
+    Flex *certificateTrust = nullptr;
+    Label *certificateFingerprint = nullptr;
     Button *saveButton = nullptr;
     std::string lastApplicationStatus;
     std::uint64_t pendingSaveRequest = 0;
@@ -441,6 +483,7 @@ struct Dialogs::Impl {
     Button *confirmAccept = nullptr;
     Button *confirmCancel = nullptr;
     std::function<void()> confirmAction;
+    std::function<bool()> confirmCurrent;
     std::string mode, confirmation, nick, searchQuery, searchBuffer;
     std::string topicBuffer, editedTopic;
     std::string toolsBuffer, toolsServer, toolsTarget, serviceNick = "ChanServ", banMask,
@@ -1453,6 +1496,10 @@ struct Dialogs::Impl {
         feedback = themeStatus = applicationStatus = motionStatus = soundStatus = cursorStatus =
             identityScope = connectionStatus = nullptr;
         connectButton = saveButton = nullptr;
+        certificateReview = nullptr;
+        certificatePort = nullptr;
+        certificateTrust = nullptr;
+        certificateFingerprint = nullptr;
         setupConnect = nullptr;
         moderationReview = nullptr;
         saveFeedbackActive = false;
@@ -1749,6 +1796,10 @@ struct Dialogs::Impl {
                 networkPicker = networkIdentityPicker = nullptr;
                 connectionStatus = sojuStatus = nullptr;
                 connectButton = sojuSubmit = nullptr;
+                certificateReview = nullptr;
+                certificatePort = nullptr;
+                certificateTrust = nullptr;
+                certificateFingerprint = nullptr;
                 displayedServer.reset();
                 sojuMutationButtons.clear();
             }
@@ -1776,6 +1827,10 @@ struct Dialogs::Impl {
         themeStatus = applicationStatus = motionStatus = soundStatus = cursorStatus =
             identityScope = connectionStatus = nullptr;
         connectButton = nullptr;
+        certificateReview = nullptr;
+        certificatePort = nullptr;
+        certificateTrust = nullptr;
+        certificateFingerprint = nullptr;
         sojuStatus = nullptr;
         displayedServer.reset();
         sojuMutationButtons.clear();
@@ -2688,7 +2743,8 @@ struct Dialogs::Impl {
                    rebuildPage();
                });
         if (setupSoju)
-            label(*page, "Use your soju account, not the address of an upstream IRC network.");
+            label(*page, "These settings connect BlastIRC to your Soju account. Set upstream IRC "
+                         "addresses and TLS separately in Manage Soju networks.");
         if (!setupSoju)
             select(*page, "Network preset", {"Libera.Chat (irc.libera.chat)", "Custom server"},
                    setupCustom ? "Custom server" : "Libera.Chat (irc.libera.chat)",
@@ -2730,7 +2786,8 @@ struct Dialogs::Impl {
         setupPort = text(*options, "Port (1–65535)", draft.port,
                          [&draft](const std::string &value) { draft.port = value; });
         auto *tlsWarning =
-            label(*options, "Plaintext exposes messages and credentials to the network.");
+            label(*options, "Plaintext exposes messages and credentials, including the SASL "
+                            "password, to anyone who can observe the connection.");
         tlsWarning->setColor(colorSpecFromRole(ColorRole::Error));
         toggle(*options, "TLS (recommended)", server.tls,
                [&server, &draft, this, tlsWarning](bool tls) {
@@ -2811,7 +2868,7 @@ struct Dialogs::Impl {
             setShown(*certificate->parent(), fresh && method == "EXTERNAL");
             setShown(*key->parent(), fresh && method == "EXTERNAL");
             setShown(*pass->parent(), !setupSoju || method.empty());
-            help->setText(method == "PLAIN"      ? "Password authentication requires TLS."
+            help->setText(method == "PLAIN"      ? "Use TLS to keep the SASL password private."
                           : method == "EXTERNAL" ? "Client certificate authentication requires TLS."
                           : setupSoju ? "Management only does not attach upstream networks."
                                       : "");
@@ -3079,6 +3136,67 @@ struct Dialogs::Impl {
         connectionStatus->setText(text);
     }
 
+    std::string_view reviewableCertificate(std::string_view name) const {
+        if (pendingSaveRequest)
+            return {};
+        const auto [failed, endpoint] = findCertificateReview(model, name);
+        if (failed.empty())
+            return {};
+        if (pendingAddresses.contains(endpoint->name) ||
+            (mode == "settings" && displayedServer && *displayedServer == endpoint->name &&
+             certificatePort && invalidFields.contains(certificatePort)))
+            return {};
+        return failed;
+    }
+
+    void updateCertificateControls(const ServerConfig *profile) {
+        if (certificateReview)
+            setShown(*certificateReview, profile && !reviewableCertificate(profile->name).empty());
+        if (certificateTrust) {
+            const bool saved = profile && profile->tls && profile->trustedCertificate &&
+                               profile->trustedCertificate->matches(profile->host, profile->port);
+            setShown(*certificateTrust, saved);
+            if (saved && certificateFingerprint->text() != profile->trustedCertificate->sha256)
+                certificateFingerprint->setText(profile->trustedCertificate->sha256);
+        }
+    }
+
+    void reviewCertificate(std::string_view name) {
+        if (!confirmation.empty())
+            return;
+        const std::string failed(reviewableCertificate(name));
+        if (failed.empty())
+            return;
+        const auto &network = model.networks.at(failed);
+        const auto &certificate = *network.certificateChallenge;
+        confirm(
+            "review-certificate", "Trust this server certificate?",
+            "TLS endpoint: " + certificateEndpoint(certificate) + "\nSHA-256 fingerprint:\n" +
+                certificate.sha256 +
+                "\n\nThis self-signed certificate was not verified by a trusted authority. "
+                "Verify the full fingerprint with your server administrator through a "
+                "separate trusted channel before choosing Trust. Trust saves this "
+                "certificate for this endpoint and reconnects.",
+            "Trust",
+            [this, action = Action{"trust-certificate",
+                                   failed,
+                                   certificate.sha256,
+                                   {},
+                                   network.sessionGeneration}]() mutable {
+                model.actions.push_back(std::move(action));
+            },
+            [this, origin = std::string(name), failed, certificate,
+             generation = network.sessionGeneration] {
+                if (reviewableCertificate(origin) != failed)
+                    return false;
+                const auto &current = model.networks.at(failed);
+                const auto &challenge = *current.certificateChallenge;
+                return current.sessionGeneration == generation &&
+                       challenge.matches(certificate.host, certificate.port) &&
+                       challenge.sha256 == certificate.sha256;
+            });
+    }
+
     Input *sharedIdentityText(Flex &parent, std::string_view name, std::size_t index,
                               std::string Identity::*member, bool password = false) {
         auto *field = text(parent, name, model.identities.at(index).*member, {}, password);
@@ -3109,7 +3227,8 @@ struct Dialogs::Impl {
         label(parent, "Shared identity credentials", true);
         sharedIdentityText(parent, "SASL password (PLAIN)", index, &Identity::password, true);
         label(parent, "Passwords are stored in plain text in your private configuration file; "
-                      "PLAIN needs TLS, and each network chooses its authentication method.");
+                      "each network selects its own authentication method. Use TLS to keep "
+                      "passwords private in transit.");
         text(parent, "Client certificate (PEM, EXTERNAL)", identity.certificate,
              [this, index](const std::string &value) {
                  model.identities.at(index).certificate = value;
@@ -3176,9 +3295,9 @@ struct Dialogs::Impl {
                              found->second.state == "Ready";
         sojuStatus = label(*manager, "");
         label(*manager,
-              "Create, edit and delete affect the actual remote soju account. New "
-              "networks attach locally by default. Local enable is independent of "
-              "the upstream connection; remote deletion retains local conversation data.");
+              "These settings control Soju’s connection to upstream IRC servers, not "
+              "BlastIRC’s connection to Soju. Local attachment is independent of the upstream "
+              "connection; remote deletion retains local conversation data.");
         button(*manager, "Refresh displayed catalog", [this] { rebuildPage(); });
         if (found != model.networks.end()) {
             indexingSettings = false;
@@ -3240,10 +3359,17 @@ struct Dialogs::Impl {
                 std::string_view(key) == "pass" || std::string_view(key) == "sasl-password");
         }
         const auto tls = sojuEditAttributes.find("tls");
-        toggle(*manager, "Remote TLS", tls == sojuEditAttributes.end() || tls->second == "1",
-               [this](bool enabled) {
+        auto *upstreamWarning = label(
+            *manager, "Without upstream TLS, Soju can expose messages and credentials, including "
+                      "the upstream SASL password, to anyone who can observe that connection.");
+        upstreamWarning->setColor(colorSpecFromRole(ColorRole::Error));
+        const bool upstreamTls = tls == sojuEditAttributes.end() || tls->second == "1";
+        setShown(*upstreamWarning, !upstreamTls);
+        toggle(*manager, "Remote TLS (Soju → upstream)", upstreamTls,
+               [this, upstreamWarning](bool enabled) {
                    sojuEditAttributes["tls"] = enabled ? "1" : "0";
                    sojuEditChanges["tls"] = enabled ? "1" : "0";
+                   setShown(*upstreamWarning, !enabled);
                });
         label(*manager, "Blank untouched password fields preserve existing remote passwords. "
                         "Editing a password to empty explicitly clears it. Server validation and "
@@ -3326,10 +3452,15 @@ struct Dialogs::Impl {
         auto source = std::make_shared<std::string>(server.name);
         displayedServer = source;
         connectionStatus = label(*profiles, "");
+        certificateReview = button(*profiles, "Review certificate…",
+                                   [this, source] { reviewCertificate(*source); });
+        updateCertificateControls(&server);
         updateConnectionStatus(server);
         if (!server.sojuParent.empty()) {
             label(*profiles,
                   "Managed by soju account: " + std::string(networkParentCaption(server)));
+            label(*profiles, "TLS and certificate trust for BlastIRC’s connection to Soju "
+                             "are set on the account profile.");
             toggle(*profiles, "Attach this network locally", server.sojuEnabled,
                    [this, name = server.name](bool enabled) {
                        model.actions.push_back({"soju-set-enabled", name, enabled ? "1" : "0", {}});
@@ -3343,7 +3474,9 @@ struct Dialogs::Impl {
         auto found = std::find_if(model.identities.begin(), model.identities.end(),
                                   [&](const auto &id) { return id.name == server.identity; });
         const std::size_t ii = std::size_t(found - model.identities.begin());
-        auto *endpoint = section("networks.endpoint", "Address & connection");
+        auto *endpoint =
+            section("networks.endpoint",
+                    server.sojuAccount ? "BlastIRC → Soju connection" : "Address & connection");
         if (!server.sojuAccount) {
             auto *profileName = text(*endpoint, "Network name", server.name, {});
             profileName->setOnChange(onServer(
@@ -3418,9 +3551,12 @@ struct Dialogs::Impl {
                     pendingAddresses.insert_or_assign(selected.name, value);
                 else {
                     pendingAddresses.erase(selected.name);
+                    if (selected.host != value)
+                        selected.trustedCertificate.reset();
                     selected.host = value;
                 }
                 updateReview(selected);
+                updateCertificateControls(&selected);
             }));
         review->setOnClick(onServer(source, [this, source, updateReview](std::size_t si) {
             const auto &selected = model.servers[si];
@@ -3439,14 +3575,17 @@ struct Dialogs::Impl {
                         if (draft == pendingAddresses.end() || draft->second != next ||
                             server.host != old)
                             return;
+                        server.trustedCertificate.reset();
                         server.host = std::move(draft->second);
                         pendingAddresses.erase(draft);
                         if (displayedServer == source)
                             updateReview(server);
+                        updateCertificateControls(&server);
                         setFeedback("");
                     }));
         }));
         auto *port = text(*endpoint, "Port (1–65535)", std::to_string(server.port), {});
+        certificatePort = port;
         port->setOnChange(onServer(source, [this, port](std::size_t si, const std::string &value) {
             int number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -3456,18 +3595,24 @@ struct Dialogs::Impl {
             port->setInvalid(!valid);
             if (valid) {
                 invalidFields.erase(port);
-                model.servers.at(si).port = number;
+                auto &selected = model.servers[si];
+                if (selected.port != number)
+                    selected.trustedCertificate.reset();
+                selected.port = number;
             } else
                 invalidFields.insert(port);
+            updateCertificateControls(&model.servers[si]);
         }));
         auto *tlsWarning =
-            label(*endpoint, "Plaintext exposes messages and credentials to the network.");
+            label(*endpoint, "Plaintext exposes messages and credentials, including the SASL "
+                             "password, to anyone who can observe the connection.");
         tlsWarning->setColor(colorSpecFromRole(ColorRole::Error));
-        tlsWarning->setVisible(!server.tls);
-        tlsWarning->setParticipatesInLayout(!server.tls);
+        setShown(*tlsWarning, !server.tls);
         toggle(*endpoint, "TLS (recommended)", server.tls,
                onServer(source, [this, port, tlsWarning](std::size_t si, bool value) {
                    auto &selected = model.servers.at(si);
+                   if (selected.tls != value)
+                       selected.trustedCertificate.reset();
                    selected.tls = value;
                    if (value && selected.port == 6667) {
                        selected.port = 6697;
@@ -3475,9 +3620,21 @@ struct Dialogs::Impl {
                        port->setInvalid(false);
                        invalidFields.erase(port);
                    }
-                   tlsWarning->setVisible(!value);
-                   tlsWarning->setParticipatesInLayout(!value);
+                   setShown(*tlsWarning, !value);
+                   updateCertificateControls(&selected);
                }));
+        auto trust = column(6);
+        certificateTrust = trust.get();
+        label(*trust, "Saved certificate trust (SHA-256)");
+        certificateFingerprint = label(*trust, "");
+        button(*trust, "Clear saved certificate trust", onServer(source, [this](std::size_t si) {
+            auto &selected = model.servers[si];
+            selected.trustedCertificate.reset();
+            updateCertificateControls(&selected);
+        }));
+        label(*trust, "Save to remove this trust from your configuration.");
+        endpoint->addChild(std::move(trust));
+        updateCertificateControls(&server);
         if (!server.sojuAccount) {
             text(*endpoint, "Server password (this network only)", server.password,
                  onServer(source,
@@ -3497,8 +3654,9 @@ struct Dialogs::Impl {
                 onServer(source, [this](std::size_t si, std::size_t index, std::string_view value) {
                     model.servers.at(si).sasl = index == 0 ? "" : std::string(value);
                 }));
-            label(*credentials, "PLAIN requires TLS and uses the selected identity's password. "
-                                "EXTERNAL uses that identity's certificate and private key.");
+            label(*credentials, "PLAIN uses the selected identity’s password. Use TLS to keep "
+                                "it private. EXTERNAL requires TLS and uses the identity’s "
+                                "certificate and private key.");
         }
         auto *identity = section("networks.identity", "Shared identity");
         networkIdentityPicker =
@@ -3529,11 +3687,12 @@ struct Dialogs::Impl {
                     setShown(*controlPass->parent(), auth.empty());
                     authHelp->setText(
                         auth == "PLAIN"
-                            ? "Password authentication requires TLS. Account credentials are "
-                              "stored in plain text in your private configuration file."
+                            ? "Use TLS to keep the SASL password private in transit. Account "
+                              "credentials are stored in plain text in your private configuration "
+                              "file."
                         : auth == "EXTERNAL"
-                            ? "Set the selected identity's client certificate and private key "
-                              "using Edit identity."
+                            ? "EXTERNAL requires TLS. Set the selected identity’s client "
+                              "certificate and private key using Edit identity."
                             : "Management only: no SASL authentication. Control connection PASS "
                               "does not attach managed networks; choose PLAIN or EXTERNAL to "
                               "attach them.");
@@ -4211,6 +4370,10 @@ struct Dialogs::Impl {
         confirmAccept = button(
             *actions, "Confirm",
             [this] {
+                if (confirmCurrent && !confirmCurrent()) {
+                    hideConfirmation();
+                    return;
+                }
                 auto accepted = std::move(confirmAction);
                 hideConfirmation();
                 if (accepted)
@@ -4223,11 +4386,13 @@ struct Dialogs::Impl {
     }
 
     void confirm(std::string name, std::string_view title, std::string_view message,
-                 std::string_view accept, std::function<void()> callback) {
+                 std::string_view accept, std::function<void()> callback,
+                 std::function<bool()> current = {}) {
         if (mode.empty() && confirmation.empty() && dispatcher)
             returnFocus = dispatcher->captureTabFocus();
         confirmation = std::move(name);
         confirmAction = std::move(callback);
+        confirmCurrent = std::move(current);
         confirmTitle->setText(title);
         confirmMessage->setText(message);
         confirmAccept->setText(accept);
@@ -4256,6 +4421,7 @@ struct Dialogs::Impl {
         stopOpening();
         confirmation.clear();
         confirmAction = {};
+        confirmCurrent = {};
         confirmPanel->setVisible(false);
         if (!mode.empty() && panel) {
             panel->setVisible(true);
@@ -4489,6 +4655,10 @@ struct Dialogs::Impl {
     void open(std::string_view name) {
         if (pendingData || (setupOpen() && pendingSaveRequest))
             return;
+        if (name.starts_with("review-certificate:")) {
+            reviewCertificate(name.substr(std::string_view("review-certificate:").size()));
+            return;
+        }
         if (name == "first-run" || name == "add-server" || name == "add-soju-account") {
             openSetup(name);
             return;
@@ -4646,6 +4816,8 @@ struct Dialogs::Impl {
     void sync(float width, float height, float scale) {
         if (model.settings.reducedMotion || model.settings.fx == FxLevel::Off)
             stopOpening();
+        if (confirmCurrent && !confirmCurrent())
+            hideConfirmation();
         const auto &profile = model.whoisProfile;
         if (mode == "whois" && !profile.open)
             dismiss();
@@ -4830,7 +5002,9 @@ struct Dialogs::Impl {
             if (serverSourcePresent) {
                 serverIndex = index;
                 updateConnectionStatus(model.servers[index]);
+                updateCertificateControls(&model.servers[index]);
             } else {
+                updateCertificateControls(nullptr);
                 if (connectButton)
                     connectButton->setEnabled(false);
                 for (auto *control : sojuMutationButtons)

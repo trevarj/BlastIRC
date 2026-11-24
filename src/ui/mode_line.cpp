@@ -1,6 +1,7 @@
 #include "mode_line.hpp"
 #include "../model.hpp"
 #include "../theme/theme.hpp"
+#include "dialogs.hpp"
 #include "logic.hpp"
 #include <algorithm>
 #include <array>
@@ -601,7 +602,7 @@ struct ModeLine::Impl {
         const auto state = current.state();
         const bool connected = state != "Disconnected" && state != "Failed";
         std::vector<ContextMenuEntry> entries;
-        entries.reserve(connected ? 3 : 2);
+        entries.reserve(4);
         entries.push_back(menuEntry(0,
                                     state == "Retrying" ? "Retry now"
                                     : connected         ? "Reconnect"
@@ -611,6 +612,8 @@ struct ModeLine::Impl {
             entries.push_back(
                 menuEntry(1, state == "Retrying" ? "Stop retrying" : "Disconnect", "plug-off"));
         entries.push_back(menuEntry(2, "Open server log", "terminal"));
+        if (!Dialogs::certificateReviewNetwork(model, current.server).empty())
+            entries.push_back(menuEntry(3, "Review certificate…", "certificate"));
         openPopup(controls[State], inputSerial, std::move(entries),
                   [this, connected, server = std::string(current.server),
                    buffer = std::string(current.buffer), state = std::string(state),
@@ -626,6 +629,8 @@ struct ModeLine::Impl {
                           execute("status-disconnect:" + server);
                       else if (index == 2)
                           execute("open-server-log:" + server);
+                      else if (index == 3)
+                          execute("review-certificate:" + server);
                   });
     }
     void activateGroup(Group group, std::optional<uint32_t> inputSerial) {

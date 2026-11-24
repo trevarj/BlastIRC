@@ -68,7 +68,14 @@ struct Environment {
     }
 };
 using TlsContext = std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)>;
-TlsContext trustedLocalhost(const fs::path &certificateFile) {
+struct LocalCertificate {
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key;
+    std::unique_ptr<X509, decltype(&X509_free)> certificate;
+};
+LocalCertificate localCertificate(const char *name = "localhost",
+                                  const char *san = "DNS:localhost,IP:127.0.0.1",
+                                  long expires = 3600, const char *purpose = "serverAuth",
+                                  const LocalCertificate *issuer = nullptr, bool ca = false) {
     std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> generator(
         EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr), EVP_PKEY_CTX_free);
     require(generator && EVP_PKEY_keygen_init(generator.get()) == 1 &&
@@ -79,43 +86,71 @@ TlsContext trustedLocalhost(const fs::path &certificateFile) {
     std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(generated, EVP_PKEY_free);
     std::unique_ptr<X509, decltype(&X509_free)> certificate(X509_new(), X509_free);
     require(certificate && X509_set_version(certificate.get(), 2) == 1 &&
-                ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1) == 1 &&
+                ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), issuer ? 2 : 1) == 1 &&
                 X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -60) &&
-                X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 3600) &&
+                X509_gmtime_adj(X509_getm_notAfter(certificate.get()), expires) &&
                 X509_set_pubkey(certificate.get(), key.get()) == 1,
             "Cannot initialize temporary TLS certificate");
     auto *subject = X509_get_subject_name(certificate.get());
     require(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
-                                       reinterpret_cast<const unsigned char *>("localhost"), -1, -1,
+                                       reinterpret_cast<const unsigned char *>(name), -1, -1,
                                        0) == 1 &&
-                X509_set_issuer_name(certificate.get(), subject) == 1,
+                X509_set_issuer_name(certificate.get(),
+                                     issuer ? X509_get_subject_name(issuer->certificate.get())
+                                            : subject) == 1,
             "Cannot name temporary TLS certificate");
     X509V3_CTX extensionContext{};
-    X509V3_set_ctx(&extensionContext, certificate.get(), certificate.get(), nullptr, nullptr, 0);
+    X509V3_set_ctx(&extensionContext, issuer ? issuer->certificate.get() : certificate.get(),
+                   certificate.get(), nullptr, nullptr, 0);
     auto extension = [&](int nid, const char *value) {
         std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> item(
             X509V3_EXT_conf_nid(nullptr, &extensionContext, nid, value), X509_EXTENSION_free);
         require(item && X509_add_ext(certificate.get(), item.get(), -1) == 1,
                 "Cannot extend temporary TLS certificate");
     };
-    extension(NID_basic_constraints, "critical,CA:TRUE");
-    extension(NID_key_usage, "critical,digitalSignature,keyCertSign");
-    extension(NID_ext_key_usage, "serverAuth");
-    extension(NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1");
-    require(X509_sign(certificate.get(), key.get(), EVP_sha256()) > 0,
+    extension(NID_basic_constraints, ca ? "critical,CA:TRUE" : "critical,CA:FALSE");
+    extension(NID_key_usage,
+              ca ? "critical,digitalSignature,keyCertSign" : "critical,digitalSignature");
+    extension(NID_ext_key_usage, purpose);
+    extension(NID_subject_alt_name, san);
+    require(X509_sign(certificate.get(), issuer ? issuer->key.get() : key.get(), EVP_sha256()) > 0,
             "Cannot sign temporary TLS certificate");
+    return {std::move(key), std::move(certificate)};
+}
+void writeAnchor(const fs::path &certificateFile, X509 *certificate) {
     std::unique_ptr<BIO, decltype(&BIO_free)> file(BIO_new_file(certificateFile.c_str(), "w"),
                                                    BIO_free);
-    require(file && PEM_write_bio_X509(file.get(), certificate.get()) == 1 &&
-                BIO_flush(file.get()) == 1,
+    require(file && PEM_write_bio_X509(file.get(), certificate) == 1 && BIO_flush(file.get()) == 1,
             "Cannot write temporary TLS trust anchor");
+}
+TlsContext tlsContext(const LocalCertificate &leaf) {
     TlsContext context(SSL_CTX_new(TLS_server_method()), SSL_CTX_free);
     require(context && SSL_CTX_set_min_proto_version(context.get(), TLS1_2_VERSION) == 1 &&
-                SSL_CTX_use_certificate(context.get(), certificate.get()) == 1 &&
-                SSL_CTX_use_PrivateKey(context.get(), key.get()) == 1 &&
+                SSL_CTX_use_certificate(context.get(), leaf.certificate.get()) == 1 &&
+                SSL_CTX_use_PrivateKey(context.get(), leaf.key.get()) == 1 &&
                 SSL_CTX_check_private_key(context.get()) == 1,
             "Cannot initialize loopback TLS server");
     return context;
+}
+TlsContext trustedLocalhost(const fs::path &certificateFile) {
+    const auto leaf = localCertificate("localhost", "DNS:localhost,IP:127.0.0.1", 3600,
+                                       "serverAuth", nullptr, true);
+    writeAnchor(certificateFile, leaf.certificate.get());
+    return tlsContext(leaf);
+}
+string sha256(SSL_CTX *context) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int size = 0;
+    require(X509_digest(SSL_CTX_get0_certificate(context), EVP_sha256(), digest, &size) == 1 &&
+                size == 32,
+            "Cannot fingerprint loopback TLS certificate");
+    constexpr char digits[] = "0123456789abcdef";
+    string hex(64, '\0');
+    for (unsigned int i = 0; i < size; ++i) {
+        hex[2 * i] = digits[digest[i] >> 4];
+        hex[2 * i + 1] = digits[digest[i] & 15];
+    }
+    return hex;
 }
 struct Fd {
     int value = -1;
@@ -214,7 +249,7 @@ struct WirePeer {
         }
         waitFd(connection.value, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, deadline);
     }
-    void accept() {
+    void accept(bool verified = true) {
         tls.reset();
         connection.reset();
         buffered.clear();
@@ -232,8 +267,13 @@ struct WirePeer {
                 "Cannot attach loopback TLS connection");
         for (;;) {
             require(Clock::now() < deadline, "Loopback TLS handshake deadline expired");
+            ERR_clear_error();
             const int result = SSL_accept(tls.get());
-            if (result == 1)
+            if (result == 1) {
+                require(verified, "Client completed a TLS handshake that should have failed");
+                return;
+            }
+            if (!verified && SSL_get_error(tls.get(), result) == SSL_ERROR_SSL)
                 return;
             tlsWait(result, deadline, "accept");
         }
@@ -550,6 +590,94 @@ int64_t wallSeconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+void certificatePinChecks(const Identity &identity, const fs::path &anchorFile) {
+    auto first = tlsContext(localCertificate());
+    auto rotated = tlsContext(localCertificate());
+    auto wrongHost = tlsContext(localCertificate("localhost", "DNS:localhost,IP:127.0.0.2"));
+    auto expired = tlsContext(localCertificate("localhost", "IP:127.0.0.1", -30));
+    auto wrongPurpose =
+        tlsContext(localCertificate("localhost", "IP:127.0.0.1", 3600, "clientAuth"));
+    const auto authority =
+        localCertificate("Loopback test CA", "IP:127.0.0.1", 3600, "serverAuth", nullptr, true);
+    auto caLeaf =
+        tlsContext(localCertificate("localhost", "IP:127.0.0.1", 3600, "serverAuth", &authority));
+    writeAnchor(anchorFile, authority.certificate.get());
+    Environment trust("SSL_CERT_FILE", anchorFile);
+    Environment nixTrust("NIX_SSL_CERT_FILE", anchorFile);
+
+    WirePeer peer(first.get());
+    ServerConfig config = server(peer.port, "PLAIN");
+    config.password = identity.password;
+    const TlsCertificate firstPin{config.host, config.port, sha256(first.get())};
+    auto rejected = [&](std::string_view offer = {}, std::string_view reason = {}) {
+        NetworkClient client(config, identity);
+        client.start();
+        peer.accept(false);
+        const auto deadline = Clock::now() + 3s;
+        for (;;) {
+            for (const auto &event : client.poll()) {
+                if (event.type != "state")
+                    continue;
+                require(event.text != "Registering" && event.text != "Ready",
+                        "Client attempted IRC registration with a rejected certificate");
+                if (event.text != "Failed")
+                    continue;
+                require(tag(event, "error").find(reason) != std::string_view::npos,
+                        "Certificate failure did not explain how to proceed");
+                if (offer.empty())
+                    require(!event.tags.contains("tls-sha256") &&
+                                !event.tags.contains("tls-host") &&
+                                !event.tags.contains("tls-port"),
+                            "Non-approvable certificate was offered for trust");
+                else
+                    require(tag(event, "tls-sha256") == offer &&
+                                tag(event, "tls-host") == config.host &&
+                                tag(event, "tls-port") == std::to_string(config.port),
+                            "Certificate challenge did not identify the exact endpoint and leaf");
+                return;
+            }
+            require(Clock::now() < deadline, "Expected a fatal TLS certificate failure");
+            std::this_thread::sleep_for(1ms);
+        }
+    };
+    auto accepted = [&] {
+        NetworkClient client(config, identity);
+        client.start();
+        peer.accept();
+        peer.expect("CAP", {"LS", "302"});
+        client.stop();
+    };
+    rejected(firstPin.sha256);
+    config.trustedCertificate = firstPin;
+    accepted();
+    peer.context = rotated.get();
+    rejected(sha256(rotated.get()), "certificate changed");
+    config.trustedCertificate->sha256 = sha256(rotated.get());
+    accepted();
+
+    for (auto *invalid : {wrongHost.get(), expired.get(), wrongPurpose.get()}) {
+        peer.context = invalid;
+        config.trustedCertificate.reset();
+        rejected();
+        config.trustedCertificate = TlsCertificate{config.host, config.port, sha256(invalid)};
+        rejected();
+    }
+    peer.context = caLeaf.get();
+    config.trustedCertificate.reset();
+    accepted();
+    config.trustedCertificate = firstPin;
+    rejected({}, "Clear certificate trust");
+
+    peer.context = first.get();
+    WirePeer configuredPort(first.get());
+    irc::saveSts(config.host, peer.port, 60);
+    config.port = configuredPort.port;
+    rejected();
+    config.port = peer.port;
+    config.tls = false;
+    rejected();
+    irc::saveSts(config.host, peer.port, 0);
 }
 void stsChecks(SSL_CTX *context, const Identity &identity) {
     WirePeer peer(context);
@@ -2735,13 +2863,14 @@ int main(int argc, char **argv) {
     std::signal(SIGPIPE, SIG_IGN);
     const bool avatar = argc == 4 && string(argv[1]) == "--avatar";
     const bool soju = argc == 2 && string(argv[1]) == "--soju";
-    if (argc != 1 && !avatar && !soju) {
-        std::cerr << "usage: network-check [--avatar PUBLIC_URL OUTPUT | --soju]\n";
+    const bool tlsPin = argc == 2 && string(argv[1]) == "--tls-pin";
+    if (argc != 1 && !avatar && !soju && !tlsPin) {
+        std::cerr << "usage: network-check [--avatar PUBLIC_URL OUTPUT | --soju | --tls-pin]\n";
         return 1;
     }
     // The full suite includes two 35s history deadline checks plus metadata/expiry
     // waits and TLS/frame I/O. Keep per-operation deadlines; bound total shutdown too.
-    ::alarm(avatar ? 40 : soju ? 20 : 180);
+    ::alarm(avatar ? 40 : (soju || tlsPin ? 20 : 180));
     const char *phase = "TLS fixture setup";
     try {
         TemporaryDirectory directory;
@@ -2765,6 +2894,12 @@ int main(int argc, char **argv) {
             sojuChecks(context.get(), identity);
             std::cout
                 << "production soju catalog, CRUD, authentication and redaction checks passed\n";
+            return 0;
+        }
+        if (tlsPin) {
+            phase = "TLS certificate pinning";
+            certificatePinChecks(identity, directory.path / "pin-check-ca.pem");
+            std::cout << "production TLS certificate pinning checks passed\n";
             return 0;
         }
         phase = "invalid nickname / Unicode registration";

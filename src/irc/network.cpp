@@ -37,11 +37,56 @@ using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 struct Failure : std::runtime_error {
     bool fatal;
+    std::optional<TlsCertificate> certificate;
     Failure(string s, bool f = false) : std::runtime_error(std::move(s)), fatal(f) {}
 };
 string opensslError(const string &prefix) {
     unsigned long e = ERR_get_error();
     return prefix + (e ? ": " + string(ERR_error_string(e, nullptr)) : "");
+}
+using CertificateHash = std::array<char, 64>;
+bool fingerprint(X509 *leaf, CertificateHash &hex) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int size = 0;
+    if (!X509_digest(leaf, EVP_sha256(), digest, &size) || size != hex.size() / 2)
+        return false;
+    constexpr char digits[] = "0123456789abcdef";
+    for (unsigned int i = 0; i < size; ++i) {
+        hex[2 * i] = digits[digest[i] >> 4];
+        hex[2 * i + 1] = digits[digest[i] & 15];
+    }
+    return true;
+}
+bool untrustedSelfSignedLeaf(X509_STORE_CTX *store) {
+    return X509_STORE_CTX_get_error_depth(store) == 0 &&
+           X509_STORE_CTX_get_error(store) == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT &&
+           X509_STORE_CTX_get0_parent_ctx(store) == nullptr;
+}
+bool reviewableLeaf(X509_STORE_CTX *store, X509 *leaf, const string &host, bool ip) {
+    auto *params = X509_STORE_CTX_get0_param(store);
+    const int nameMatches = ip ? X509_check_ip_asc(leaf, host.c_str(), 0)
+                               : X509_check_host(leaf, host.c_str(), host.size(),
+                                                 X509_VERIFY_PARAM_get_hostflags(params), nullptr);
+    if (nameMatches != 1 || X509_cmp_current_time(X509_get0_notBefore(leaf)) >= 0 ||
+        X509_cmp_current_time(X509_get0_notAfter(leaf)) <= 0)
+        return false;
+    // Check for other verification failures without allowing the live handshake to continue.
+    std::unique_ptr<X509_STORE_CTX, decltype(&X509_STORE_CTX_free)> review(X509_STORE_CTX_new(),
+                                                                           X509_STORE_CTX_free);
+    if (!review ||
+        X509_STORE_CTX_init(review.get(), X509_STORE_CTX_get0_store(store), leaf,
+                            X509_STORE_CTX_get0_untrusted(store)) != 1 ||
+        X509_VERIFY_PARAM_set1(X509_STORE_CTX_get0_param(review.get()), params) != 1)
+        return false;
+    X509_STORE_CTX_set_verify_cb(review.get(), [](int ok, X509_STORE_CTX *ctx) {
+        if (!ok && untrustedSelfSignedLeaf(ctx)) {
+            X509_STORE_CTX_set_error(ctx, X509_V_OK);
+            return 1;
+        }
+        return ok;
+    });
+    return X509_verify_cert(review.get()) == 1 &&
+           X509_STORE_CTX_get_error(review.get()) == X509_V_OK;
 }
 vector<string> words(const string &s) {
     std::istringstream in(s);
@@ -268,6 +313,7 @@ struct NetworkClient::Impl {
     bool supplementalSafe = true;
     bool fallbackSafe = true;
     ServerConfig config;
+    const int configuredTlsPort;
     Identity identity;
     std::atomic<bool> stopping{false};
     std::thread worker;
@@ -282,6 +328,8 @@ struct NetworkClient::Impl {
     int socket = -1;
     SSL_CTX *context = nullptr;
     SSL *tls = nullptr;
+    std::optional<CertificateHash> reviewHash;
+    bool tlsIp = false, pinMismatch = false;
     bool ready = false, capEnded = false, saslRunning = false, saslDone = false, fatal = false,
          stsUpgrade = false;
     std::optional<int64_t> stsDuration;
@@ -327,7 +375,8 @@ struct NetworkClient::Impl {
     std::deque<std::shared_ptr<Delivery>> ordered;
     std::shared_ptr<Delivery> capture;
     size_t orderedBytes = 0, orderedCount = 0;
-    explicit Impl(const ServerConfig &c, const Identity &i) : config(c), identity(i), nick(i.nick) {
+    explicit Impl(const ServerConfig &c, const Identity &i)
+        : config(c), configuredTlsPort(c.tls ? c.port : 0), identity(i), nick(i.nick) {
         if (upper(config.sasl) == "NONE")
             config.sasl.clear();
         if (config.bouncer.starts_with("soju:"))
@@ -477,13 +526,19 @@ struct NetworkClient::Impl {
         e.label = l;
         emit(std::move(e));
     }
-    void state(const string &s, const string &err = {}) {
+    void state(const string &s, const string &err = {},
+               const std::optional<TlsCertificate> &certificate = {}) {
         Event e;
         e.type = "state";
         e.text = s;
         e.nick = nick;
         if (!err.empty())
             e.tags["error"] = diagnostic(err);
+        if (certificate) {
+            e.tags["tls-host"] = certificate->host;
+            e.tags["tls-port"] = std::to_string(certificate->port);
+            e.tags["tls-sha256"] = certificate->sha256;
+        }
         emit(std::move(e));
     }
     string label() { return "blastirc-" + sessionId + "-" + std::to_string(++serial); }
@@ -861,6 +916,47 @@ struct NetworkClient::Impl {
         }
         return {};
     }
+    const TlsCertificate *activePin() const {
+        return config.port == configuredTlsPort && config.trustedCertificate &&
+                       config.trustedCertificate->matches(config.host, config.port)
+                   ? &*config.trustedCertificate
+                   : nullptr;
+    }
+    static int verifyCertificate(int ok, X509_STORE_CTX *store) {
+        if (ok > 1 || X509_STORE_CTX_get_error_depth(store) != 0 ||
+            X509_STORE_CTX_get0_parent_ctx(store))
+            return ok;
+        auto *ssl = static_cast<SSL *>(
+            X509_STORE_CTX_get_ex_data(store, SSL_get_ex_data_X509_STORE_CTX_idx()));
+        auto &self = *static_cast<Impl *>(SSL_get_app_data(ssl));
+        const auto *pin = self.activePin();
+        const bool selfSigned =
+            !ok && self.configuredTlsPort == self.config.port && untrustedSelfSignedLeaf(store);
+        if ((!ok || !pin) && !selfSigned)
+            return ok;
+        X509 *leaf = X509_STORE_CTX_get_current_cert(store);
+        CertificateHash hash;
+        const bool hashed = fingerprint(leaf, hash);
+        const bool matches =
+            hashed && pin && pin->sha256 == std::string_view(hash.data(), hash.size());
+        if (ok) {
+            if (!matches) {
+                self.pinMismatch = hashed;
+                X509_STORE_CTX_set_error(store, X509_V_ERR_APPLICATION_VERIFICATION);
+            }
+            return matches;
+        }
+        auto *key = X509_get0_pubkey(leaf);
+        if (hashed && key && X509_verify(leaf, key) == 1) {
+            if (matches) {
+                X509_STORE_CTX_set_error(store, X509_V_OK);
+                return 1;
+            }
+            if (reviewableLeaf(store, leaf, self.config.host, self.tlsIp))
+                self.reviewHash = hash;
+        }
+        return 0;
+    }
     void connectTransport() {
         for (const auto &[address, length] : resolve()) {
             if (stopping)
@@ -903,7 +999,7 @@ struct NetworkClient::Impl {
         if (!context)
             throw Failure(opensslError("TLS initialization failed"), true);
         SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION);
-        SSL_CTX_set_verify(context, SSL_VERIFY_PEER, nullptr);
+        SSL_CTX_set_verify(context, SSL_VERIFY_PEER, verifyCertificate);
         SSL_CTX_set_default_passwd_cb(context, [](char *, int, int, void *) { return 0; });
         if (SSL_CTX_set_default_verify_paths(context) != 1)
             throw Failure(opensslError("Cannot load trusted certificate authorities"), true);
@@ -918,12 +1014,13 @@ struct NetworkClient::Impl {
         tls = SSL_new(context);
         if (!tls)
             throw Failure(opensslError("TLS session failed"), true);
-        SSL_set_fd(tls, socket);
+        if (SSL_set_fd(tls, socket) != 1 || SSL_set_app_data(tls, this) != 1)
+            throw Failure(opensslError("TLS session setup failed"), true);
         X509_VERIFY_PARAM_set_hostflags(SSL_get0_param(tls), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
         std::array<unsigned char, 16> address{};
-        bool ip = inet_pton(AF_INET, config.host.c_str(), address.data()) == 1 ||
-                  inet_pton(AF_INET6, config.host.c_str(), address.data()) == 1;
-        if (ip) {
+        tlsIp = inet_pton(AF_INET, config.host.c_str(), address.data()) == 1 ||
+                inet_pton(AF_INET6, config.host.c_str(), address.data()) == 1;
+        if (tlsIp) {
             if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(tls), config.host.c_str()) != 1)
                 throw Failure("Invalid TLS IP address", true);
         } else {
@@ -931,6 +1028,8 @@ struct NetworkClient::Impl {
                 SSL_set1_host(tls, config.host.c_str()) != 1)
                 throw Failure("Invalid TLS hostname", true);
         }
+        reviewHash.reset();
+        pinMismatch = false;
         auto deadline = Clock::now() + 20s;
         while (!stopping) {
             ERR_clear_error();
@@ -941,9 +1040,29 @@ struct NetworkClient::Impl {
                 return;
             }
             int e = SSL_get_error(tls, r);
-            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE)
-                throw Failure(opensslError("TLS handshake/certificate verification failed"),
-                              e == SSL_ERROR_SSL || SSL_get_verify_result(tls) != X509_V_OK);
+            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+                const auto verification = SSL_get_verify_result(tls);
+                if (reviewHash && verification == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT) {
+                    Failure failure(activePin() ? "The server's self-signed certificate changed. "
+                                                  "Verify the new fingerprint before trusting it."
+                                                : "The server uses a self-signed certificate. "
+                                                  "Verify its fingerprint before trusting it.",
+                                    true);
+                    failure.certificate =
+                        TlsCertificate{config.host, configuredTlsPort,
+                                       string(reviewHash->data(), reviewHash->size())};
+                    throw failure;
+                }
+                if (pinMismatch)
+                    throw Failure("The server certificate differs from the saved fingerprint. "
+                                  "Clear certificate trust to use normal CA verification.",
+                                  true);
+                if (verification != X509_V_OK)
+                    throw Failure("TLS certificate verification failed: " +
+                                      string(X509_verify_cert_error_string(verification)),
+                                  true);
+                throw Failure(opensslError("TLS handshake failed"), e == SSL_ERROR_SSL);
+            }
             if (Clock::now() > deadline)
                 throw Failure("TLS handshake timed out");
             waitFd(e == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, 200);
@@ -3569,7 +3688,7 @@ struct NetworkClient::Impl {
                         failAttempt(pendingSends.begin()->first, e.what(), true);
                     while (!pendingReactions.empty())
                         undoReaction(pendingReactions.begin()->first, e.what());
-                    state(fatal ? "Failed" : "Disconnected", e.what());
+                    state(fatal ? "Failed" : "Disconnected", e.what(), e.certificate);
                 } catch (const std::exception &e) {
                     rejectQueued(e.what());
                     while (!pendingSends.empty())

@@ -52,6 +52,14 @@ struct Identity {
     string name = "default", nick = "blastirc", username = "blastirc", realname = "BlastIRC";
     string password, certificate, key;
 };
+struct TlsCertificate {
+    string host;
+    int port = 0;
+    string sha256;
+    bool matches(std::string_view address, int service) const {
+        return host == address && port == service;
+    }
+};
 struct ServerConfig {
     string name = "Libera", host = "irc.libera.chat";
     string alias, avatar;
@@ -61,6 +69,7 @@ struct ServerConfig {
     vector<string> channels;
     bool sojuAccount = false, sojuEnabled = true;
     string sojuParent, sojuNetworkId, sojuTrustedFileHost;
+    std::optional<TlsCertificate> trustedCertificate{};
 };
 struct ConnectionSetup {
     ServerConfig server;
@@ -273,6 +282,7 @@ struct SojuNetworkInfo {
 };
 struct Network {
     string name, state = "Disconnected", nick, error, clientTagDeny;
+    std::optional<TlsCertificate> certificateChallenge{};
     string firstChannel, firstChannelError;
     double firstChannelStarted = 0;
     bool retrying = false, automaticHistoryPaused = false;

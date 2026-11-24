@@ -18,9 +18,11 @@ To build separately, use `nix build .#default` and run `./result/bin/blastirc`; 
 
 Run `nix run .#install-dev` from the checkout root to build the current source and install **BlastIRC (Dev)** in your app launcher. If the build fails, the launcher is left untouched. Opening it later rebuilds only what changed, including uncommitted edits. It shares your BlastIRC settings and history; close the stable instance first. No NixOS rebuild is needed.
 
-On the welcome screen, enter your server, port, nickname and identity, keep TLS enabled, add any auto-join channels, and select **Save and connect**.
+On the welcome screen, choose a server and nickname, add any auto-join channels, and select **Save and connect**. TLS is on by default. For a plaintext listener, turn off **TLS** under **Advanced options** and use the listener's port. Plaintext exposes messages and passwords to the network.
 
 For soju, choose **Add soju account** in **Settings → Networks**, enter the bouncer endpoint and base-account identity without a `/network` suffix, then set **Password (SASL PLAIN)** credentials and select **Save and connect**.
+
+If a TLS server or soju bouncer uses a self-signed certificate, choose **Review certificate…** after the connection fails. Confirm the SHA-256 fingerprint with the server administrator before selecting **Trust**. Trust applies only to that hostname, port, and certificate; manage it in the network's settings.
 
 ## Features
 

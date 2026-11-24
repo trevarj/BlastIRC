@@ -1499,7 +1499,7 @@ struct Ui::Impl::PaneView final : Node {
     ScrollView *welcomeScroll = nullptr;
     Flex *welcome = nullptr;
     Label *welcomeTitle = nullptr, *welcomeBody = nullptr;
-    enum WelcomeAction { Add, Manage, Edit, Retry, Stop, Log, Soju, Networks, Join, Dm };
+    enum WelcomeAction { Add, Manage, Edit, Review, Retry, Stop, Log, Soju, Networks, Join, Dm };
     std::array<Button *, Dm + 1> welcomeButtons{};
     Flex *welcomeActions = nullptr, *conversationActions = nullptr;
     Input *conversationTarget = nullptr;
@@ -1559,6 +1559,7 @@ struct Ui::Impl::PaneView final : Node {
         addButton(*actions, Add, "Add connection", "welcome-add");
         addButton(*actions, Manage, "Manage connections", "welcome-manage");
         addButton(*actions, Edit, "Edit details", "onboarding-edit");
+        addButton(*actions, Review, "Review certificate…", "onboarding-review-certificate");
         addButton(*actions, Retry, "Retry", "onboarding-retry");
         addButton(*actions, Stop, "Stop", "onboarding-stop");
         addButton(*actions, Log, "View server log", "onboarding-log");
@@ -1643,6 +1644,8 @@ struct Ui::Impl::PaneView final : Node {
         const auto *network = onboardingNetwork();
         if (action == Edit)
             ui.pending.push_back("server:" + profile->name);
+        else if (action == Review)
+            ui.pending.push_back("review-certificate:" + profile->name);
         else if (action == Retry || action == Stop)
             queue(model, action == Retry ? "connect" : "disconnect", {}, profile->name);
         else if (action == Log)
@@ -1693,6 +1696,8 @@ struct Ui::Impl::PaneView final : Node {
         const bool chat = ready && profile && !profile->sojuAccount;
         const bool soju = ready && profile && profile->sojuAccount;
         const bool managementOnly = soju && profile->sasl.empty();
+        const bool review =
+            profile && !Dialogs::certificateReviewNetwork(ui.model, profile->name).empty();
         const bool sojuDiscovery = soju && network->caps.contains("soju.im/bouncer-networks");
         const bool catalog = sojuDiscovery && network->sojuDiscoveryComplete;
         const bool retrySoju =
@@ -1709,7 +1714,8 @@ struct Ui::Impl::PaneView final : Node {
             else if (state == "Retrying")
                 body = "Waiting to retry automatically. Stop cancels the next attempt.";
             else if (state == "Failed")
-                body = "Check your connection details, or retry.";
+                body = review ? "Review the certificate before trusting this connection."
+                              : "Check your connection details, or retry.";
             else if (soju) {
                 body = network->nick.empty() ? "Soju account connected."
                                              : "Soju account connected as " + network->nick + ".";
@@ -1743,6 +1749,7 @@ struct Ui::Impl::PaneView final : Node {
         const std::array shown = {!profile,
                                   !profile && !ui.model.servers.empty(),
                                   profile != nullptr,
+                                  review,
                                   profile &&
                                       ((!active && !ready) || state == "Retrying" || retrySoju),
                                   profile && (active || ready),
@@ -3808,6 +3815,11 @@ bool Ui::Impl::statusControlsAvailable() const {
 void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> pointer) {
     if (command.empty())
         return;
+    if (command.starts_with("review-certificate:")) {
+        if (statusControlsAvailable())
+            dialogs->open(command);
+        return;
+    }
     if (command.starts_with("status-")) {
         if (!statusControlsAvailable())
             return;

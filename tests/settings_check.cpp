@@ -441,6 +441,164 @@ void welcomeControls() {
     assert(named<Input>(dialogs, "Server address")->value() == "irc.new.example");
     press(dispatcher, *button(dialogs, "Cancel"));
     assert(!dialogs.active() && !model.connectionSetup && model.servers.empty());
+
+    dialogs.open("add-server");
+    frame();
+    edit(dispatcher, *named<Input>(dialogs, "Nickname"), "PlainNick");
+    activate(dispatcher, *named<Toggle>(dialogs, "Advanced options"));
+    assert(named<Input>(dialogs, "Port (1–65535)")->value() == "6697");
+    activate(dispatcher, *named<Toggle>(dialogs, "TLS (recommended)"));
+    assert(named<Input>(dialogs, "Port (1–65535)")->value() == "6667");
+    assert(find<Label>(dialogs, [](const Label &label) {
+        return label.text().starts_with("Plaintext exposes") &&
+               label.text().find("SASL password") != std::string::npos;
+    }));
+    named<Select>(dialogs, "Authentication method")->setSelectedIndex(0);
+    edit(dispatcher, *named<Input>(dialogs, "SASL password (PLAIN)"), "plain-secret");
+    press(dispatcher, *button(dialogs, "Save and connect"));
+    assert(model.actions.back().type == "setup-connect" && model.connectionSetup);
+    assert(!model.connectionSetup->server.tls && model.connectionSetup->server.port == 6667 &&
+           model.connectionSetup->server.sasl == "PLAIN" &&
+           model.connectionSetup->identity->password == "plain-secret");
+}
+
+void certificateControls() {
+    using namespace blast;
+    Model model;
+    model.firstRun = false;
+    model.settings.reducedMotion = true;
+    model.identities.emplace_back().password = "saved-password";
+    auto &profile = model.servers.emplace_back();
+    profile.name = "account";
+    profile.host = "soju.example";
+    profile.port = 6698;
+    profile.sojuAccount = true;
+    profile.sasl = "PLAIN";
+    auto &runtime = model.networks[profile.name];
+    runtime.state = "Failed";
+    runtime.sessionGeneration = 7;
+    const TlsCertificate certificate{profile.host, profile.port, std::string(64, 'a')};
+    model.activeBuffer = profile.name + "/*server*";
+    auto &log = model.buffers[model.activeBuffer];
+    log.id = model.activeBuffer;
+    log.server = profile.name;
+    log.target = "*server*";
+    log.kind = "server";
+    model.onboardingNetwork = profile.name;
+
+    struct Clipboard final : TextClipboard {
+        std::string text;
+        std::optional<std::string> clipboardText() override { return text; }
+        void setClipboardText(std::string value) override { text = std::move(value); }
+    } clipboard;
+    Theme theme;
+    theme.update(model);
+    PangoRenderer renderer;
+    InputDispatcher dispatcher;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1280, 760, 1);
+        ui.root().layout(renderer);
+    };
+    const auto present = [&](std::string_view text) {
+        return find<Button>(ui.root(),
+                            [&](const Button &control) { return control.label()->text() == text; });
+    };
+    frame();
+    assert(!present("Review certificate…"));
+    runtime.certificateChallenge = certificate;
+    frame();
+    press(dispatcher, *button(ui.root(), "Review certificate…"));
+    frame();
+    assert(find<Label>(ui.root(), [&](const Label &label) {
+        return label.text().find("soju.example:6698") != std::string::npos &&
+               label.text().find(certificate.sha256) != std::string::npos &&
+               label.text().find("server administrator") != std::string::npos;
+    }));
+    assert(dispatcher.focusedArea() == button(ui.root(), "Cancel")->inputArea());
+    press(dispatcher, *button(ui.root(), "Cancel"));
+    frame();
+    assert(model.actions.empty() && !present("Trust"));
+    press(dispatcher, *button(ui.root(), "Review certificate…"));
+    frame();
+    ++runtime.sessionGeneration;
+    press(dispatcher, *button(ui.root(), "Trust"));
+    frame();
+    assert(model.actions.empty() && !present("Trust"));
+    press(dispatcher, *button(ui.root(), "Review certificate…"));
+    frame();
+    press(dispatcher, *button(ui.root(), "Trust"));
+    assert(model.actions.size() == 1);
+    const auto &action = model.actions.back();
+    assert(action.type == "trust-certificate" && action.buffer == profile.name &&
+           action.text == certificate.sha256 && action.extra.empty() && action.requestId == 8);
+    model.actions.clear();
+    model.onboardingNetwork.clear();
+
+    ui.execute("server:" + profile.name);
+    frame();
+    auto *dialogs = find<Dialogs>(ui.root(), [](const Dialogs &dialog) { return dialog.active(); });
+    assert(dialogs && present("Review certificate…"));
+    const auto clearTrust = "Clear saved certificate trust";
+    profile.trustedCertificate = certificate;
+    frame();
+    assert(find<Label>(*dialogs, [](const Label &label) {
+        return label.text() == "Saved certificate trust (SHA-256)";
+    }));
+    assert(find<Label>(*dialogs,
+                       [&](const Label &label) { return label.text() == certificate.sha256; }));
+    press(dispatcher, *button(*dialogs, clearTrust));
+    assert(!profile.trustedCertificate && !present(clearTrust) && model.actions.empty());
+    profile.trustedCertificate = certificate;
+    edit(dispatcher, *named<Input>(*dialogs, "Port (1–65535)"), "99999");
+    assert(profile.trustedCertificate && !present("Review certificate…"));
+    edit(dispatcher, *named<Input>(*dialogs, "Port (1–65535)"), "6699");
+    assert(!profile.trustedCertificate && !present("Review certificate…"));
+    edit(dispatcher, *named<Input>(*dialogs, "Port (1–65535)"), "6698");
+    profile.trustedCertificate = certificate;
+    activate(dispatcher, *named<Toggle>(*dialogs, "TLS (recommended)"));
+    assert(!profile.tls && !profile.trustedCertificate && !present("Review certificate…"));
+    assert(named<Input>(*dialogs, "Account password")->enabled());
+    activate(dispatcher, *named<Toggle>(*dialogs, "TLS (recommended)"));
+    profile.trustedCertificate = certificate;
+    edit(dispatcher, *named<Input>(*dialogs, "Server address"), "other.example");
+    assert(profile.host == certificate.host && !present("Review certificate…"));
+    press(dispatcher, *button(*dialogs, "Review address change…"));
+    press(dispatcher, *button(*dialogs, "Reuse credentials"));
+    assert(profile.host == "other.example" && !profile.trustedCertificate &&
+           !present("Review certificate…"));
+
+    profile.host = certificate.host;
+    profile.trustedCertificate = certificate;
+    auto &child = model.servers.emplace_back();
+    child.name = "child";
+    child.sojuParent = log.server;
+    child.sojuNetworkId = "upstream";
+    ui.execute("server:" + child.name);
+    frame();
+    assert(!present(clearTrust));
+    press(dispatcher, *button(*dialogs, "Review certificate…"));
+    frame();
+    press(dispatcher, *button(*dialogs, "Trust"));
+    assert(model.actions.size() == 1 && model.actions.back().buffer == child.sojuParent &&
+           model.actions.back().requestId == 8);
+
+    runtime.state = "Ready";
+    auto &childRuntime = model.networks[child.name];
+    childRuntime.state = "Failed";
+    childRuntime.sessionGeneration = 12;
+    childRuntime.certificateChallenge = certificate;
+    childRuntime.certificateChallenge->sha256.assign(64, 'b');
+    frame();
+    press(dispatcher, *button(*dialogs, "Review certificate…"));
+    frame();
+    press(dispatcher, *button(*dialogs, "Trust"));
+    assert(model.actions.size() == 2 && model.actions.back().buffer == child.name &&
+           model.actions.back().requestId == 12 &&
+           model.actions.back().text == childRuntime.certificateChallenge->sha256);
 }
 
 void dataStorageControls() {
@@ -1260,7 +1418,6 @@ void whoisProfileControls() {
     using namespace blast;
     Model model;
     model.firstRun = false;
-    codecs::installImageDecoder();
     PangoRenderer renderer;
     model.buffers["conversation"].draft = "unsent 猫 draft";
     Theme theme;
@@ -1635,8 +1792,10 @@ void nativePopupFonts() {
 
 void runSettingsCheck() {
     using namespace blast;
+    codecs::installImageDecoder();
     nativePopupFonts();
     welcomeControls();
+    certificateControls();
     dataStorageControls();
     settingsTreeControls();
     settingsTreeAnimatedSelection();

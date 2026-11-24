@@ -38,6 +38,7 @@ struct HistoryRequest {
 // This is local transport completion, not a server acknowledgement or echo.
 // tags[echo-expected] is "1"/"0", captured at frame admission, not completion.
 // state: text Connecting/Registering/Ready/Disconnected/Failed; tags[error].
+// Failed also carries tls-host, tls-port and tls-sha256 for a reviewable leaf only.
 // Ready follows network-selection updates and acknowledged deferred capabilities.
 // error: text reason. Failed sends additionally carry target, attempt label when
 // a ghost exists (or caller submission before it), tags[send-failed]=1 and
@@ -137,9 +138,10 @@ struct HistoryRequest {
 // a wire reply id is absent or +reply is not currently permitted.
 // CLIENTTAGDENY uses irc::clientTagAllowed: case-sensitive wildcard rules, with
 // matching '-' exceptions overriding denials; message-tags must also be enabled.
-// TLS chain and hostname verification are mandatory; encrypted client keys fail
-// noninteractively. STS is advertisement-only (never CAP REQ); verified policies
-// persist and their last positive duration is renewed on connection close.
+// TLS verifies chain and endpoint; an exact endpoint pin can replace CA trust for
+// a self-signed leaf only. Encrypted client keys fail noninteractively.
+// STS is advertisement-only (never CAP REQ); verified policies persist and their
+// last positive duration is renewed on connection close.
 class NetworkClient {
   public:
     NetworkClient(const ServerConfig &, const Identity &);

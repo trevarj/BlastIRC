@@ -8493,6 +8493,14 @@ void hiddenUnreadStatusCheck(
         auto *area = areaWithKey(*line, "buffer:" + id);
         return area && visible(*area) ? area : nullptr;
     };
+    const auto shownLabel = [](Node &node, std::string_view text) -> Label * {
+        auto *label = labelWithText(node, text);
+        return label && visible(*label) && label->width() > 0 ? label : nullptr;
+    };
+    const auto statusLabel = [&](const std::string &key, std::string_view text) -> Label * {
+        auto *area = areaWithKey(*line, key);
+        return area ? shownLabel(*area, text) : nullptr;
+    };
     const auto fits = [&](const Label *label) {
         return label && label->width() + .5f >=
                             renderer
@@ -8500,39 +8508,114 @@ void hiddenUnreadStatusCheck(
                                              TextAlign::Start, TextEllipsize::End, false)
                                 .width;
     };
-    const auto counted = [&](const std::string &id, std::string_view caption, int count) {
-        auto *area = activity(id);
-        assert(area && areaWithTooltip(*area, caption) == area);
-        const auto suffix = ": " + std::to_string(count);
-        auto *label = visibleLabelContaining(*area, suffix);
-        assert(label && label->text() == suffix && fits(label));
-        assert(label->x() >= 0 && label->x() + label->width() <= area->width() + .5f);
-        return area;
+    const auto bounds = [](const Node &node) {
+        std::array<float, 4> rect{};
+        Node::transformedBounds(&node, rect[0], rect[1], rect[2], rect[3]);
+        return rect;
     };
     const auto marker = [&](const std::string &id) -> Label * {
         auto *area = activity(id);
-        return area ? visibleLabelContaining(*area, "@") : nullptr;
+        return area ? shownLabel(*area, "@") : nullptr;
     };
-    counted(normal, "Local/#ops: 12", 12);
-    auto *other = counted(mention, "Remote/#ops: 1", 1);
-    counted(fools, "Local/#fools: 1", 1);
-    counted(dm, "Local/DM ada: 2", 2);
-    assert(!marker(mention) && !marker(fools));
+    const auto restingFill =
+        lerpColor(themeForegroundColor("background"), themeForegroundColor("on_surface"), .07f);
+    const auto card = [&](const std::string &id, std::string_view tooltip, std::string_view network,
+                          std::string_view target, std::string_view count, bool mentioned = false,
+                          bool truncated = false) {
+        auto *area = activity(id);
+        assert(area && areaWithTooltip(*area, tooltip) == area);
+        auto *name = shownLabel(*area, network);
+        auto *chat = shownLabel(*area, target);
+        auto *number = shownLabel(*area, count);
+        auto *at = marker(id);
+        assert(name && chat && fits(number));
+        assert(mentioned ? fits(at) : !at);
+        assert(truncated ? !fits(name) || !fits(chat) : fits(name) && fits(chat));
+
+        Box *plate = nullptr;
+        std::vector<Box *> rules;
+        const auto findBoxes = [&](auto &&self, Node &node) -> void {
+            if (!visible(node))
+                return;
+            if (auto *box = dynamic_cast<Box *>(&node); box && box->style().fill.a > 0) {
+                if (box->style().radius != 0.f) {
+                    assert(!plate);
+                    plate = box;
+                } else if (box->height() > box->width() && box->width() > 0) {
+                    rules.push_back(box);
+                }
+            }
+            for (const auto &child : node.children())
+                self(self, *child);
+        };
+        findBoxes(findBoxes, *area);
+        const auto fill = area->hovered() ? themeForegroundColor("hover") : restingFill;
+        assert(plate && plate->style().fill == fill && rules.size() == 2);
+        std::ranges::sort(rules, {}, [&](const auto *rule) { return bounds(*rule)[0]; });
+        const auto [left, top, right, bottom] = bounds(*plate);
+        const auto hit = bounds(*area);
+        assert(hit[0] <= left && right <= hit[2] && hit[1] < top && bottom <= hit[3]);
+        for (const auto *node :
+             std::array<const Node *, 6>{name, at, chat, number, rules[0], rules[1]})
+            if (node) {
+                const auto [x, y, endX, endY] = bounds(*node);
+                assert(left <= x && endX <= right && top <= y && endY <= bottom);
+                assert(std::abs(y + endY - top - bottom) <= 1.f);
+            }
+        assert(bounds(*name)[2] < bounds(*rules[0])[0]);
+        assert(bounds(*rules[0])[2] < bounds(*(at ? at : chat))[0]);
+        if (at)
+            assert(bounds(*at)[2] < bounds(*chat)[0]);
+        assert(bounds(*chat)[2] < bounds(*rules[1])[0]);
+        assert(bounds(*rules[1])[2] < bounds(*number)[0]);
+        const auto distance = [](Color a, Color b) {
+            const float r = a.r - b.r, g = a.g - b.g, bDiff = a.b - b.b;
+            return r * r + g * g + bDiff * bDiff;
+        };
+        const auto ruleFill = rules[0]->style().fill;
+        assert(ruleFill == rules[1]->style().fill && ruleFill != fill &&
+               distance(ruleFill, fill) < distance(ruleFill, chat->color()));
+        assert(rules[0]->height() < plate->height() && rules[1]->height() < plate->height());
+        return plate;
+    };
+    auto *localPlate = card(normal, "Local/#ops: 12", "Local", "#ops", "12");
+    auto *remotePlate = card(mention, "Remote/#ops: 1", "Remote", "#ops", "1");
+    std::array plates{localPlate, remotePlate,
+                      card(fools, "Local/#fools: 1", "Local", "#fools", "1"),
+                      card(dm, "Local/DM ada: 2", "Local", "DM ada", "2")};
+    std::ranges::sort(plates, {}, [&](const auto *plate) { return bounds(*plate)[0]; });
+    for (size_t i = 1; i < plates.size(); ++i)
+        assert(bounds(*plates[i - 1])[2] < bounds(*plates[i])[0]);
     assert(!activity(archived) && !activity(system));
-    assert(fits(segment("Connected")) && fits(labelWithText(*line, "Me")) &&
-           fits(labelWithText(*line, "Local")));
+    assert(fits(segment("Connected")) && fits(statusLabel("status-nick", "Me")) &&
+           fits(statusLabel("status-network", "Local")));
+    const auto nickBounds = bounds(*statusLabel("status-nick", "Me"));
+    assert(bounds(*plates.back())[2] < nickBounds[0]);
+    for (const auto *plate : plates) {
+        const auto rect = bounds(*plate);
+        assert(std::abs(rect[1] + rect[3] - nickBounds[1] - nickBounds[3]) <= 1.f);
+    }
     assert(!segment(model.buffers.at(edgeBuffers[0]).target));
-    const auto normalColor = visibleLabelContaining(*other, "Remote/#ops")->color();
-    const auto normalWeight = visibleLabelContaining(*other, "Remote/#ops")->font().weight;
-    for (int i = 0; i < 5; ++i)
+    const auto hoverPoint = pointerPoint(*shownLabel(*activity(normal), "12"));
+    dispatcher.pointerMotion(hoverPoint[0], hoverPoint[1], 1);
+    frame();
+    assert(activity(normal)->hovered() && !activity(mention)->hovered());
+    card(normal, "Local/#ops: 12", "Local", "#ops", "12");
+    assert(remotePlate->style().fill == restingFill);
+    dispatcher.pointerMotion(0, 0, 2);
+    frame();
+    assert(!activity(normal)->hovered() && localPlate->style().fill == restingFill);
+    const auto *otherTitle = shownLabel(*activity(mention), "#ops");
+    const auto normalColor = otherTitle->color();
+    const auto normalWeight = otherTitle->font().weight;
+    for (int i = 0; i < 15; ++i)
         incoming(mention);
     const auto newestMention = incoming(mention, false, false, true);
     frame();
-    other = counted(mention, "@Remote/#ops: 7", 7);
+    card(mention, "@Remote/#ops: 17", "Remote", "#ops", "17", true);
     const auto *at = marker(mention);
-    assert(at && at->text() == "@" && fits(at));
     assert(at->color() != normalColor && at->font().weight > normalWeight);
-    click(dispatcher, *other);
+    click(dispatcher, *at);
     frame();
     assert(model.activeBuffer == mention);
     click(dispatcher, *activity(normal));
@@ -8545,8 +8628,8 @@ void hiddenUnreadStatusCheck(
         return area && visible(*area) ? area : nullptr;
     };
     assert(!overflowControl() && !areaWithKey(*line, "status-mark-all-read"));
-    assert(pointerPoint(*activity(mention))[0] < pointerPoint(*labelWithText(*line, "Me"))[0]);
-    // Find a width that has room for one activity chip and the overflow control.
+    assert(bounds(*activity(mention))[2] <= bounds(*statusLabel("status-nick", "Me"))[0]);
+    // Find a width that has room for one activity card and the overflow control.
     float overflowOnlyWidth = 0;
     for (width = 64; width <= 600; width += 4) {
         frame();
@@ -8559,8 +8642,7 @@ void hiddenUnreadStatusCheck(
     }
     auto *overflow = overflowControl();
     assert(width <= 600 && overflow && fits(visibleLabelContaining(*overflow, "+3 chats")));
-    counted(mention, "@Remote/#ops: 7", 7);
-    assert(fits(marker(mention)));
+    card(mention, "@Remote/#ops: 17", "Remote", "#ops", "17", true, true);
     const auto omitted = [&](std::initializer_list<std::string_view> expected) {
         assert(menu.open && overflowControl());
         const auto point = pointerPoint(*overflowControl());
@@ -8648,7 +8730,7 @@ void hiddenUnreadStatusCheck(
     assert(overflowControl() && !activity(mention) &&
            fits(visibleLabelContaining(*overflowControl(), "+4 chats")));
     click(dispatcher, *overflowControl());
-    omitted({"@Remote/#ops: 7", "Local/#ops: 12", "Local/#fools: 1", "Local/DM ada: 2"});
+    omitted({"@Remote/#ops: 17", "Local/#ops: 12", "Local/#fools: 1", "Local/DM ada: 2"});
     width = 2000;
     frame();
     assert(!menu.open && !overflowControl() && activity(dm));
@@ -8676,8 +8758,7 @@ void hiddenUnreadStatusCheck(
     model.buffers.at(mention).unread = 0;
     incoming(mention);
     frame();
-    counted(mention, "Remote/#ops: 1", 1);
-    assert(!marker(mention));
+    card(mention, "Remote/#ops: 1", "Remote", "#ops", "1");
     model.buffers.at(mention).unread = 0;
     frame();
     assert(!activity(mention));
@@ -8718,7 +8799,8 @@ void hiddenUnreadStatusCheck(
     ui.execute("toggle-navigation");
     frame();
     const auto identityFits = [&] {
-        return fits(labelWithText(*line, "Me")) && fits(labelWithText(*line, "Local"));
+        return fits(statusLabel("status-nick", "Me")) &&
+               fits(statusLabel("status-network", "Local"));
     };
     auto &network = model.networks.at("test");
     auto &history = model.buffers.at(edgeBuffers[2]).initialHistorySync;

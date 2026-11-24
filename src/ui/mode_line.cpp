@@ -86,17 +86,11 @@ ContextMenuEntry menuEntry(size_t value, std::string label, std::string_view ico
 struct ModeLine::Impl {
     enum Group { History, Feedback, Chord, Nick, NetworkName, State, GroupCount };
     struct Activity {
-        std::string name, target, readMarker, caseMapping, caption;
-        size_t suffixOffset = 0, size = 0;
+        std::string name, target, readMarker, caseMapping, caption, chatTitle, countText;
+        size_t size = 0;
         uint64_t revision = 0;
         int count = 0;
         bool mentioned = false, query = false;
-
-        std::string_view title() const {
-            const size_t start = mentioned ? 1 : 0;
-            return std::string_view(caption).substr(start, suffixOffset - start);
-        }
-        std::string_view suffix() const { return std::string_view(caption).substr(suffixOffset); }
     };
     using ActivityMap = std::map<std::string, Activity, std::less<>>;
     struct Button {
@@ -106,7 +100,8 @@ struct ModeLine::Impl {
         Box *highlight;
         Box *focus;
         std::optional<Group> group;
-        Label *marker = nullptr, *suffix = nullptr;
+        Label *marker = nullptr, *suffix = nullptr, *network = nullptr;
+        std::array<Box *, 2> dividers{};
     };
     struct Slot {
         Button button;
@@ -149,7 +144,7 @@ struct ModeLine::Impl {
     ActivityMap activity;
     std::vector<const ActivityMap::value_type *> ordered;
     std::vector<Slot> slots;
-    std::vector<std::array<float, 2>> measuredChips;
+    std::vector<std::array<float, 3>> measuredChips;
     Button overflow;
     Box *tip;
     Label *tipText;
@@ -163,6 +158,10 @@ struct ModeLine::Impl {
     float scale = 1, contentBottomInset = 0;
     Color activityInk{}, mentionInk{}, focusInk{};
     Color hoverFill{};
+    struct CardColors {
+        Color fill, network, text, mention, divider;
+    };
+    std::array<CardColors, 2> cardColors{};
     std::array<Color, GroupCount> controlInks{};
     std::string shownBuffer, shownServer, shownState;
     uint64_t shownSession = 0;
@@ -243,16 +242,29 @@ struct ModeLine::Impl {
         button.focus->setVisible(allowed && area.enabled() && area.focused() &&
                                  pointerFocused != &area);
     }
-    void updateHover(const Button &button) const {
+    bool hovered(const Button &button) const {
         const auto &area = *button.area;
-        const bool available = allowed && !popupButton && area.visible() && area.enabled();
-        const bool shown = available && area.hovered();
-        if (button.highlight->visible() != shown) {
-            button.highlight->setVisible(shown);
+        return allowed && !popupButton && area.visible() && area.enabled() && area.hovered();
+    }
+    void updateHover(const Button &button) const {
+        const bool shown = hovered(button);
+        if (button.network || button.highlight->visible() != shown) {
+            button.highlight->setVisible(button.network || shown);
             updateInk(button);
         }
     }
     void updateInk(const Button &button) const {
+        if (button.network) {
+            const auto &colors = cardColors[hovered(button)];
+            button.highlight->setFill(colors.fill);
+            button.network->setColor(colors.network);
+            button.title->setColor(colors.text);
+            button.marker->setColor(colors.mention);
+            button.suffix->setColor(button.marker->visible() ? colors.mention : colors.text);
+            for (auto *divider : button.dividers)
+                divider->setFill(colors.divider);
+            return;
+        }
         const auto ink = [&](Color normal) {
             return button.highlight->visible() ? themePairedForeground(hoverFill, normal) : normal;
         };
@@ -261,10 +273,6 @@ struct ModeLine::Impl {
         button.title->setColor(foreground);
         if (button.group)
             icons[*button.group]->setColor(foreground);
-        if (button.marker)
-            button.marker->setColor(ink(mentionInk));
-        if (button.suffix)
-            button.suffix->setColor(foreground);
     }
     std::string_view caption(Group group) const { return controls[group].title->text(); }
     void updateTipText(Group group) {
@@ -356,9 +364,20 @@ struct ModeLine::Impl {
         auto *focus = child<Box>(*area);
         focus->setHitTestVisible(false);
         focus->setVisible(false);
-        const Button button{area, content, lineLabel(*content), highlight, focus, group,
+        const Button button{area,
+                            content,
+                            lineLabel(*content),
+                            highlight,
+                            focus,
+                            group,
                             activityChip ? lineLabel(*content) : nullptr,
-                            activityChip ? lineLabel(*content) : nullptr};
+                            activityChip ? lineLabel(*content) : nullptr,
+                            activityChip ? lineLabel(*content) : nullptr,
+                            activityChip ? std::array{child<Box>(*content), child<Box>(*content)}
+                                         : std::array<Box *, 2>{}};
+        for (auto *divider : button.dividers)
+            if (divider)
+                divider->setHitTestVisible(false);
         area->setOnFocusGain([this, button] {
             pointerFocused = nullptr;
             updateFocus(button);
@@ -397,9 +416,10 @@ struct ModeLine::Impl {
         const float highlightHeight = contentHeight - 2 * inset;
         button.highlight->setPosition(0, inset);
         button.highlight->setFrameSize(width, highlightHeight);
-        button.highlight->setRadius(
-            std::min(themeCornerRadius(), std::min(width, highlightHeight) / 2));
-        button.highlight->setFill(hoverFill);
+        const float radius = button.network ? 7 * scale : themeCornerRadius();
+        button.highlight->setRadius(std::min(radius, std::min(width, highlightHeight) / 2));
+        if (!button.network)
+            button.highlight->setFill(hoverFill);
         button.focus->setFill(focusInk);
         const float rule = std::max(1.f, scale);
         button.focus->setPosition(0, height - rule);
@@ -783,6 +803,15 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
         return;
     }
 
+    const auto text = themeForegroundColor("on_surface");
+    const auto variant = themeForegroundColor("on_surface_variant");
+    const auto mention = themeForegroundColor("error");
+    for (size_t i = 0; i < p.cardColors.size(); ++i) {
+        const auto fill = i ? p.hoverFill : lerpColor(backdrop, text, .07f);
+        const auto foreground = themePairedForeground(fill, text);
+        p.cardColors[i] = {fill, themePairedForeground(fill, variant), foreground,
+                           themePairedForeground(fill, mention), lerpColor(fill, foreground, .22f)};
+    }
     const bool foolRulesChanged =
         p.foolUnread != model.settings.foolUnread || p.fools != model.settings.fools;
     if (foolRulesChanged) {
@@ -821,8 +850,9 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
             if (mentioned)
                 entry.caption += '@';
             entry.caption.append(name).append(query ? "/DM " : "/").append(chat.target);
-            entry.suffixOffset = entry.caption.size();
-            entry.caption.append(": ").append(std::to_string(chat.unread));
+            entry.countText = std::to_string(chat.unread);
+            entry.caption.append(": ").append(entry.countText);
+            entry.chatTitle = query ? "DM " + chat.target : chat.target;
             entry.name = name;
             entry.target = chat.target;
             entry.query = query;
@@ -863,6 +893,7 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
         p.enableButton(slot.button, allowActivityMenu);
         style(*slot.button.marker, bold, p.scale);
         style(*slot.button.suffix, font, p.scale);
+        style(*slot.button.network, font, p.scale);
         p.styleButton(slot.button, font);
     }
 }
@@ -891,6 +922,11 @@ void ModeLine::doLayout(Renderer &renderer) {
     const float ellipsis = measure("…");
     const float gap = std::min(12 * p.scale, width() / 32);
     const float inset = 4 * p.scale;
+    const float cardInset = 6 * p.scale, cardGap = 4 * p.scale;
+    const float dividerWidth = std::max(1.f, std::round(p.scale));
+    const float dividerInset = 4 * p.scale;
+    const float dividerSpan = 2 * dividerInset + dividerWidth;
+    const float cardChrome = 2 * (cardInset + dividerSpan);
     const float iconPrefix = std::round(14 * p.scale) + std::ceil(4 * p.scale);
     std::array<float, GroupCount> ideal{}, used{}, labelWidths{}, iconWidths{};
     for (size_t i = 0; i < ideal.size(); ++i)
@@ -938,11 +974,22 @@ void ModeLine::doLayout(Renderer &renderer) {
         take(Feedback, remaining - overflowFloor - nickFloor - nameFloor);
 
     const float marker = count ? textWidth(renderer, "@", p.scale, bold) : 0.f;
+    const float markerGap = 2 * p.scale;
+    const auto markerSpan = [&](const Impl::Activity &entry) {
+        return entry.mentioned ? marker + markerGap : 0.f;
+    };
+    const float channelMinimum = count ? measure("#…") : 0.f;
+    const float dmMinimum = count ? measure("DM …") : 0.f;
+    const auto minTitle = [&](const Impl::Activity &entry, float natural) {
+        return std::min(natural, entry.query ? dmMinimum : channelMinimum);
+    };
     float ledgerFloor = overflowFloor;
     if (count) {
         const auto &first = p.ordered.front()->second;
-        const float firstMinimum = (first.mentioned ? marker : 0.f) + measure(first.suffix()) +
-                                   ellipsis + 2 * inset + menuWidth(count - 1);
+        const float firstMinimum = std::min(measure(first.name), ellipsis) +
+                                   minTitle(first, measure(first.chatTitle)) +
+                                   measure(first.countText) + markerSpan(first) + cardChrome +
+                                   (count > 1 ? cardGap + menuWidth(count - 1) : 0.f);
         if (remaining >= firstMinimum + nickFloor + nameFloor)
             ledgerFloor = std::max(ledgerFloor, firstMinimum);
     }
@@ -958,23 +1005,32 @@ void ModeLine::doLayout(Renderer &renderer) {
     float naturalTotal = 0;
     for (size_t i = 0; i < count && naturalTotal <= remaining; ++i) {
         const auto &entry = p.ordered[i]->second;
-        const float suffix = measure(entry.suffix());
-        const float title = measure(entry.title());
-        p.measuredChips.push_back({title, suffix});
-        naturalTotal += title + suffix + (entry.mentioned ? marker : 0.f) + 2 * inset;
+        const auto name = measure(entry.name);
+        const auto title = measure(entry.chatTitle);
+        const auto countWidth = measure(entry.countText);
+        p.measuredChips.push_back({name, title, countWidth});
+        naturalTotal += name + title + countWidth + markerSpan(entry) + cardChrome +
+                        (i + 1 < count ? cardGap : 0.f);
     }
     const bool allFit = p.measuredChips.size() == count && naturalTotal <= remaining;
     float x = padding;
     size_t shown = 0;
     for (; shown < p.measuredChips.size(); ++shown) {
         const auto &[id, entry] = *p.ordered[shown];
-        const auto [naturalTitle, suffix] = p.measuredChips[shown];
-        const float mark = entry.mentioned ? marker : 0.f;
-        const float fixed = suffix + mark + 2 * inset;
+        const auto [naturalName, naturalTitle, countWidth] = p.measuredChips[shown];
+        const float mark = markerSpan(entry);
+        const float trailingGap = shown + 1 < count ? cardGap : 0.f;
+        const float fixed = countWidth + mark + cardChrome + trailingGap;
         const float reserve = allFit ? 0.f : menuWidth(count - shown - 1);
-        const float title = std::min(naturalTitle, std::floor(remaining - reserve - fixed));
-        if (title < std::min(naturalTitle, ellipsis))
+        const float namesRoom = std::floor(remaining - reserve - fixed);
+        const float nameMin = std::min(naturalName, ellipsis);
+        const float titleMin = minTitle(entry, naturalTitle);
+        if (namesRoom < nameMin + titleMin)
             break;
+        const float nameWidth =
+            std::min({naturalName, namesRoom - titleMin,
+                      std::max({nameMin, namesRoom - naturalTitle, std::floor(namesRoom * .35f)})});
+        const float title = std::min(naturalTitle, namesRoom - nameWidth);
 
         auto &slot = p.slotAt(shown);
         if (slot.id != id) {
@@ -983,23 +1039,38 @@ void ModeLine::doLayout(Renderer &renderer) {
             slot.id = id;
             slot.button.area->setTabFocusKey("buffer:" + id);
         }
-        if (slot.button.title->setText(entry.title()) ||
-            slot.button.suffix->text() != entry.suffix() ||
-            slot.button.marker->visible() != entry.mentioned)
-            slot.button.area->setTooltip(entry.caption);
-        slot.button.marker->setText("@");
-        slot.button.suffix->setText(entry.suffix());
-        p.enableButton(slot.button, p.allowed);
-        style(*slot.button.marker, bold, p.scale);
-        style(*slot.button.suffix, font, p.scale);
-        p.styleButton(slot.button, font);
-        const float chipWidth = title + fixed;
-        p.moveButton(slot.button, x, chipWidth, contentHeight);
-        placeLabel(*slot.button.marker, renderer, inset, mark, contentHeight);
-        placeLabel(*slot.button.title, renderer, inset + mark, title, contentHeight);
-        placeLabel(*slot.button.suffix, renderer, inset + mark + title, suffix, contentHeight);
-        x += chipWidth;
-        remaining -= chipWidth;
+        auto &button = slot.button;
+        const bool nameChanged = button.network->setText(entry.name);
+        const bool titleChanged = button.title->setText(entry.chatTitle);
+        const bool countChanged = button.suffix->setText(entry.countText);
+        if (nameChanged || titleChanged || countChanged ||
+            button.marker->visible() != entry.mentioned)
+            button.area->setTooltip(entry.caption);
+        button.marker->setText("@");
+        style(*button.title, font, p.scale);
+        style(*button.network, font, p.scale);
+        style(*button.marker, bold, p.scale);
+        style(*button.suffix, font, p.scale);
+        const float chipWidth = nameWidth + title + fixed - trailingGap;
+        p.moveButton(button, x, chipWidth, contentHeight);
+        float offset = cardInset;
+        const auto placeDivider = [&](Box &divider) {
+            divider.setPosition(offset + dividerInset, contentHeight / 4);
+            divider.setSize(dividerWidth, contentHeight / 2);
+            offset += dividerSpan;
+        };
+        placeLabel(*button.network, renderer, offset, nameWidth, contentHeight);
+        offset += nameWidth;
+        placeDivider(*button.dividers[0]);
+        placeLabel(*button.marker, renderer, offset, entry.mentioned ? marker : 0, contentHeight);
+        offset += mark;
+        placeLabel(*button.title, renderer, offset, title, contentHeight);
+        offset += title;
+        placeDivider(*button.dividers[1]);
+        placeLabel(*button.suffix, renderer, offset, countWidth, contentHeight);
+        p.enableButton(button, p.allowed);
+        x += chipWidth + trailingGap;
+        remaining -= chipWidth + trailingGap;
     }
     for (size_t i = shown; i < p.slots.size(); ++i)
         p.hideButton(p.slots[i].button);

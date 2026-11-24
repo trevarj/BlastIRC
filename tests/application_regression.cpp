@@ -7134,7 +7134,150 @@ struct ApplicationRegression {
                app.historyPages_.empty());
         assert(app.storage_.historyDiscovery(server.name).watermark == "2026-11-02T04:00:00.000Z");
     }
+    static void onboardingAndLocalData() {
+        namespace fs = std::filesystem;
+        const auto config = fs::path(std::getenv("XDG_CONFIG_HOME")) / "blastirc";
+        const auto profile = config / "config.toml";
+        {
+            RenameDrainPeer peer;
+            Application app(true);
+            assert(app.model.firstRun && app.model.servers.empty() && app.model.buffers.empty());
+            bool excluded = false;
+            try {
+                Application concurrent(true);
+            } catch (const std::runtime_error &error) {
+                excluded = std::string_view(error.what()).find("already using") != string::npos;
+            }
+            assert(excluded);
+            const auto setup = [&](std::string_view type) {
+                const auto request = ++app.model.settingsSaveRequest;
+                app.model.actions.push_back({string(type), {}, {}, {}, request});
+                app.tick(app.model.now + .01);
+                assert(app.model.settingsSaveResult.requestId == request);
+                return app.model.settingsSaveResult.success;
+            };
+            ConnectionSetup draft;
+            draft.server.name = "onboarding-demo";
+            draft.server.host = "127.0.0.1";
+            draft.server.port = peer.port;
+            draft.server.tls = false;
+            draft.identity.emplace();
+            draft.identity->nick = "Nova";
+            draft.identity->username = "nova";
+            fs::create_directory(profile);
+            app.model.connectionSetup = draft;
+            assert(!setup("setup-connect") && app.model.firstRun && app.clients_.empty() &&
+                   app.model.servers.empty());
+            fs::remove(profile);
+            assert(setup("setup-offline") && !app.model.firstRun && fs::is_regular_file(profile));
+            assert(app.model.servers.empty() && app.clients_.empty() && app.model.buffers.empty());
+            app.model.connectionSetup = draft;
+            assert(setup("setup-connect") && app.model.onboardingNetwork == draft.server.name);
+            const auto &server = draft.server.name;
+            const auto serverLog = server + "/*server*";
+            assert(app.model.activeBuffer == serverLog);
+            peer.accept();
+            peer.expect("CAP", {"LS", "302"});
+            peer.send(":irc.demo CAP * LS :");
+            peer.expect("NICK", {"Nova"});
+            peer.expect("USER", {"nova", "0", "*", "BlastIRC"});
+            peer.expect("CAP", {"END"});
+            peer.send(":irc.demo 001 Nova_ :Welcome");
+            peer.send(":irc.demo 376 Nova_ :End of MOTD");
+            const auto frame = [&] {
+                peer.fence();
+                app.tick(app.model.now + .01);
+            };
+            frame();
+            auto &net = app.model.networks.at(server);
+            assert(net.state == "Ready" && net.nick == "Nova_");
+            app.action({"onboarding-join", server, "#blocked", {}});
+            peer.expect("JOIN", {"#blocked"});
+            assert(app.model.activeBuffer == serverLog && net.firstChannel == "#blocked");
+            peer.send(":irc.demo 473 Nova_ #blocked :Invite only");
+            frame();
+            assert(app.model.activeBuffer == serverLog && net.firstChannel.empty() &&
+                   net.firstChannelError.find("Invite only") != string::npos &&
+                   app.model.servers.front().channels.empty());
+            app.action({"onboarding-join", server, "#first", {}});
+            peer.expect("JOIN", {"#first"});
+            peer.send(":Nova_!test@localhost JOIN :#first");
+            peer.expect("WHO", {"#first"});
+            frame();
+            const auto room = server + "/#first";
+            assert(app.model.activeBuffer == room && app.model.buffers.at(room).joined &&
+                   app.model.servers.front().channels == vector<string>{"#first"});
+            auto &chat = app.model.buffers.at(room);
+            chat.draft = "Unsent telescope notes";
+            Message entry;
+            entry.id = "retained-chat";
+            entry.text = "First light";
+            entry.timestamp =
+                std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            app.insert(chat, entry);
+            const auto clear = [&](std::string_view category) {
+                const auto request = ++app.model.settingsSaveRequest;
+                app.model.actions.push_back(
+                    {"clear-local-data", {}, string(category), {}, request});
+                app.tick(app.model.now + .01);
+                assert(app.model.settingsSaveResult.requestId == request &&
+                       app.model.settingsSaveResult.success);
+            };
+            clear("logs");
+            assert(app.model.buffers.at(serverLog).messages.empty() &&
+                   app.storage_.message(room, entry.id) && !chat.draft.empty() && chat.joined);
+            app.model.onboardingNetwork = server;
+            app.model.activeBuffer = serverLog;
+            app.action({"onboarding-join", server, "#late", {}});
+            peer.expect("JOIN", {"#late"});
+            app.model.onboardingNetwork.clear(); // The user explicitly opened the server log.
+            peer.send(":Nova_!test@localhost JOIN :#late");
+            peer.expect("WHO", {"#late"});
+            frame();
+            assert(app.model.activeBuffer == serverLog &&
+                   app.model.buffers.at(server + "/#late").joined);
+            auto &log = app.model.buffers.at(serverLog);
+            auto logEntry = entry;
+            logEntry.id = "retained-log";
+            assert(app.insert(log, logEntry));
+            clear("history");
+            assert(!app.storage_.message(room, entry.id) &&
+                   app.storage_.message(serverLog, logEntry.id) && !chat.draft.empty() &&
+                   net.automaticHistoryPaused && app.historySessions_.empty());
+            assert(app.insert(chat, entry));
+            clear("connections");
+            assert(app.clients_.empty() && app.model.servers.empty() && !fs::exists(profile) &&
+                   app.storage_.message(room, entry.id) && !chat.draft.empty() && !chat.joined);
+            clear("drafts");
+            assert(chat.draft.empty() && app.storage_.message(room, entry.id));
+            app.model.settings.scale = 1.8;
+            app.model.settings.retentionDays = 0;
+            app.model.settings.maxMessages = 200000;
+            clear("preferences");
+            assert(app.model.settings.scale == defaultSettings().scale &&
+                   app.model.settings.retentionDays == 0 &&
+                   app.model.settings.maxMessages == 200000 &&
+                   app.storage_.message(room, entry.id));
+            clear("all");
+            assert(app.model.quit && !app.save() && !fs::exists(profile));
+        }
+        {
+            Application reopened;
+            assert(reopened.model.firstRun && reopened.model.servers.empty() &&
+                   reopened.model.buffers.empty() && !fs::exists(profile));
+            reopened.model.identities.emplace_back().name = "standalone";
+            assert(reopened.save() && !reopened.model.firstRun);
+            Model stored;
+            reopened.storage_.load(stored);
+            assert(!stored.firstRun && stored.servers.empty() && stored.identities.size() == 1 &&
+                   stored.identities.front().name == "standalone");
+            reopened.action({"clear-local-data", {}, "connections", {}});
+            assert(!fs::exists(profile));
+        }
+    }
+
     static void run() {
+        onboardingAndLocalData();
         localHistorySkipsProvisionalWindowEdge();
         preloadActiveScrollback();
         commandArgumentContext();

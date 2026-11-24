@@ -895,6 +895,7 @@ struct Ui::Impl {
     TouchPanel touchPanel = TouchPanel::None;
     bool shellDirty = true;
     std::string lastBuffer, chord, query, publishedActive, selectedServer;
+    std::uint64_t draftResetRevision = 0, preferencesResetRevision = 0, cacheResetRevision = 0;
     std::map<std::string, std::string> configuredBindings, activeBindings;
     const auto &keyBindings() {
         if (configuredBindings != model.settings.bindings) {
@@ -1271,8 +1272,6 @@ struct Ui::Impl {
         for (const auto &[key, value] : model.settings.workspace)
             if (key.starts_with("last_buffer:"))
                 lastServerBuffer.emplace(key.substr(12), value);
-        if (model.firstRun)
-            dialogs->open("first-run");
         model.bufferWillRename = [this](const std::string &oldId, const std::string &newId) {
             beforeBufferRename(oldId, newId);
         };
@@ -1479,6 +1478,7 @@ struct Ui::Impl {
     void pruneViews();
     void syncViews();
     void refresh(bool panelResize = false);
+    void observeLocalResets();
     bool repairFocus();
     bool key(const InputArea::KeyData &, std::uint32_t physicalKey);
     bool replyReadable(std::uint64_t, const std::string &) const;
@@ -1499,6 +1499,12 @@ struct Ui::Impl::PaneView final : Node {
     ScrollView *welcomeScroll = nullptr;
     Flex *welcome = nullptr;
     Label *welcomeTitle = nullptr, *welcomeBody = nullptr;
+    enum WelcomeAction { Add, Manage, Edit, Retry, Stop, Log, Soju, Networks, Join, Dm };
+    std::array<Button *, Dm + 1> welcomeButtons{};
+    Flex *welcomeActions = nullptr, *conversationActions = nullptr;
+    Input *conversationTarget = nullptr;
+    Label *conversationFeedback = nullptr;
+    std::string formError;
     float userScale = 1;
     PaneView(Impl &owner, PaneState &state) : ui(owner), pane(state) {
         setClipChildren(true);
@@ -1529,16 +1535,61 @@ struct Ui::Impl::PaneView final : Node {
         welcomeScroll->setViewportPaddingH(0);
         welcomeScroll->setViewportPaddingV(0);
         welcomeScroll->setReserveScrollbarGutter(true);
-        welcome = static_cast<Flex *>(welcomeScroll->content()->addChild(
-            ui::column({.gap = 12},
-                       ui::label({.out = &welcomeTitle,
-                                  .text = "Welcome to BlastIRC",
-                                  .fontSize = 22,
-                                  .maxLines = 0}),
-                       ui::label({.out = &welcomeBody,
-                                  .text = "Add a network from the BlastIRC application menu, then "
-                                          "choose a conversation.",
-                                  .maxLines = 0}))));
+        auto content = ui::column({.align = FlexAlign::Stretch, .gap = 12},
+                                  ui::label({.out = &welcomeTitle, .maxLines = 0}),
+                                  ui::label({.out = &welcomeBody, .maxLines = 0}));
+        welcome = content.get();
+        auto actions = ui::row({.gap = 6});
+        auto chatActions = ui::row({.gap = 6});
+        welcomeActions = actions.get();
+        conversationActions = chatActions.get();
+        welcomeActions->setWrap(true);
+        conversationActions->setWrap(true);
+        const auto addButton = [this](Flex &row, WelcomeAction action, const char *text,
+                                      const char *key) {
+            auto button = std::make_unique<Button>();
+            if (action == Add || action == Join)
+                button->setVariant(ButtonVariant::Primary);
+            button->setText(text);
+            button->setTabStop(true);
+            button->inputArea()->setTabFocusKey(key);
+            button->setOnClick([this, action] { useWelcomeAction(action); });
+            welcomeButtons[action] = static_cast<Button *>(row.addChild(std::move(button)));
+        };
+        addButton(*actions, Add, "Add connection", "welcome-add");
+        addButton(*actions, Manage, "Manage connections", "welcome-manage");
+        addButton(*actions, Edit, "Edit details", "onboarding-edit");
+        addButton(*actions, Retry, "Retry", "onboarding-retry");
+        addButton(*actions, Stop, "Stop", "onboarding-stop");
+        addButton(*actions, Log, "View server log", "onboarding-log");
+        addButton(*actions, Soju, "Manage Soju networks", "onboarding-soju");
+        addButton(*actions, Networks, "Show networks", "onboarding-networks");
+        addButton(*chatActions, Join, "Join a channel", "onboarding-join");
+        addButton(*chatActions, Dm, "Open a DM", "onboarding-dm");
+        content->addChild(std::move(actions));
+        content->addChild(ui::input({.out = &conversationTarget,
+                                     .placeholder = "Channel or nickname",
+                                     .onChange =
+                                         [this](const std::string &) {
+                                             formError.clear();
+                                             conversationTarget->setInvalid(false);
+                                         },
+                                     .onSubmit =
+                                         [this](const std::string &target) {
+                                             const auto network = onboardingNetwork();
+                                             if (network && !target.empty() &&
+                                                 network->channelTypes.contains(target.front()))
+                                                 useWelcomeAction(Join);
+                                             else
+                                                 useWelcomeAction(Dm);
+                                         }}));
+        conversationTarget->setMinLayoutWidth(0);
+        conversationTarget->inputArea()->setTabFocusKey("onboarding-target");
+        conversationTarget->inputArea()->setTooltip(
+            "Enter one channel (such as #help) or a nickname");
+        content->addChild(std::move(chatActions));
+        content->addChild(ui::label({.out = &conversationFeedback, .maxLines = 0}));
+        welcomeScroll->content()->addChild(std::move(content));
         welcomeScroll->content()->setAlign(FlexAlign::Stretch);
         welcome->setFillWidth(true);
         motionHost = addChild(std::make_unique<Node>());
@@ -1551,6 +1602,204 @@ struct Ui::Impl::PaneView final : Node {
         ui.editors.setReplyHost(pane.id, nullptr);
         transcript->setMotionHost(nullptr);
     }
+    const ServerConfig *onboardingProfile() const {
+        const auto &model = ui.model;
+        if (model.onboardingNetwork.empty())
+            return nullptr;
+        const auto buffer = model.buffers.find(pane.buffer);
+        if (buffer == model.buffers.end() || buffer->second.kind != "server")
+            return nullptr;
+        const auto profile =
+            std::find_if(model.servers.begin(), model.servers.end(), [&](const auto &server) {
+                return server.name == buffer->second.server &&
+                       (server.name == model.onboardingNetwork ||
+                        server.sojuParent == model.onboardingNetwork);
+            });
+        return profile == model.servers.end() ? nullptr : &*profile;
+    }
+
+    const Network *onboardingNetwork() const {
+        if (const auto *profile = onboardingProfile())
+            if (const auto it = ui.model.networks.find(profile->name);
+                it != ui.model.networks.end())
+                return &it->second;
+        return nullptr;
+    }
+
+    void useWelcomeAction(WelcomeAction action) {
+        if (ui.workspace.focused != pane.id || ui.model.activeBuffer != pane.buffer ||
+            !ui.statusControlsAvailable() || !welcomeScroll->visible() ||
+            !welcomeButtons[action]->visible())
+            return;
+        if (action == Add || action == Manage) {
+            if (!ui.model.buffers.contains(pane.buffer))
+                ui.pending.emplace_back(action == Add ? "add-server" : "manage-networks");
+            return;
+        }
+        const auto *profile = onboardingProfile();
+        if (!profile)
+            return;
+        auto &model = ui.model;
+        const auto *network = onboardingNetwork();
+        if (action == Edit)
+            ui.pending.push_back("server:" + profile->name);
+        else if (action == Retry || action == Stop)
+            queue(model, action == Retry ? "connect" : "disconnect", {}, profile->name);
+        else if (action == Log)
+            ui.pending.push_back("open-server-log:" + profile->name);
+        else if (action == Soju)
+            ui.pending.push_back("soju-manage:" + profile->name);
+        else if (action == Networks) {
+            model.settings.workspace["soju-group:" + profile->name] = "expanded";
+            if (!ui.workspace.serverRailVisible)
+                ui.pending.emplace_back("toggle-networks");
+            else
+                queue(model, "save");
+        } else if (network && network->state == "Ready" && !profile->sojuAccount &&
+                   network->firstChannel.empty() && !conversationTarget->composing()) {
+            const auto &target = conversationTarget->value();
+            const bool channel = target.size() > 1 && network->channelTypes.contains(target[0]) &&
+                                 std::none_of(target.begin(), target.end(), [](unsigned char c) {
+                                     return c <= ' ' || c == ',' || c == '\x7f';
+                                 });
+            if (action == Join ? !channel : !irc::validNickname(target)) {
+                formError = action == Join ? "Enter one valid channel name, such as #help."
+                                           : "Enter one valid IRC nickname.";
+                conversationTarget->setInvalid(true);
+                if (ui.dispatcher)
+                    ui.dispatcher->setFocus(conversationTarget->inputArea());
+                return;
+            }
+            formError.clear();
+            conversationTarget->setInvalid(false);
+            if (action == Join)
+                queue(model, "onboarding-join", profile->name, target);
+            else {
+                queue(model, "query", pane.buffer, target);
+                model.onboardingNetwork.clear();
+            }
+        }
+    }
+
+    void syncWelcome(const ServerConfig *profile) {
+        const auto *network = profile ? onboardingNetwork() : nullptr;
+        std::string_view state = network ? std::string_view(network->state) : "Disconnected";
+        if (network && network->retrying)
+            state = "Retrying";
+        else if (network && state == "Disconnected" && !network->error.empty())
+            state = "Failed";
+        const bool active = state == "Connecting" || state == "Registering" || state == "Retrying";
+        const bool ready = state == "Ready";
+        const bool chat = ready && profile && !profile->sojuAccount;
+        const bool soju = ready && profile && profile->sojuAccount;
+        const bool managementOnly = soju && profile->sasl.empty();
+        const bool sojuDiscovery = soju && network->caps.contains("soju.im/bouncer-networks");
+        const bool catalog = sojuDiscovery && network->sojuDiscoveryComplete;
+        const bool retrySoju =
+            soju && (!sojuDiscovery || (!catalog && !network->sojuMutationError.empty()));
+        const bool pendingJoin = chat && !network->firstChannel.empty();
+        std::string body;
+        if (profile) {
+            welcomeTitle->setText(std::string(state) + " · " +
+                                  std::string(serverDisplayName(ui.model, profile->name)));
+            if (state == "Connecting")
+                body = "Opening the connection to the server.";
+            else if (state == "Registering")
+                body = "Waiting for the server to finish registration.";
+            else if (state == "Retrying")
+                body = "Waiting to retry automatically. Stop cancels the next attempt.";
+            else if (state == "Failed")
+                body = "Check your connection details, or retry.";
+            else if (soju) {
+                body = network->nick.empty() ? "Soju account connected."
+                                             : "Soju account connected as " + network->nick + ".";
+                if (managementOnly)
+                    body += " This account is set to management only. Configure SASL in Edit "
+                            "details to attach IRC networks.";
+                if (!sojuDiscovery)
+                    body += " This server does not support Soju network discovery.";
+                else if (catalog) {
+                    if (network->sojuNetworks.empty())
+                        body += " No IRC networks were found. Add one in Manage Soju networks.";
+                    else if (!managementOnly)
+                        body += " Choose an IRC network in the Networks rail. To attach a "
+                                "disabled network, use Manage Soju networks.";
+                } else if (!network->sojuMutationError.empty())
+                    body += " " + network->sojuMutationError + ". Retry the account connection.";
+                else
+                    body += " Discovering IRC networks…";
+            } else if (chat) {
+                body = network->nick.empty() ? "Connected." : "Connected as " + network->nick + ".";
+                body += " Enter a channel name or nickname to start a conversation.";
+            } else
+                body = "This connection is offline. Retry to connect.";
+            if (network && !network->error.empty())
+                body.append("\n").append(network->error);
+            welcomeBody->setText(body);
+        } else {
+            welcomeTitle->setText("Welcome to BlastIRC");
+            welcomeBody->setText("Add a connection to start chatting.");
+        }
+        const std::array shown = {!profile,
+                                  !profile && !ui.model.servers.empty(),
+                                  profile != nullptr,
+                                  profile &&
+                                      ((!active && !ready) || state == "Retrying" || retrySoju),
+                                  profile && (active || ready),
+                                  profile != nullptr,
+                                  soju,
+                                  catalog && !managementOnly && !network->sojuNetworks.empty(),
+                                  chat,
+                                  chat};
+        for (std::size_t i = 0; i < welcomeButtons.size(); ++i) {
+            auto *button = welcomeButtons[i];
+            if (!shown[i] && button->visible())
+                ui.retireSubtreePointerCapture(*button);
+            button->setVisible(shown[i]);
+            button->setExcludeSubtreeFromTabOrder(!shown[i]);
+            if (shown[i]) {
+                button->setFontSize(14 * userScale);
+                button->label()->setFontWeight(themeUiFont().weight);
+            }
+        }
+        welcomeButtons[Join]->setEnabled(!pendingJoin);
+        welcomeButtons[Dm]->setEnabled(!pendingJoin);
+        conversationActions->setVisible(chat);
+        if (!chat && conversationTarget->visible())
+            ui.retireSubtreePointerCapture(*conversationTarget);
+        conversationTarget->setVisible(chat);
+        conversationTarget->setExcludeSubtreeFromTabOrder(!chat);
+        conversationTarget->setFontFamily(themeUiFont().family);
+        conversationTarget->setFontFeatures(themeUiFont().features);
+        conversationTarget->setFontWeight(themeUiFont().weight);
+        conversationTarget->setFontSize(14 * userScale);
+        conversationTarget->setControlHeight(34 * userScale);
+        conversationTarget->setFrameRadius(themeCornerRadius());
+        std::string feedback;
+        if (chat) {
+            if (!formError.empty())
+                feedback = formError;
+            else if (pendingJoin)
+                feedback =
+                    "Waiting for the server to confirm joining " + network->firstChannel + "…";
+            else if (!network->firstChannelError.empty())
+                feedback = network->firstChannelError +
+                           "\nCheck the channel name or view the server log, then try again.";
+        }
+        conversationFeedback->setText(feedback);
+        conversationFeedback->setVisible(!feedback.empty());
+        welcome->setGap(12 * userScale);
+        welcomeActions->setGap(6 * userScale);
+        conversationActions->setGap(6 * userScale);
+        for (auto *label : {welcomeTitle, welcomeBody, conversationFeedback}) {
+            label->setFontFamily(themeUiFont().family);
+            label->setFontFeatures(themeUiFont().features);
+            label->setFontWeight(themeUiFont().weight);
+            label->setFontSize((label == welcomeTitle ? 22.f : 14.f) * userScale);
+            label->setColor(themeForegroundColor("on_surface"));
+        }
+    }
+
     void sync(const WorkspaceRect &rect, bool selected) {
         place(*this, rect);
         setVisible(selected);
@@ -1568,10 +1817,14 @@ struct Ui::Impl::PaneView final : Node {
         const bool exists = found != ui.model.buffers.end();
         const bool search =
             exists && (found->second.kind == "search" || found->second.kind == "mentions");
+        const auto *setup = onboardingProfile();
+        const bool guide = setup || !exists;
         conversationMaterial->sync();
         titleDivider->setFill(withAlpha(themeColor("outline_variant"), .18f * themeSurfaceAlpha()));
-        transcript->setVisible(exists);
-        transcript->setReadEligible(ui.windowActive && ui.conversationFocus == pane.id &&
+        if (guide && transcript->visible())
+            ui.retireSubtreePointerCapture(*transcript);
+        transcript->setVisible(exists && !guide);
+        transcript->setReadEligible(!guide && ui.windowActive && ui.conversationFocus == pane.id &&
                                     ui.workspace.focused == pane.id && selected &&
                                     !ui.paletteOpen && !ui.jumpOpen && !ui.reactionTarget &&
                                     !ui.dialogs->active());
@@ -1579,16 +1832,13 @@ struct Ui::Impl::PaneView final : Node {
             ui.topicSource || ui.uploadStage != UploadStage::Closed || ui.media->active())
             transcript->cancelAutoscroll();
         transcript->sync();
-        composer->setVisible(exists && !search);
-        welcomeScroll->setVisible(!exists);
-        welcome->setGap(12 * userScale);
-        for (auto *label : {welcomeTitle, welcomeBody}) {
-            label->setFontFamily(themeUiFont().family);
-            label->setFontFeatures(themeUiFont().features);
-            label->setFontWeight(themeUiFont().weight);
-            label->setFontSize((label == welcomeTitle ? 22.f : 14.f) * userScale);
-            label->setColor(themeForegroundColor("on_surface"));
-        }
+        composer->setVisible(exists && !search && !guide);
+        if (!guide && welcomeScroll->visible())
+            ui.retireSubtreePointerCapture(*welcomeScroll);
+        welcomeScroll->setVisible(guide);
+        welcomeScroll->setExcludeSubtreeFromTabOrder(!guide);
+        if (guide)
+            syncWelcome(setup);
     }
 
   protected:
@@ -1664,7 +1914,7 @@ struct Ui::Impl::PaneView final : Node {
         Node::transformedBounds(composer, composerLeft, composerTop, composerRight, composerBottom);
         transcript->setComposerOrigin((composerLeft + composerRight) * .5f, composerTop);
         welcomeScroll->setContentScale(s);
-        place(*welcomeScroll, left, top, innerWidth, available);
+        place(*welcomeScroll, left, top, std::min(innerWidth, 600 * s), available);
         place(*motionHost, 0, 0, width(), height());
         Node::doLayout(renderer);
     }
@@ -2072,6 +2322,7 @@ void Ui::Impl::remapBuffer(std::string_view oldId, std::string_view newId) {
                                   navigationMode);
     // This callback runs inside core reduction, including the final shutdown
     // tick. Publish live identities before core can perform any same-tick save.
+    observeLocalResets();
     workspace.persist();
     persistShell();
 }
@@ -2528,7 +2779,10 @@ void Ui::Impl::pollUpload() {
             uploadStage = UploadStage::Error;
     }
     if (auto result = uploader.takeResult()) {
-        if (*result) {
+        if (!uploadOrigin.state) {
+            uploadStage = UploadStage::Error;
+            uploadAction("upload-close");
+        } else if (*result) {
             uploadUrl = std::move(result->url);
             uploadStage = UploadStage::Complete;
             if (!uploadCancelRequested && uploadTrustCurrent() &&
@@ -3167,10 +3421,14 @@ void Ui::Impl::selectServer(std::string_view name) {
                                    [&](const auto &server) { return server.name == name; });
     if (!known)
         return;
-    if (selectedServer == name)
-        return;
-    selectedServer = name;
-    shellDirty = true;
+    if (selectedServer == name) {
+        const auto current = model.buffers.find(model.activeBuffer);
+        if (current != model.buffers.end() && current->second.server == name)
+            return;
+    } else {
+        selectedServer = name;
+        shellDirty = true;
+    }
     if (const auto last = lastServerBuffer.find(selectedServer); last != lastServerBuffer.end()) {
         const auto buffer = model.buffers.find(last->second);
         if (buffer != model.buffers.end() && buffer->second.server == selectedServer) {
@@ -3597,24 +3855,30 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         return;
     }
     if (command.starts_with("upload-")) {
+        observeLocalResets();
         uploadAction(command);
         return;
     }
-    if (command == "settings-uploads") {
+    if (command == "settings-uploads" || command == "settings-data") {
         dialogs->open(command);
         return;
     }
-    if (command == "open-server-log") {
+    if (command == "open-server-log" || command.starts_with("open-server-log:")) {
         const auto current = model.buffers.find(model.activeBuffer);
-        const auto &server = current != model.buffers.end() && !current->second.server.empty()
-                                 ? current->second.server
-                                 : selectedServer;
-        if (!server.empty())
-            queue(model, command, server);
-        return;
-    }
-    if (command.starts_with("open-server-log:")) {
-        queue(model, "open-server-log", command.substr(16));
+        const std::string_view server =
+            command.starts_with("open-server-log:") ? std::string_view(command).substr(16)
+            : current != model.buffers.end() && !current->second.server.empty()
+                ? std::string_view(current->second.server)
+                : std::string_view(selectedServer);
+        if (!server.empty()) {
+            if (!model.onboardingNetwork.empty() &&
+                (server == model.onboardingNetwork ||
+                 std::any_of(model.servers.begin(), model.servers.end(), [&](const auto &profile) {
+                     return profile.name == server && profile.sojuParent == model.onboardingNetwork;
+                 })))
+                model.onboardingNetwork.clear();
+            queue(model, "open-server-log", std::string(server));
+        }
         return;
     }
     if (command.starts_with("soju-group-toggle:")) {
@@ -3791,6 +4055,7 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
         return;
     }
     if (command == "persist") {
+        observeLocalResets();
         workspace.persist();
         persistShell();
         return;
@@ -3873,7 +4138,8 @@ void Ui::Impl::run(std::string command, std::optional<InputArea::PointerData> po
             found->second.focusComposer = true;
         }
     } else if (command == "settings" || command == "search" || command == "add-server" ||
-               command == "first-run" || command == "clear-history" || command == "config-error" ||
+               command == "add-soju-account" || command == "first-run" ||
+               command == "clear-history" || command == "config-error" ||
                command == "manage-networks" || command.starts_with("server:") ||
                command.starts_with("nick-color:")) {
         if (paletteOpen)
@@ -4084,7 +4350,35 @@ void Ui::Impl::drainPending() {
         run(std::move(command));
     }
 }
+void Ui::Impl::observeLocalResets() {
+    if (std::exchange(preferencesResetRevision, model.preferencesResetRevision) !=
+        model.preferencesResetRevision) {
+        if (widthDrag)
+            retirePointerCapture();
+        workspace.resetPreferences();
+        selectedServer.clear();
+        lastServerBuffer.clear();
+        shellDirty = true;
+        snapPanelMotion = true;
+    }
+    if (std::exchange(draftResetRevision, model.draftResetRevision) != model.draftResetRevision) {
+        closeUploadMenu();
+        uploadOrigin = {};
+        if (uploadStage == UploadStage::Choosing) {
+            filePicker.cancel();
+            uploadStage = UploadStage::Error;
+        }
+        if (uploadStage != UploadStage::Closed)
+            uploadAction("upload-close");
+    }
+    if (std::exchange(cacheResetRevision, model.cacheResetRevision) != model.cacheResetRevision) {
+        media->invalidate();
+        mediaChanged();
+    }
+}
+
 void Ui::Impl::refresh(bool panelResize) {
+    observeLocalResets();
     std::string externalActive;
     if (!motionEnabled()) {
         resetPanelOpacity(*palettePanel);
@@ -4468,6 +4762,8 @@ bool Ui::Impl::repairFocus() {
              view != views.end() && view->second->visible()) {
         if (view->second->composer->visible())
             target = view->second->composer;
+        else if (view->second->welcomeScroll->visible())
+            target = view->second->welcomeScroll;
         else
             target = view->second->titleLine;
     } else
@@ -5010,6 +5306,7 @@ void Ui::update(float width, float height, float nativeRenderScale) {
     impl_->width = width;
     impl_->height = height;
     (void)nativeRenderScale; // Output density is exclusively renderer-owned.
+    impl_->observeLocalResets();
     impl_->pollUpload();
     impl_->refresh();
 }
@@ -5231,6 +5528,7 @@ void Ui::execute(std::string command) {
     impl_->refresh();
 }
 void Ui::flush() {
+    impl_->observeLocalResets();
     const std::string externalActive =
         impl_->model.activeBuffer != impl_->publishedActive ? impl_->model.activeBuffer : "";
     impl_->drainPending();

@@ -328,26 +328,212 @@ void welcomeControls() {
     dialogs.open("first-run");
     const auto frame = [&] { dialogs.sync(720, 480, 1); };
     frame();
+    assert(model.firstRun && model.servers.empty() && model.identities.empty());
+    assert(named<Select>(dialogs, "Network preset")->selectedText() ==
+           "Libera.Chat (irc.libera.chat)");
     auto *connect = button(dialogs, "Save and connect");
-    assert(connect->parent() == button(dialogs, "Configure offline")->parent());
+    assert(connect->parent() == button(dialogs, "Continue offline")->parent());
+    auto *nick = named<Input>(dialogs, "Nickname");
+    assert(nick->value().empty());
+    assert(!find<Input>(dialogs, [](const Input &field) { return field.value() == "6697"; }));
+    press(dispatcher, *connect);
+    assert(model.actions.empty() && dispatcher.focusedArea() == nick->inputArea());
+    edit(dispatcher, *nick, "FirstNick");
+    activate(dispatcher, *named<Toggle>(dialogs, "Advanced options"));
     auto *port = named<Input>(dialogs, "Port (1–65535)");
     edit(dispatcher, *port, "99999");
     press(dispatcher, *connect);
     assert(model.actions.empty() && dispatcher.focusedArea() == port->inputArea());
     edit(dispatcher, *port, "6697");
+    edit(dispatcher, *named<Input>(dialogs, "Auto-join channels"), "#start, #other");
     press(dispatcher, *connect);
-    assert(model.actions.size() == 1 && model.actions.back().type == "save-connect");
-    auto request = model.actions.back().requestId;
+    assert(model.actions.size() == 1 && model.actions.back().type == "setup-connect");
+    assert(model.servers.empty() && model.identities.empty() && model.connectionSetup);
+    const auto &stage = *model.connectionSetup;
+    assert(stage.server.host == "irc.libera.chat" && stage.server.tls &&
+           stage.server.port == 6697 && stage.identity && stage.identity->nick == "FirstNick" &&
+           (stage.server.channels == std::vector<std::string>{"#start", "#other"}));
+    const auto request = model.actions.back().requestId;
     model.settingsSaveResult = {request + 1, true, {}};
     frame();
-    assert(dialogs.visible());
+    assert(dialogs.visible() && !connect->enabled());
     model.settingsSaveResult = {request, false, "Cannot save profile"};
     frame();
     assert(find<Label>(dialogs, [](const Label &l) { return l.text() == "Cannot save profile"; }));
+    assert(nick->value() == "FirstNick" && port->value() == "6697");
+    assert(!model.connectionSetup && model.firstRun);
     press(dispatcher, *connect);
-    model.settingsSaveResult = {model.actions.back().requestId, true, {}};
+    const auto retry = model.actions.back().requestId;
+    assert(retry > request && model.connectionSetup->identity->nick == "FirstNick");
+    model.firstRun = false;
+    model.settingsSaveResult = {retry, true, {}};
     frame();
     assert(!dialogs.visible());
+
+    model.firstRun = true;
+    dialogs.open("first-run");
+    frame();
+    edit(dispatcher, *named<Input>(dialogs, "Nickname"), "DiscardMe");
+    press(dispatcher, *button(dialogs, "Close"));
+    assert(!dialogs.active() && !model.connectionSetup && model.firstRun && model.servers.empty() &&
+           model.identities.empty());
+    dialogs.open("first-run");
+    frame();
+    assert(named<Input>(dialogs, "Nickname")->value().empty());
+    press(dispatcher, *button(dialogs, "Continue offline"));
+    assert(model.actions.back().type == "setup-offline" && !model.connectionSetup &&
+           model.servers.empty() && model.identities.empty());
+    model.firstRun = false;
+    model.settingsSaveResult = {model.actions.back().requestId, true, {}};
+    frame();
+    assert(!dialogs.active());
+
+    dialogs.open("add-server");
+    frame();
+    named<Select>(dialogs, "Network preset")->setSelectedIndex(1);
+    edit(dispatcher, *named<Input>(dialogs, "Nickname"), "CustomNick");
+    activate(dispatcher, *named<Toggle>(dialogs, "Advanced options"));
+    constexpr auto passLabel = "Server password (this network only)";
+    // A credential entered before the first address belongs to that address, not to Libera.
+    edit(dispatcher, *named<Input>(dialogs, passLabel), "custom-secret");
+    edit(dispatcher, *named<Input>(dialogs, "Server address"), "irc.example");
+    named<Select>(dialogs, "Network preset")->setSelectedIndex(0);
+    frame();
+    assert(named<Input>(dialogs, "Nickname")->value().empty());
+    activate(dispatcher, *named<Toggle>(dialogs, "Advanced options"));
+    assert(named<Input>(dialogs, passLabel)->value().empty());
+    named<Select>(dialogs, "Network preset")->setSelectedIndex(1);
+    frame();
+    assert(named<Input>(dialogs, passLabel)->value() == "custom-secret");
+    edit(dispatcher, *named<Input>(dialogs, "Server address"), "irc.new.example");
+    assert(named<Input>(dialogs, passLabel)->value().empty());
+    named<Select>(dialogs, "Connection type")->setSelectedIndex(1);
+    frame();
+    assert(named<Input>(dialogs, "Soju server address")->value().empty());
+    named<Select>(dialogs, "Connection type")->setSelectedIndex(0);
+    frame();
+    assert(named<Input>(dialogs, "Server address")->value() == "irc.new.example");
+    press(dispatcher, *button(dialogs, "Cancel"));
+    assert(!dialogs.active() && !model.connectionSetup && model.servers.empty());
+}
+
+void dataStorageControls() {
+    using namespace blast;
+    Model model;
+    model.firstRun = false;
+    model.settings.retentionDays = 12;
+    model.identities.emplace_back();
+    model.servers.emplace_back();
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    Dialogs dialogs(model, [](std::string) {});
+    dispatcher.setSceneRoot(&dialogs);
+    dialogs.setInputDispatcher(dispatcher);
+    dialogs.open("settings");
+    const auto frame = [&] { dialogs.sync(720, 480, 1); };
+    frame();
+    auto *query = named<Input>(dialogs, "Search settings");
+    const auto search = [&](const std::string &queryText) {
+        edit(dispatcher, *query, queryText);
+        dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+        frame();
+    };
+    search("Retention days");
+    auto *retention = named<Input>(dialogs, "Retention days (1–3650)");
+    edit(dispatcher, *retention, "invalid");
+    assert(retention->invalid());
+    search("Clear server logs");
+    press(dispatcher, *button(dialogs, "Clear server logs…"));
+    assert(dispatcher.focusedArea() == button(dialogs, "Cancel")->inputArea());
+    press(dispatcher, *button(dialogs, "Cancel"));
+    assert(model.actions.empty() && dialogs.settingsOpen());
+
+    dialogs.open("settings-data");
+    frame();
+    query = named<Input>(dialogs, "Search settings");
+    edit(dispatcher, *query, "");
+    const auto confirm = [&](std::string_view caption, std::string_view token) {
+        press(dispatcher, *button(dialogs, std::string(caption) + "…"));
+        assert(dispatcher.focusedArea() == button(dialogs, "Cancel")->inputArea());
+        press(dispatcher, *button(dialogs, caption));
+        assert(model.actions.back().type == "clear-local-data" &&
+               model.actions.back().text == token);
+        return model.actions.back().requestId;
+    };
+    const auto finish = [&](std::uint64_t request) {
+        model.settingsSaveResult = {request, true, {}};
+        frame();
+    };
+    const auto failed = confirm("Clear server logs", "logs");
+    model.settingsSaveResult = {failed + 1, true, {}};
+    frame();
+    assert(!button(dialogs, "Save now")->enabled());
+    model.settingsSaveResult = {failed, false, "Cannot clear logs"};
+    frame();
+    assert(find<Label>(dialogs, [](const Label &l) { return l.text() == "Cannot clear logs"; }));
+    finish(confirm("Clear server logs", "logs"));
+    assert(find<Label>(dialogs, [](const Label &l) {
+        return l.text() == "Local server logs cleared. Chat history was kept.";
+    }));
+    finish(confirm("Clear drafts and send recovery", "drafts"));
+    finish(confirm("Clear cache", "cache"));
+    dialogs.open("clear-history");
+    assert(dispatcher.focusedArea() == button(dialogs, "Cancel")->inputArea());
+    assert(find<Label>(dialogs, [](const Label &l) {
+        return l.text().find("Server logs, drafts and pending send recovery stay") !=
+                   std::string::npos &&
+               l.text().find("fetched again manually or after reconnecting") != std::string::npos;
+    }));
+    press(dispatcher, *button(dialogs, "Clear chat history"));
+    assert(model.actions.back().type == "clear-local-data" &&
+           model.actions.back().text == "history");
+    finish(model.actions.back().requestId);
+    assert(find<Label>(dialogs, [](const Label &l) {
+        return l.text() == "Local chat history cleared. Server logs and drafts were kept.";
+    }));
+
+    search("Retention days");
+    retention = named<Input>(dialogs, "Retention days (1–3650)");
+    edit(dispatcher, *retention, "invalid");
+    search("Reset preferences");
+    const auto preferences = confirm("Reset preferences", "preferences");
+    model.settings = Settings{};
+    ++model.preferencesResetRevision;
+    finish(preferences);
+    search("Retention days");
+    retention = named<Input>(dialogs, "Retention days (1–3650)");
+    assert(!retention->invalid() && retention->value() == std::to_string(Settings{}.retentionDays));
+
+    search("Remove saved connections");
+    const auto connections = confirm("Remove saved connections", "connections");
+    model.identities.clear();
+    model.servers.clear();
+    model.firstRun = true;
+    finish(connections);
+    search("Saved networks");
+    assert(button(dialogs, "Add network") && model.identities.empty());
+    press(dispatcher, *button(dialogs, "Add network"));
+    frame();
+    assert(named<Select>(dialogs, "Connection type")->selectedText() == "Direct IRC");
+    assert(model.servers.empty() && model.identities.empty());
+    press(dispatcher, *button(dialogs, "Cancel"));
+    frame();
+    query = named<Input>(dialogs, "Search settings");
+    search("Reset BlastIRC");
+    press(dispatcher, *button(dialogs, "Reset BlastIRC…"));
+    assert(dispatcher.focusedArea() == button(dialogs, "Cancel")->inputArea());
+    assert(find<Label>(dialogs, [](const Label &l) {
+        return l.text().find("BlastIRC closes") != std::string::npos &&
+               l.text().find("next launch starts fresh") != std::string::npos &&
+               l.text().find("(STS)") != std::string::npos;
+    }));
+    const auto actionCount = model.actions.size();
+    press(dispatcher, *button(dialogs, "Review reset"));
+    assert(model.actions.size() == actionCount &&
+           dispatcher.focusedArea() == button(dialogs, "Cancel")->inputArea());
+    press(dispatcher, *button(dialogs, "Reset BlastIRC"));
+    assert(model.actions.back().type == "clear-local-data" && model.actions.back().text == "all");
 }
 
 void settingsTreeControls() {
@@ -361,6 +547,14 @@ void settingsTreeControls() {
     server.name = "Tree network";
     server.identity = "tree";
     model.servers.push_back(server);
+    ServerConfig account = server, child = server;
+    account.name = "Tree soju";
+    account.sojuAccount = true;
+    account.bouncer = "soju";
+    child.name = "Tree child";
+    child.sojuParent = account.name;
+    child.sojuNetworkId = "tree-child";
+    model.servers.insert(model.servers.end(), {account, child});
     Theme theme;
     theme.update(model);
     PangoRenderer renderer;
@@ -384,7 +578,7 @@ void settingsTreeControls() {
         dispatcher.keyEvent(sym, 0, modifiers, true);
         frame();
     };
-    const std::array<std::vector<std::string>, 7> leaves{{
+    const std::array<std::vector<std::string>, 8> leaves{{
         {"appearance.theme", "appearance.fonts", "appearance.spellcheck", "appearance.cursor",
          "appearance.messages", "appearance.previews", "appearance.navigation"},
         {"keyboard.messaging", "keyboard.cursor", "keyboard.editing", "keyboard.navigation",
@@ -395,6 +589,7 @@ void settingsTreeControls() {
         {"networks.saved", "networks.endpoint", "networks.authentication", "networks.identity",
          "networks.channels", "networks.actions"},
         {"identities.saved", "identities.profile"},
+        {"data.local", "data.reset"},
     }};
     for (std::size_t category = 0; category < leaves.size(); ++category) {
         picker->setSelectedIndex(category);
@@ -434,7 +629,7 @@ void settingsTreeControls() {
                 keyed(dialogs, "blastirc.settings.category." + std::to_string(category))->parent());
             assert(root && root->foregroundColor() == ::palette.onSurface);
             const auto compactSelection = picker->selectedIndex();
-            assert(compactSelection >= 7 && dispatcher.focusedArea() == nav);
+            assert(compactSelection >= leaves.size() && dispatcher.focusedArea() == nav);
             frame(true);
             assert(picker->selectedIndex() == compactSelection &&
                    dispatcher.focusedArea() == pickerArea);
@@ -481,13 +676,12 @@ void settingsTreeControls() {
     key(XKB_KEY_n, KeyMod::Ctrl);
     key(XKB_KEY_Right);
     key(XKB_KEY_Right);
-    assert(picker->selectedIndex() >= 7);
+    assert(picker->selectedIndex() >= leaves.size());
     key(XKB_KEY_Left);
     assert(picker->selectedIndex() == 1);
     key(XKB_KEY_Return);
     key(XKB_KEY_End);
-    assert(dynamic_cast<Button *>(
-               keyed(dialogs, "blastirc.settings.section.identities.profile")->parent())
+    assert(dynamic_cast<Button *>(keyed(dialogs, "blastirc.settings.section.data.reset")->parent())
                ->foregroundColor() == ::palette.onPrimary);
 
     // Conditional controls retain their leaf and refresh the search index after rebuilds.
@@ -521,16 +715,19 @@ void settingsTreeControls() {
     // Managed children remove direct-network leaves; selection falls back to their root.
     picker->setSelectedIndex(5);
     frame();
-    press(dispatcher, *button(dialogs, "Add soju account"));
+    auto *serverAddress = named<Input>(dialogs, "Server address");
+    edit(dispatcher, *serverAddress, "corrected.example");
+    assert(!serverAddress->invalid() && model.servers.front().host == "corrected.example");
+    model.identities.front().certificate = "/private/tls-client.pem";
+    edit(dispatcher, *serverAddress, "other.example");
+    assert(serverAddress->invalid() && model.servers.front().host == "corrected.example");
+    edit(dispatcher, *serverAddress, "corrected.example");
+    assert(!serverAddress->invalid());
+    model.identities.front().certificate.clear();
+    named<Select>(dialogs, "Network")->setSelectedIndex(1);
     frame();
-    const auto accountIndex = model.servers.size() - 1;
-    const auto accountName = model.servers.back().name;
     key(XKB_KEY_Right);
     assert(keyed(dialogs, "blastirc.settings.section.networks.remote"));
-    press(dispatcher, *button(dialogs, "Add network"));
-    frame();
-    model.servers.back().sojuParent = accountName;
-    model.servers.back().sojuNetworkId = "tree-child";
     auto *networks = named<Select>(dialogs, "Network");
     networks->setSelectedIndex(0);
     frame();
@@ -543,7 +740,7 @@ void settingsTreeControls() {
     assert(!find<InputArea>(dialogs, [](const InputArea &area) {
         return area.tabFocusKey() == "blastirc.settings.section.networks.endpoint";
     }));
-    named<Select>(dialogs, "Network")->setSelectedIndex(accountIndex);
+    named<Select>(dialogs, "Network")->setSelectedIndex(1);
     frame();
     // Keep the rest of this isolated fixture on its original direct profile.
     model.servers.resize(1);
@@ -1372,6 +1569,7 @@ void runSettingsCheck() {
     using namespace blast;
     nativePopupFonts();
     welcomeControls();
+    dataStorageControls();
     settingsTreeControls();
     settingsTreeAnimatedSelection();
     dialogOpeningMotion();
@@ -1985,8 +2183,11 @@ void runSettingsCheck() {
     edit(dispatcher, *nickname, "OnlyOtherNick");
     assert(!nickname->invalid());
 
-    category(5);
-    press(dispatcher, *button(dialogs, "Add network"));
+    ServerConfig third;
+    third.name = "Third network";
+    third.identity = model.identities[1].name;
+    model.servers.push_back(third);
+    dialogs.open("server:" + third.name);
     sync();
     assert(model.servers.size() == 3 && named<Select>(dialogs, "Network")->selectedIndex() == 2);
     auto *port = named<Input>(dialogs, "Port (1–65535)");
@@ -2105,7 +2306,7 @@ void runSettingsCheck() {
     assert(model.identities.front().username == "native-account-user" &&
            model.identities.front().password == "native-account-secret" &&
            model.identities.size() == identityCount &&
-           model.servers[accountIndex].password == "legacy-control-pass" &&
+           model.servers[accountIndex].password.empty() &&
            model.servers.front().password == "alpha-new");
     auto *accountPassword = named<Input>(dialogs, "Account password");
     dispatcher.setFocus(accountPassword->inputArea());
@@ -2137,8 +2338,7 @@ void runSettingsCheck() {
            named<Select>(dialogs, "Authentication method")->selectedIndex() == 1);
     named<Select>(dialogs, "Authentication method")->setSelectedIndex(2);
     assert(model.servers[accountIndex].sasl.empty() &&
-           named<Input>(dialogs, "Control connection PASS (management only)")->value() ==
-               "legacy-control-pass");
+           named<Input>(dialogs, "Control connection PASS (management only)")->value().empty());
     named<Select>(dialogs, "Authentication method")->setSelectedIndex(0);
     activate(dispatcher, *named<Toggle>(dialogs, "Connect automatically"));
     assert(model.servers[accountIndex].sojuEnabled);
@@ -2150,7 +2350,7 @@ void runSettingsCheck() {
            savedAccount.identities[0].password == "native-account-secret" &&
            savedAccount.servers[accountIndex].sasl == "PLAIN" &&
            savedAccount.servers[accountIndex].identity == model.identities[0].name &&
-           savedAccount.servers[accountIndex].password == "legacy-control-pass" &&
+           savedAccount.servers[accountIndex].password.empty() &&
            savedAccount.servers[accountIndex].sojuEnabled &&
            savedAccount.servers[accountIndex].name == account.name &&
            savedAccount.servers.back().sojuParent == account.name &&
@@ -2294,16 +2494,62 @@ void runSettingsCheck() {
     }));
     dialogs.open("server:" + beta.name);
     sync();
-    const auto otherName = model.servers.front().name;
     const auto otherHost = model.servers.front().host;
-    edit(dispatcher, *named<Input>(dialogs, "Network name"), otherName);
-    assert(named<Input>(dialogs, "Network name")->invalid());
-    edit(dispatcher, *named<Input>(dialogs, "Server address"), "still-beta.example");
-    const auto stillBeta = std::find_if(model.servers.begin(), model.servers.end(),
-                                        [&](const auto &entry) { return entry.name == beta.name; });
-    assert(stillBeta != model.servers.end() && stillBeta->host == "still-beta.example" &&
-           model.servers.front().host == otherHost);
-    edit(dispatcher, *named<Input>(dialogs, "Network name"), beta.name);
+    const auto oldAddress = model.servers[1].host;
+    constexpr auto newAddress = "still-beta.example";
+    auto &betaRuntime = model.networks.at(beta.name);
+    betaRuntime.state = "Ready";
+    auto *networkName = named<Input>(dialogs, "Network name");
+    edit(dispatcher, *networkName, "Live rename");
+    assert(networkName->invalid() && model.servers[1].name == beta.name);
+    betaRuntime.state = "Disconnected";
+    betaRuntime.retrying = true;
+    sync();
+    assert(find<Label>(dialogs, [&](const Label &label) {
+        return label.text().starts_with(beta.name + ": Retrying");
+    }));
+    edit(dispatcher, *networkName, "Retrying rename");
+    assert(networkName->invalid() && model.servers[1].name == beta.name);
+    betaRuntime.retrying = false;
+    edit(dispatcher, *networkName, model.servers.front().name);
+    assert(networkName->invalid() && model.servers[1].name == beta.name);
+    edit(dispatcher, *networkName, beta.name);
+    assert(!networkName->invalid());
+
+    auto *address = named<Input>(dialogs, "Server address");
+    edit(dispatcher, *address, newAddress);
+    sync();
+    assert(address->invalid() && model.servers[1].host == oldAddress);
+    model.actions.clear();
+    press(dispatcher, *button(dialogs, "Save and connect"));
+    assert(model.actions.empty());
+    named<Select>(dialogs, "Network")->setSelectedIndex(0);
+    sync();
+    press(dispatcher, *button(dialogs, "Save now"));
+    assert(model.actions.empty());
+    named<Select>(dialogs, "Network")->setSelectedIndex(1);
+    sync();
+    address = named<Input>(dialogs, "Server address");
+    assert(address->invalid() && address->value() == newAddress);
+    press(dispatcher, *button(dialogs, "Review address change…"));
+    assert(find<Label>(dialogs, [&](const Label &label) {
+        const auto &text = label.text();
+        return text.find(oldAddress) != std::string::npos &&
+               text.find(newAddress) != std::string::npos &&
+               text.find("saved credentials") != std::string::npos;
+    }));
+    assert(!find<Label>(dialogs, [](const Label &label) {
+        return label.text().find("beta-server-secret") != std::string::npos ||
+               label.text().find("native-account-secret") != std::string::npos;
+    }));
+    press(dispatcher, *button(dialogs, "Cancel"));
+    assert(address->invalid() && model.servers[1].host == oldAddress);
+    press(dispatcher, *button(dialogs, "Review address change…"));
+    press(dispatcher, *button(dialogs, "Reuse credentials"));
+    assert(!address->invalid() && model.servers[1].host == newAddress &&
+           model.servers[1].password == "beta-server-secret" &&
+           model.identities.front().password == "native-account-secret" &&
+           model.servers.front().host == otherHost && model.actions.empty());
     // Legacy display selectors require selecting a separate base-account identity.
     Identity selectorIdentity = model.identities.front();
     selectorIdentity.name = "Legacy selector identity";
@@ -2427,12 +2673,61 @@ void runSettingsCheck() {
     sync();
     assert(named<Select>(dialogs, "Network")->selectedIndex() == model.servers.size() - 1 &&
            named<Input>(dialogs, "Network name")->value() == literalCaption.name);
-    const auto retiredKey = "Network " + std::to_string(model.servers.size() + 1);
+    const std::string retiredKey = "soju.example";
     model.buffers[retiredKey + "/#history"].server = retiredKey;
+    const auto profileCount = model.servers.size();
+    const auto beforeSetupIdentities = model.identities.size();
+    const auto reusedName = model.identities.front().name;
+    const auto reusedUsername = model.identities.front().username;
+    const auto reusedPassword = model.identities.front().password;
     press(dispatcher, *button(dialogs, "Add soju account"));
-    assert(model.servers.back().sojuAccount && model.servers.back().sasl == "PLAIN" &&
-           model.servers.back().name != retiredKey &&
+    sync();
+    assert(!dialogs.settingsOpen() && model.servers.size() == profileCount);
+    assert(named<Select>(dialogs, "Connection type")->selectedText() == "Soju account");
+    assert(named<Select>(dialogs, "Authentication method")->selectedIndex() == 0);
+    edit(dispatcher, *named<Input>(dialogs, "Soju server address"), retiredKey);
+    edit(dispatcher, *named<Input>(dialogs, "Account username"), "isolated-user");
+    edit(dispatcher, *named<Input>(dialogs, "Account password"), "isolated-password");
+    activate(dispatcher, *named<Toggle>(dialogs, "Advanced options"));
+    named<Select>(dialogs, "Identity profile")->setSelectedIndex(1);
+    assert(!find<Input>(dialogs, [](const Input &field) {
+        return field.value() == "isolated-password" || field.value() == "isolated-user";
+    }));
+    edit(dispatcher, *named<Input>(dialogs, "Soju server address"), "new.soju.example");
+    assert(named<Select>(dialogs, "Identity profile")->selectedIndex() == 0 &&
+           named<Input>(dialogs, "Account username")->value().empty() &&
+           named<Input>(dialogs, "Account password")->value().empty());
+    edit(dispatcher, *named<Input>(dialogs, "Soju server address"), retiredKey);
+    named<Select>(dialogs, "Identity profile")->setSelectedIndex(1);
+    auto *authMethod = named<Select>(dialogs, "Authentication method");
+    authMethod->setSelectedIndex(2); // Management only (no SASL).
+    assert(find<Label>(dialogs, [](const Label &caption) {
+        return caption.text().find("client certificate may be presented over TLS even when "
+                                   "SASL is off") != std::string::npos;
+    }));
+    edit(dispatcher, *named<Input>(dialogs, "Control connection PASS (management only)"),
+         "temporary-control-pass");
+    authMethod->setSelectedIndex(0);
+    authMethod->setSelectedIndex(2);
+    assert(named<Input>(dialogs, "Control connection PASS (management only)")->value().empty());
+    authMethod->setSelectedIndex(0);
+    press(dispatcher, *button(dialogs, "Save and connect"));
+    assert(model.actions.back().type == "setup-connect" && model.connectionSetup);
+    const auto &staged = model.connectionSetup->server;
+    assert(staged.name != retiredKey && staged.host == retiredKey && staged.sojuAccount &&
+           staged.sasl == "PLAIN" && staged.identity == reusedName &&
+           !model.connectionSetup->identity);
+    assert(model.servers.size() == profileCount &&
+           model.identities.size() == beforeSetupIdentities &&
+           model.identities.front().username == reusedUsername &&
+           model.identities.front().password == reusedPassword &&
            model.buffers.contains(retiredKey + "/#history"));
+    model.settingsSaveResult = {model.actions.back().requestId, false, "Cannot save soju account"};
+    model.actions.clear();
+    sync();
+    press(dispatcher, *button(dialogs, "Cancel"));
+    assert(dialogs.settingsOpen() && !model.connectionSetup &&
+           model.servers.size() == profileCount);
     press(dispatcher, *button(dialogs, "Close"));
     assert(!dialogs.active() && model.settings.cursorShape == "box" &&
            model.settings.cursorBlink == "smooth" && model.settings.cursorTrail &&

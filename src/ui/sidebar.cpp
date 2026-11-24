@@ -622,19 +622,23 @@ void serverMenu(Model &model, Popup &popup, Node &anchor, float scale, const std
                 const std::function<void(std::string)> &execute,
                 std::optional<InputArea::PointerData> pointer = {}) {
     const auto network = model.networks.find(name);
-    const bool connected = network != model.networks.end() &&
-                           network->second.state != "Disconnected" &&
-                           network->second.state != "Failed";
+    const bool retrying = network != model.networks.end() && network->second.retrying;
+    const bool connected =
+        retrying || (network != model.networks.end() && network->second.state != "Disconnected" &&
+                     network->second.state != "Failed");
     const auto profile = std::find_if(model.servers.begin(), model.servers.end(),
                                       [&](const auto &config) { return config.name == name; });
     const bool account = profile != model.servers.end() && profile->sojuAccount;
     const bool childNetwork = profile != model.servers.end() && !profile->sojuParent.empty();
     auto connection = menuEntry("Connection", "plug");
     connection.children.reserve(connected ? 2 : 1);
-    connection.children.push_back(
-        menuEntry(connected ? "Reconnect" : "Connect", connected ? "refresh" : "plug", 0));
+    connection.children.push_back(menuEntry(retrying    ? "Retry now"
+                                            : connected ? "Reconnect"
+                                                        : "Connect",
+                                            connected ? "refresh" : "plug", 0));
     if (connected)
-        connection.children.push_back(menuEntry("Disconnect", "plug-off", 1));
+        connection.children.push_back(
+            menuEntry(retrying ? "Stop retrying" : "Disconnect", "plug-off", 1));
     std::vector<ContextMenuEntry> menu;
     menu.reserve(4);
     menu.push_back(menuEntry("Open server log", "terminal", 3));
@@ -746,12 +750,15 @@ class Avatar final : public InputArea {
             source.assign(path);
             markLayoutDirty();
         }
-        const auto state = network ? std::string_view(network->state) : "Disconnected";
-        dotColor = themeForegroundColor(network && !network->error.empty() ? "error"
-                                        : state == "Ready"                 ? "primary"
-                                        : state == "Failed"                ? "error"
-                                        : state == "Disconnected"          ? "outline"
-                                                                           : "secondary");
+        const std::string_view state = !network            ? "Disconnected"
+                                       : network->retrying ? "Retrying"
+                                                           : std::string_view(network->state);
+        dotColor = themeForegroundColor(state == "Retrying"                  ? "secondary"
+                                        : network && !network->error.empty() ? "error"
+                                        : state == "Ready"                   ? "primary"
+                                        : state == "Failed"                  ? "error"
+                                        : state == "Disconnected"            ? "outline"
+                                                                             : "secondary");
         scratch.assign(caption);
         scratch.append("\n").append(state);
         if (network && !network->error.empty())
@@ -1068,8 +1075,10 @@ struct ServerRail::Impl {
                         network != model.networks.end() &&
                         (network->second.state == "Failed" || !network->second.error.empty());
                     childStatus.append("\n").append(serverDisplayName(model, configChild.name));
-                    childStatus.append(": ").append(
-                        network == model.networks.end() ? "Disconnected" : network->second.state);
+                    childStatus.append(": ").append(network == model.networks.end() ? "Disconnected"
+                                                    : network->second.retrying
+                                                        ? "Retrying"
+                                                        : std::string_view(network->second.state));
                     if (!configChild.sojuEnabled)
                         childStatus.append(" (locally disabled)");
                     if (network != model.networks.end() && !network->second.error.empty())

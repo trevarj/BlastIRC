@@ -22,7 +22,7 @@ string sojuSessionKey(const ServerConfig &, const Identity &);
 class Application {
   public:
     Model model;
-    Application();
+    explicit Application(bool exclusiveWriter = false);
     ~Application() noexcept;
     // Frame order: tick, Theme::update, Ui::update, Effects::draw.
     void tick(double now);
@@ -106,6 +106,7 @@ class Application {
         uint64_t request = 0;
     };
     Storage storage_;
+    bool localResetInProgress_ = false;
     map<string, std::unique_ptr<NetworkClient>> clients_;
     AvatarLoader avatarLoader_;
     map<string, ChannelAvatar> channelAvatars_;
@@ -177,6 +178,10 @@ class Application {
     void connect(string server, string origin = "");
     void stopClient(string server);
     void reduce(const Event &);
+    void setupConnection(const Action &);
+    void clearLocalData(const Action &);
+    void firstJoin(const Action &);
+    void clearLoaded(Buffer &, bool preserveRecovery);
     void action(const Action &);
     void dispatchActions();
     void command(Buffer &, const string &);

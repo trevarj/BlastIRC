@@ -222,9 +222,10 @@ void refreshFonts(Node &node) {
 } // namespace
 
 struct Dialogs::Impl {
-    enum class Tab { Appearance, Keys, Chat, Fx, Sounds, Servers, Identities };
-    static constexpr const char *tabNames[] = {"Appearance", "Keyboard", "Chat",      "Effects",
-                                               "Sounds",     "Networks", "Identities"};
+    enum class Tab { Appearance, Keys, Chat, Fx, Sounds, Servers, Identities, Data };
+    static constexpr const char *tabNames[] = {"Appearance", "Keyboard",      "Chat",
+                                               "Effects",    "Sounds",        "Networks",
+                                               "Identities", "Data & Storage"};
     enum class MetricKind {
         Flex,
         Section,
@@ -278,7 +279,7 @@ struct Dialogs::Impl {
     std::vector<SettingsSection> sections;
     std::vector<TreeEntry> treeEntries;
     std::vector<std::pair<Tab, std::string>> compactEntries;
-    std::array<bool, 7> expanded{true, false, false, false, false, false, false};
+    std::array<bool, std::size(tabNames)> expanded{true};
     struct SearchTarget {
         Tab category;
         std::string caption, terms;
@@ -287,7 +288,7 @@ struct Dialogs::Impl {
     };
     std::vector<SearchTarget> searchTargets;
     std::vector<std::size_t> rankedTargets;
-    std::array<Flex *, 7> categoryPages{};
+    std::array<Flex *, std::size(tabNames)> categoryPages{};
     struct BindingControls {
         Input *field;
         Label *warning;
@@ -325,6 +326,32 @@ struct Dialogs::Impl {
     std::uint64_t pendingSaveRequest = 0;
     bool closeAfterSave = false;
     bool saveFeedbackActive = false;
+    struct DataAction {
+        std::string_view token, button, title, message, result;
+    };
+    const DataAction *pendingData = nullptr;
+    struct SetupDraft {
+        Identity identity;
+        ServerConfig server;
+        std::string port = "6697", channels, shared, credentialHost;
+        bool advanced = false;
+
+        void bindCredentials() {
+            if (!shared.empty() || !server.password.empty() || !identity.password.empty() ||
+                !identity.certificate.empty() || !identity.key.empty() ||
+                (server.sojuAccount && !identity.username.empty()))
+                credentialHost = server.host;
+            else
+                credentialHost.clear();
+        }
+    };
+    std::array<SetupDraft, 3> setup;
+    bool setupSoju = false, setupCustom = false, setupFromSettings = false;
+    Button *setupConnect = nullptr;
+    Input *setupPort = nullptr, *setupNick = nullptr, *setupHost = nullptr, *setupUser = nullptr;
+
+    bool setupOpen() const { return mode == "first-run" || mode == "add-connection"; }
+    SetupDraft &currentSetup() { return setup[setupSoju ? 2 : setupCustom ? 1 : 0]; }
     Label *themeStatus = nullptr;
     Select *networkPicker = nullptr;
     Select *identityPicker = nullptr;
@@ -375,6 +402,7 @@ struct Dialogs::Impl {
     std::string sojuEditId;
     std::string sojuEditParent;
     std::shared_ptr<std::string> displayedServer;
+    std::map<std::string, std::string> pendingAddresses;
     std::map<std::string, std::string> sojuEditAttributes, sojuEditChanges;
     Label *sojuStatus = nullptr;
     Label *connectionStatus = nullptr;
@@ -730,7 +758,14 @@ struct Dialogs::Impl {
         result->setClearButtonEnabled(!password);
         result->setMinLayoutWidth(0);
         result->setFlexGrow(1);
-        result->setOnChange(std::move(changed));
+        if (setupOpen() && changed) {
+            result->setOnChange([ptr, changed = std::move(changed)](const std::string &value) {
+                ptr->setInvalid(false);
+                changed(value);
+            });
+        } else {
+            result->setOnChange(std::move(changed));
+        }
         result->setOnFocusGain([this, unit = group.get()] {
             if (recordingButton)
                 stopRecording(false);
@@ -844,7 +879,7 @@ struct Dialogs::Impl {
                 colorSpecFromRole(error ? ColorRole::Error : ColorRole::OnSurfaceVariant));
             feedback->setVisible(!message.empty());
             feedback->setParticipatesInLayout(!message.empty());
-            if (!message.empty() && scroll && mode != "first-run")
+            if (!message.empty() && scroll && !setupOpen())
                 scroll->requestScrollIntoView(feedback);
         }
     }
@@ -984,7 +1019,7 @@ struct Dialogs::Impl {
         for (std::size_t i = 0; i < std::size(tabNames); ++i)
             compactEntries.emplace_back(Tab(i), "");
         static constexpr const char *icons[] = {"palette",  "keyboard", "messages", "sparkles",
-                                                "volume-2", "network",  "user"};
+                                                "volume-2", "network",  "user",     "database"};
         for (std::size_t i = 0; i < std::size(tabNames); ++i) {
             const auto category = Tab(i);
             const auto add = [this, category](std::string id, std::string title) {
@@ -1123,6 +1158,12 @@ struct Dialogs::Impl {
     }
 
     void beginPanel(std::string name, std::string_view title, bool tabs) {
+        if (setupOpen() && name != "first-run" && name != "add-connection") {
+            setup = {};
+            setupFromSettings = false;
+        }
+        if (name != "settings" && !setupFromSettings)
+            pendingAddresses.clear();
         if (mode == "whois" && name != "whois") {
             model.whoisProfile.open = false;
             model.whoisProfile.loading = false;
@@ -1162,6 +1203,7 @@ struct Dialogs::Impl {
         feedback = themeStatus = applicationStatus = motionStatus = soundStatus = cursorStatus =
             identityScope = connectionStatus = nullptr;
         connectButton = saveButton = nullptr;
+        setupConnect = nullptr;
         moderationReview = nullptr;
         saveFeedbackActive = false;
         networkPicker = identityPicker = nullptr;
@@ -1313,7 +1355,7 @@ struct Dialogs::Impl {
         } else {
             chrome->addChild(std::move(viewport));
         }
-        feedback = label(mode == "first-run" ? *chrome : *scroll->content(), "");
+        feedback = label(setupOpen() ? *chrome : *scroll->content(), "");
         feedback->setColor(colorSpecFromRole(ColorRole::Error));
         feedback->setVisible(false);
         feedback->setParticipatesInLayout(false);
@@ -1328,32 +1370,22 @@ struct Dialogs::Impl {
             persistence->setFlexGrow(1);
             persistence->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
             persistence->setTooltip(
-                "Changes take effect immediately. Automatic saving is attempted "
-                "every 30 seconds and on exit; invalid profiles or storage "
-                "errors prevent a write. Save now requests an earlier write. "
-                "Close keeps changes; it does not undo them.");
+                "Changes take effect immediately, except server addresses awaiting credential "
+                "reuse approval. Automatic saving is attempted every 30 seconds and on exit; "
+                "invalid profiles or storage errors prevent a write. Save now requests an earlier "
+                "write. Close keeps applied changes and discards unconfirmed addresses.");
             saveButton =
                 button(*footer, "Save now", [this] { saveSettings(); }, ButtonVariant::Primary);
             footer->setJustify(FlexJustify::End);
             button(*footer, "Close", [this] { dismiss(); });
-        } else if (mode == "first-run") {
-            connectButton = button(
-                *footer, "Save and connect",
-                [this] {
-                    if (displayedServer) {
-                        const auto index = resolveServer(displayedServer);
-                        if (index < model.servers.size())
-                            connect(index);
-                    }
-                },
+        } else if (setupOpen()) {
+            setupConnect = button(
+                *footer, "Save and connect", [this] { submitSetup(false); },
                 ButtonVariant::Primary);
-            saveButton = button(*footer, "Configure offline", [this] {
-                if (pendingSaveRequest)
-                    return;
-                model.servers.clear();
-                model.firstRun = false;
-                save({}, true);
-            });
+            if (mode == "first-run")
+                saveButton = button(*footer, "Continue offline", [this] { submitSetup(true); });
+            else
+                button(*footer, "Cancel", [this] { dismiss(); });
         } else if (mode == "search") {
             button(*footer, "Find", [this] { search(); }, ButtonVariant::Primary);
             button(*footer, "Cancel", [this] { dismiss(); });
@@ -1412,10 +1444,13 @@ struct Dialogs::Impl {
             sounds();
             break;
         case Tab::Servers:
-            connection(false);
+            connection();
             break;
         case Tab::Identities:
             identities();
+            break;
+        case Tab::Data:
+            dataStorage();
             break;
         }
     }
@@ -1471,8 +1506,7 @@ struct Dialogs::Impl {
         detach(page, *scroll->content());
         themeStatus = applicationStatus = motionStatus = soundStatus = cursorStatus =
             identityScope = connectionStatus = nullptr;
-        if (mode != "first-run")
-            connectButton = nullptr;
+        connectButton = nullptr;
         sojuStatus = nullptr;
         displayedServer.reset();
         sojuMutationButtons.clear();
@@ -1529,15 +1563,8 @@ struct Dialogs::Impl {
             profileError = profileField(*page, "Error", "blastirc.whois.error");
             profileError->setTextColors(themeForegroundColor("error"), {}, {}, {});
             updateProfile();
-        } else if (mode == "first-run") {
-            label(*page, "Enter your IRC server and identity to connect. You can change these "
-                         "later in Settings.");
-            connection(true);
-            applicationStatus = label(*page, "");
-            applicationStatus->setColor(colorSpecFromRole(ColorRole::Error));
-            applicationStatus->setVisible(false);
-            applicationStatus->setParticipatesInLayout(false);
-            lastApplicationStatus.clear();
+        } else if (setupOpen()) {
+            setupForm();
         } else if (mode == "search") {
             auto *query = text(*page, "Search", searchQuery,
                                [this](const std::string &value) { searchQuery = value; });
@@ -2272,10 +2299,10 @@ struct Dialogs::Impl {
         integer(*history, "Messages in memory / saved history (200–100000)",
                 model.settings.maxMessages, 200, 100000,
                 [this](int value) { model.settings.maxMessages = value; });
-        label(*history, "These limits apply to memory and saved local history; clearing it deletes "
-                        "nothing from your server.");
+        label(*history, "These limits apply to memory and saved local history. Chat history can "
+                        "be cleared without deleting server logs or remote history.");
         button(
-            *history, "Clear saved history…", [this] { clearHistory(); },
+            *history, "Clear saved chat history…", [this] { clearHistory(); },
             ButtonVariant::Destructive);
     }
 
@@ -2343,34 +2370,344 @@ struct Dialogs::Impl {
         }
     }
 
-    void ensureIdentity() {
-        if (model.identities.empty())
-            model.identities.emplace_back();
+    std::string nextSetupName(const ServerConfig &server) const {
+        const std::string base = server.sojuAccount || setupCustom ? server.host : "Libera";
+        std::string name = base;
+        for (std::size_t n = 2;
+             std::any_of(model.servers.begin(), model.servers.end(),
+                         [&](const auto &saved) { return saved.name == name; }) ||
+             std::any_of(model.buffers.begin(), model.buffers.end(),
+                         [&](const auto &buffer) { return buffer.second.server == name; });
+             ++n)
+            name = base + " " + std::to_string(n);
+        return name;
     }
 
-    void addServer() {
-        ensureIdentity();
-        ServerConfig server;
-        server.identity = model.identities.front().name;
-        for (std::size_t n = model.servers.size() + 1;; ++n) {
-            server.name = "Network " + std::to_string(n);
-            if (std::none_of(model.servers.begin(), model.servers.end(),
-                             [&](const auto &existing) { return existing.name == server.name; }) &&
-                std::none_of(model.buffers.begin(), model.buffers.end(),
-                             [&](const auto &entry) { return entry.second.server == server.name; }))
-                break;
+    void openSetup(std::string_view name, bool fromSettings = false) {
+        if (pendingSaveRequest)
+            return;
+        setup = {};
+        setup[0].identity.nick.clear();
+        setup[1].identity.nick.clear();
+        setup[1].server.host.clear();
+        setup[2].identity.username.clear();
+        auto &account = setup[2].server;
+        account.sojuAccount = true;
+        account.bouncer = "soju";
+        account.sasl = "PLAIN";
+        account.host.clear();
+        setupSoju = name == "add-soju-account";
+        setupCustom = false;
+        setupFromSettings = fromSettings;
+        const bool first = name == "first-run";
+        beginPanel(first ? "first-run" : "add-connection",
+                   first ? "Welcome to BlastIRC" : "Add connection", false);
+        rebuildPage();
+    }
+
+    void setupForm() {
+        auto &draft = currentSetup();
+        auto &server = draft.server;
+        auto &identity = draft.identity;
+        label(*page, "Add a connection now. You can edit it later in Settings → Networks.");
+        select(*page, "Connection type", {"Direct IRC", "Soju account"},
+               setupSoju ? "Soju account" : "Direct IRC",
+               [this](std::size_t index, std::string_view) {
+                   if (pendingSaveRequest || setupSoju == bool(index))
+                       return;
+                   setupSoju = bool(index);
+                   rebuildPage();
+               });
+        if (setupSoju)
+            label(*page, "Use your soju account, not the address of an upstream IRC network.");
+        if (!setupSoju)
+            select(*page, "Network preset", {"Libera.Chat (irc.libera.chat)", "Custom server"},
+                   setupCustom ? "Custom server" : "Libera.Chat (irc.libera.chat)",
+                   [this](std::size_t index, std::string_view) {
+                       if (pendingSaveRequest || setupCustom == bool(index))
+                           return;
+                       setupCustom = bool(index);
+                       rebuildPage();
+                   });
+        setupHost =
+            setupSoju || setupCustom
+                ? text(*page, setupSoju ? "Soju server address" : "Server address", server.host, {})
+                : nullptr;
+        auto privateProfile = column(8);
+        auto *privateMain = privateProfile.get();
+        setupUser = setupSoju ? text(*privateMain, "Account username", identity.username,
+                                     [&identity, &draft](const std::string &value) {
+                                         identity.username = value;
+                                         draft.bindCredentials();
+                                     })
+                              : nullptr;
+        setupNick = !setupSoju
+                        ? text(*privateMain, "Nickname", identity.nick,
+                               [&identity](const std::string &value) { identity.nick = value; })
+                        : nullptr;
+        page->addChild(std::move(privateProfile));
+
+        auto authentication = column(8);
+        auto *auth = authentication.get();
+        if (setupSoju)
+            page->addChild(std::move(authentication));
+        auto advanced = column(8);
+        auto *options = advanced.get();
+        toggle(*page, "Advanced options", draft.advanced, [&draft, options](bool show) {
+            draft.advanced = show;
+            setShown(*options, show);
+        });
+        page->addChild(std::move(advanced));
+        setupPort = text(*options, "Port (1–65535)", draft.port,
+                         [&draft](const std::string &value) { draft.port = value; });
+        auto *tlsWarning =
+            label(*options, "Plaintext exposes messages and credentials to the network.");
+        tlsWarning->setColor(colorSpecFromRole(ColorRole::Error));
+        toggle(*options, "TLS (recommended)", server.tls,
+               [&server, &draft, this, tlsWarning](bool tls) {
+                   if (draft.port == (server.tls ? "6697" : "6667")) {
+                       draft.port = tls ? "6697" : "6667";
+                       setupPort->setValue(draft.port);
+                   }
+                   server.tls = tls;
+                   setShown(*tlsWarning, !tls);
+               });
+        setShown(*tlsWarning, !server.tls);
+        if (!setupSoju) {
+            options->addChild(std::move(authentication));
+            text(*options, "Auto-join channels", draft.channels,
+                 [&draft](const std::string &value) { draft.channels = value; });
+            select(*options, "Legacy bouncer", {"none", "soju", "znc"}, server.bouncer,
+                   [&server](std::size_t, std::string_view value) { server.bouncer = value; });
         }
-        model.servers.push_back(std::move(server));
-        serverIndex = model.servers.size() - 1;
+
+        auto *methodSelect =
+            select(*auth, "Authentication method",
+                   setupSoju ? std::vector<std::string>{"Password (SASL PLAIN)",
+                                                        "Client certificate (EXTERNAL)",
+                                                        "Management only (no SASL)"}
+                             : std::vector<std::string>{"SASL PLAIN", "SASL EXTERNAL", "None"},
+                   {}, {});
+        methodSelect->setSelectedIndexSilently(server.sasl == "PLAIN"      ? 0
+                                               : server.sasl == "EXTERNAL" ? 1
+                                                                           : 2);
+        auto *identityHelp = label(*page, "");
+        auto *password = text(
+            *auth, setupSoju ? "Account password" : "SASL password (PLAIN)", identity.password,
+            [&identity, &draft](const std::string &value) {
+                identity.password = value;
+                draft.bindCredentials();
+            },
+            true);
+        auto *certificate = text(*auth, "Client certificate path", identity.certificate,
+                                 [&identity, &draft](const std::string &value) {
+                                     identity.certificate = value;
+                                     draft.bindCredentials();
+                                 });
+        auto *key = text(*auth, "Private key path (optional)", identity.key,
+                         [&identity, &draft](const std::string &value) {
+                             identity.key = value;
+                             draft.bindCredentials();
+                         });
+        auto *pass = text(
+            setupSoju ? *auth : *options,
+            setupSoju ? "Control connection PASS (management only)"
+                      : "Server password (this network only)",
+            server.password,
+            [&server, &draft](const std::string &value) {
+                server.password = value;
+                draft.bindCredentials();
+            },
+            true);
+        auto *help = label(*auth, "");
+        const auto updateAuth = [this, &draft, privateMain, identityHelp, password, certificate,
+                                 key, pass, help] {
+            const auto &method = draft.server.sasl;
+            const bool fresh = draft.shared.empty();
+            setShown(*privateMain, fresh);
+            if (fresh) {
+                identityHelp->setText("");
+            } else {
+                auto message = "Using saved identity “" + draft.shared + "” without changing it.";
+                const auto profile = std::find_if(
+                    model.identities.begin(), model.identities.end(),
+                    [&](const auto &identity) { return identity.name == draft.shared; });
+                if (profile != model.identities.end() && !profile->certificate.empty())
+                    message += " Its client certificate may be presented over TLS even when "
+                               "SASL is off.";
+                identityHelp->setText(message);
+            }
+            setShown(*identityHelp, !fresh);
+            setShown(*password->parent(), fresh && method == "PLAIN");
+            setShown(*certificate->parent(), fresh && method == "EXTERNAL");
+            setShown(*key->parent(), fresh && method == "EXTERNAL");
+            setShown(*pass->parent(), !setupSoju || method.empty());
+            help->setText(method == "PLAIN"      ? "Password authentication requires TLS."
+                          : method == "EXTERNAL" ? "Client certificate authentication requires TLS."
+                          : setupSoju ? "Management only does not attach upstream networks."
+                                      : "");
+            setShown(*help, !help->text().empty());
+        };
+        methodSelect->setOnSelectionChanged(
+            [this, &server, &draft, pass, updateAuth](std::size_t index, std::string_view) {
+                server.sasl = index == 0 ? "PLAIN" : index == 1 ? "EXTERNAL" : "";
+                if (setupSoju && !server.sasl.empty()) {
+                    server.password.clear();
+                    pass->setValue("");
+                    draft.bindCredentials();
+                }
+                updateAuth();
+            });
+        auto names = identityNames();
+        Select *picker = nullptr;
+        if (!names.empty()) {
+            std::vector<std::string> choices{"New private identity"};
+            for (const auto &name : names)
+                choices.push_back("Reuse " + name);
+            const auto selected = std::find(names.begin(), names.end(), draft.shared);
+            const auto index = selected == names.end() ? 0 : 1 + (selected - names.begin());
+            picker = select(*options, "Identity profile", std::move(choices), {},
+                            [&draft, updateAuth, names = std::move(names)](std::size_t index,
+                                                                           std::string_view) {
+                                draft.shared = index ? names.at(index - 1) : "";
+                                draft.bindCredentials();
+                                updateAuth();
+                            });
+            picker->setSelectedIndexSilently(index);
+        }
+        label(*options, "Passwords are stored in plain text in your private configuration file.");
+        if (setupHost) {
+            setupHost->setOnFocusLoss([&draft] { draft.bindCredentials(); });
+            setupHost->setOnChange([this, &draft, password, certificate, key, pass, picker,
+                                    host = setupHost, user = setupUser,
+                                    updateAuth](const std::string &value) {
+                host->setInvalid(false);
+                draft.server.host = value;
+                if (draft.credentialHost.empty() || draft.credentialHost == value)
+                    return;
+                draft.credentialHost.clear();
+                draft.shared.clear();
+                draft.server.password.clear();
+                draft.identity.password.clear();
+                draft.identity.certificate.clear();
+                draft.identity.key.clear();
+                for (auto *field : {password, certificate, key, pass})
+                    field->setValue("");
+                if (user) {
+                    draft.identity.username.clear();
+                    user->setValue("");
+                }
+                if (picker)
+                    picker->setSelectedIndexSilently(0);
+                updateAuth();
+                setFeedback("Server address changed. Enter credentials for the new address.",
+                            false);
+            });
+        }
+        setShown(*options, draft.advanced);
+        updateAuth();
+    }
+
+    static void setShown(Node &node, bool show) {
+        node.setVisible(show);
+        node.setParticipatesInLayout(show);
+        node.setExcludeSubtreeFromTabOrder(!show);
+    }
+
+    void submitSetup(bool offline) {
+        if (pendingSaveRequest)
+            return;
+        if (!offline) {
+            const auto &draft = currentSetup();
+            auto server = draft.server;
+            auto fail = [this, &draft](std::string_view error, Input *field) {
+                if (field == setupPort && !draft.advanced) {
+                    currentSetup().advanced = true;
+                    rebuildPage(false);
+                    field = setupPort;
+                }
+                setFeedback(error);
+                if (field) {
+                    field->setInvalid(true);
+                    if (dispatcher)
+                        dispatcher->setFocus(field->inputArea());
+                }
+            };
+            if (!setupSoju && !setupCustom)
+                server.host = "irc.libera.chat";
+            const auto parsed = std::from_chars(draft.port.data(),
+                                                draft.port.data() + draft.port.size(), server.port);
+            if (parsed.ec != std::errc{} || parsed.ptr != draft.port.data() + draft.port.size() ||
+                server.port < 1 || server.port > 65535) {
+                fail("Port must be between 1 and 65535.", setupPort);
+                return;
+            }
+            server.name = nextSetupName(server);
+            server.channels = words(draft.channels);
+            if (setupSoju && !server.sasl.empty())
+                server.password.clear();
+
+            Model candidate;
+            if (draft.shared.empty()) {
+                auto &identity = candidate.identities.emplace_back(draft.identity);
+                identity.name = server.name + " identity";
+                for (std::size_t n = 2;
+                     std::any_of(model.identities.begin(), model.identities.end(),
+                                 [&](const auto &saved) { return saved.name == identity.name; });
+                     ++n)
+                    identity.name = server.name + " identity " + std::to_string(n);
+                if (!setupSoju)
+                    identity.username = identity.nick;
+                if (server.sasl != "PLAIN")
+                    identity.password.clear();
+                if (server.sasl != "EXTERNAL") {
+                    identity.certificate.clear();
+                    identity.key.clear();
+                }
+                server.identity = identity.name;
+            } else {
+                server.identity = draft.shared;
+                const auto existing =
+                    std::find_if(model.identities.begin(), model.identities.end(),
+                                 [&](const auto &profile) { return profile.name == draft.shared; });
+                if (existing != model.identities.end())
+                    candidate.identities.push_back(*existing);
+            }
+            candidate.servers.push_back(std::move(server));
+            if (const auto error = validateServerProfile(candidate, 0); !error.empty()) {
+                Input *field = nullptr;
+                if (error.starts_with("Choose a nickname"))
+                    field = setupNick;
+                else if (error.find("address") != error.npos)
+                    field = setupHost;
+                else if (error.starts_with("Username") ||
+                         error.starts_with("A soju control account"))
+                    field = setupUser;
+                fail(error, field);
+                return;
+            }
+            model.connectionSetup.emplace(ConnectionSetup{
+                std::move(candidate.servers.front()),
+                draft.shared.empty() ? std::optional{std::move(candidate.identities.front())}
+                                     : std::nullopt,
+            });
+        }
+        pendingSaveRequest = ++model.settingsSaveRequest;
+        model.actions.push_back(
+            {offline ? "setup-offline" : "setup-connect", {}, {}, {}, pendingSaveRequest});
+        setFeedback(offline ? "Saving offline setup…" : "Saving connection…", false);
+        setupConnect->setEnabled(false);
+        if (saveButton)
+            saveButton->setEnabled(false);
     }
 
     void connect(std::size_t index) {
         if (pendingSaveRequest)
             return;
+        if (!addressesReviewed())
+            return;
         if (!invalidFields.empty()) {
             setFeedback("Correct the highlighted fields before connecting.");
-            if (mode == "first-run" && dispatcher)
-                dispatcher->setFocus((*invalidFields.begin())->inputArea());
             return;
         }
         if (auto error = validateServerProfile(model, index); !error.empty()) {
@@ -2379,7 +2716,7 @@ struct Dialogs::Impl {
         }
         const std::string name = model.servers[index].name;
         model.firstRun = false;
-        save(name, mode == "first-run");
+        save(name);
     }
 
     std::string sharingNetworks(std::string_view identity) const {
@@ -2404,13 +2741,44 @@ struct Dialogs::Impl {
         }
     }
 
+    bool networkIsLive(const ServerConfig &server) const {
+        const auto runtime = model.networks.find(server.name);
+        return runtime != model.networks.end() &&
+               (runtime->second.retrying ||
+                (runtime->second.state != "Disconnected" && runtime->second.state != "Failed"));
+    }
+
+    bool hasEndpointCredentials(const ServerConfig &server) const {
+        if (!server.password.empty())
+            return true;
+        const auto identity =
+            std::find_if(model.identities.begin(), model.identities.end(),
+                         [&](const auto &profile) { return profile.name == server.identity; });
+        // A dormant shared credential can be activated by changing the authentication method
+        // or TLS, so protect it even if the current connection does not send it.
+        return identity != model.identities.end() &&
+               (!identity->password.empty() || !identity->certificate.empty() ||
+                (server.sojuAccount && !server.sasl.empty()));
+    }
+
+    bool addressesReviewed() {
+        std::erase_if(pendingAddresses, [&](const auto &draft) {
+            return std::none_of(model.servers.begin(), model.servers.end(),
+                                [&](const auto &server) { return server.name == draft.first; });
+        });
+        if (pendingAddresses.empty())
+            return true;
+        setFeedback("Review the changed server address before saving or connecting.");
+        return false;
+    }
+
     std::string connectionState(const ServerConfig &server) const {
         const auto runtime = model.networks.find(server.name);
         std::string state;
         if (!server.sojuEnabled && !server.sojuParent.empty())
             state = "Disabled locally";
         else if (runtime != model.networks.end())
-            state = runtime->second.state;
+            state = runtime->second.retrying ? "Retrying" : runtime->second.state;
         else if (!server.sojuParent.empty()) {
             const auto parent = model.networks.find(server.sojuParent);
             state = parent != model.networks.end() && parent->second.state == "Ready"
@@ -2653,45 +3021,29 @@ struct Dialogs::Impl {
         };
     }
 
-    void connection(bool first) {
-        ensureIdentity();
-        if (first && model.servers.empty())
-            model.servers.emplace_back();
-        auto *profiles = first ? page : section("networks.saved", "Saved networks");
-        if (!first) {
-            if (!model.servers.empty()) {
-                serverIndex = std::min(serverIndex, model.servers.size() - 1);
-                auto labels = networkLabels();
-                networkPicker =
-                    select(*profiles, "Network", std::move(labels), {},
-                           [this](std::size_t index, std::string_view) {
-                               if (index >= networkOptions.size())
-                                   return;
-                               const auto key = networkOptions[index].key;
-                               const auto selected = std::find_if(
-                                   model.servers.begin(), model.servers.end(),
-                                   [&](const auto &entry) { return entry.name == key; });
-                               if (selected != model.servers.end()) {
-                                   serverIndex = std::size_t(selected - model.servers.begin());
-                                   rebuildPage();
-                               }
-                           });
-                networkPicker->setSelectedIndexSilently(serverIndex);
-            }
-            button(*profiles, "Add network", [this] {
-                addServer();
-                rebuildPage();
-            });
-            button(*profiles, "Add soju account", [this] {
-                addServer();
-                auto &account = model.servers.back();
-                account.sojuAccount = true;
-                account.bouncer = "soju";
-                account.host.clear();
-                account.sasl = "PLAIN";
-                rebuildPage();
-            });
+    void connection() {
+        auto *profiles = section("networks.saved", "Saved networks");
+        if (!model.servers.empty()) {
+            serverIndex = std::min(serverIndex, model.servers.size() - 1);
+            auto labels = networkLabels();
+            networkPicker =
+                select(*profiles, "Network", std::move(labels), {},
+                       [this](std::size_t index, std::string_view) {
+                           if (index >= networkOptions.size())
+                               return;
+                           const auto key = networkOptions[index].key;
+                           const auto selected =
+                               std::find_if(model.servers.begin(), model.servers.end(),
+                                            [&](const auto &entry) { return entry.name == key; });
+                           if (selected != model.servers.end()) {
+                               serverIndex = std::size_t(selected - model.servers.begin());
+                               rebuildPage();
+                           }
+                       });
+            networkPicker->setSelectedIndexSilently(serverIndex);
         }
+        button(*profiles, "Add network", [this] { openSetup("add-server", true); });
+        button(*profiles, "Add soju account", [this] { openSetup("add-soju-account", true); });
         if (model.servers.empty()) {
             label(*profiles,
                   "No networks saved. Add a network to connect, or keep using BlastIRC offline.");
@@ -2702,10 +3054,8 @@ struct Dialogs::Impl {
         auto &server = model.servers[si];
         auto source = std::make_shared<std::string>(server.name);
         displayedServer = source;
-        if (server.sojuAccount || !server.sojuParent.empty()) {
-            connectionStatus = label(*profiles, "");
-            updateConnectionStatus(server);
-        }
+        connectionStatus = label(*profiles, "");
+        updateConnectionStatus(server);
         if (!server.sojuParent.empty()) {
             label(*profiles,
                   "Managed by soju account: " + std::string(networkParentCaption(server)));
@@ -2722,11 +3072,19 @@ struct Dialogs::Impl {
         auto found = std::find_if(model.identities.begin(), model.identities.end(),
                                   [&](const auto &id) { return id.name == server.identity; });
         const std::size_t ii = std::size_t(found - model.identities.begin());
-        auto *endpoint = first ? page : section("networks.endpoint", "Address & connection");
+        auto *endpoint = section("networks.endpoint", "Address & connection");
         if (!server.sojuAccount) {
             auto *profileName = text(*endpoint, "Network name", server.name, {});
             profileName->setOnChange(onServer(
                 source, [this, source, profileName](std::size_t si, const std::string &value) {
+                    const auto &server = model.servers[si];
+                    if (value != server.name && networkIsLive(server)) {
+                        profileName->setInvalid(true);
+                        invalidFields.insert(profileName);
+                        setFeedback("Disconnect this network before renaming it, or edit its "
+                                    "display alias instead.");
+                        return;
+                    }
                     const bool unique =
                         !value.empty() && std::none_of(model.servers.begin(), model.servers.end(),
                                                        [&](const auto &entry) {
@@ -2739,6 +3097,12 @@ struct Dialogs::Impl {
                         return;
                     }
                     invalidFields.erase(profileName);
+                    if (value == server.name)
+                        return;
+                    if (auto draft = pendingAddresses.extract(*source); !draft.empty()) {
+                        draft.key() = value;
+                        pendingAddresses.insert(std::move(draft));
+                    }
                     model.servers.at(si).name = value;
                     *source = value;
                     if (networkPicker) {
@@ -2748,25 +3112,69 @@ struct Dialogs::Impl {
                     updateIdentityScope();
                 }));
         }
-        if (!first) {
-            text(*endpoint, server.sojuAccount ? "Account alias" : "Display alias", server.alias,
-                 onServer(source, [this](std::size_t si, const std::string &value) {
-                     model.servers.at(si).alias = value;
-                 }));
-            text(*endpoint, "Avatar image path", server.avatar,
-                 onServer(source, [this](std::size_t si, const std::string &value) {
-                     model.servers.at(si).avatar = value;
-                 }));
-            label(*endpoint, server.sojuAccount
-                                 ? "Account alias changes its display name, not its stable profile key "
-                                   "or saved conversations."
-                                 : "The alias is the display name. The network name identifies saved "
-                                   "conversations. Choose a local image for the server rail.");
-        }
-        text(*endpoint, "Server address", server.host,
+        text(*endpoint, server.sojuAccount ? "Account alias" : "Display alias", server.alias,
              onServer(source, [this](std::size_t si, const std::string &value) {
-                 model.servers.at(si).host = value;
+                 model.servers.at(si).alias = value;
              }));
+        text(*endpoint, "Avatar image path", server.avatar,
+             onServer(source, [this](std::size_t si, const std::string &value) {
+                 model.servers.at(si).avatar = value;
+             }));
+        label(*endpoint, server.sojuAccount
+                             ? "Account alias changes its display name, not its stable profile key "
+                               "or saved conversations."
+                             : "The alias is the display name. The network name identifies saved "
+                               "conversations. Choose a local image for the server rail.");
+        const auto draft = pendingAddresses.find(server.name);
+        auto *host = text(*endpoint, "Server address",
+                          draft == pendingAddresses.end() ? server.host : draft->second, {});
+        auto *review = button(*endpoint, "Review address change…", {});
+        const auto updateReview = [this, host, review](const ServerConfig &selected) {
+            const auto pending = pendingAddresses.find(selected.name);
+            const bool needsReview = pending != pendingAddresses.end();
+            host->setInvalid(needsReview);
+            setShown(*review, needsReview);
+            review->setEnabled(needsReview && !pending->second.empty() &&
+                               pending->second.size() <= 253 &&
+                               std::none_of(pending->second.begin(), pending->second.end(),
+                                            [](unsigned char c) { return c <= 32 || c == 127; }));
+        };
+        updateReview(server);
+        host->setOnChange(
+            onServer(source, [this, updateReview](std::size_t si, const std::string &value) {
+                auto &selected = model.servers[si];
+                if (value != selected.host && hasEndpointCredentials(selected))
+                    pendingAddresses.insert_or_assign(selected.name, value);
+                else {
+                    pendingAddresses.erase(selected.name);
+                    selected.host = value;
+                }
+                updateReview(selected);
+            }));
+        review->setOnClick(onServer(source, [this, source, updateReview](std::size_t si) {
+            const auto &selected = model.servers[si];
+            const auto pending = pendingAddresses.find(selected.name);
+            if (pending == pendingAddresses.end() || pending->second.empty())
+                return;
+            confirm("change-server-address", "Reuse credentials at the new address?",
+                    "Change the server address from “" + selected.host + "” to “" +
+                        pending->second +
+                        "”? This network may send its saved credentials to the new address.",
+                    "Reuse credentials",
+                    onServer(source, [this, source, updateReview, old = selected.host,
+                                      next = pending->second](std::size_t si) {
+                        auto &server = model.servers[si];
+                        const auto draft = pendingAddresses.find(server.name);
+                        if (draft == pendingAddresses.end() || draft->second != next ||
+                            server.host != old)
+                            return;
+                        server.host = std::move(draft->second);
+                        pendingAddresses.erase(draft);
+                        if (displayedServer == source)
+                            updateReview(server);
+                        setFeedback("");
+                    }));
+        }));
         auto *port = text(*endpoint, "Port (1–65535)", std::to_string(server.port), {});
         port->setOnChange(onServer(source, [this, port](std::size_t si, const std::string &value) {
             int number = 0;
@@ -2810,7 +3218,7 @@ struct Dialogs::Impl {
                   "This network-only password is separate from shared identity "
                   "credentials and is stored in plain text in your private configuration file.");
         }
-        auto *credentials = first ? page : section("networks.authentication", "Authentication");
+        auto *credentials = section("networks.authentication", "Authentication");
         if (!server.sojuAccount) {
             select(
                 *credentials, "Authentication method", {"None", "PLAIN", "EXTERNAL"},
@@ -2821,7 +3229,7 @@ struct Dialogs::Impl {
             label(*credentials, "PLAIN requires TLS and uses the selected identity's password. "
                                 "EXTERNAL uses that identity's certificate and private key.");
         }
-        auto *identity = first ? page : section("networks.identity", "Shared identity");
+        auto *identity = section("networks.identity", "Shared identity");
         networkIdentityPicker =
             select(*identity, "Shared identity profile", identityNames(), server.identity,
                    onServer(source, [this](std::size_t si, std::size_t index, std::string_view) {
@@ -2847,8 +3255,7 @@ struct Dialogs::Impl {
                 auto *authHelp = label(*identity, "");
                 const auto updateAuth = [password, controlPass, authHelp](std::string_view auth) {
                     password->setEnabled(auth == "PLAIN");
-                    controlPass->parent()->setVisible(auth.empty());
-                    controlPass->parent()->setParticipatesInLayout(auth.empty());
+                    setShown(*controlPass->parent(), auth.empty());
                     authHelp->setText(
                         auth == "PLAIN"
                             ? "Password authentication requires TLS. Account credentials are "
@@ -2860,17 +3267,21 @@ struct Dialogs::Impl {
                               "does not attach managed networks; choose PLAIN or EXTERNAL to "
                               "attach them.");
                 };
-                auto *auth =
-                    select(*credentials, "Authentication method",
-                           {"Password (SASL PLAIN)", "Client certificate (EXTERNAL)",
-                            "Management only (no SASL)"},
-                           {},
-                           onServer(source, [this, updateAuth](std::size_t si, std::size_t index,
-                                                               std::string_view) {
-                               auto &selected = model.servers.at(si);
-                               selected.sasl = index == 0 ? "PLAIN" : index == 1 ? "EXTERNAL" : "";
-                               updateAuth(selected.sasl);
-                           }));
+                auto *auth = select(
+                    *credentials, "Authentication method",
+                    {"Password (SASL PLAIN)", "Client certificate (EXTERNAL)",
+                     "Management only (no SASL)"},
+                    {},
+                    onServer(source, [this, controlPass, updateAuth](
+                                         std::size_t si, std::size_t index, std::string_view) {
+                        auto &selected = model.servers.at(si);
+                        selected.sasl = index == 0 ? "PLAIN" : index == 1 ? "EXTERNAL" : "";
+                        if (!selected.sasl.empty()) {
+                            selected.password.clear();
+                            controlPass->setValue("");
+                        }
+                        updateAuth(selected.sasl);
+                    }));
                 if (server.sasl.empty() || server.sasl == "PLAIN" || server.sasl == "EXTERNAL")
                     auth->setSelectedIndexSilently(server.sasl == "PLAIN"      ? 0
                                                    : server.sasl == "EXTERNAL" ? 1
@@ -2880,30 +3291,26 @@ struct Dialogs::Impl {
                                  "affect every profile listed above. Save and reconnect to apply "
                                  "account or authentication changes.");
             }
-            if (first && !server.sojuAccount)
-                identityFields(*identity, ii);
-            else {
-                label(*identity, server.sojuAccount
-                                     ? "Edit nickname, client certificate and private key in "
-                                       "Identities."
-                                     : "Nickname, username and authentication credentials are "
-                                       "shared by every network listed above. Edit them in "
-                                       "Identities.");
-                button(*identity, "Edit identity", [this, ii] {
-                    const bool different = identityIndex != ii;
-                    identityIndex = ii;
-                    chooseTab(Tab::Identities);
-                    if (different)
-                        rebuildPage(false);
-                    focusFirst();
-                });
-            }
+            label(*identity, server.sojuAccount
+                                 ? "Edit nickname, client certificate and private key in "
+                                   "Identities."
+                                 : "Nickname, username and authentication credentials are "
+                                   "shared by every network listed above. Edit them in "
+                                   "Identities.");
+            button(*identity, "Edit identity", [this, ii] {
+                const bool different = identityIndex != ii;
+                identityIndex = ii;
+                chooseTab(Tab::Identities);
+                if (different)
+                    rebuildPage(false);
+                focusFirst();
+            });
         } else {
             label(*identity, "This identity is unavailable. Choose an existing profile before "
                              "connecting.")
                 ->setColor(colorSpecFromRole(ColorRole::Error));
         }
-        auto *startup = first ? page : section("networks.channels", "Channels & bouncer");
+        auto *startup = section("networks.channels", "Channels & bouncer");
         text(*startup, "Auto-join channels", joined(server.channels),
              onServer(source, [this](std::size_t si, const std::string &value) {
                  model.servers.at(si).channels = words(value);
@@ -2959,7 +3366,7 @@ struct Dialogs::Impl {
                 }));
             sojuAssociation(server.name, *startup);
         }
-        if (!first) {
+        {
             auto *actionSection = section("networks.actions", "Actions");
             auto *actions = row(*actionSection);
             connectButton = button(*actions, "Save and connect",
@@ -2983,6 +3390,7 @@ struct Dialogs::Impl {
                                    "configuration only, not remote networks. Saved history, drafts "
                                    "and recovery are kept.",
                                "Remove network", onServer(source, [this](std::size_t si) {
+                                   pendingAddresses.erase(model.servers[si].name);
                                    if (model.servers[si].sojuAccount) {
                                        model.actions.push_back(
                                            {"soju-remove-account", model.servers[si].name, {}, {}});
@@ -3005,21 +3413,26 @@ struct Dialogs::Impl {
     }
 
     void identities() {
-        ensureIdentity();
-        identityIndex = std::min(identityIndex, model.identities.size() - 1);
         auto *profiles = section("identities.saved", "Saved identities");
-        identityPicker =
-            select(*profiles, "Profile", identityNames(), model.identities[identityIndex].name,
-                   [this](std::size_t index, std::string_view) {
-                       if (index < model.identities.size()) {
-                           identityIndex = index;
-                           rebuildPage();
-                       }
-                   });
+        if (!model.identities.empty()) {
+            identityIndex = std::min(identityIndex, model.identities.size() - 1);
+            identityPicker =
+                select(*profiles, "Profile", identityNames(), model.identities[identityIndex].name,
+                       [this](std::size_t index, std::string_view) {
+                           if (index < model.identities.size()) {
+                               identityIndex = index;
+                               rebuildPage();
+                           }
+                       });
+        }
         button(*profiles, "Add identity", [this] {
             addIdentity();
             rebuildPage();
         });
+        if (model.identities.empty()) {
+            label(*profiles, "No identity profiles saved.");
+            return;
+        }
         const std::size_t ii = identityIndex;
         const auto &identity = model.identities[ii];
         identityScope = label(*profiles, "");
@@ -3094,6 +3507,8 @@ struct Dialogs::Impl {
 
     void saveSettings() {
         if (pendingSaveRequest)
+            return;
+        if (!addressesReviewed())
             return;
         if (!invalidFields.empty()) {
             setFeedback("Correct the highlighted fields before saving.");
@@ -3569,13 +3984,87 @@ struct Dialogs::Impl {
         confirmReturnFocus = nullptr;
     }
 
-    void clearHistory() {
-        confirm(
-            "clear-history", "Delete local history?",
-            "Permanently delete locally saved messages? Server and bouncer history are unaffected.",
-            "Delete local history",
-            [this] { model.actions.push_back({"clear_history", {}, {}, {}}); });
+    static constexpr DataAction localData[] = {
+        {"history", "Clear chat history…", "Clear local chat history?",
+         "Delete saved messages and mentions from channels and direct chats, including closed "
+         "conversations. Server logs, drafts and pending send recovery stay. Remote history is "
+         "unchanged and may be fetched again manually or after reconnecting.",
+         "Local chat history cleared. Server logs and drafts were kept."},
+        {"logs", "Clear server logs…", "Clear local server logs?",
+         "Delete saved server and soju account logs. Channel and direct chat history, drafts, "
+         "and connections stay.",
+         "Local server logs cleared. Chat history was kept."},
+        {"drafts", "Clear drafts and send recovery…", "Clear drafts and send recovery?",
+         "Delete saved and open drafts, pending or unconfirmed send recovery, and their "
+         "unconfirmed local message copies. Confirmed chat messages stay. This cannot undo "
+         "messages already sent.",
+         "Drafts and send recovery cleared. Confirmed chat history was kept."},
+        {"connections", "Remove saved connections…", "Remove all saved connections?",
+         "Disconnect and remove every local network, soju account profile, and identity, "
+         "including stored credentials. Chat history, server logs, drafts, and preferences "
+         "stay. Remote accounts and networks, certificates, and keys are not deleted.",
+         "Disconnected and removed all saved connections and identities."},
+        {"preferences", "Reset preferences…", "Restore default preferences?",
+         "Restore default appearance, audio, chat, upload settings, shortcuts, and workspace "
+         "layout now. Retention limits, connections, history, drafts, and external theme files "
+         "stay.",
+         "Default preferences restored. Retention limits were kept."},
+        {"cache", "Clear cache…", "Clear BlastIRC’s cache?",
+         "Remove cached previews and other temporary assets owned by this BlastIRC session. "
+         "Original files, remote uploads, and cache files from other sessions stay. "
+         "BlastIRC may fetch assets again as needed.",
+         "BlastIRC’s session cache cleared."},
+        {"all", "Reset BlastIRC…", "Reset BlastIRC?",
+         "Delete local chat history, server logs, drafts and send recovery, connections and "
+         "stored credentials, preferences, learned transport policies (STS), and BlastIRC’s "
+         "cache. Remote history, accounts, networks and uploads, and external theme, certificate, "
+         "and key files stay. "
+         "BlastIRC closes after a successful reset. The next launch starts fresh.",
+         "BlastIRC reset. The next launch starts fresh."},
+    };
+
+    void dataStorage() {
+        auto *data =
+            section("data.local", "Local data",
+                    "Choose what to remove from this device. Each action asks for confirmation.");
+        for (const auto &action : localData) {
+            if (action.token == "all")
+                data = section("data.reset", "Reset BlastIRC",
+                               "Remove all local data and start fresh on the next launch.");
+            button(
+                *data, action.button, [this, &action] { confirmData(action); },
+                action.token == "all" ? ButtonVariant::Destructive : ButtonVariant::Default);
+        }
     }
+
+    void confirmData(const DataAction &action) {
+        if (pendingSaveRequest)
+            return;
+        auto apply = [this, &action] {
+            pendingData = &action;
+            pendingSaveRequest = ++model.settingsSaveRequest;
+            model.actions.push_back(
+                {"clear-local-data", {}, std::string(action.token), {}, pendingSaveRequest});
+            setFeedback("Applying local data changes…", false);
+            if (saveButton)
+                saveButton->setEnabled(false);
+        };
+        if (action.token == "all") {
+            confirm("review-local-reset", action.title, action.message, "Review reset",
+                    [this, apply = std::move(apply)] {
+                        confirm("clear-local-all", "Permanently reset BlastIRC?",
+                                "This cannot be undone. Delete all the local data just listed "
+                                "and close BlastIRC?",
+                                "Reset BlastIRC", apply);
+                    });
+        } else {
+            confirm("clear-local-" + std::string(action.token), action.title, action.message,
+                    action.button.substr(0, action.button.size() - std::string_view("…").size()),
+                    std::move(apply));
+        }
+    }
+
+    void clearHistory() { confirmData(localData[0]); }
 
     Input *profileField(Flex &parent, std::string_view caption, const std::string &key) {
         auto *field = text(parent, caption, "", {});
@@ -3712,14 +4201,20 @@ struct Dialogs::Impl {
     }
 
     void open(std::string_view name) {
+        if (pendingData || (setupOpen() && pendingSaveRequest))
+            return;
+        if (name == "first-run" || name == "add-server" || name == "add-soju-account") {
+            openSetup(name);
+            return;
+        }
         if (name.starts_with("status-details:")) {
             statusSnapshot = name.substr(15);
             beginPanel("status-details", "Status details", false);
             rebuildPage();
             return;
         }
-        if (name == "settings-uploads") {
-            tab = Tab::Chat;
+        if (name == "settings-uploads" || name == "settings-data") {
+            tab = name == "settings-data" ? Tab::Data : Tab::Chat;
             beginPanel("settings", "Settings", true);
             rebuildPage();
             return;
@@ -3769,6 +4264,8 @@ struct Dialogs::Impl {
             return;
         }
         if (name == "clear-history") {
+            if (mode != "settings")
+                open("settings-data");
             clearHistory();
             return;
         }
@@ -3786,17 +4283,11 @@ struct Dialogs::Impl {
                 setFeedback("No saved network named '" + std::string(target) + "'.");
             return;
         }
-        if (name == "add-server") {
-            addServer();
-            tab = Tab::Servers;
-            beginPanel("settings", "Settings", true);
-        } else if (name == "networks") {
+        if (name == "networks") {
             tab = Tab::Servers;
             beginPanel("settings", "Settings", true);
         } else if (name == "settings") {
             beginPanel("settings", "Settings", true);
-        } else if (name == "first-run") {
-            beginPanel("first-run", "Welcome to BlastIRC", false);
         } else if (name == "search") {
             searchQuery.clear();
             searchBuffer = model.activeBuffer;
@@ -3827,6 +4318,22 @@ struct Dialogs::Impl {
             hideConfirmation();
             return;
         }
+        if (pendingData || (setupOpen() && pendingSaveRequest))
+            return;
+        if (setupOpen()) {
+            setup = {};
+            if (std::exchange(setupFromSettings, false)) {
+                open("networks");
+                return;
+            }
+            stopOpening();
+            detach(panel, owner);
+            panel = nullptr;
+            feedback = nullptr;
+            setupConnect = saveButton = nullptr;
+            page = nullptr;
+            scroll = nullptr;
+        }
         stopOpening();
         stopRecording(false);
         if (mode == "whois") {
@@ -3840,6 +4347,7 @@ struct Dialogs::Impl {
         if (dispatcher)
             dispatcher->setFocus(nullptr);
         mode.clear();
+        pendingAddresses.clear();
         saveFeedbackActive = false;
         owner.setVisible(false);
         owner.setHitTestVisible(false);
@@ -3955,7 +4463,38 @@ struct Dialogs::Impl {
             const auto &result = model.settingsSaveResult;
             pendingSaveRequest = 0;
             const bool close = std::exchange(closeAfterSave, false);
-            if (saveFeedbackActive) {
+            if (setupOpen()) {
+                model.connectionSetup.reset();
+                if (result.success) {
+                    setupFromSettings = false;
+                    dismiss();
+                } else {
+                    setFeedback(result.error);
+                    setupConnect->setEnabled(true);
+                }
+            } else if (const auto *data = std::exchange(pendingData, nullptr)) {
+                const bool removedConnections =
+                    (data->token == "connections" || data->token == "all") &&
+                    model.servers.empty() && model.identities.empty();
+                if (removedConnections) {
+                    networkOptions.clear();
+                    pendingAddresses.clear();
+                    sojuEditParent.clear();
+                    sojuEditId.clear();
+                    sojuEditAttributes.clear();
+                    sojuEditChanges.clear();
+                    sojuEditMode = false;
+                }
+                if (mode == "settings" &&
+                    ((result.success && data->token == "preferences") || removedConnections)) {
+                    categoryPages.fill(nullptr);
+                    rebuildPage(false);
+                    if (dispatcher && !dispatcher->focusedArea())
+                        dispatcher->setFocus(settingsSearch->inputArea());
+                    applyMetrics();
+                }
+                setFeedback(result.success ? data->result : result.error, !result.success);
+            } else if (saveFeedbackActive) {
                 saveFeedbackActive = false;
                 if (result.success && close)
                     dismiss();
@@ -4025,10 +4564,7 @@ struct Dialogs::Impl {
         }
         updateIdentityScope();
         if (serverSourcePresent && connectButton && serverIndex < model.servers.size()) {
-            const auto network = model.networks.find(model.servers[serverIndex].name);
-            const bool reconnect = network != model.networks.end() &&
-                                   network->second.state != "Disconnected" &&
-                                   network->second.state != "Failed";
+            const bool reconnect = networkIsLive(model.servers[serverIndex]);
             connectButton->setText(reconnect ? "Save and reconnect" : "Save and connect");
             connectButton->setEnabled(!pendingSaveRequest);
         }
@@ -4049,8 +4585,10 @@ struct Dialogs::Impl {
                 sojuStatus->setText(
                     "Remote request acknowledged by soju. Refresh displayed catalog.");
             else if (!capable)
-                sojuStatus->setText("Remote management unavailable: " + runtime->second.state +
-                                    ". The server must support soju.im/bouncer-networks.");
+                sojuStatus->setText(
+                    "Remote management unavailable: " +
+                    (runtime->second.retrying ? "Retrying" : runtime->second.state) +
+                    ". The server must support soju.im/bouncer-networks.");
             else
                 sojuStatus->setText(
                     runtime->second.sojuDiscoveryComplete
@@ -4091,7 +4629,7 @@ struct Dialogs::Impl {
             const float preferredWidth = confirming ? 540.f : mode == "settings" ? 1000.f : 630.f;
             const float preferredHeight = confirming                 ? 250.f
                                           : mode == "settings"       ? 720.f
-                                          : mode == "first-run"      ? 720.f
+                                          : setupOpen()              ? 500.f
                                           : mode == "whois"          ? 720.f
                                           : mode == "channel-tools"  ? 720.f
                                           : mode == "search"         ? 270.f
@@ -4138,13 +4676,13 @@ struct Dialogs::Impl {
                 char rectangle[128];
                 std::snprintf(rectangle, sizeof(rectangle), "%.3f %.3f %.3f %.3f", double(x),
                               double(y), double(w), double(h));
-                if (lastGeometry != rectangle) {
+                if (!setupOpen() && lastGeometry != rectangle) {
                     lastGeometry = rectangle;
                     model.settings.workspace["native_dialog_rect"] = lastGeometry;
                 }
             }
         }
-        if (lastDialog != dialog) {
+        if (!setupOpen() && lastDialog != dialog) {
             lastDialog = dialog;
             model.settings.workspace["native_dialog"] = dialog;
         }

@@ -289,4 +289,18 @@ void saveSts(std::string_view host, int port, int64_t durationSeconds) {
     persist(directory.value, policies);
 }
 
+void clearSts(const std::filesystem::path &config) {
+    const std::lock_guard lock(storeMutex);
+    Fd directory(::open(config.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (directory.value < 0) {
+        if (errno == ENOENT)
+            return;
+        ioError("opening configuration directory");
+    }
+    lockDirectory(directory.value, LOCK_EX);
+    if (::unlinkat(directory.value, "sts", 0) != 0 && errno != ENOENT)
+        ioError("removing policy file");
+    syncFd(directory.value, "syncing configuration directory after policy removal");
+}
+
 } // namespace blast::irc

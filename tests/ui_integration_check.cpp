@@ -1846,29 +1846,12 @@ void sidebarConversationFilterCheck() {
     const auto profilesBefore = model.servers.size();
     menu.select("Add network");
     frame();
-    assert(dialogs->active() && visible(*dialogs) && model.servers.size() == profilesBefore + 1);
-    auto *address = inputWithText(*dialogs, model.servers.back().host);
-    assert(address);
-    dispatcher.setFocus(address->inputArea());
-    address->selectAll();
-    assert(address->insertText("new-network.example.invalid"));
-    frame();
-    assert(model.servers.back().host == "new-network.example.invalid");
-    assert(model.servers[0].host == "example.invalid" &&
-           model.servers[1].host == "example.invalid");
-    auto *connect = primaryButton(*dialogs);
-    assert(connect && connect->enabled());
-    const auto firstAction = model.actions.size();
-    activate(*connect->inputArea());
-    assert(std::count_if(
-               model.actions.begin() + firstAction, model.actions.end(), [&](const Action &action) {
-                   return action.type == "save-connect" && action.text == model.servers.back().name;
-               }) == 1);
-    assert(std::none_of(model.actions.begin() + firstAction, model.actions.end(),
-                        [](const Action &action) { return action.type == "connect"; }));
+    assert(dialogs->active() && visible(*dialogs) && model.servers.size() == profilesBefore);
+    assert(!model.connectionSetup);
+    unchangedSelection();
     ui.execute("cancel");
     frame();
-    assert(!dialogs->active() && !visible(*dialogs) && model.servers.size() == profilesBefore + 1);
+    assert(!dialogs->active() && !visible(*dialogs) && model.servers.size() == profilesBefore);
     unchangedSelection();
 
     // Search ordinary conversations while the active channel remains pinned.
@@ -3490,6 +3473,23 @@ void statusActionsCheck() {
     assert(std::any_of(model.actions.begin(), model.actions.end(), [](const auto &action) {
         return action.type == "connect" && action.text == "test";
     }));
+    auto &network = model.networks.at("test");
+    network.state = "Disconnected";
+    network.retrying = true;
+    frame();
+    assert(visibleLabelContaining(*connection, "Retrying"));
+    for (const auto key : {"status-connection", "server:test"}) {
+        click(dispatcher, *control(key),
+              key == std::string_view("server:test") ? BTN_RIGHT : BTN_LEFT);
+        menu.select("Stop retrying");
+        frame();
+    }
+    assert(std::count_if(model.actions.begin(), model.actions.end(), [](const auto &action) {
+               return action.type == "disconnect" && action.text == "test";
+           }) == 2);
+    network.retrying = false;
+    network.state = "Ready";
+    frame();
     click(dispatcher, *connection);
     assert(menu.open);
     menu.select("Open server log");
@@ -3504,6 +3504,191 @@ void statusActionsCheck() {
     frame();
     assert(model.activeBuffer == edgeBuffers[1]);
     dispatcher.setFocus(nullptr);
+    dispatcher.setSceneRoot(nullptr);
+}
+
+void onboardingWorkspaceCheck() {
+    using namespace blast;
+    Model model;
+    model.firstRun = false;
+    model.settings.reducedMotion = true;
+    model.settings.workspace["native_server_rail_visible"] = "false";
+    model.settings.workspace["server_rail_width"] = "120";
+    Clipboard clipboard;
+    Theme theme;
+    theme.update(model);
+    InputDispatcher dispatcher;
+    PangoRenderer renderer;
+    Ui ui(model, clipboard);
+    dispatcher.setSceneRoot(&ui.root());
+    ui.setInputDispatcher(dispatcher);
+    ui.setWindowActive(true);
+    const auto frame = [&] {
+        ui.update(1280, 760, 1);
+        ui.root().layout(renderer);
+    };
+    const auto control = [&](std::string_view key) -> InputArea * {
+        for (const auto &child : ui.root().children())
+            if (child->visible())
+                if (auto *area = areaWithKey(*child, key); area && visible(*area))
+                    return area;
+        return nullptr;
+    };
+    const auto press = [&](std::string_view key) {
+        auto *area = control(key);
+        assert(area);
+        click(dispatcher, *area);
+        frame();
+    };
+    const auto text = [&](std::string_view expected) {
+        return visibleLabelContaining(ui.root(), expected);
+    };
+    const auto action = [&](const char *type, const char *buffer, const char *value) {
+        return std::ranges::any_of(model.actions, [&](const Action &a) {
+            return a.type == type && a.buffer == buffer && a.text == value;
+        });
+    };
+    const auto addLog = [&](const std::string &server) -> Buffer & {
+        const auto id = server + "/*server*";
+        auto &buffer = model.buffers[id];
+        buffer.id = id;
+        buffer.server = server;
+        buffer.target = "*server*";
+        buffer.kind = "server";
+        return buffer;
+    };
+    frame();
+    assert(text("Welcome to BlastIRC"));
+    press("welcome-add");
+    auto *dialogs = visibleNode<Dialogs>(ui.root());
+    assert(dialogs && dialogs->active());
+    dialogs->dismiss();
+
+    model.identities.emplace_back();
+    model.servers.emplace_back().name = "direct";
+    auto &network = model.networks["direct"];
+    auto &log = addLog("direct");
+    log.draft = "Keep this server draft";
+    model.onboardingNetwork = "direct";
+    model.activeBuffer = log.id;
+    for (const auto state : {"Connecting", "Registering"}) {
+        network.state = state;
+        frame();
+        assert(text(std::string(state) + " · direct") && control("onboarding-stop"));
+        assert(!control("onboarding-target") && !visibleNode<TranscriptView>(ui.root()));
+    }
+    network.state = "Disconnected";
+    network.retrying = true;
+    frame();
+    assert(text("Retrying · direct"));
+    press("onboarding-stop");
+    assert(action("disconnect", "", "direct"));
+    network.retrying = false;
+    network.state = "Failed";
+    network.error = "TLS certificate rejected";
+    frame();
+    assert(text("Failed · direct") && text("TLS certificate rejected"));
+    assert(control("onboarding-edit") && !control("onboarding-stop"));
+    press("onboarding-retry");
+    assert(action("connect", "", "direct"));
+
+    network.state = "Ready";
+    network.nick = "ServerAccepted";
+    network.error.clear();
+    frame();
+    assert(text("Ready · direct") && text("Connected as ServerAccepted."));
+    auto *fieldArea = control("onboarding-target");
+    assert(fieldArea && control("onboarding-join") && control("onboarding-dm"));
+    auto *field = dynamic_cast<Input *>(fieldArea->textInputClient());
+    assert(field);
+    field->setValue("#first key");
+    press("onboarding-join");
+    assert(text("Enter one valid channel name"));
+    field->setValue("#first");
+    assert(!action("onboarding-join", "direct", "#first"));
+    press("onboarding-join");
+    assert(action("onboarding-join", "direct", "#first") && model.activeBuffer == log.id);
+    assert(!model.buffers.contains("direct/#first"));
+    network.firstChannel = "#first";
+    frame();
+    assert(text("Waiting for the server to confirm joining #first"));
+    network.firstChannel.clear();
+    network.firstChannelError = "Cannot join channel (+i)";
+    frame();
+    assert(text("Cannot join channel (+i)") && text("view the server log, then try again"));
+    press("onboarding-log");
+    assert(model.onboardingNetwork.empty() && action("open-server-log", "direct", ""));
+    assert(visibleNode<TranscriptView>(ui.root()) && !control("onboarding-target"));
+    assert(log.draft == "Keep this server draft");
+    model.onboardingNetwork = "direct";
+    frame();
+    dispatcher.setFocus(fieldArea);
+    field->setValue("Peer");
+    frame();
+    assert(!action("query", "direct/*server*", "Peer"));
+    hostKey(ui, dispatcher, XKB_KEY_Return);
+    frame();
+    assert(action("query", "direct/*server*", "Peer") && model.onboardingNetwork.empty());
+
+    model.servers.emplace_back().name = "account";
+    model.servers.back().sojuAccount = true;
+    auto &parent = model.networks["account"];
+    parent.state = "Ready";
+    parent.nick = "BouncerNick";
+    model.onboardingNetwork = "account";
+    model.activeBuffer = addLog("account").id;
+    frame();
+    assert(text("Soju account connected as BouncerNick.") &&
+           text("does not support Soju network discovery") && !control("onboarding-target"));
+    parent.caps.insert("soju.im/bouncer-networks");
+    frame();
+    assert(text("Discovering IRC networks") && !control("onboarding-target"));
+    parent.sojuDiscoveryComplete = true;
+    parent.sojuNetworks.try_emplace("remote");
+    frame();
+    assert(text("set to management only") && control("onboarding-soju") &&
+           !control("onboarding-networks"));
+    model.servers.back().sasl = "account";
+    model.servers.emplace_back().name = "child";
+    model.servers.back().sojuParent = "account";
+    model.settings.workspace["soju-group:account"] = "collapsed";
+    model.networks["child"].state = "Ready";
+    model.networks["child"].nick = "ChildNick";
+    frame();
+    assert(control("onboarding-soju") && !control("onboarding-target"));
+    press("onboarding-networks");
+    press("server:child");
+    assert(model.activeBuffer == "account/*server*");
+    addLog("child");
+    frame();
+    press("server:child");
+    assert(text("Connected as ChildNick.") && control("onboarding-target"));
+
+    // A saved chat, including one whose profile was removed, is not onboarding UI.
+    auto &retained = model.buffers["account/retained"];
+    retained.id = "account/retained";
+    retained.server = "account";
+    retained.target = "retained";
+    retained.kind = "query";
+    retained.draft = "Retained chat draft";
+    model.activeBuffer = retained.id;
+    frame();
+    assert(visibleNode<TranscriptView>(ui.root()) && !control("onboarding-target"));
+    model.servers.clear();
+    frame();
+    assert(model.activeBuffer == retained.id && retained.draft == "Retained chat draft");
+    assert(visibleNode<TranscriptView>(ui.root()));
+    auto &saved = model.settings.workspace;
+    assert(saved.contains("server_rail_width") && saved.contains("last_buffer:direct"));
+    ui.execute("toggle-networks");
+    assert(saved.at("native_server_rail_visible") == "false");
+    saved.clear();
+    ++model.preferencesResetRevision;
+    frame();
+    assert(saved.at("native_server_rail_visible") == "true");
+    assert(!saved.contains("server_rail_width") && !saved.contains("last_buffer:direct"));
+    assert(model.activeBuffer == retained.id && retained.draft == "Retained chat draft");
+    assert(std::ranges::none_of(model.actions, [](const Action &a) { return a.type == "send"; }));
     dispatcher.setSceneRoot(nullptr);
 }
 
@@ -11191,6 +11376,7 @@ void runUiIntegrationCheck() {
     initialHistoryConsumerCheck();
     statusDetailsCheck();
     statusActionsCheck();
+    onboardingWorkspaceCheck();
     topbarReadAllCheck();
     serverLogConsumerCheck();
     queuedServerLogPaletteCheck();

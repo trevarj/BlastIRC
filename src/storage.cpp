@@ -1,5 +1,6 @@
 #include "storage.hpp"
 #include "irc/protocol.hpp"
+#include "irc/sts.hpp"
 #include "key_bindings.hpp"
 #include "ui/logic.hpp"
 #include <algorithm>
@@ -21,12 +22,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <toml++/toml.hpp>
 #include <tuple>
 #include <type_traits>
-#include <utility>
 #include <unistd.h>
+#include <utility>
 
 namespace blast {
 namespace {
@@ -68,6 +70,23 @@ void closeChecked(int fd, const fs::path &path) {
     if (::close(fd) != 0)
         systemFail("close", path);
 }
+struct WriterLock {
+    int fd = -1;
+    ~WriterLock() {
+        if (fd >= 0)
+            ::close(fd);
+    }
+    void lock(const fs::path &path) {
+        fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+        if (fd < 0)
+            systemFail("open writer lock", path);
+        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            if (errno == EWOULDBLOCK)
+                fail("Another BlastIRC window is already using this profile.");
+            systemFail("lock profile writer", path);
+        }
+    }
+};
 void atomicWrite(const fs::path &path, const string &content) {
     string pattern = path.string() + ".tmp.XXXXXX";
     vector<char> name(pattern.begin(), pattern.end());
@@ -119,6 +138,34 @@ void atomicWrite(const fs::path &path, const string &content) {
         throw;
     }
 }
+void removeConfigFile(const fs::path &path) {
+    const auto parent = path.parent_path();
+    const auto filename = path.filename();
+    const int directory = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) {
+        if (errno == ENOENT)
+            return;
+        systemFail("open directory to remove", path);
+    }
+    int error = 0;
+    const char *operation = "remove";
+    if (::unlinkat(directory, filename.c_str(), 0) != 0 && errno != ENOENT) {
+        error = errno;
+    } else {
+        operation = "sync directory after removal of";
+        int result;
+        do {
+            result = ::fsync(directory);
+        } while (result != 0 && errno == EINTR);
+        if (result != 0)
+            error = errno;
+    }
+    ::close(directory);
+    if (error) {
+        errno = error;
+        systemFail(operation, path);
+    }
+}
 void databaseCheck(sqlite3 *db, int code, const char *operation) {
     if (code != SQLITE_OK)
         fail(string(operation) + ": " + sqlite3_errmsg(db));
@@ -131,6 +178,9 @@ void execute(sqlite3 *db, const char *sql) {
         sqlite3_free(error);
         fail("database: " + detail);
     }
+}
+void checkpoint(sqlite3 *db, int mode, const char *operation) {
+    databaseCheck(db, sqlite3_wal_checkpoint_v2(db, nullptr, mode, nullptr, nullptr), operation);
 }
 struct Statement {
     sqlite3 *db;
@@ -455,17 +505,6 @@ const char *messageLayoutName(MessageLayout value, const char *key, std::string_
         if (value == layout)
             return token;
     invalid(string(key).append(suffix), "a valid message layout");
-}
-Settings defaults() {
-    Settings settings;
-    for (const char *cue :
-         {"kick",   "ban",    "netsplit", "mention",    "reaction",  "redact", "join",
-          "part",   "quit",   "unread",   "disconnect", "send",      "echo",   "message",
-          "action", "notice", "boom",     "rumble",     "ding",      "blip",   "tick",
-          "whoosh", "click",  "pop",      "hush",       "power_down"})
-        settings.cues.emplace(cue, Cue{});
-    settings.bindings = defaultBindings();
-    return settings;
 }
 void range(float value, float low, float high, const char *name) {
     if (!std::isfinite(value) || value < low || value > high)
@@ -1143,6 +1182,18 @@ void serverNanoseconds(sqlite3_context *context, int, sqlite3_value **values) {
 }
 } // namespace
 
+Settings defaultSettings() {
+    Settings settings;
+    for (const char *cue :
+         {"kick",   "ban",    "netsplit", "mention",    "reaction",  "redact", "join",
+          "part",   "quit",   "unread",   "disconnect", "send",      "echo",   "message",
+          "action", "notice", "boom",     "rumble",     "ding",      "blip",   "tick",
+          "whoosh", "click",  "pop",      "hush",       "power_down"})
+        settings.cues.emplace(cue, Cue{});
+    settings.bindings = defaultBindings();
+    return settings;
+}
+
 bool actualNickMention(std::string_view text, std::string_view nick, std::string_view caseMapping) {
     if (nick.empty())
         return false;
@@ -1212,6 +1263,7 @@ string validateServerProfile(const Model &model, std::size_t index) {
 struct Storage::Impl {
     fs::path config = xdgDirectory("XDG_CONFIG_HOME", ".config");
     fs::path data = xdgDirectory("XDG_DATA_HOME", ".local/share");
+    WriterLock configWriter, dataWriter;
     sqlite3 *db = nullptr;
     int retentionDays = 30, maxMessages = 100000;
     unsigned historyWriteDepth = 0;
@@ -1222,9 +1274,18 @@ struct Storage::Impl {
         int64_t sequence = 0;
     };
     map<string, MentionScan> mentionScans;
-    Impl() {
+    void requireSafeConfig() const {
+        if (!configSafe)
+            fail("save refused after a configuration load failure; fix the configuration and "
+                 "reload before saving (existing files were preserved)");
+    }
+    explicit Impl(bool exclusiveWriter) {
         privateDirectory(config);
         privateDirectory(data);
+        if (exclusiveWriter) {
+            configWriter.lock(config / "config.writer");
+            dataWriter.lock(data / "history.writer");
+        }
         const fs::path database = data / "state.sqlite3";
         const int fd = ::open(database.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (fd < 0)
@@ -2037,7 +2098,7 @@ std::optional<string> Storage::historyDiscarded(const string &buffer) {
     return {};
 }
 
-Storage::Storage() : impl(std::make_unique<Impl>()) {}
+Storage::Storage(bool exclusiveWriter) : impl(std::make_unique<Impl>(exclusiveWriter)) {}
 Storage::~Storage() = default;
 string Storage::configDir() const { return impl->config.string(); }
 uint64_t Storage::revision() const {
@@ -2126,7 +2187,7 @@ map<string, Buffer> Storage::mentionSources(const map<string, Network> &networks
 }
 void Storage::load(Model &model) {
     Model loaded;
-    loaded.settings = defaults();
+    loaded.settings = defaultSettings();
     const fs::path profiles = impl->config / "config.toml",
                    preferences = impl->config / "settings.toml";
     impl->configSafe = false;
@@ -2296,23 +2357,22 @@ void Storage::seedChatActivity(Buffer &buffer, bool initialize) {
     }
 }
 void Storage::saveSettings(const Settings &settings) {
-    if (!impl->configSafe)
-        fail("save refused after a configuration load failure; fix the configuration and reload "
-             "before saving (existing files were preserved)");
+    impl->requireSafeConfig();
     validate(settings);
     atomicWrite(impl->config / "settings.toml", formatted(settingsDocument(settings)));
 }
+void Storage::saveProfiles(const Model &model) {
+    impl->requireSafeConfig();
+    validateProfiles(model);
+    atomicWrite(impl->config / "config.toml", formatted(profileDocument(model)));
+}
 void Storage::save(const Model &model) {
-    if (!impl->configSafe)
-        fail("save refused after a configuration load failure; fix the configuration and reload "
-             "before saving (existing files were preserved)");
+    impl->requireSafeConfig();
     validate(model.settings);
     const string preferences = formatted(settingsDocument(model.settings));
     // Cancelling the wizard must not turn default profiles into saved connections.
-    if (!model.firstRun) {
-        validateProfiles(model);
-        atomicWrite(impl->config / "config.toml", formatted(profileDocument(model)));
-    }
+    if (!model.firstRun)
+        saveProfiles(model);
     atomicWrite(impl->config / "settings.toml", preferences);
     Transaction transaction(impl->db);
     for (const auto &[id, buffer] : model.buffers) {
@@ -2893,10 +2953,7 @@ void Storage::clearHistory() {
     transaction.commit();
     // Checkpoint deletion without blocking other connections' read transactions.
     if (sqlite3_get_autocommit(impl->db))
-        databaseCheck(impl->db,
-                      sqlite3_wal_checkpoint_v2(impl->db, nullptr, SQLITE_CHECKPOINT_PASSIVE,
-                                                nullptr, nullptr),
-                      "checkpoint cleared history");
+        checkpoint(impl->db, SQLITE_CHECKPOINT_PASSIVE, "checkpoint cleared history");
 }
 void Storage::clearHistory(const string &buffer) {
     Transaction transaction(impl->db);
@@ -2917,6 +2974,124 @@ void Storage::clearHistory(const string &buffer) {
         reset.step();
     }
     transaction.commit();
+}
+void Storage::preflightLocalReset() {
+    if (!sqlite3_get_autocommit(impl->db))
+        fail("cannot clear local data during an active database write");
+    const auto &config = impl->config;
+    const int directory = ::open(config.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory >= 0) {
+        closeChecked(directory, config);
+        return;
+    }
+    const int error = errno;
+    std::error_code ignored;
+    if (fs::is_symlink(fs::symlink_status(config, ignored)))
+        fail("reset cannot safely remove transport policies through a symlinked configuration "
+             "directory");
+    if (error == ENOENT)
+        return; // An already absent configuration directory needs no cleanup.
+    errno = error;
+    systemFail("open configuration directory for reset", config);
+}
+void Storage::clearLocalData(LocalData scope) {
+    if (scope == LocalData::Connections) {
+        removeConfigFile(impl->config / "config.toml");
+        return;
+    }
+    auto *db = impl->db;
+    const bool reset = scope == LocalData::All;
+    if (reset)
+        preflightLocalReset();
+    else if (!sqlite3_get_autocommit(db))
+        fail("cannot clear local data during an active database write");
+    try {
+        Transaction transaction(db);
+        switch (scope) {
+        case LocalData::ChatHistory:
+        case LocalData::ServerLogs: {
+            const bool logs = scope == LocalData::ServerLogs;
+            // Closed buffers retain their kind. Only orphan rows use the entire target
+            // after the first slash to identify the reserved server buffer.
+            const auto clear = [&](const char *statement, const char *column,
+                                   const char *condition = "") {
+                string sql(statement);
+                sql += logs ? " WHERE COALESCE(" : " WHERE NOT COALESCE(";
+                sql += "(SELECT kind='server' FROM buffers AS source WHERE source.id=";
+                sql += column;
+                sql += "),substr(";
+                sql += column;
+                sql += ",instr(";
+                sql += column;
+                sql += ",'/'))='/*server*')";
+                sql += condition;
+                execute(db, sql.c_str());
+            };
+            // Unconfirmed own echoes can be the only copy left for failed-send recovery.
+            clear("DELETE FROM messages", "messages.buffer",
+                  logs ? "" : " AND NOT (own=1 AND local_echo=1)");
+            execute(db, logs ? "UPDATE buffers SET unread=0,read_marker='' WHERE kind='server'"
+                             : "UPDATE buffers SET unread=0,read_marker='' WHERE kind<>'server'");
+            if (!logs) {
+                clear("DELETE FROM history_state", "history_state.buffer");
+                clear("DELETE FROM history_gaps", "history_gaps.buffer");
+                execute(db, "DELETE FROM history_discovery");
+            }
+            break;
+        }
+        case LocalData::Drafts:
+            // Provisional own echoes can also restore failed-send text without a queue backup.
+            // Keep successful writes without echo acknowledgment (local_echo=2).
+            execute(db, "UPDATE buffers SET draft='' WHERE draft<>'';"
+                        "DELETE FROM queued_sends;"
+                        "DELETE FROM messages WHERE own=1 AND local_echo=1;");
+            break;
+        case LocalData::All:
+            // Reactions cascade from messages. Keep the schema and the open connection.
+            execute(db, "DELETE FROM messages; DELETE FROM history_state; DELETE FROM history_gaps;"
+                        "DELETE FROM history_discovery; DELETE FROM queued_sends;"
+                        "DELETE FROM buffers; DELETE FROM closed_buffers; DELETE FROM meta;"
+                        "DELETE FROM sqlite_sequence;");
+            break;
+        case LocalData::Connections: // Handled before opening the database transaction.
+        case LocalData::Preferences:
+        case LocalData::Cache:
+            fail("this data scope is not managed by SQLite");
+        }
+        transaction.commit();
+    } catch (const std::runtime_error &error) {
+        if (reset)
+            fail(
+                "reset could not clear the local database; configuration files were not touched: " +
+                string(error.what()));
+        throw;
+    }
+    if (scope == LocalData::ChatHistory || reset)
+        impl->mentionScans.clear();
+    if (!reset)
+        return;
+    impl->historyInvalidations.clear();
+    const Settings defaults;
+    impl->retentionDays = defaults.retentionDays;
+    impl->maxMessages = defaults.maxMessages;
+
+    const char *phase = "the database checkpoint";
+    try {
+        checkpoint(db, SQLITE_CHECKPOINT_TRUNCATE, "truncate the reset database WAL");
+        phase = "STS policies";
+        irc::clearSts(impl->config);
+        phase = "preferences";
+        removeConfigFile(impl->config / "settings.toml");
+        // Remove the first-run sentinel last so a partial reset can be retried.
+        phase = "connection profiles";
+        removeConfigFile(impl->config / "config.toml");
+    } catch (const std::runtime_error &error) {
+        fail("reset stopped at " + string(phase) +
+             "; the local database was cleared"
+             " and earlier steps were not undone: " +
+             error.what());
+    }
+    impl->configSafe = true;
 }
 void Storage::prune(const Settings &settings) {
     validate(settings);

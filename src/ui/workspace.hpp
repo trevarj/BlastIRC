@@ -42,6 +42,7 @@ class Workspace {
     void reconcile();
     void remapBuffer(std::string_view oldId, std::string_view newId);
     void persist();
+    void resetPreferences();
 
   private:
     struct SavedPane {

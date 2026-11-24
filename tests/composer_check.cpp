@@ -997,6 +997,15 @@ void checkComposerEditingCommands(Renderer &renderer) {
     assert(!editors.handleCompositionKey(0x732b, 0x732b, 0, true, false, model.settings.bindings));
     assert(input->editingStateMatches(composing));
     input->textInputResetPreedit();
+    reset("private draft", 13, 13);
+    execute("paste");
+    buffer.draft.clear();
+    ++model.draftResetRevision;
+    editors.flush();
+    clipboard.deliver("late clipboard payload");
+    execute("undo");
+    frame();
+    assert(input->value().empty() && buffer.draft.empty());
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);
 }

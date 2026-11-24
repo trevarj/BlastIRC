@@ -4,6 +4,7 @@
 #include "irc/protocol.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -16,6 +17,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <unistd.h>
+#include <utility>
 
 namespace blast {
 using namespace application_detail;
@@ -228,7 +230,7 @@ bool sojuFileHostContextCurrent(const Model &model, const SojuFileHostContext &c
     return current && *current == context;
 }
 
-Application::Application() {
+Application::Application(bool exclusiveWriter) : storage_(exclusiveWriter) {
     const auto serial = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     idPrefix_ = "local:" + std::to_string(serial) + ":" + std::to_string(getpid()) + ":";
     try {
@@ -237,6 +239,10 @@ Application::Application() {
         savingAllowed_ = false;
         report(string("Configuration was not loaded; original files will not be overwritten: ") +
                e.what());
+    }
+    if (model.firstRun) {
+        model.servers.clear();
+        model.identities.clear();
     }
     adoptSojuProfiles();
     for (const auto &s : model.servers) {
@@ -869,6 +875,9 @@ void Application::disconnect(string server) {
             auto &n = runtime->second;
             n.state = "Disconnected";
             n.error.clear();
+            n.retrying = false;
+            n.firstChannel.clear();
+            n.firstChannelError.clear();
             n.fileHost.clear();
             n.saslAuthenticated = false;
             n.sojuSessionKey.clear();
@@ -913,6 +922,8 @@ void Application::synchronizeSoju(const string &parent) {
     if (config == model.servers.end() || live == model.networks.end() ||
         live->second.state != "Ready" || !live->second.sojuDiscoveryComplete)
         return;
+    if (config->sasl.empty())
+        return;
     auto identity = std::find_if(model.identities.begin(), model.identities.end(),
                                  [&](const auto &i) { return i.name == config->identity; });
     if (identity == model.identities.end() ||
@@ -938,7 +949,7 @@ void Application::synchronizeSoju(const string &parent) {
             model.servers.push_back(std::move(created));
             child = std::prev(model.servers.end());
         }
-        if (child->sojuEnabled && !client(child->name))
+        if (child->sojuEnabled && !sojuSuspended_.contains(child->name) && !client(child->name))
             attach.push_back(child->name);
     }
     for (const auto &name : attach)
@@ -958,8 +969,12 @@ void Application::connect(string name, string origin) {
         for (const auto &s : model.servers)
             if (s.sojuParent == name)
                 children.push_back(s.name);
-        for (const auto &child : children)
+        for (const auto &child : children) {
+            const bool alreadySuspended = sojuSuspended_.contains(child);
             disconnect(child);
+            if (!alreadySuspended)
+                sojuSuspended_.erase(child);
+        }
     }
     if (!resolved.sojuParent.empty()) {
         if (!resolved.sojuEnabled)
@@ -969,6 +984,14 @@ void Application::connect(string name, string origin) {
         });
         if (parent == model.servers.end())
             return;
+        if (parent->sasl.empty()) {
+            auto &network = model.networks[name];
+            network.state = "Failed";
+            network.error = "This Soju account is set to management only. Configure SASL to attach "
+                            "IRC networks.";
+            report(network.error, name, origin);
+            return;
+        }
         const auto control = model.networks.find(parent->name);
         if (control == model.networks.end() || control->second.state != "Ready" ||
             !control->second.sojuDiscoveryComplete ||
@@ -985,7 +1008,7 @@ void Application::connect(string name, string origin) {
         resolved.tls = parent->tls;
         resolved.identity = parent->identity;
         resolved.sasl = parent->sasl;
-        resolved.password = parent->password;
+        resolved.password.clear();
         resolved.bouncer = "soju:" + resolved.sojuNetworkId;
         resolved.sojuTrustedFileHost = parent->sojuTrustedFileHost;
     }
@@ -1002,6 +1025,10 @@ void Application::connect(string name, string origin) {
     n.name = name;
     n.nick = identity->nick;
     n.error.clear();
+    n.state = "Connecting";
+    n.retrying = false;
+    n.firstChannel.clear();
+    n.firstChannelError.clear();
     n.caps.clear();
     n.clientTagDeny.clear();
     ++n.sessionGeneration;
@@ -1933,6 +1960,11 @@ void Application::reduce(const Event &input) {
         return;
     auto &n = model.networks[e.server];
     n.name = e.server;
+    if (e.type == "connection-retry") {
+        if (n.state == "Disconnected")
+            n.retrying = true;
+        return;
+    }
     if (e.type == "sent") {
         if (e.label.empty() || failedLabels_.contains(e.label) || failedSubmission(e.label))
             return;
@@ -2010,6 +2042,11 @@ void Application::reduce(const Event &input) {
         const string old = n.state;
         n.state = e.text;
         n.error = tag(e, "error");
+        n.retrying = false;
+        if (n.state != "Ready" && !n.firstChannel.empty()) {
+            n.firstChannelError = "Connection ended before joining " + n.firstChannel + ".";
+            n.firstChannel.clear();
+        }
         if (!e.nick.empty())
             n.nick = e.nick;
         if (!tag(e, "nick").empty())
@@ -2042,6 +2079,7 @@ void Application::reduce(const Event &input) {
             cancelHistorySession(e.server);
         }
         if (e.text == "Connecting") {
+            n.automaticHistoryPaused = false;
             n.sojuNetworks.clear();
             n.caps.clear();
             n.clientTagDeny.clear();
@@ -2167,6 +2205,21 @@ void Application::reduce(const Event &input) {
     }
     if (e.type == "network") {
         auto kind = tag(e, "kind");
+        if (!n.firstChannel.empty()) {
+            constexpr std::array joinErrors{"403", "405", "437", "471", "473", "474",
+                                            "475", "476", "477", "479", "489"};
+            const auto command = tag(e, "command");
+            const bool standard =
+                command == "FAIL" && e.params.size() >= 4 && e.params.front() == "JOIN";
+            const size_t target = standard ? 2 : 1;
+            if (e.params.size() > target &&
+                (standard ||
+                 std::find(joinErrors.begin(), joinErrors.end(), command) != joinErrors.end()) &&
+                fold(e.server, e.params[target]) == fold(e.server, n.firstChannel)) {
+                n.firstChannelError = "Could not join " + n.firstChannel + ": " + e.text;
+                n.firstChannel.clear();
+            }
+        }
         if (kind == "isupport-settled") {
             historyClassificationSettled_.insert(e.server);
             return;
@@ -2688,6 +2741,27 @@ void Application::reduce(const Event &input) {
                 nick->account.clear();
             if (e.own) {
                 b.joined = true;
+                if (!n.firstChannel.empty() &&
+                    fold(e.server, e.target) == fold(e.server, n.firstChannel)) {
+                    n.firstChannel.clear();
+                    n.firstChannelError.clear();
+                    const auto server =
+                        std::find_if(model.servers.begin(), model.servers.end(),
+                                     [&](const auto &s) { return s.name == e.server; });
+                    if (server != model.servers.end() &&
+                        std::none_of(server->channels.begin(), server->channels.end(),
+                                     [&](const auto &target) {
+                                         return fold(e.server, target) == fold(e.server, b.target);
+                                     }))
+                        server->channels.push_back(b.target);
+                    if (server != model.servers.end() && !model.onboardingNetwork.empty() &&
+                        (server->name == model.onboardingNetwork ||
+                         server->sojuParent == model.onboardingNetwork) &&
+                        model.activeBuffer == e.server + "/*server*") {
+                        model.activeBuffer = b.id;
+                        model.onboardingNetwork.clear();
+                    }
+                }
                 requestHistory(b, "", true);
             }
         }
@@ -3667,10 +3741,218 @@ void Application::command(Buffer &b, const string &input) {
     if (!name.empty())
         enqueueCommand(b, name + (args.empty() ? "" : " " + args));
 }
+void Application::setupConnection(const Action &a) {
+    if (a.requestId != model.settingsSaveRequest)
+        return;
+    auto setup = std::exchange(model.connectionSetup, std::nullopt);
+    auto &result = model.settingsSaveResult;
+    try {
+        if (!savingAllowed_ || localResetInProgress_)
+            throw std::runtime_error("Configuration cannot be written. Check the configuration and "
+                                     "restart BlastIRC.");
+        Model profiles;
+        profiles.identities = model.identities;
+        profiles.servers = model.servers;
+        if (a.type == "setup-connect") {
+            if (!setup)
+                throw std::runtime_error("No connection details were submitted.");
+            if (std::any_of(profiles.servers.begin(), profiles.servers.end(),
+                            [&](const auto &server) { return server.name == setup->server.name; }))
+                throw std::runtime_error("Choose a name that is not already used by a connection.");
+            if (setup->identity)
+                profiles.identities.push_back(std::move(*setup->identity));
+            profiles.servers.push_back(std::move(setup->server));
+            if (const auto error = validateServerProfile(profiles, profiles.servers.size() - 1);
+                !error.empty())
+                throw std::runtime_error(error);
+        }
+        storage_.saveProfiles(profiles);
+        model.identities = std::move(profiles.identities);
+        model.servers = std::move(profiles.servers);
+        model.firstRun = false;
+    } catch (const std::exception &error) {
+        result = {a.requestId, false, error.what()};
+        return;
+    }
+    result = {a.requestId, true, {}};
+    if (a.type == "setup-connect") {
+        model.onboardingNetwork = model.servers.back().name;
+        model.activeBuffer = buffer(model.onboardingNetwork, "*server*", "server").id;
+        connect(model.onboardingNetwork);
+    }
+}
+
+void Application::firstJoin(const Action &a) {
+    const auto network = model.networks.find(a.buffer);
+    auto *connection = client(a.buffer);
+    if (network == model.networks.end() || network->second.state != "Ready" || !connection)
+        return;
+    auto &n = network->second;
+    if (!n.firstChannel.empty())
+        return;
+    if (a.text.size() < 2 || a.text.size() > 505 || !channel(a.buffer, a.text) ||
+        std::ranges::any_of(a.text,
+                            [](unsigned char c) { return c <= 32 || c == ',' || c == 127; })) {
+        n.firstChannelError = "Enter one channel name, for example #channel.";
+        return;
+    }
+    const auto id = a.buffer + "/" + fold(a.buffer, a.text);
+    if (const auto b = model.buffers.find(id); b != model.buffers.end() && b->second.joined) {
+        model.activeBuffer = id;
+        model.onboardingNetwork.clear();
+        return;
+    }
+    try {
+        connection->command("JOIN " + a.text);
+        n.firstChannelError.clear();
+        n.firstChannel = a.text;
+        n.firstChannelStarted = model.now;
+    } catch (const std::exception &error) {
+        n.firstChannelError = error.what();
+    }
+}
+
+void Application::clearLoaded(Buffer &b, bool preserveRecovery) {
+    auto removed = b.messages.size();
+    if (preserveRecovery)
+        removed = std::erase_if(b.messages, [](const Message &m) {
+            return !m.own || (!m.pending && m.sendStatus != SendStatus::Queued &&
+                              m.sendStatus != SendStatus::Unknown);
+        });
+    else
+        b.messages.clear();
+    if (b.kind != "search" && b.kind != "mentions")
+        messageCount_ -= removed;
+    if (removed)
+        reviseMessages(b);
+    b.sourceMessageIndex.clear();
+    b.historyState = {};
+    b.chatReplaySequences.clear();
+    b.replayChatKeys.clear();
+    b.lastChatTimestamp = b.lastChatSequence = 0;
+    b.lastChatTime.clear();
+    b.lastChatId.clear();
+    b.unread = 0;
+    b.readMarker.clear();
+}
+
+void Application::clearLocalData(const Action &a) {
+    if (a.requestId && a.requestId != model.settingsSaveRequest)
+        return;
+    const auto finish = [&](bool success, string error = {}) {
+        if (a.requestId)
+            model.settingsSaveResult = {a.requestId, success, std::move(error)};
+        else if (!success)
+            model.status = std::move(error);
+    };
+    try {
+        const std::string_view scope = a.text;
+        if ((!savingAllowed_ || localResetInProgress_) && scope != "cache" &&
+            !(localResetInProgress_ && scope == "all"))
+            throw std::runtime_error("Local data cannot be changed while configuration saving is "
+                                     "blocked. Check the configuration and restart BlastIRC.");
+        if (scope == "connections" || scope == "all") {
+            if (scope == "all")
+                storage_.preflightLocalReset();
+            while (!clients_.empty())
+                disconnect(clients_.begin()->first);
+            if (scope == "all") {
+                localResetInProgress_ = true;
+                storage_.clearLocalData(LocalData::All);
+                model.actions.clear();
+                model.quit = true;
+                finish(true);
+                return;
+            }
+            storage_.clearLocalData(LocalData::Connections);
+            model.servers.clear();
+            model.identities.clear();
+            model.networks.clear();
+            model.onboardingNetwork.clear();
+            model.connectionSetup.reset();
+            model.firstRun = true;
+            sojuSuspended_.clear();
+            sojuRetired_.clear();
+        } else if (scope == "history" || scope == "logs") {
+            const bool logs = scope == "logs";
+            storage_.clearLocalData(logs ? LocalData::ServerLogs : LocalData::ChatHistory);
+            cancelSearchJump();
+            searchRequests_.clear();
+            if (!logs) {
+                for (auto &[server, network] : model.networks) {
+                    network.automaticHistoryPaused = true;
+                    cancelHistorySession(server);
+                }
+                presenceGroups_.clear();
+                activity_.clear();
+                ++mentionsLiveRevision_;
+            }
+            for (auto &[id, b] : model.buffers)
+                if (b.kind == "search" || (b.kind == "server") == logs) {
+                    if (logs && b.kind == "search") {
+                        const auto source = model.buffers.find(b.searchSource);
+                        if (source == model.buffers.end() || source->second.kind != "server")
+                            continue;
+                    }
+                    cancelHistory(b);
+                    unsavedSources_.erase(id);
+                    clearLoaded(b, !logs && (b.kind == "channel" || b.kind == "query"));
+                }
+            model.pendingSourceJump.buffer.clear();
+            model.pendingSourceJump.message.clear();
+            ++model.pendingSourceJump.revision;
+        } else if (scope == "drafts") {
+            storage_.clearLocalData(LocalData::Drafts);
+            for (const auto &[label, queued] : queuedSends_)
+                failedSubmissions_[label] = model.now;
+            queuedSends_.clear();
+            pending_.clear();
+            for (auto &[id, b] : model.buffers) {
+                b.draft.clear();
+                const auto removed = std::erase_if(b.messages, [&](const Message &m) {
+                    if (!m.own || (!m.pending && m.sendStatus != SendStatus::Queued &&
+                                   m.sendStatus != SendStatus::Unknown))
+                        return false;
+                    if (!m.label.empty())
+                        failedSubmissions_[string(submissionRoot(m.label))] = model.now;
+                    return true;
+                });
+                if (removed) {
+                    if (b.kind != "search" && b.kind != "mentions")
+                        messageCount_ -= removed;
+                    reviseMessages(b);
+                }
+            }
+            ++model.draftResetRevision;
+        } else if (scope == "preferences") {
+            auto defaults = defaultSettings();
+            defaults.retentionDays = model.settings.retentionDays;
+            defaults.maxMessages = model.settings.maxMessages;
+            storage_.saveSettings(defaults);
+            model.settings = std::move(defaults);
+            ++model.preferencesResetRevision;
+        } else if (scope == "cache") {
+            for (auto &[id, b] : model.buffers)
+                clearAvatar(b, false);
+            ++model.cacheResetRevision;
+        } else {
+            throw std::runtime_error("Unknown local data category.");
+        }
+        finish(true);
+    } catch (const std::exception &error) {
+        finish(false, localResetInProgress_
+                          ? string(error.what()) + " Some data may already be gone. Saving is "
+                                                   "paused; retry Reset BlastIRC or restart."
+                          : error.what());
+    }
+}
+
 void Application::dispatchActions() {
     activeActions_.swap(model.actions);
     model.actions.clear();
     for (nextAction_ = 0; nextAction_ < activeActions_.size(); ++nextAction_) {
+        if (localResetInProgress_ && model.quit)
+            break;
         const auto &a = activeActions_[nextAction_];
         try {
             action(a);
@@ -3686,6 +3968,20 @@ void Application::dispatchActions() {
     nextAction_ = 0;
 }
 void Application::action(const Action &a) {
+    if (a.type == "clear-local-data") {
+        clearLocalData(a);
+        return;
+    }
+    if (localResetInProgress_)
+        return;
+    if (a.type == "setup-connect" || a.type == "setup-offline") {
+        setupConnection(a);
+        return;
+    }
+    if (a.type == "onboarding-join") {
+        firstJoin(a);
+        return;
+    }
     if (a.type == "search-jump") {
         jumpSearch(a.buffer, a.text);
         return;
@@ -3693,8 +3989,8 @@ void Application::action(const Action &a) {
     if (a.type == "source-jump" || a.type == "global-mentions")
         cancelSearchJump();
     if (a.type == "global-mentions") {
-        refreshMentions();
         model.activeBuffer = GlobalMentionsBufferId;
+        refreshMentions();
         return;
     }
     if (a.type == "source-jump") {
@@ -4284,6 +4580,8 @@ void Application::action(const Action &a) {
     report("Unknown UI action: " + a.type, server);
 }
 void Application::refreshMentions() {
+    if (model.buffers.empty() && model.activeBuffer != GlobalMentionsBufferId)
+        return;
     string networkKey;
     for (const auto &[name, network] : model.networks)
         networkKey += std::to_string(name.size()) + ":" + name +
@@ -4778,6 +5076,8 @@ void Application::trim() {
 }
 bool Application::save() {
     lastSave_ = model.now;
+    if (localResetInProgress_)
+        return false;
     if (!savingAllowed_) {
         model.status =
             "Configuration errors must be fixed before saving; original files are unchanged";
@@ -4853,6 +5153,10 @@ bool Application::save() {
             source = unsavedSources_.erase(source);
         }
         storage_.save(model);
+        if (model.firstRun && model.servers.empty() && !model.identities.empty()) {
+            storage_.saveProfiles(model);
+            model.firstRun = false;
+        }
         storage_.prune(model.settings);
         for (auto &[id, value] : model.buffers)
             storage_.loadHistoryState(value);
@@ -4934,6 +5238,14 @@ void Application::tick(double now) {
     }
     drainClients();
     dispatchActions();
+    if (localResetInProgress_)
+        return;
+    for (auto &[server, network] : model.networks)
+        if (!network.firstChannel.empty() && model.now - network.firstChannelStarted >= 30) {
+            network.firstChannelError =
+                "No confirmation for " + network.firstChannel + ". Try again.";
+            network.firstChannel.clear();
+        }
     // Drain local echoes already produced by the worker; later ticks collect the rest.
     drainClients();
     scheduleHistory();

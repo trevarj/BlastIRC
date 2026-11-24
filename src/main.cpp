@@ -210,7 +210,7 @@ int main(int argc, char **argv) {
         registerFonts();
         RenderContext render;
         render.initialize(shared);
-        blast::Application app;
+        blast::Application app(true);
         blast::Theme theme;
         theme.update(app.model);
         std::string fontFamily = blast::themeUiFont().family;

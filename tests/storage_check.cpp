@@ -1,6 +1,7 @@
-// Standalone: compile with storage.cpp, upload.cpp, irc/protocol.cpp and ui/logic.cpp;
+// Standalone: compile with storage.cpp, upload.cpp, irc/protocol.cpp, irc/sts.cpp and ui/logic.cpp;
 // link sqlite3, libcurl, toml++ and pthread (or use the storage-check Meson target).
 #include "irc/protocol.hpp"
+#include "irc/sts.hpp"
 #include "storage.hpp"
 #include <algorithm>
 #include <cassert>
@@ -2628,6 +2629,220 @@ static void historyPlaybackOrdering(const fs::path &database, int64_t now) {
         storage.clearHistory();
     }
 }
+static void localDataScopes(const fs::path &root, int64_t now) {
+    ::setenv("XDG_CONFIG_HOME", (root / "config").c_str(), 1);
+    ::setenv("XDG_DATA_HOME", (root / "data").c_str(), 1);
+    const auto config = root / "config" / "blastirc";
+    const auto profiles = config / "config.toml", preferences = config / "settings.toml";
+    const auto database = root / "data" / "blastirc" / "state.sqlite3";
+    const string room = "Libera/#ops/*server*", closed = "Libera/#clear-closed/*server*",
+                 log = "Libera/*server*", orphanLog = "Orphan/*server*",
+                 closedLog = "Libera/legacy-server-log", orphanRoom = "Orphan/#ops/*server*";
+    Storage storage;
+    Model model;
+    storage.load(model);
+    auto &chat = model.buffers.emplace(room, sendBuffer(room)).first->second;
+    chat.draft = "editable draft";
+    model.buffers[log] = sendBuffer(log);
+    model.buffers[log].kind = "server";
+    model.activeBuffer = room;
+    model.settings.sound = false;
+    storage.saveProfiles(model);
+    assert(fs::exists(profiles) && !fs::exists(preferences));
+    assert(scalar(database, "SELECT count(*) FROM buffers") == 0);
+    model.firstRun = false;
+    storage.save(model);
+    const auto savedProfiles = contents(profiles);
+
+    auto row = message("row", now);
+    row.reactions["reaction"] = {"alice"};
+    storage.append(room, row);
+    storage.append(closed, row);
+    storage.closeBuffer(sendBuffer(closed));
+    const auto cutoff = storage.historyDiscarded(closed);
+    assert(cutoff && !cutoff->empty());
+    storage.append(log, row);
+    storage.append(orphanLog, row); // Crash before the log's source metadata was materialized.
+    storage.append(orphanRoom, row);
+    storage.append(closedLog, row);
+    auto legacy = sendBuffer(closedLog);
+    legacy.kind = "server";
+    storage.closeBuffer(legacy);
+    chat.readMarker = row.id;
+    chat.unread = 2;
+    storage.read(log, row.id);
+    chat.historyState.oldest = chat.historyState.newest = {row.id, ""};
+    chat.historyState.gaps.push_back({0, {}, {row.id, ""}, false});
+    storage.saveHistoryState(chat);
+    storage.saveHistoryDiscovery("Libera", {"watermark", "", true});
+    storage.queueSend(chat, "submission", "queued text");
+    auto ghost = message("local:ghost", now);
+    ghost.own = ghost.pending = true;
+    ghost.label = "submission.part1";
+    storage.append(room, ghost);
+    auto unbacked = ghost;
+    unbacked.id = "local:unbacked";
+    unbacked.label = "no-backup";
+    unbacked.text = "unconfirmed text";
+    storage.append(room, unbacked);
+    unbacked.pending = false;
+    storage.update(room, unbacked);
+
+    storage.clearLocalData(LocalData::ServerLogs);
+    for (const auto &id : {log, orphanLog, closedLog})
+        assert(storage.history(id, -1).empty());
+    assert(storage.message(room, row.id) && storage.message(closed, row.id));
+    assert(storage.message(orphanRoom, row.id));
+    assert(storage.historyDiscovery("Libera").watermark == "watermark");
+    assert(scalar(database, "SELECT count(*) FROM buffers WHERE read_marker<>''") == 1);
+    assert(scalar(database, "SELECT sum(unread) FROM buffers") == 2);
+    assert(scalar(database, "SELECT count(*) FROM history_gaps") == 1);
+    storage.append(orphanLog, row);
+    storage.append(closedLog, row);
+    storage.read(log, "log-marker");
+
+    storage.clearLocalData(LocalData::ChatHistory);
+    assert(storage.history(room).empty() && storage.history(closed, -1).empty());
+    assert(!storage.message(room, row.id) && storage.message(room, ghost.id) &&
+           storage.message(room, unbacked.id));
+    assert(!storage.message(orphanRoom, row.id));
+    assert(storage.historyDiscarded(closed) == cutoff && storage.message(orphanLog, row.id) &&
+           storage.message(closedLog, row.id));
+    assert(storage.historyDiscovery("Libera").watermark.empty());
+    assert(scalar(database, "SELECT count(*) FROM reactions") == 2);
+    assert(scalar(database, "SELECT count(*) FROM history_state") == 0);
+    assert(scalar(database, "SELECT count(*) FROM history_gaps") == 0);
+    assert(scalar(database, "SELECT count(*) FROM buffers WHERE read_marker='log-marker'") == 1);
+    assert(scalar(database, "SELECT count(*) FROM buffers WHERE read_marker='row'") == 0);
+    assert(scalar(database, "SELECT sum(unread) FROM buffers") == 0);
+    assert(scalar(database, "SELECT count(*) FROM queued_sends") == 1);
+    Model loaded;
+    {
+        Storage reopened;
+        reopened.load(loaded);
+        auto &restored = loaded.buffers.at(room);
+        assert(restored.draft == "queued text\neditable draft");
+        assert(restored.messages.size() == 1 && restored.messages.front().id == unbacked.id &&
+               restored.messages.front().sendStatus == SendStatus::Unknown);
+        restored.draft = restored.messages.front().text + "\n" + restored.draft;
+        reopened.recoverSend(restored, unbacked.label);
+    }
+    storage.load(loaded);
+    assert(loaded.buffers.at(room).messages.empty() &&
+           loaded.buffers.at(room).draft == "unconfirmed text\nqueued text\neditable draft");
+
+    storage.queueSend(loaded.buffers.at(room), "submission", "do not recover");
+    storage.append(room, ghost);
+    ghost.id = "local:orphan";
+    ghost.label = "missing-backup";
+    storage.append(room, ghost);
+    ghost.pending = false;
+    storage.update(room, ghost); // A provisional row even after the visual pending timeout.
+    row.own = true;
+    row.label = "submission";
+    storage.append(room, row, "", 0, true);
+    auto sent = message("local:sent", now);
+    sent.own = true;
+    sent.sendStatus = SendStatus::Sent;
+    storage.append(room, sent);
+    storage.clearLocalData(LocalData::Drafts);
+    storage.load(loaded);
+    assert(loaded.buffers.at(room).draft.empty() && storage.history(room, -1).size() == 2);
+    assert(storage.message(room, row.id)->sendStatus == SendStatus::Confirmed);
+    assert(storage.message(room, sent.id)->sendStatus == SendStatus::Sent);
+
+    irc::saveSts("irc.example.test", 6697, 3600);
+    auto defaults = defaultSettings();
+    storage.saveSettings(defaults);
+    assert(contents(profiles) == savedProfiles && storage.message(room, row.id));
+    storage.load(loaded);
+    assert(!loaded.firstRun && loaded.settings.sound && loaded.settings.cues.contains("mention") &&
+           loaded.settings.bindings == defaults.bindings);
+    const auto savedPreferences = contents(preferences);
+    storage.clearLocalData(LocalData::Connections);
+    assert(!fs::exists(profiles) && contents(preferences) == savedPreferences &&
+           irc::loadSts("irc.example.test") && storage.message(room, row.id));
+    storage.load(loaded);
+    assert(loaded.firstRun && loaded.buffers.contains(room));
+
+    const auto theme = config / "noctalia.toml", external = root / "client.key";
+    std::ofstream(theme) << "external theme";
+    std::ofstream(external) << "external key";
+    std::ofstream(profiles) << "[invalid file";
+    bool refused = false;
+    try {
+        storage.load(loaded);
+    } catch (const std::runtime_error &) {
+        try {
+            storage.saveProfiles(model);
+        } catch (const std::runtime_error &) {
+            refused = true;
+        }
+    }
+    assert(refused && contents(profiles) == "[invalid file");
+
+    {
+        auto write = storage.historyWrite();
+        bool rejected = false;
+        try {
+            storage.preflightLocalReset();
+        } catch (const std::runtime_error &error) {
+            rejected = std::string_view(error.what()).find("active database write") !=
+                       std::string_view::npos;
+        }
+        assert(rejected && storage.message(room, row.id));
+    }
+
+    const auto savedConfig = config.parent_path() / "test-saved-config";
+    const auto savedPolicies = contents(config / "sts");
+    fs::rename(config, savedConfig);
+    fs::create_directory_symlink(savedConfig, config);
+    for (const bool preflightOnly : {true, false}) {
+        bool rejected = false;
+        try {
+            if (preflightOnly)
+                storage.preflightLocalReset();
+            else
+                storage.clearLocalData(LocalData::All);
+        } catch (const std::runtime_error &error) {
+            rejected = std::string_view(error.what()).find("symlinked configuration") !=
+                       std::string_view::npos;
+        }
+        assert(rejected && storage.message(room, row.id) && contents(profiles) == "[invalid file" &&
+               contents(preferences) == savedPreferences &&
+               contents(config / "sts") == savedPolicies);
+    }
+    fs::remove(config);
+    fs::rename(savedConfig, config);
+
+    const auto sts = config / "sts", savedSts = config / "test-saved-sts";
+    fs::rename(sts, savedSts);
+    fs::create_directory(sts); // Removal must fail, not recurse into an unowned directory.
+    bool partial = false;
+    try {
+        storage.clearLocalData(LocalData::All);
+    } catch (const std::runtime_error &error) {
+        const std::string_view detail(error.what());
+        partial = detail.find("STS policies") != string::npos &&
+                  detail.find("local database was cleared") != string::npos;
+    }
+    assert(partial && contents(profiles) == "[invalid file" &&
+           contents(preferences) == savedPreferences && !storage.message(room, row.id));
+    fs::remove(sts);
+    fs::rename(savedSts, sts);
+    storage.clearLocalData(LocalData::All);
+    assert(!fs::exists(profiles) && !fs::exists(preferences) && !fs::exists(config / "sts"));
+    assert(contents(theme) == "external theme" && contents(external) == "external key");
+    assert(fs::exists(database) && !storage.historyDiscarded(closed) &&
+           storage.takeHistoryInvalidations().empty());
+    for (const auto *table : {"messages", "reactions", "buffers", "queued_sends", "closed_buffers",
+                              "history_state", "history_gaps", "history_discovery", "meta"})
+        assert(scalar(database, (string("SELECT count(*) FROM ") + table).c_str()) == 0);
+    Storage fresh;
+    fresh.load(loaded);
+    assert(loaded.firstRun && loaded.buffers.empty() && loaded.activeBuffer.empty());
+}
+
 int main() {
     char temporary[] = "/tmp/blastirc-storage-XXXXXX";
     const char *directory = ::mkdtemp(temporary);
@@ -4175,6 +4390,7 @@ int main() {
                    contents(config / "config.toml") == sojuProfiles + extra &&
                    contents(config / "settings.toml") == uploadSettings);
         }
+        localDataScopes(root / "local-data-scopes", now);
         fs::remove_all(root);
         std::cout << "storage round-trip, retention, migrations, redaction, echo correlation, "
                      "queued-send handoff and presentation/workspace validation and parse "

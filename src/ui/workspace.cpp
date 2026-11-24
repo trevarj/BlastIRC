@@ -411,6 +411,14 @@ void Workspace::remapBuffer(std::string_view oldId, std::string_view newId) {
         publishedActive_ = newBuffer;
     deduplicate();
 }
+void Workspace::resetPreferences() {
+    navigationMode = SidebarMode::Expanded;
+    serverRailVisible = true;
+    serverRailWidth_.reset();
+    channelSidebarWidth_.reset();
+    compactChannelSidebarWidth_.reset();
+    serialized_.clear();
+}
 void Workspace::persist() {
     auto &settings = model_.settings.workspace;
     std::erase_if(settings, [&](const auto &entry) {

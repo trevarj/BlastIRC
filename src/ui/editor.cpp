@@ -447,6 +447,8 @@ struct EditorStore::Impl {
     std::shared_ptr<int> alive = std::make_shared<int>(0);
     std::string kill;
     bool restoring = false;
+    std::uint64_t draftResetRevision = 0;
+    void resetDrafts();
 
     Impl(Model &m, TextClipboard &c, UiCommand u, FocusPane f, std::function<void(Node &)> retire)
         : model(m), clipboard(c), payloadClipboard(dynamic_cast<Clipboard *>(&c)),
@@ -4133,8 +4135,29 @@ void EditorStore::remapBuffer(std::string_view oldId, std::string_view newId,
                               std::uint64_t activePane) {
     impl_->remapBuffer(oldId, newId, activePane);
 }
+void EditorStore::Impl::resetDrafts() {
+    if (draftResetRevision == model.draftResetRevision)
+        return;
+    draftResetRevision = model.draftResetRevision;
+    const bool previous = std::exchange(restoring, true);
+    drafts.clear();
+    kill.clear();
+    for (auto *view : views) {
+        view->cancelPaste(false);
+        view->pendingPaste.reset();
+        view->hideCompletion();
+        view->pane.reply.clear();
+        view->scrollPositions.clear();
+        auto &current = draft(view->buffer);
+        view->input->restoreEditingState(current.state);
+        view->revision = current.revision;
+    }
+    restoring = previous;
+}
+
 void EditorStore::sync() {
     auto &s = *impl_;
+    s.resetDrafts();
     for (auto *view : s.views)
         view->sync();
     s.syncSpelling();
@@ -4166,6 +4189,7 @@ void EditorStore::sync() {
     }
 }
 void EditorStore::flush() {
+    impl_->resetDrafts();
     for (auto *view : impl_->views)
         impl_->capture(*view);
     for (auto &[id, d] : impl_->drafts)

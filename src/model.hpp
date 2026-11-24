@@ -7,6 +7,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -61,6 +62,11 @@ struct ServerConfig {
     bool sojuAccount = false, sojuEnabled = true;
     string sojuParent, sojuNetworkId, sojuTrustedFileHost;
 };
+struct ConnectionSetup {
+    ServerConfig server;
+    std::optional<Identity> identity;
+};
+enum class LocalData { ChatHistory, ServerLogs, Drafts, Connections, Preferences, Cache, All };
 struct Cue {
     bool enabled = true;
     float volume = .5f, pitch = 1.f;
@@ -267,6 +273,9 @@ struct SojuNetworkInfo {
 };
 struct Network {
     string name, state = "Disconnected", nick, error, clientTagDeny;
+    string firstChannel, firstChannelError;
+    double firstChannelStarted = 0;
+    bool retrying = false, automaticHistoryPaused = false;
     double latency = 0;
     set<string> caps;
     map<string, SojuNetworkInfo> sojuNetworks;
@@ -385,6 +394,9 @@ struct Model {
     map<string, Network> networks;
     string activeBuffer, status;
     bool firstRun = true, quit = false;
+    std::optional<ConnectionSetup> connectionSetup;
+    string onboardingNetwork;
+    uint64_t draftResetRevision = 0, preferencesResetRevision = 0, cacheResetRevision = 0;
     double now = 0;
     vector<Event> effects;
     vector<Action> actions;

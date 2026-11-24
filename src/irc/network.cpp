@@ -1488,7 +1488,7 @@ struct NetworkClient::Impl {
     void beginRegistration() {
         if (registrationSent)
             return;
-        if (!config.password.empty())
+        if (!config.password.empty() && (!config.sojuAccount || config.sasl.empty()))
             raw("PASS", {config.password});
         raw("NICK", {nick});
         raw("USER", {identity.username, "0", "*", identity.realname});
@@ -3613,6 +3613,9 @@ struct NetworkClient::Impl {
                     break;
                 if (stsUpgrade || reconfigure)
                     continue;
+                Event retry;
+                retry.type = "connection-retry";
+                deliver(std::move(retry));
                 if (!delay(backoff * 1000))
                     break;
                 backoff = std::min(backoff * 2, 60);

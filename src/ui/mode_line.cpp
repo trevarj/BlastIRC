@@ -116,14 +116,16 @@ struct ModeLine::Impl {
         const Buffer *chat;
         const Network *network;
         const ServerConfig *profile;
+        bool onboarding;
 
         bool mentions() const { return chat && chat->kind == "mentions"; }
         bool writable() const {
-            return chat &&
+            return chat && !onboarding &&
                    (chat->kind == "channel" || chat->kind == "query" || chat->kind == "server");
         }
         std::string_view state() const {
             return mentions()                           ? "Read only"
+                   : network && network->retrying       ? "Retrying"
                    : network && !network->state.empty() ? std::string_view(network->state)
                                                         : "Disconnected";
         }
@@ -305,9 +307,17 @@ struct ModeLine::Impl {
         const auto profile =
             std::find_if(model.servers.begin(), model.servers.end(),
                          [&](const auto &config) { return config.name == server; });
-        return {model.activeBuffer, server, chat,
+        const auto *config = profile == model.servers.end() ? nullptr : &*profile;
+        const bool onboarding = chat && chat->kind == "server" && config &&
+                                !model.onboardingNetwork.empty() &&
+                                (config->name == model.onboardingNetwork ||
+                                 config->sojuParent == model.onboardingNetwork);
+        return {model.activeBuffer,
+                server,
+                chat,
                 network == model.networks.end() ? nullptr : &network->second,
-                profile == model.servers.end() ? nullptr : &*profile};
+                config,
+                onboarding};
     }
     bool matchesScope(const Scope &current) const {
         return shownBuffer == current.buffer && shownServer == current.server &&
@@ -592,10 +602,14 @@ struct ModeLine::Impl {
         const bool connected = state != "Disconnected" && state != "Failed";
         std::vector<ContextMenuEntry> entries;
         entries.reserve(connected ? 3 : 2);
-        entries.push_back(
-            menuEntry(0, connected ? "Reconnect" : "Connect", connected ? "refresh" : "plug"));
+        entries.push_back(menuEntry(0,
+                                    state == "Retrying" ? "Retry now"
+                                    : connected         ? "Reconnect"
+                                                        : "Connect",
+                                    connected ? "refresh" : "plug"));
         if (connected)
-            entries.push_back(menuEntry(1, "Disconnect", "plug-off"));
+            entries.push_back(
+                menuEntry(1, state == "Retrying" ? "Stop retrying" : "Disconnect", "plug-off"));
         entries.push_back(menuEntry(2, "Open server log", "terminal"));
         openPopup(controls[State], inputSerial, std::move(entries),
                   [this, connected, server = std::string(current.server),
@@ -745,9 +759,10 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
         const bool hasCaption = !button.title->text().empty();
         button.area->setHitTestVisible(allowActivityMenu && hasCaption);
         p.enableButton(button, hasCaption);
-        const auto color = i == State ? (state == "Failed" || connectionError ? p.mentionInk
-                                         : p.healthy                          ? p.activityInk
-                                                                              : p.focusInk)
+        const auto color = i == State                           ? (state == "Retrying"                    ? p.focusInk
+                                                                   : state == "Failed" || connectionError ? p.mentionInk
+                                                                   : p.healthy                            ? p.activityInk
+                                                                                                          : p.focusInk)
                            : i == Feedback && p.failureFeedback ? p.mentionInk
                            : i == Chord || i == Nick            ? contextInk
                                                                 : contextualInk;

@@ -490,6 +490,9 @@ void registerClient(WirePeer &peer, NetworkClient &client, vector<Event> &events
                     "Rejected BIND must not retry or consume a later welcome");
             events.push_back(std::move(event));
         }
+        require(std::none_of(events.begin(), events.end(),
+                             [](const Event &event) { return event.type == "connection-retry"; }),
+                "Fatal BIND rejection announced a reconnect backoff");
         return;
     }
     peer.send(":server 001 " + identity.nick + " :Welcome");
@@ -1076,11 +1079,24 @@ void blockedSentChecks(SSL_CTX *context, const Identity &identity, bool multilin
                     0,
                 "Cannot arrange deterministic loopback reset");
         peer.connection.reset();
-        waitEvent(client, events, 0, [](const Event &event) {
+        const auto disconnected = waitEvent(client, events, 0, [](const Event &event) {
             return event.type == "state" && event.text == "Disconnected";
         });
+        const auto retry = waitEvent(client, events, disconnected + 1, [](const Event &event) {
+            return event.type == "connection-retry";
+        });
+        require(events[retry].server == "wire-check", "Reconnect backoff lost its server key");
+        const auto stopping = Clock::now();
         client.stop();
+        require(Clock::now() - stopping < 750ms, "Stopping did not interrupt the reconnect delay");
         collect(client, events);
+        require(events.back().type == "state" && events.back().text == "Disconnected" &&
+                    std::none_of(events.begin() + retry + 1, events.end(),
+                                 [](const Event &event) {
+                                     return event.type == "connection-retry" ||
+                                            (event.type == "state" && event.text == "Connecting");
+                                 }),
+                "Stopping during backoff did not leave the connection disconnected");
         require(multiline ? sentCount() == 0 : sentCount() > 0 && sentCount() < parts,
                 "Failed incomplete transport emitted a completion");
         const string unfinished = multiline ? submission : submission + ".part4095";
@@ -2135,6 +2151,7 @@ void sojuChecks(SSL_CTX *context, const Identity &identity) {
     WirePeer peer(context);
     auto config = server(peer.port, "PLAIN", "soju");
     config.sojuAccount = true;
+    config.password = "stale-management-only-pass";
     NetworkClient client(config, identity);
     client.sojuMutation("DELNETWORK", "not-ready", {});
     vector<Event> events;

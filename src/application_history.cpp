@@ -980,7 +980,7 @@ void Application::scheduleHistory() {
     for (const auto &[server, c] : clients_) {
         try {
             const auto &network = model.networks[server];
-            if (network.state != "Ready")
+            if (network.state != "Ready" || network.automaticHistoryPaused)
                 continue;
             const bool supported =
                 network.caps.contains("draft/chathistory") || network.caps.contains("chathistory");
@@ -1464,6 +1464,8 @@ void Application::finishHistoryPage(HistoryPage page, const Event &end, bool app
 }
 void Application::requestHistory(Buffer &b, const string &before, bool initial) {
     const auto &n = model.networks[b.server];
+    if (initial && n.automaticHistoryPaused)
+        return;
     if (const auto session = historySessions_.find(b.server);
         session != historySessions_.end() && session->second.refused.contains(b.id))
         return;

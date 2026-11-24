@@ -11,10 +11,12 @@ namespace blast {
 string validateIdentityProfile(const Model &, std::size_t index);
 string validateServerProfile(const Model &, std::size_t index);
 
+Settings defaultSettings();
+
 // All failures throw std::runtime_error. Callers must surface them to the user.
 class Storage {
   public:
-    Storage();
+    explicit Storage(bool exclusiveWriter = false);
     ~Storage();
     Storage(const Storage &) = delete;
     Storage &operator=(const Storage &) = delete;
@@ -61,6 +63,8 @@ class Storage {
     // Global presence inheritance is valid only for channel overrides, not the global mode.
     // Saves canonical people_mode; legacy people_visible is accepted only on load.
     void save(const Model &);
+    // Writes only the validated connection profiles, including the first-run sentinel.
+    void saveProfiles(const Model &);
     // Preferences only: pin lifecycle edits leave retained Source state untouched.
     void saveSettings(const Settings &);
     // Seed on restore/reopen; initialize=false preserves this session's replay exclusions.
@@ -115,6 +119,11 @@ class Storage {
     void read(const string &buffer, const string &marker);
     void clearHistory();
     void clearHistory(const string &buffer);
+    // Non-destructive reset checks; call before stopping workers or disabling saves.
+    void preflightLocalReset();
+    // Clear the selected durable store; preferences and cache are handled by the caller.
+    // Reset spans SQLite and files; a failure can leave earlier stores cleared.
+    void clearLocalData(LocalData);
     // retentionDays=0 disables age expiry; maxMessages is a global positive cap.
     void prune(const Settings &);
     string configDir() const;

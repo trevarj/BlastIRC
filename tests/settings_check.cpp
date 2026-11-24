@@ -32,6 +32,7 @@
 #include <render/scene/input_dispatcher.h>
 #include <render/text/cairo_text_renderer.h>
 #include <thread>
+#include <tuple>
 #include <typeinfo>
 #include <ui/controls/button.h>
 #include <ui/controls/context_menu.h>
@@ -221,12 +222,37 @@ InputArea *keyed(Node &node, std::string_view key) {
     return area;
 }
 
+Button *settingResult(Node &node, std::size_t rank) {
+    auto *area = keyed(node, "blastirc.settings.result." + std::to_string(rank));
+    auto *result = dynamic_cast<Button *>(area->parent());
+    assert(result);
+    return result;
+}
+
+bool hasSettingResults(Node &node) {
+    return find<InputArea>(node, [](const InputArea &area) {
+        return area.tabFocusKey().starts_with("blastirc.settings.result.");
+    });
+}
+
+bool noSettingsFound(Node &node) {
+    return find<Label>(node,
+                       [](const Label &caption) { return caption.text() == "No settings found"; });
+}
+
 InputArea::KeyData stroke(std::uint32_t sym, std::uint32_t modifiers = 0) {
     InputArea::KeyData key{};
     key.sym = sym;
     key.modifiers = modifiers;
     key.pressed = true;
     return key;
+}
+
+void dialogKey(blast::Dialogs &dialogs, InputDispatcher &dispatcher, std::uint32_t sym,
+               std::uint32_t modifiers = 0) {
+    if (!dialogs.handleKey(stroke(sym, modifiers)))
+        dispatcher.keyEvent(sym, 0, modifiers, true);
+    dispatcher.keyEvent(sym, 0, modifiers, false);
 }
 
 void press(InputDispatcher &dispatcher, Button &control) {
@@ -436,17 +462,22 @@ void dataStorageControls() {
     auto *query = named<Input>(dialogs, "Search settings");
     const auto search = [&](const std::string &queryText) {
         edit(dispatcher, *query, queryText);
-        dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+        dialogKey(dialogs, dispatcher, XKB_KEY_Return);
         frame();
+        assert(query->value().empty());
     };
     search("Retention days");
     auto *retention = named<Input>(dialogs, "Retention days (1–3650)");
     edit(dispatcher, *retention, "invalid");
     assert(retention->invalid());
     search("Clear server logs");
+    assert(dialogs.settingsOpen() && model.actions.empty() &&
+           dispatcher.focusedArea() == button(dialogs, "Clear server logs…")->inputArea());
     press(dispatcher, *button(dialogs, "Clear server logs…"));
     assert(dispatcher.focusedArea() == button(dialogs, "Cancel")->inputArea());
-    press(dispatcher, *button(dialogs, "Cancel"));
+    dialogKey(dialogs, dispatcher, XKB_KEY_f, KeyMod::Ctrl);
+    assert(dispatcher.focusedArea() == button(dialogs, "Cancel")->inputArea());
+    dialogKey(dialogs, dispatcher, XKB_KEY_Escape);
     assert(model.actions.empty() && dialogs.settingsOpen());
 
     dialogs.open("settings-data");
@@ -521,6 +552,8 @@ void dataStorageControls() {
     frame();
     query = named<Input>(dialogs, "Search settings");
     search("Reset BlastIRC");
+    assert(dialogs.settingsOpen() &&
+           dispatcher.focusedArea() == button(dialogs, "Reset BlastIRC…")->inputArea());
     press(dispatcher, *button(dialogs, "Reset BlastIRC…"));
     assert(dispatcher.focusedArea() == button(dialogs, "Cancel")->inputArea());
     assert(find<Label>(dialogs, [](const Label &l) {
@@ -591,10 +624,31 @@ void settingsTreeControls() {
         {"identities.saved", "identities.profile"},
         {"data.local", "data.reset"},
     }};
+    const auto click = [&](Button &choice) {
+        float x, y;
+        auto *area = choice.inputArea();
+        Node::mapToScene(area, area->width() / 2, area->height() / 2, x, y);
+        dispatcher.pointerEnter(x, y, 1);
+        assert(dispatcher.pointerButton(x, y, BTN_LEFT, true, 2, 20, false));
+        assert(dispatcher.pointerButton(x, y, BTN_LEFT, false, 3, 30, false));
+        dispatcher.pointerLeave();
+        frame();
+    };
+    const auto chatFirst = [](const InputArea &area) {
+        return area.tabFocusKey() == "blastirc.settings.section.chat.uploads";
+    };
+    assert(!find<InputArea>(dialogs, chatFirst));
+    click(*dynamic_cast<Button *>(keyed(dialogs, "blastirc.settings.category.2")->parent()));
+    assert(find<InputArea>(dialogs, chatFirst) && dispatcher.focusedArea() == nav &&
+           picker->selectedText() == "Chat");
+    std::array<std::size_t, leaves.size()> rootIndices{};
+    for (std::size_t i = 1; i < rootIndices.size(); ++i)
+        rootIndices[i] = rootIndices[i - 1] + 1 + leaves[i - 1].size();
     for (std::size_t category = 0; category < leaves.size(); ++category) {
-        picker->setSelectedIndex(category);
+        picker->setSelectedIndex(rootIndices[category]);
         frame();
         if (category == 1) {
+            assert(picker->selectedText() == "Keyboard shortcuts");
             for (const auto &[name, chord] : defaultBindings()) {
                 const auto *field = dynamic_cast<Input *>(
                     keyed(dialogs, "blastirc.settings.binding." + name)->textInputClient());
@@ -618,7 +672,8 @@ void settingsTreeControls() {
             return area.tabFocusKey() == "blastirc.settings.section." + leaves[category].front();
         }));
         key(XKB_KEY_Right);
-        for (const auto &id : leaves[category]) {
+        for (std::size_t i = 0; i < leaves[category].size(); ++i) {
+            const auto &id = leaves[category][i];
             auto *area = keyed(dialogs, "blastirc.settings.section." + id);
             auto *choice = dynamic_cast<Button *>(area->parent());
             assert(choice);
@@ -629,7 +684,8 @@ void settingsTreeControls() {
                 keyed(dialogs, "blastirc.settings.category." + std::to_string(category))->parent());
             assert(root && root->foregroundColor() == ::palette.onSurface);
             const auto compactSelection = picker->selectedIndex();
-            assert(compactSelection >= leaves.size() && dispatcher.focusedArea() == nav);
+            assert(compactSelection == rootIndices[category] + i + 1 &&
+                   dispatcher.focusedArea() == nav);
             frame(true);
             assert(picker->selectedIndex() == compactSelection &&
                    dispatcher.focusedArea() == pickerArea);
@@ -663,29 +719,29 @@ void settingsTreeControls() {
                 assert(field->value().empty() && model.settings.bindings.at("/join").empty());
             }
             key(XKB_KEY_Left);
-            assert(picker->selectedIndex() == category);
+            assert(picker->selectedIndex() == rootIndices[category]);
         }
     }
     // Keyboard movement follows only visible entries and keeps the roving host as one Tab stop.
     key(XKB_KEY_Home);
     key(XKB_KEY_Left);
     key(XKB_KEY_n, KeyMod::Ctrl);
-    assert(picker->selectedIndex() == 1);
+    assert(picker->selectedIndex() == rootIndices[1]);
     key(XKB_KEY_p, KeyMod::Ctrl);
     assert(picker->selectedIndex() == 0);
     key(XKB_KEY_n, KeyMod::Ctrl);
     key(XKB_KEY_Right);
     key(XKB_KEY_Right);
-    assert(picker->selectedIndex() >= leaves.size());
+    assert(picker->selectedIndex() == rootIndices[1] + 1);
     key(XKB_KEY_Left);
-    assert(picker->selectedIndex() == 1);
+    assert(picker->selectedIndex() == rootIndices[1]);
     key(XKB_KEY_Return);
     key(XKB_KEY_End);
     assert(dynamic_cast<Button *>(keyed(dialogs, "blastirc.settings.section.data.reset")->parent())
                ->foregroundColor() == ::palette.onPrimary);
 
     // Conditional controls retain their leaf and refresh the search index after rebuilds.
-    picker->setSelectedIndex(2);
+    picker->setSelectedIndex(rootIndices[2]);
     frame();
     key(XKB_KEY_Right);
     press(dispatcher, *dynamic_cast<Button *>(
@@ -698,22 +754,22 @@ void settingsTreeControls() {
             ->foregroundColor() == ::palette.onPrimary);
     auto *conditionalQuery = named<Input>(dialogs, "Search settings");
     edit(dispatcher, *conditionalQuery, "Custom HTTPS endpoint");
-    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    dialogKey(dialogs, dispatcher, XKB_KEY_Return);
     frame();
-    assert(named<Input>(dialogs, "Custom HTTPS endpoint") &&
-           dispatcher.focusedArea() == conditionalQuery->inputArea());
+    assert(dispatcher.focusedArea() == named<Input>(dialogs, "Custom HTTPS endpoint")->inputArea());
     named<Select>(dialogs, "Default file host")
         ->setSelectedIndex(std::size_t(UploadProvider::Litterbox));
     frame();
     edit(dispatcher, *conditionalQuery, "Custom HTTPS endpoint");
-    named<Select>(dialogs, "Matching settings")->setSelectedIndex(0);
-    assert(named<Select>(dialogs, "Matching settings")->selectedText().empty());
+    assert(noSettingsFound(dialogs) && !hasSettingResults(dialogs));
+    dialogKey(dialogs, dispatcher, XKB_KEY_Escape);
+    assert(dialogs.settingsOpen() && conditionalQuery->value().empty());
     named<Select>(dialogs, "Default file host")
         ->setSelectedIndex(std::size_t(UploadProvider::Soju));
     frame();
 
     // Managed children remove direct-network leaves; selection falls back to their root.
-    picker->setSelectedIndex(5);
+    picker->setSelectedIndex(rootIndices[5]);
     frame();
     auto *serverAddress = named<Input>(dialogs, "Server address");
     edit(dispatcher, *serverAddress, "corrected.example");
@@ -736,7 +792,8 @@ void settingsTreeControls() {
                           keyed(dialogs, "blastirc.settings.section.networks.endpoint")->parent()));
     networks->setSelectedIndex(model.servers.size() - 1);
     frame();
-    assert(picker->selectedIndex() == 5 && named<Toggle>(dialogs, "Attach this network locally"));
+    assert(picker->selectedIndex() == rootIndices[5] &&
+           named<Toggle>(dialogs, "Attach this network locally"));
     assert(!find<InputArea>(dialogs, [](const InputArea &area) {
         return area.tabFocusKey() == "blastirc.settings.section.networks.endpoint";
     }));
@@ -760,7 +817,7 @@ void settingsTreeControls() {
         named<Select>(dialogs, "Nick palette")->setSelectedIndex(i);
         assert(model.settings.nickPalette == paletteIds[i]);
     }
-    picker->setSelectedIndex(4);
+    picker->setSelectedIndex(rootIndices[4]);
     frame();
     constexpr std::array pitchIds{"natural", "musical", "fixed"};
     for (std::size_t i = 0; i < pitchIds.size(); ++i) {
@@ -771,25 +828,37 @@ void settingsTreeControls() {
     frame();
     auto *themeScale = named<Slider>(dialogs, "Interface scale");
     auto *query = named<Input>(dialogs, "Search settings");
-    edit(dispatcher, *query, "UI font family");
-    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
-    frame();
-    assert(dispatcher.focusedArea() == query->inputArea());
-    assert(named<Input>(dialogs, "UI font family"));
+    const auto search = [&](const std::string &text) {
+        edit(dispatcher, *query, text);
+        frame();
+        assert(dispatcher.focusedArea() == query->inputArea());
+    };
+    search("UI font family");
+    auto *result = settingResult(dialogs, 0);
+    assert(result->label()->text().starts_with("UI font family · Appearance"));
+    click(*result);
+    assert(query->value().empty() && !hasSettingResults(dialogs) &&
+           dispatcher.focusedArea() == named<Input>(dialogs, "UI font family")->inputArea());
     assert(!find<Slider>(dialogs, [&](const Slider &control) { return &control == themeScale; }));
-    auto *results = named<Select>(dialogs, "Matching settings");
-    auto *resultsGroup = results->parent();
-    assert(resultsGroup->visible() && resultsGroup->participatesInLayout() &&
-           dispatcher.firstTabFocusUnder(resultsGroup));
-    edit(dispatcher, *query, "");
+
+    search("fonts");
+    assert(settingResult(dialogs, 0)->label()->text().starts_with("Fonts · Appearance"));
+    dialogKey(dialogs, dispatcher, XKB_KEY_Return);
     frame();
-    assert(!resultsGroup->visible() && !resultsGroup->participatesInLayout() &&
-           !dispatcher.firstTabFocusUnder(resultsGroup));
-    edit(dispatcher, *query, "retention");
-    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    assert(query->value().empty() && dispatcher.focusedArea() == nav);
+
+    frame(true);
+    edit(dispatcher, *query, "keyboard shortcuts");
+    frame(true);
+    dialogKey(dialogs, dispatcher, XKB_KEY_Return);
+    frame(true);
+    assert(query->value().empty() && dispatcher.focusedArea() == pickerArea &&
+           picker->selectedText() == "Keyboard shortcuts");
     frame();
-    assert(resultsGroup->visible() && resultsGroup->participatesInLayout() &&
-           dispatcher.firstTabFocusUnder(resultsGroup));
+
+    search("retention");
+    dialogKey(dialogs, dispatcher, XKB_KEY_Return);
+    frame();
     auto *retention = named<Input>(dialogs, "Retention days (1–3650)");
     const auto lastValid = model.settings.retentionDays;
     edit(dispatcher, *retention, "not-a-number");
@@ -797,11 +866,10 @@ void settingsTreeControls() {
     frame();
     model.actions.clear();
     press(dispatcher, *button(dialogs, "Save now"));
-    assert(model.actions.empty() && retention->invalid() &&
-           model.settings.retentionDays == lastValid);
-    edit(dispatcher, *query, "retention");
-    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
     frame();
+    assert(model.actions.empty() && retention->invalid() &&
+           model.settings.retentionDays == lastValid &&
+           dispatcher.focusedArea() == retention->inputArea());
     assert(named<Input>(dialogs, "Retention days (1–3650)") == retention &&
            retention->value() == "not-a-number");
     edit(dispatcher, *retention, "42");
@@ -1053,9 +1121,8 @@ void bindingGeometryControls() {
             dialogs.setInputDispatcher(dispatcher);
             dialogs.open("settings");
             dialogs.sync(720 * scale, 480 * scale, scale);
-            auto *category = find<Select>(dialogs, [](const Select &) { return true; });
-            assert(category);
-            category->setSelectedIndex(1);
+            edit(dispatcher, *named<Input>(dialogs, "Search settings"), "Keyboard shortcuts");
+            dialogKey(dialogs, dispatcher, XKB_KEY_Return);
             const auto frame = [&](float width) {
                 dialogs.sync(width, 1000 * scale, scale);
                 dialogs.layout(renderer);
@@ -1173,12 +1240,13 @@ void bindingSearchRevealGeometry() {
             assert(left >= clipLeft - tolerance && top >= clipTop - tolerance);
             assert(right <= clipRight + tolerance && bottom <= clipBottom + tolerance);
         }
-        assert(dispatcher.focusedArea() == query->inputArea());
+        assert(dispatcher.focusedArea() == target);
     };
     const auto search = [&](std::string_view command, float width) {
         edit(dispatcher, *query, std::string(commandDisplayName(command)));
-        dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+        dialogKey(dialogs, dispatcher, XKB_KEY_Return);
         frame(width);
+        assert(query->value().empty());
         visibleTarget(command); // First completed layout, not a retry or settled frame.
         frame(width);
         visibleTarget(command);
@@ -1602,59 +1670,130 @@ void runSettingsCheck() {
     dialogs.open("settings");
     const auto sync = [&] { dialogs.sync(720, 480, 2); };
     sync();
-    const auto category = [&](std::size_t index) {
-        auto *picker = find<Select>(dialogs, [](const Select &) { return true; });
-        assert(picker);
-        assert(dispatcher.firstTabFocusUnder(picker));
-        picker->setSelectedIndex(index);
+    auto *settingsQuery = named<Input>(dialogs, "Search settings");
+    assert(dispatcher.focusedArea() == settingsQuery->inputArea());
+    const auto search = [&](const std::string &text) {
+        edit(dispatcher, *named<Input>(dialogs, "Search settings"), text);
         sync();
-        assert(dialogs.settingsOpen());
-        assert(dispatcher.firstTabFocusUnder(&dialogs));
+    };
+    const auto openResult = [&] {
+        dialogKey(dialogs, dispatcher, XKB_KEY_Return);
+        sync();
+        assert(named<Input>(dialogs, "Search settings")->value().empty() &&
+               !hasSettingResults(dialogs));
+    };
+    const auto category = [&](std::string_view title) {
+        search(std::string(title));
+        openResult();
+        auto *pickerArea = keyed(dialogs, "blastirc.settings.location");
+        auto *picker = dynamic_cast<Select *>(pickerArea->parent());
+        assert(dialogs.settingsOpen() && dispatcher.focusedArea() == pickerArea && picker &&
+               picker->selectedText() == title);
         sliderInput(dialogs, dispatcher);
     };
-    // Search discovers unvisited categories without rebuilding invalid edits or losing focus.
-    auto *settingsQuery = named<Input>(dialogs, "Search settings");
-    edit(dispatcher, *settingsQuery, "Retention days");
-    auto *results = named<Select>(dialogs, "Matching settings");
-    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
-    sync();
+    // Search discovers unvisited categories without rebuilding invalid edits.
+    search("Retention days");
+    openResult();
     auto *retention = named<Input>(dialogs, "Retention days (1–3650)");
-    assert(dispatcher.focusedArea() == settingsQuery->inputArea());
+    assert(dispatcher.focusedArea() == retention->inputArea());
     edit(dispatcher, *retention, "invalid-retention");
     assert(retention->invalid());
-    edit(dispatcher, *settingsQuery, "UI font family");
-    results->setSelectedIndex(0);
-    sync();
-    assert(named<Input>(dialogs, "UI font family"));
-    for (const char *name : {"UI font weight", "Message font weight"}) {
-        edit(dispatcher, *settingsQuery, name);
-        auto *matches = named<Select>(dialogs, "Matching settings");
-        matches->setSelectedIndex(0);
-        assert(matches->selectedText().find(name) != std::string::npos);
-        dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
-        sync();
-        assert(named<Select>(dialogs, name));
+    for (const std::string name : {"UI font weight", "Message font weight"}) {
+        search(name);
+        assert(settingResult(dialogs, 0)->label()->text().starts_with(name + " · "));
+        openResult();
+        assert(dispatcher.focusedArea() ==
+               dispatcher.firstTabFocusUnder(named<Select>(dialogs, name)));
     }
-    edit(dispatcher, *settingsQuery, "msg txt scl");
-    named<Select>(dialogs, "Matching settings")->setSelectedIndex(0);
-    assert(named<Select>(dialogs, "Matching settings")->selectedText().find("Message text scale") !=
-           std::string::npos);
-    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
-    sync();
-    assert(named<Slider>(dialogs, "Message text scale"));
-    edit(dispatcher, *settingsQuery, "Retention days");
-    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
-    sync();
+    search("font");
+    assert(settingResult(dialogs, 0)->label()->text() == "Fonts · Appearance");
+    assert(!find<Button>(dialogs, [](const Button &result) {
+        return result.label() && result.label()->text().starts_with("/halfop · ");
+    }));
+    for (const auto &[text, caption] :
+         {std::pair{"msg txt scl", "Message text scale"},
+          std::pair{"  SCALE   appearance TEXT  ", "Message text scale"},
+          std::pair{"zoom", "Interface scale"}}) {
+        search(text);
+        assert(
+            settingResult(dialogs, 0)->label()->text().starts_with(std::string(caption) + " · "));
+        openResult();
+        assert(dispatcher.focusedArea() ==
+               dispatcher.firstTabFocusUnder(named<Slider>(dialogs, caption)));
+    }
+    search("ignore");
+    assert(settingResult(dialogs, 0)->label()->text() == "Fools · Chat / Friends & fools");
+    openResult();
+    assert(dispatcher.focusedArea() == named<Input>(dialogs, "Fools")->inputArea());
+    search("fools");
+    assert(settingResult(dialogs, 0)->label()->text() == "Fools · Chat / Friends & fools");
+    assert(find<Button>(dialogs, [](const Button &candidate) {
+        return candidate.label()->text() == "Friends & fools · Chat";
+    }));
+    assert(find<Button>(dialogs, [](const Button &candidate) {
+        return candidate.label()->text() == "Fool messages · Chat / Friends & fools";
+    }));
+    openResult();
+
+    // Stepping keeps the editor focused. Test both directions by opening the highlighted row.
+    for (const auto &[forward, backward, modifiers] :
+         {std::tuple{XKB_KEY_Down, XKB_KEY_Up, 0u},
+          std::tuple{XKB_KEY_n, XKB_KEY_p, std::uint32_t(KeyMod::Ctrl)}}) {
+        for (const bool back : {false, true}) {
+            search("scale");
+            const std::string_view first = settingResult(dialogs, 0)->label()->text();
+            const std::string_view second = settingResult(dialogs, 1)->label()->text();
+            assert((first.starts_with("Interface scale · ") &&
+                    second.starts_with("Message text scale · ")) ||
+                   (second.starts_with("Interface scale · ") &&
+                    first.starts_with("Message text scale · ")));
+            const auto choice = back ? first : second;
+            const std::string target(choice.substr(0, choice.find(" · ")));
+            dialogKey(dialogs, dispatcher, forward, modifiers);
+            if (back)
+                dialogKey(dialogs, dispatcher, backward, modifiers);
+            assert(dispatcher.focusedArea() == settingsQuery->inputArea() &&
+                   settingsQuery->value() == "scale");
+            openResult();
+            assert(dispatcher.focusedArea() ==
+                   dispatcher.firstTabFocusUnder(named<Slider>(dialogs, target)));
+        }
+    }
+    search("Retention days");
+    openResult();
     assert(named<Input>(dialogs, "Retention days (1–3650)") == retention &&
            retention->value() == "invalid-retention" && retention->invalid());
     edit(dispatcher, *retention, std::to_string(model.settings.retentionDays));
-    edit(dispatcher, *settingsQuery, "identity-secret");
-    assert(named<Select>(dialogs, "Matching settings")->selectedText().empty());
+    for (const std::string_view verb : {"Record", "Reset"}) {
+        search(std::string(verb));
+        assert(!find<Button>(dialogs, [&](const Button &candidate) {
+            const auto caption = candidate.label()->text();
+            return candidate.inputArea()->tabFocusKey().starts_with("blastirc.settings.result.") &&
+                   caption.starts_with(std::string(verb) + " · ");
+        }));
+    }
     edit(dispatcher, *settingsQuery, "");
+    dispatcher.setFocus(retention->inputArea());
+    dialogKey(dialogs, dispatcher, XKB_KEY_f, KeyMod::Ctrl);
+    assert(dispatcher.focusedArea() == settingsQuery->inputArea());
+    search("identity-secret");
+    assert(noSettingsFound(dialogs) && !hasSettingResults(dialogs));
+    dialogKey(dialogs, dispatcher, XKB_KEY_Return);
+    assert(dialogs.settingsOpen() && settingsQuery->value() == "identity-secret");
+    dialogKey(dialogs, dispatcher, XKB_KEY_g, KeyMod::Ctrl);
+    assert(dialogs.settingsOpen() && settingsQuery->value().empty() && !noSettingsFound(dialogs) &&
+           !hasSettingResults(dialogs));
+    search("   ");
+    assert(!hasSettingResults(dialogs) && !noSettingsFound(dialogs));
+    edit(dispatcher, *settingsQuery, "");
+    dialogKey(dialogs, dispatcher, XKB_KEY_Escape);
+    assert(!dialogs.active());
+    dialogs.open("settings");
+    sync();
 
-    // All seven pages use their production value callbacks. Compact pixel layout
+    // All pages use their production value callbacks. Compact pixel layout
     // and clipping are checked by the real Wayland workflow, not a fake renderer.
-    category(0);
+    category("Appearance");
     spellingControls(model, dialogs, dispatcher);
     predictionControls(model, dialogs, dispatcher);
     model.settings.spellcheckLanguage = "unavailable_dictionary_for_settings_check";
@@ -1705,12 +1844,6 @@ void runSettingsCheck() {
     }
     assert(model.settings.foolDisplay == FoolDisplay::Minimized && !model.settings.foolUnread &&
            model.settings.messageWrapColumns == 80);
-    for (int style = 0; style < 4; ++style) {
-        named<Select>(dialogs, "Fool messages")->setSelectedIndex(style);
-        assert(model.settings.foolDisplay == FoolDisplay(style));
-    }
-    activate(dispatcher, *named<Toggle>(dialogs, "Count fool messages as unread"));
-    assert(model.settings.foolUnread);
     for (int columns : {0, 80, 1000}) {
         named<Slider>(dialogs, "Message wrap columns (0 = unlimited)")->setValue(columns);
         assert(model.settings.messageWrapColumns == columns);
@@ -1879,10 +2012,16 @@ void runSettingsCheck() {
     assert(named<Select>(dialogs, "Channel message layout")->selectedText() == layoutNames[0] &&
            named<Select>(dialogs, "Direct message layout")->selectedText() == layoutNames[2]);
 
-    category(1);
+    category("Keyboard shortcuts");
     auto *record = keyed(dialogs, "blastirc.settings.record.complete");
     dispatcher.setFocus(record);
     assert(dispatcher.focusedArea() == record);
+    dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
+    assert(record->capturesAllKeys());
+    dialogKey(dialogs, dispatcher, XKB_KEY_f, KeyMod::Ctrl);
+    assert(record->capturesAllKeys() && dispatcher.focusedArea() == record);
+    dialogKey(dialogs, dispatcher, XKB_KEY_g, KeyMod::Ctrl);
+    assert(!record->capturesAllKeys());
     dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
     assert(record->capturesAllKeys());
     const auto tab = stroke(XKB_KEY_Tab), escape = stroke(XKB_KEY_Escape);
@@ -1983,8 +2122,14 @@ void runSettingsCheck() {
            bindingField->value() == defaultBindings().at("complete") &&
            spellingField->value() == "C-;" && !rejectedBinding("complete"));
 
-    category(2);
-    named<Select>(dialogs, "Presence rows")->setSelectedIndex(2);
+    category("Chat");
+    named<Select>(dialogs, "Join, quit & nickname changes")->setSelectedIndex(2);
+    for (int style = 0; style < 4; ++style) {
+        named<Select>(dialogs, "Fool messages")->setSelectedIndex(style);
+        assert(model.settings.foolDisplay == FoolDisplay(style));
+    }
+    activate(dispatcher, *named<Toggle>(dialogs, "Count fool messages as unread"));
+    assert(model.settings.foolUnread);
     activate(dispatcher, *named<Toggle>(dialogs, "Send typing indicators"));
     assert(model.settings.presence == PresenceMode::Hidden && !model.settings.typingSend);
     named<Select>(dialogs, "Default file host")
@@ -2030,7 +2175,7 @@ void runSettingsCheck() {
     edit(dispatcher, *uploadEndpoint, "https://different.example/b");
     edit(dispatcher, *named<Input>(dialogs, "Custom upload password"), "saved-upload-secret");
 
-    category(3);
+    category("Effects");
     auto *movement = named<Select>(dialogs, "Sending movement");
     auto *reveal = named<Select>(dialogs, "Sending reveal");
     auto *incomingMovement = named<Select>(dialogs, "Incoming movement");
@@ -2078,16 +2223,16 @@ void runSettingsCheck() {
     }));
     sliderInput(dialogs, dispatcher);
     activate(dispatcher, *named<Toggle>(dialogs, "Reduced motion"));
-    category(0);
+    category("Appearance");
     expectCursorStatus("Effective: cursor blink and trail suppressed by Reduced motion.");
     assert(named<Select>(dialogs, "Trail style")->selectedText() == "Pixiedust");
     assert(named<Slider>(dialogs, "Smooth blink fade (ms)")->value() == 625);
-    category(3);
+    category("Effects");
     named<Select>(dialogs, "Effects")->setSelectedIndex(0);
     assert(model.settings.fx == FxLevel::Off);
-    category(0);
+    category("Appearance");
     expectCursorStatus("Effective: cursor blink and trail suppressed by Effects Off.");
-    category(3);
+    category("Effects");
     named<Slider>(dialogs, "Gravity")->setValue(150);
     named<Slider>(dialogs, "Particle drag")->setValue(2);
     named<Slider>(dialogs, "Overlay shake")->setValue(.5);
@@ -2104,15 +2249,21 @@ void runSettingsCheck() {
            model.settings.cursorTrail && model.settings.cursorTrailStyle == "pixiedust" &&
            model.settings.cursorShape == "box" && model.settings.cursorSmoothBlinkMs == 625);
 
-    category(4);
+    category("Sounds");
     activate(dispatcher, *named<Toggle>(dialogs, "Sound enabled"));
     named<Slider>(dialogs, "Master volume")->setValue(.7);
-    activate(dispatcher, *named<Toggle>(dialogs, "mention"));
+    search("Mention volume");
+    assert(settingResult(dialogs, 0)->label()->text().starts_with("Mention volume · "));
+    search("Mention sounds");
+    assert(settingResult(dialogs, 0)->label()->text().starts_with("Mention sounds · "));
+    openResult();
+    assert(model.settings.cues.at("mention").enabled);
+    dialogKey(dialogs, dispatcher, XKB_KEY_Return);
     sync();
     assert(!model.settings.sound && !model.settings.cues.at("mention").enabled);
     assert(std::abs(model.settings.masterVolume - .7f) < .001f);
 
-    category(5);
+    category("Networks");
     assert(!find<Input>(dialogs, [&](const Input &field) {
         return field.value() == model.identities[0].password;
     }));
@@ -2163,7 +2314,7 @@ void runSettingsCheck() {
     assert(model.servers[0].identity == "shared-renamed" &&
            model.servers[1].identity == "shared-renamed");
     assert(model.identities[1].password == "other-secret");
-    category(6);
+    category("Identities");
     named<Select>(dialogs, "Profile")->setSelectedIndex(1);
     sync();
     edit(dispatcher, *named<Input>(dialogs, "Nickname"), "OnlyOtherNick");
@@ -2294,6 +2445,13 @@ void runSettingsCheck() {
            !named<Input>(dialogs, "Account password")->enabled() &&
            named<Input>(dialogs, "Control connection PASS (management only)")->value() ==
                account.password);
+    auto *accountSearch = named<Input>(dialogs, "Search settings");
+    const auto controlPassResult = [](const Button &result) {
+        return result.label()->text().starts_with("Control connection PASS (management only) · ");
+    };
+    edit(dispatcher, *accountSearch, "control connection pass");
+    assert(find<Button>(dialogs, controlPassResult));
+    dialogKey(dialogs, dispatcher, XKB_KEY_Escape);
     named<Select>(dialogs, "Authentication method")->setSelectedIndex(0);
     assert(model.servers[accountIndex].sasl == "PLAIN" &&
            named<Input>(dialogs, "Account password")->enabled());
@@ -2301,6 +2459,9 @@ void runSettingsCheck() {
         return label.text() == "Server password (this network only)" ||
                label.text() == "Control connection PASS (management only)";
     }));
+    edit(dispatcher, *accountSearch, "control connection pass");
+    assert(!find<Button>(dialogs, controlPassResult));
+    dialogKey(dialogs, dispatcher, XKB_KEY_Escape);
     edit(dispatcher, *named<Input>(dialogs, "Account username"), "native-account-user");
     edit(dispatcher, *named<Input>(dialogs, "Account password"), "native-account-secret");
     assert(model.identities.front().username == "native-account-user" &&

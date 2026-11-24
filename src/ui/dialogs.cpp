@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cstdio>
 #include <ctime>
@@ -50,6 +51,72 @@ std::vector<std::string> words(std::string text) {
     for (std::string word; stream >> word;)
         result.push_back(std::move(word));
     return result;
+}
+
+std::string settingsSearchKey(std::string_view text) {
+    std::string key;
+    key.reserve(text.size());
+    bool space = false;
+    for (unsigned char ch : text) {
+        if (std::isspace(ch)) {
+            space = !key.empty();
+        } else {
+            if (space)
+                key += ' ';
+            key += static_cast<char>(std::tolower(ch));
+            space = false;
+        }
+    }
+    return key;
+}
+
+int settingsTermScore(std::string_view token, std::string_view text, bool fuzzy) {
+    if (token == text)
+        return 64;
+    const auto pos = text.find(token);
+    if (pos != text.npos) {
+        for (auto start = pos; start != text.npos; start = text.find(token, start + 1))
+            if (start == 0 || !ui_logic::word(text[start - 1]))
+                return 48;
+        return 32;
+    }
+    if (!fuzzy || token.size() < 3)
+        return 0;
+    int best = 0;
+    for (std::size_t i = 0; i < text.size();) {
+        if (!ui_logic::word(text[i])) {
+            ++i;
+            continue;
+        }
+        const auto start = i++;
+        while (i < text.size() && ui_logic::word(text[i]))
+            ++i;
+        if (i - start >= token.size())
+            best = std::max(best, ui_logic::fuzzy(token, text.substr(start, i - start)));
+    }
+    return best > 0 ? std::clamp(best / 8, 1, 16) : 0;
+}
+
+std::string_view settingsAliases(std::string_view name) {
+    static constexpr std::pair<std::string_view, std::string_view> aliases[] = {
+        {"Interface scale", "zoom ui size"},
+        {"Message text scale", "zoom font size"},
+        {"Keyboard shortcuts", "keybinds keybindings hotkeys"},
+        {"Spelling & prediction", "spellcheck dictionary"},
+        {"Predict words", "autocomplete suggestions"},
+        {"Fools", "ignore block mute"},
+        {"Direct message layout", "dm query private bubbles"},
+        {"Channel message layout", "two-line bubbles"},
+        {"Reduced motion", "animation accessibility"},
+        {"Join, quit & nickname changes", "presence rows leave part events"},
+        {"Smooth blink fade (ms)", "cursor blink speed"},
+        {"Retention days (1–3650)", "scrollback keep messages"},
+        {"Reset BlastIRC…", "factory reset erase all data"},
+    };
+    for (const auto &[label, terms] : aliases)
+        if (name == label)
+            return terms;
+    return {};
 }
 
 template <class Range> std::string joined(const Range &values) {
@@ -223,9 +290,9 @@ void refreshFonts(Node &node) {
 
 struct Dialogs::Impl {
     enum class Tab { Appearance, Keys, Chat, Fx, Sounds, Servers, Identities, Data };
-    static constexpr const char *tabNames[] = {"Appearance", "Keyboard",      "Chat",
-                                               "Effects",    "Sounds",        "Networks",
-                                               "Identities", "Data & Storage"};
+    static constexpr const char *tabNames[] = {
+        "Appearance", "Keyboard shortcuts", "Chat",       "Effects",
+        "Sounds",     "Networks",           "Identities", "Data & Storage"};
     enum class MetricKind {
         Flex,
         Section,
@@ -262,8 +329,13 @@ struct Dialogs::Impl {
     RovingListNavHost *categoryNavigation = nullptr;
     ScrollView *navigation = nullptr;
     Input *settingsSearch = nullptr;
-    Select *settingsResults = nullptr;
-    std::string settingsQuery, currentSection;
+    ScrollView *settingsResults = nullptr;
+    Label *resultsHeading = nullptr, *resultsHint = nullptr;
+    std::vector<Button *> resultRows;
+    std::vector<std::pair<int, std::size_t>> rankedTargets;
+    std::size_t selectedResult = 0;
+    bool indexingSettings = false, searchingSettings = false;
+    std::string currentSection;
     std::string statusSnapshot;
     std::string currentSectionId, selectedSection;
     struct SettingsSection {
@@ -282,12 +354,11 @@ struct Dialogs::Impl {
     std::array<bool, std::size(tabNames)> expanded{true};
     struct SearchTarget {
         Tab category;
-        std::string caption, terms;
-        std::string section;
+        std::string label, key, pathKey, aliases, section, caption;
         Node *node;
     };
     std::vector<SearchTarget> searchTargets;
-    std::vector<std::size_t> rankedTargets;
+    static constexpr std::size_t visibleSettingsResults = 20;
     std::array<Flex *, std::size(tabNames)> categoryPages{};
     struct BindingControls {
         Input *field;
@@ -297,7 +368,7 @@ struct Dialogs::Impl {
     Label *bindingConflicts = nullptr;
     std::map<std::string, std::string> lastConflictBindings;
     Select *categoryPicker = nullptr;
-    Label *detailTitle = nullptr;
+    Label *detailTitle = nullptr, *settingsScope = nullptr;
     Label *topicTitle = nullptr;
     struct ProfileCard {
         Flex *body = nullptr;
@@ -555,7 +626,11 @@ struct Dialogs::Impl {
                 auto *control = static_cast<Button *>(metric.node);
                 control->setFontSize(metric.font * zoom);
                 control->setRadius(corners);
-                control->setControlHeight(std::max(32.f, Style::controlHeight * zoom));
+                const bool listRow =
+                    control->parent() == categoryNavigation ||
+                    (settingsResults && control->parent() == settingsResults->content());
+                const float height = listRow ? Style::controlHeightSm : Style::controlHeight;
+                control->setControlHeight(std::max(32.f, height * zoom));
                 break;
             }
             case MetricKind::Input:
@@ -594,6 +669,8 @@ struct Dialogs::Impl {
             }
             case MetricKind::Scroll: {
                 auto *control = static_cast<ScrollView *>(metric.node);
+                if (control == navigation)
+                    control->setSize(288.f * zoom, 0.f);
                 control->setContentScale(zoom);
                 control->setRadius(corners);
                 break;
@@ -668,58 +745,198 @@ struct Dialogs::Impl {
         return ptr;
     }
 
+    void addSettingsTarget(Tab category, std::string_view name, std::string_view sectionId,
+                           std::string_view sectionTitle, Node *node) {
+        const std::string_view categoryName = tabNames[std::size_t(category)];
+        auto path = std::string(categoryName);
+        if (!sectionTitle.empty())
+            path += " / " + std::string(sectionTitle);
+        auto caption = std::string(name);
+        if (node != categoryPages[std::size_t(category)])
+            caption += " · " + (name == sectionTitle ? std::string(categoryName) : path);
+        searchTargets.push_back({category, std::string(name), settingsSearchKey(name),
+                                 settingsSearchKey(path), std::string(settingsAliases(name)),
+                                 std::string(sectionId), std::move(caption), node});
+    }
+
     void indexSetting(std::string_view name, Node *node, Node *parent = nullptr) {
-        if (mode != "settings" || !page)
+        if (!indexingSettings || name == "Record" || name == "Reset")
             return;
-        const std::string category = tabNames[std::size_t(tab)];
-        auto sectionId = currentSectionId;
-        auto sectionTitle = currentSection;
+        if (parent == page) {
+            addSettingsTarget(tab, name, "", "", node);
+            return;
+        }
         for (auto *ancestor = parent; ancestor; ancestor = ancestor->parent())
             for (const auto &section : sections)
                 if (section.node == ancestor) {
-                    sectionId = section.id;
-                    sectionTitle = section.title;
-                    break;
+                    addSettingsTarget(tab, name, section.id, section.title, node);
+                    return;
                 }
-        searchTargets.push_back({tab, category + " · " + sectionTitle + " · " + std::string(name),
-                                 std::string(name) + " " + sectionTitle + " " + category, sectionId,
-                                 node});
+        addSettingsTarget(tab, name, currentSectionId, currentSection, node);
+    }
+
+    void revealSetting(Tab category, std::string_view section, Node *node) {
+        if (section.empty())
+            expanded[std::size_t(category)] = true;
+        chooseLocation(category, std::string(section));
+        if (dispatcher) {
+            const bool isPage = node == categoryPages[std::size_t(tab)] ||
+                                std::ranges::any_of(sections, [node](const auto &section) {
+                                    return section.node == node;
+                                });
+            auto *focus = isPage ? nullptr : dispatcher->firstTabFocusUnder(node);
+            if (!focus)
+                focus = navigation->visible() ? categoryNavigation->focusArea()
+                                              : dispatcher->firstTabFocusUnder(categoryPicker);
+            dispatcher->setFocus(focus);
+        }
+        auto *row = node;
+        if (dynamic_cast<Input *>(row) || dynamic_cast<Toggle *>(row) ||
+            dynamic_cast<Slider *>(row) || dynamic_cast<Select *>(row))
+            row = row->parent();
+        scroll->requestScrollIntoView(row);
     }
 
     void jumpToSetting(std::size_t result) {
-        if (result >= rankedTargets.size())
+        if (result >= std::min(rankedTargets.size(), visibleSettingsResults))
             return;
-        const auto target = searchTargets[rankedTargets[result]];
-        chooseLocation(target.category, target.section);
-        // Search remains ready for refinement; Tab reaches the ranked result picker.
-        if (dispatcher)
-            dispatcher->setFocus(settingsSearch->inputArea());
-        scroll->requestScrollIntoView(target.node);
+        const auto &target = searchTargets[rankedTargets[result].second];
+        revealSetting(target.category, target.section, target.node);
+    }
+
+    void selectSettingsResult(std::size_t index) {
+        if (index >= std::min(rankedTargets.size(), visibleSettingsResults))
+            return;
+        auto *row = resultRows[index];
+        if (index != selectedResult) {
+            auto *previous = resultRows[selectedResult];
+            previous->setSelected(false);
+            previous->setTabStop(false);
+            row->setSelected(true);
+            row->setTabStop(true);
+            selectedResult = index;
+            if (dispatcher && dispatcher->focusedArea() == previous->inputArea())
+                dispatcher->setFocus(row->inputArea());
+        }
+        settingsResults->requestScrollIntoView(row);
+    }
+
+    bool moveSettingsResult(std::uint32_t sym, std::uint32_t modifiers) {
+        if (!searchingSettings)
+            return false;
+        const int step = emacsListStep(sym, modifiers);
+        const bool up = step < 0 || (!modifiers && sym == XKB_KEY_Up);
+        const bool down = step > 0 || (!modifiers && sym == XKB_KEY_Down);
+        if (!up && !down)
+            return false;
+        if (up && selectedResult)
+            selectSettingsResult(selectedResult - 1);
+        else if (down)
+            selectSettingsResult(selectedResult + 1);
+        return true;
+    }
+
+    bool settingAvailable(const SearchTarget &target) const {
+        const auto *page = categoryPages[std::size_t(target.category)];
+        for (auto *node = target.node; node && node != page; node = node->parent())
+            if (!node->visible() && (target.section.empty() || node->parent() != page))
+                return false;
+        return true;
     }
 
     void filterSettings() {
         if (!settingsResults)
             return;
+        const auto query = settingsSearchKey(settingsSearch->value());
+        searchingSettings = !query.empty();
         rankedTargets.clear();
-        if (!settingsQuery.empty()) {
-            for (std::size_t i = 0; i < searchTargets.size(); ++i)
-                if (ui_logic::fuzzy(settingsQuery, searchTargets[i].terms) > -100000)
-                    rankedTargets.push_back(i);
-            std::stable_sort(rankedTargets.begin(), rankedTargets.end(), [this](auto a, auto b) {
-                return ui_logic::fuzzy(settingsQuery, searchTargets[a].terms) >
-                       ui_logic::fuzzy(settingsQuery, searchTargets[b].terms);
+        if (searchingSettings) {
+            std::vector<std::string_view> tokens;
+            for (std::size_t start = 0; start < query.size();) {
+                const auto end = query.find(' ', start);
+                tokens.push_back(std::string_view(query).substr(start, end - start));
+                if (end == query.npos)
+                    break;
+                start = end + 1;
+            }
+            for (std::size_t i = 0; i < searchTargets.size(); ++i) {
+                const auto &target = searchTargets[i];
+                int score = 0;
+                for (const auto token : tokens) {
+                    const int label = settingsTermScore(token, target.key, true);
+                    const int alias = settingsTermScore(token, target.aliases, true);
+                    const int path = settingsTermScore(token, target.pathKey, false);
+                    const int best = std::max({label, alias ? alias / 2 + 5 : 0, path / 4});
+                    if (!best) {
+                        score = 0;
+                        break;
+                    }
+                    score += best;
+                }
+                if (score && settingAvailable(target))
+                    rankedTargets.emplace_back(score + (query == target.key ? 128 : 0), i);
+            }
+            std::ranges::sort(rankedTargets, [&](const auto &a, const auto &b) {
+                if (a.first != b.first)
+                    return a.first > b.first;
+                const auto &left = searchTargets[a.second];
+                const auto &right = searchTargets[b.second];
+                if (left.category != right.category)
+                    return left.category < right.category;
+                return a.second < b.second;
             });
         }
-        std::vector<std::string> captions;
-        for (auto index : rankedTargets)
-            captions.push_back(searchTargets[index].caption);
-        settingsResults->setOptions(std::move(captions));
-        settingsResults->clearSelection();
-        settingsResults->setPlaceholder(rankedTargets.empty() ? "No matching settings"
-                                                              : "Choose a setting…");
-        auto *resultsGroup = settingsResults->parent();
-        resultsGroup->setVisible(!settingsQuery.empty());
-        resultsGroup->setParticipatesInLayout(!settingsQuery.empty());
+
+        const auto count = std::min(rankedTargets.size(), visibleSettingsResults);
+        resultsHeading->setText(count == 0 ? "No settings found"
+                                : count < rankedTargets.size()
+                                    ? "Top " + std::to_string(count) + " of " +
+                                          std::to_string(rankedTargets.size()) + " matches"
+                                    : std::to_string(count) + (count == 1 ? " match" : " matches"));
+        resultsHint->setText(count ? "↑ / ↓ to move · Enter to open · Esc to clear"
+                                   : "Try a shorter search or a category name.");
+        settingsResults->cancelPendingScrollRequests();
+        settingsResults->setScrollOffset(0);
+        selectedResult = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto &caption = searchTargets[rankedTargets[i].second].caption;
+            if (i == resultRows.size()) {
+                auto *result = button(
+                    *settingsResults->content(), caption, [this, i] { jumpToSetting(i); },
+                    ButtonVariant::Ghost);
+                result->setFillWidth(true);
+                result->setMinWidth(0);
+                result->setContentAlign(ButtonContentAlign::Start);
+                result->inputArea()->setTabFocusKey("blastirc.settings.result." +
+                                                    std::to_string(i));
+                resultRows.push_back(result);
+            }
+            auto *result = resultRows[i];
+            result->setText(caption);
+            result->setTooltip(caption);
+            result->setSelected(i == 0);
+            result->setTabStop(i == 0);
+        }
+        for (std::size_t i = 0; i < resultRows.size(); ++i) {
+            resultRows[i]->setVisible(i < count);
+            resultRows[i]->setParticipatesInLayout(i < count);
+        }
+        settingsResults->setVisible(searchingSettings);
+        settingsResults->setParticipatesInLayout(searchingSettings);
+        settingsResults->setExcludeSubtreeFromTabOrder(!searchingSettings);
+        scroll->setVisible(!searchingSettings);
+        scroll->setParticipatesInLayout(!searchingSettings);
+        scroll->setExcludeSubtreeFromTabOrder(searchingSettings);
+        navigation->setExcludeSubtreeFromTabOrder(searchingSettings);
+        categoryPicker->setExcludeSubtreeFromTabOrder(searchingSettings);
+        updateSettingsHeader();
+    }
+
+    void clearSettingsSearch() {
+        if (settingsSearch && !settingsSearch->value().empty()) {
+            settingsSearch->setValue("");
+            filterSettings();
+        }
     }
 
     Flex *section(std::string_view id, std::string_view title, std::string_view description = {}) {
@@ -729,7 +946,8 @@ struct Dialogs::Impl {
         currentSectionId = id;
         if (mode == "settings")
             sections.push_back({std::string(id), std::string(title), tab, body});
-        indexSetting(title, body);
+        if (id != "data.reset")
+            indexSetting(title, body);
         label(*body, title, true);
         if (!description.empty())
             label(*body, description)->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
@@ -879,7 +1097,7 @@ struct Dialogs::Impl {
                 colorSpecFromRole(error ? ColorRole::Error : ColorRole::OnSurfaceVariant));
             feedback->setVisible(!message.empty());
             feedback->setParticipatesInLayout(!message.empty());
-            if (!message.empty() && scroll && !setupOpen())
+            if (!message.empty() && scroll && !setupOpen() && mode != "settings")
                 scroll->requestScrollIntoView(feedback);
         }
     }
@@ -976,9 +1194,9 @@ struct Dialogs::Impl {
         for (std::size_t i = 0; i < compactEntries.size(); ++i)
             if (compactEntries[i].first == tab && compactEntries[i].second == selectedSection)
                 categoryPicker->setSelectedIndexSilently(i);
-        if (detailTitle)
-            detailTitle->setText(std::string("Settings · ") + tabNames[std::size_t(tab)] +
-                                 (selectedSection.empty() ? "" : " / " + currentLocationTitle()));
+        detailTitle->setText(std::string(tabNames[std::size_t(tab)]) +
+                             (selectedSection.empty() ? "" : " / " + currentLocationTitle()));
+        updateSettingsHeader();
         if (categoryNavigation) {
             if (categoryNavigation->focusArea()->focused())
                 categoryNavigation->controller().onFocusGain();
@@ -994,7 +1212,31 @@ struct Dialogs::Impl {
         return {};
     }
 
+    void updateSettingsHeader() {
+        if (!detailTitle)
+            return;
+        const bool showTitle = !searchingSettings && navigation->visible();
+        detailTitle->setVisible(showTitle);
+        detailTitle->setParticipatesInLayout(showTitle);
+        std::string_view scope, prefix;
+        if (tab == Tab::Servers && displayedServer && serverIndex < model.servers.size() &&
+            model.servers[serverIndex].name == *displayedServer) {
+            scope = networkCaption(model.servers[serverIndex]);
+            prefix = "Editing network: ";
+        } else if (tab == Tab::Identities && identityIndex < model.identities.size()) {
+            scope = model.identities[identityIndex].name;
+            prefix = "Editing identity: ";
+        }
+        const bool showingScope = !searchingSettings && !selectedSection.empty() && !scope.empty();
+        if (showingScope && (!settingsScope->text().starts_with(prefix) ||
+                             settingsScope->text().substr(prefix.size()) != scope))
+            settingsScope->setText(std::string(prefix) + std::string(scope));
+        settingsScope->setVisible(showingScope);
+        settingsScope->setParticipatesInLayout(showingScope);
+    }
+
     void chooseLocation(Tab next, std::string section = {}) {
+        clearSettingsSearch();
         if (tab != next || selectedSection != section)
             stopRecording(false);
         tab = next;
@@ -1015,19 +1257,21 @@ struct Dialogs::Impl {
             detach(entry.button, *categoryNavigation);
         treeEntries.clear();
         compactEntries.clear();
-        std::vector<std::string> captions(std::begin(tabNames), std::end(tabNames));
-        for (std::size_t i = 0; i < std::size(tabNames); ++i)
-            compactEntries.emplace_back(Tab(i), "");
+        std::vector<std::string> captions;
         static constexpr const char *icons[] = {"palette",  "keyboard", "messages", "sparkles",
                                                 "volume-2", "network",  "user",     "database"};
         for (std::size_t i = 0; i < std::size(tabNames); ++i) {
             const auto category = Tab(i);
+            compactEntries.emplace_back(category, "");
+            captions.emplace_back(tabNames[i]);
             const auto add = [this, category](std::string id, std::string title) {
                 auto *choice = button(
                     *categoryNavigation, title,
                     [this, category, id] {
-                        if (id.empty() && tab == category && selectedSection.empty())
-                            expanded[std::size_t(category)] = !expanded[std::size_t(category)];
+                        if (id.empty()) {
+                            auto &open = expanded[std::size_t(category)];
+                            open = tab != category || !selectedSection.empty() || !open;
+                        }
                         chooseLocation(category, id);
                         if (dispatcher)
                             dispatcher->setFocus(categoryNavigation->focusArea());
@@ -1045,6 +1289,7 @@ struct Dialogs::Impl {
                 return choice;
             };
             auto *root = add("", tabNames[i]);
+            root->setTooltip(tabNames[i]);
             root->setGlyph(icons[i]);
             root->label()->setFontWeight(FontWeight::Bold);
             for (auto &metric : metrics)
@@ -1052,7 +1297,8 @@ struct Dialogs::Impl {
                     metric.explicitBold = true;
             for (const auto &section : sections)
                 if (section.category == category) {
-                    add(section.id, "    " + section.title);
+                    auto *leaf = add(section.id, "  " + section.title);
+                    leaf->setTooltip(section.title);
                     compactEntries.emplace_back(category, section.id);
                     captions.push_back(std::string(tabNames[i]) + " / " + section.title);
                 }
@@ -1188,9 +1434,13 @@ struct Dialogs::Impl {
         categoryNavigation = nullptr;
         navigation = nullptr;
         categoryPicker = nullptr;
-        detailTitle = nullptr;
+        detailTitle = settingsScope = nullptr;
         settingsSearch = nullptr;
         settingsResults = nullptr;
+        resultsHeading = resultsHint = nullptr;
+        resultRows.clear();
+        rankedTargets.clear();
+        searchingSettings = false;
         searchTargets.clear();
         categoryPages.fill(nullptr);
         bindingControls.clear();
@@ -1219,26 +1469,21 @@ struct Dialogs::Impl {
         chrome = layout.get();
         padding(*chrome, tabs ? 12 : 18);
         auto *header = row(*chrome, false);
-        auto *heading = label(*header,
-                              tabs ? std::string("Settings · ") + tabNames[std::size_t(tab)]
-                                   : std::string(title),
-                              true);
-        heading->setFlexGrow(1);
-        if (tabs)
-            detailTitle = heading;
+        auto *heading = label(*header, title, true);
+        heading->setFlexGrow(tabs ? 0.f : 1.f);
         if (!tabs)
             button(*header, "Close", [this] { dismiss(); }, ButtonVariant::Ghost);
         if (tabs) {
-            settingsSearch =
-                text(*chrome, "Search settings", settingsQuery, [this](const std::string &value) {
-                    settingsQuery = value;
-                    filterSettings();
-                });
+            settingsSearch = text(*chrome, "Search settings", {},
+                                  [this](const std::string &) { filterSettings(); });
+            settingsSearch->setPlaceholder("Try zoom, fonts, or cursor blink");
+            settingsSearch->setOnFocusGain([this] { stopRecording(false); });
             settingsSearch->inputArea()->setTabFocusKey("blastirc.settings.search");
-            settingsSearch->setOnSubmit([this](const std::string &) { jumpToSetting(0); });
-            settingsResults =
-                select(*chrome, "Matching settings", {}, "",
-                       [this](std::size_t index, std::string_view) { jumpToSetting(index); });
+            settingsSearch->setOnKeyEvent([this](std::uint32_t sym, std::uint32_t mods) {
+                return moveSettingsResult(sym, mods);
+            });
+            settingsSearch->setOnSubmit(
+                [this](const std::string &) { jumpToSetting(selectedResult); });
         }
         auto viewport = std::make_unique<ScrollView>();
         scroll = viewport.get();
@@ -1266,7 +1511,9 @@ struct Dialogs::Impl {
                 if (index < compactEntries.size())
                     chooseLocation(compactEntries[index].first, compactEntries[index].second);
             });
+            compact->setNotifyOnReselect(true);
             compact->setFillWidth(true);
+            compact->setFlexGrow(1.f);
             compact->setVisible(false);
             track(compact.get(), MetricKind::Select);
             header->addChild(std::move(compact));
@@ -1278,8 +1525,6 @@ struct Dialogs::Impl {
             auto sidebar = std::make_unique<ScrollView>();
             navigation = sidebar.get();
             sidebar->setFillHeight(true);
-            sidebar->setMinWidth(240);
-            sidebar->setMaxWidth(240);
             sidebar->setViewportPaddingH(0);
             sidebar->setViewportPaddingV(0);
             sidebar->setReserveScrollbarGutter(true);
@@ -1349,13 +1594,32 @@ struct Dialogs::Impl {
             detail->setFillHeight(true);
             detail->setFlexGrow(1);
             detail->setMinWidth(0);
+            detailTitle = label(*detail, "", true);
+            settingsScope = label(*detail, "");
+            settingsScope->setMaxLines(1);
             detail->addChild(std::move(viewport));
+            auto results = std::make_unique<ScrollView>();
+            settingsResults = results.get();
+            track(settingsResults, MetricKind::Scroll);
+            results->setFlexGrow(1);
+            results->setFillWidth(true);
+            results->setFillHeight(true);
+            results->setReserveScrollbarGutter(true);
+            results->setViewportPaddingH(0);
+            results->setViewportPaddingV(0);
+            results->content()->setDirection(FlexDirection::Vertical);
+            results->content()->setAlign(FlexAlign::Stretch);
+            results->content()->setGap(2);
+            track(results->content(), MetricKind::Flex);
+            resultsHeading = label(*results->content(), "", true);
+            resultsHint = label(*results->content(), "");
+            detail->addChild(std::move(results));
             body->addChild(std::move(detail));
             chrome->addChild(std::move(body));
         } else {
             chrome->addChild(std::move(viewport));
         }
-        feedback = label(setupOpen() ? *chrome : *scroll->content(), "");
+        feedback = label(tabs || setupOpen() ? *chrome : *scroll->content(), "");
         feedback->setColor(colorSpecFromRole(ColorRole::Error));
         feedback->setVisible(false);
         feedback->setParticipatesInLayout(false);
@@ -1366,7 +1630,8 @@ struct Dialogs::Impl {
             footer->setExcludeSubtreeFromTabOrder(true);
         }
         if (tabs) {
-            auto *persistence = label(*footer, "Live · autosaves every 30s");
+            auto *persistence =
+                label(*footer, "Valid changes apply immediately.\nAutosave every 30s and on exit.");
             persistence->setFlexGrow(1);
             persistence->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
             persistence->setTooltip(
@@ -1427,6 +1692,10 @@ struct Dialogs::Impl {
     }
 
     void buildSettingsCategory() {
+        currentSection.clear();
+        currentSectionId.clear();
+        addSettingsTarget(tab, tabNames[std::size_t(tab)], "", "", page);
+        indexingSettings = true;
         switch (tab) {
         case Tab::Appearance:
             appearance();
@@ -1453,6 +1722,7 @@ struct Dialogs::Impl {
             dataStorage();
             break;
         }
+        indexingSettings = false;
     }
 
     void rebuildPage(bool focusContent = true) {
@@ -1488,7 +1758,6 @@ struct Dialogs::Impl {
             page = replacement.get();
             categoryPages[std::size_t(tab)] = page;
             allPages->addChild(std::move(replacement));
-            currentSection.clear();
             buildSettingsCategory();
             page = allPages;
             rebuildTree();
@@ -1531,7 +1800,6 @@ struct Dialogs::Impl {
                 auto body = column(16);
                 page = body.get();
                 categoryPages[category] = page;
-                currentSection.clear();
                 allPages->addChild(std::move(body));
                 buildSettingsCategory();
                 const bool active = tab == selectedTab;
@@ -1547,10 +1815,6 @@ struct Dialogs::Impl {
             applicationStatus->setColor(colorSpecFromRole(ColorRole::Error));
             applicationStatus->setVisible(false);
             applicationStatus->setParticipatesInLayout(false);
-            label(*page, "Changes apply now; autosave runs every 30 seconds and on exit, "
-                         "Save now writes sooner, invalid profiles or storage errors block "
-                         "saving, and Close does not undo changes.")
-                ->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
         } else if (mode == "status-details") {
             auto *field = profileField(*page, "Feedback", "blastirc.status.details");
             field->setMultiline(true);
@@ -1693,7 +1957,7 @@ struct Dialogs::Impl {
         label(*typography, "Type to find installed fonts and choose one to apply, or press Enter "
                            "for a custom family; each font is independent, empty uses sans-serif, "
                            "and closing discards unapplied text.");
-        auto *spelling = section("appearance.spellcheck", "Spellcheck");
+        auto *spelling = section("appearance.spellcheck", "Spelling & prediction");
         auto *spellingStatus = label(*spelling, "");
         auto languages = Spellcheck::languages();
         const auto updateSpellingStatus = [this, spellingStatus, languages] {
@@ -1825,18 +2089,6 @@ struct Dialogs::Impl {
                0, 1000, 1, [this](float value) { model.settings.messageWrapColumns = int(value); });
         label(*messages,
               "Wrapping fits words to the window without adding newlines to copied text.");
-        static constexpr const char *foolStyles[] = {"Minimized", "Blurred", "Dimmed", "Hidden"};
-        select(*messages, "Fool messages", {std::begin(foolStyles), std::end(foolStyles)},
-               foolStyles[std::clamp(int(model.settings.foolDisplay), 0, 3)],
-               [this](std::size_t index, std::string_view) {
-                   if (index < std::size(foolStyles))
-                       model.settings.foolDisplay = FoolDisplay(index);
-               });
-        toggle(*messages, "Count fool messages as unread", model.settings.foolUnread,
-               [this](bool value) { model.settings.foolUnread = value; });
-        label(*messages, "Fools never trigger notifications, sounds, typing or effects; minimized "
-                         "and blurred messages require reveal to copy, dimmed text is readable, "
-                         "hidden messages remain saved, and unread counts are optional.");
         auto *previews = section("appearance.previews", "Previews");
         static constexpr const char *previewModes[] = {"Off", "Click to load", "Automatic"};
         select(*previews, "Link previews", {std::begin(previewModes), std::end(previewModes)},
@@ -1977,7 +2229,7 @@ struct Dialogs::Impl {
                     else
                         field->setInvalid(false);
                 });
-                searchTargets.back().terms += " " + name;
+                searchTargets.back().aliases += " " + name;
                 field->inputArea()->setTabFocusKey("blastirc.settings.binding." + name);
                 field->inputArea()->setTooltip(
                     "Current binding for " + name +
@@ -2142,12 +2394,16 @@ struct Dialogs::Impl {
         label(*cues,
               "Each event has its own switch, volume and pitch; master volume applies to all.");
         for (const auto &[name, cue] : model.settings.cues) {
+            auto caption = name;
+            if (!caption.empty())
+                caption.front() =
+                    static_cast<char>(std::toupper(static_cast<unsigned char>(caption.front())));
             auto group = column(12);
-            toggle(*group, name, cue.enabled,
+            toggle(*group, caption + " sounds", cue.enabled,
                    [this, name](bool value) { model.settings.cues.at(name).enabled = value; });
-            slider(*group, "Volume", cue.volume, 0, 1, .01,
+            slider(*group, caption + " volume", cue.volume, 0, 1, .01,
                    [this, name](float value) { model.settings.cues.at(name).volume = value; });
-            slider(*group, "Pitch", cue.pitch, .25, 4, .01,
+            slider(*group, caption + " pitch", cue.pitch, .25, 4, .01,
                    [this, name](float value) { model.settings.cues.at(name).pitch = value; });
             cues->addChild(std::move(group));
         }
@@ -2259,20 +2515,19 @@ struct Dialogs::Impl {
                     "never sent automatically; review before uploading.");
         auto *presence = section("chat.typing", "Typing & events");
         const char *modes[] = {"All", "Smart", "Hidden"};
-        select(*presence, "Presence rows", {"All", "Smart", "Hidden"},
+        select(*presence, "Join, quit & nickname changes", {"All", "Smart", "Hidden"},
                modes[std::clamp(int(model.settings.presence), 0, 2)],
                [this](std::size_t index, std::string_view) {
                    model.settings.presence = PresenceMode(index);
                });
-        label(*presence,
-              "Smart shows recent participants; each channel menu can override this setting.");
+        label(*presence, "Also covers other network events. Smart shows recent participants. "
+                         "Each channel can override this setting.");
         toggle(*presence, "Send typing indicators", model.settings.typingSend,
                [this](bool value) { model.settings.typingSend = value; });
         toggle(*presence, "Show typing indicators", model.settings.typingReceive,
                [this](bool value) { model.settings.typingReceive = value; });
         auto *people = section("chat.people", "Friends & fools");
-        label(*people, "Enter space-separated nicknames; fool display and unread counts are "
-                       "in Appearance / Messages.");
+        label(*people, "Enter nicknames separated by spaces.");
         text(*people, "Friends", joined(model.settings.friends), [this](const std::string &value) {
             const auto parsed = words(value);
             model.settings.friends = {parsed.begin(), parsed.end()};
@@ -2281,7 +2536,20 @@ struct Dialogs::Impl {
             const auto parsed = words(value);
             model.settings.fools = {parsed.begin(), parsed.end()};
         });
+        static constexpr const char *foolStyles[] = {"Minimized", "Blurred", "Dimmed", "Hidden"};
+        select(*people, "Fool messages", {std::begin(foolStyles), std::end(foolStyles)},
+               foolStyles[std::clamp(int(model.settings.foolDisplay), 0, 3)],
+               [this](std::size_t index, std::string_view) {
+                   if (index < std::size(foolStyles))
+                       model.settings.foolDisplay = FoolDisplay(index);
+               });
+        toggle(*people, "Count fool messages as unread", model.settings.foolUnread,
+               [this](bool value) { model.settings.foolUnread = value; });
+        label(*people, "Fools never trigger notifications, sounds, typing or effects. Hidden "
+                       "messages are still saved; minimized and blurred messages must be "
+                       "revealed before copying.");
         auto *colors = section("chat.colors", "Nick colors");
+        indexingSettings = false;
         for (const auto &[name, value] : model.settings.nickColors) {
             (void)value;
             auto group = column(4);
@@ -2292,6 +2560,7 @@ struct Dialogs::Impl {
             });
             colors->addChild(std::move(group));
         }
+        indexingSettings = true;
         label(*colors, "Add overrides from a member's context menu.");
         auto *history = section("chat.history", "History");
         integer(*history, "Retention days (1–3650)", model.settings.retentionDays, 1, 3650,
@@ -2912,6 +3181,7 @@ struct Dialogs::Impl {
               "the upstream connection; remote deletion retains local conversation data.");
         button(*manager, "Refresh displayed catalog", [this] { rebuildPage(); });
         if (found != model.networks.end()) {
+            indexingSettings = false;
             for (const auto &[id, info] : found->second.sojuNetworks) {
                 const auto name = info.attributes.find("name");
                 label(*manager,
@@ -2945,6 +3215,7 @@ struct Dialogs::Impl {
                                        {"soju-set-enabled", name, enabled ? "1" : "0", {}});
                                });
             }
+            indexingSettings = true;
         }
         button(*manager, "New remote network form", [this] {
             sojuEditId.clear();
@@ -3511,6 +3782,21 @@ struct Dialogs::Impl {
         if (!addressesReviewed())
             return;
         if (!invalidFields.empty()) {
+            for (const auto &metric : metrics) {
+                if (metric.kind != MetricKind::Input ||
+                    !invalidFields.contains(static_cast<Input *>(metric.node)))
+                    continue;
+                const auto target =
+                    std::ranges::find(searchTargets, metric.node, &SearchTarget::node);
+                if (target == searchTargets.end()) {
+                    setFeedback("Correct the nickname color before saving.");
+                    revealSetting(Tab::Chat, "chat.colors", metric.node);
+                } else {
+                    setFeedback("Correct “" + target->label + "” before saving.");
+                    revealSetting(target->category, target->section, metric.node);
+                }
+                return;
+            }
             setFeedback("Correct the highlighted fields before saving.");
             return;
         }
@@ -4310,7 +4596,9 @@ struct Dialogs::Impl {
         } else {
             return;
         }
-        rebuildPage();
+        rebuildPage(name != "settings");
+        if (name == "settings" && dispatcher)
+            dispatcher->setFocus(settingsSearch->inputArea());
     }
 
     void dismiss() {
@@ -4644,8 +4932,6 @@ struct Dialogs::Impl {
             visible->setSize(w, h);
             (confirming ? confirmChrome : chrome)->setSize(w, h);
             if (!confirming && mode == "settings" && navigation && categoryPicker) {
-                navigation->setMinWidth(240.f * zoom);
-                navigation->setMaxWidth(240.f * zoom);
                 const bool compact = w < 760.f * zoom || h < 440.f * zoom;
                 bool focusInNavigation = false, focusInPicker = false;
                 if (dispatcher)
@@ -4655,14 +4941,11 @@ struct Dialogs::Impl {
                     }
                 chrome->setPadding((compact ? 8.f : 12.f) * zoom);
                 chrome->setGap((compact ? 6.f : 8.f) * zoom);
-                if (detailTitle) {
-                    detailTitle->setVisible(!compact);
-                    detailTitle->setParticipatesInLayout(!compact);
-                }
                 navigation->setVisible(!compact);
                 categoryPicker->setVisible(compact);
                 navigation->setParticipatesInLayout(!compact);
                 categoryPicker->setParticipatesInLayout(compact);
+                updateSettingsHeader();
                 if (dispatcher && compact && focusInNavigation)
                     dispatcher->setFocus(dispatcher->firstTabFocusUnder(categoryPicker));
                 else if (dispatcher && !compact && focusInPicker)
@@ -4838,9 +5121,34 @@ bool Dialogs::handleKey(const InputArea::KeyData &key) {
                                                             key.pressed, key.preedit);
         return true;
     }
-    const bool controlG =
-        (key.modifiers & (KeyMod::Ctrl | KeyMod::Alt | KeyMod::Super)) == KeyMod::Ctrl &&
-        (key.sym == XKB_KEY_g || key.sym == XKB_KEY_G);
+    const bool control =
+        (key.modifiers & (KeyMod::Ctrl | KeyMod::Alt | KeyMod::Super | KeyMod::Shift)) ==
+        KeyMod::Ctrl;
+    const bool controlG = control && (key.sym == XKB_KEY_g || key.sym == XKB_KEY_G);
+    if (settingsOpen() && impl_->confirmation.empty() && impl_->dispatcher) {
+        auto *search = impl_->settingsSearch->inputArea();
+        auto *focused = impl_->dispatcher->focusedArea();
+        if (control && (key.sym == XKB_KEY_f || key.sym == XKB_KEY_F)) {
+            impl_->dispatcher->setFocus(search);
+            return true;
+        }
+        if (impl_->searchingSettings && (key.sym == XKB_KEY_Escape || controlG)) {
+            impl_->clearSettingsSearch();
+            impl_->dispatcher->setFocus(search);
+            return true;
+        }
+        if (impl_->searchingSettings &&
+            (focused == search ||
+             (!impl_->rankedTargets.empty() &&
+              focused == impl_->resultRows[impl_->selectedResult]->inputArea()))) {
+            if (impl_->moveSettingsResult(key.sym, key.modifiers))
+                return true;
+            if (!key.modifiers && (key.sym == XKB_KEY_Return || key.sym == XKB_KEY_KP_Enter)) {
+                impl_->jumpToSetting(impl_->selectedResult);
+                return true;
+            }
+        }
+    }
     if (key.sym == XKB_KEY_Escape || controlG) {
         dismiss();
         return true;
@@ -4850,7 +5158,12 @@ bool Dialogs::handleKey(const InputArea::KeyData &key) {
             impl_->dispatcher->cycleTabFocusInSubtree(this, key.sym == XKB_KEY_ISO_Left_Tab ||
                                                                 (key.modifiers & KeyMod::Shift));
             if (impl_->scroll && impl_->confirmation.empty())
-                impl_->scroll->requestScrollIntoView(impl_->dispatcher->focusedArea());
+                for (Node *node = impl_->dispatcher->focusedArea(); node; node = node->parent())
+                    if (node == impl_->scroll || node == impl_->settingsResults) {
+                        static_cast<ScrollView *>(node)->requestScrollIntoView(
+                            impl_->dispatcher->focusedArea());
+                        break;
+                    }
         }
         return true;
     }

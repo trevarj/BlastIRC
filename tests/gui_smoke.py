@@ -776,13 +776,13 @@ def open_settings(window, preferences, *, from_icon=False, action="settings"):
     else:
         command("settings", window=window)
     # Bookkeeping must follow the real rendered modal, not merely a queued command.
-    # The compact header intentionally shows its category instead of "Settings".
     from PIL import Image
     scale = tomllib.loads(preferences.read_text())["appearance"]["scale"]
     geometry = window_geometry(window)
-    width, height = min(1000 * scale, geometry["WIDTH"] - 24), min(720 * scale, geometry["HEIGHT"] - 24)
-    compact = width < 760 * scale or height < 440 * scale
-    padding = (8 if compact else 12) * scale
+    adding = action == "add_network"
+    width = min((630 if adding else 1000) * scale, geometry["WIDTH"] - 24)
+    height = min((500 if adding else 720) * scale, geometry["HEIGHT"] - 24)
+    padding = (18 if adding else 8 if compact_settings(window, scale) else 12) * scale
     left, top = (geometry["WIDTH"] - width) / 2 + padding, (geometry["HEIGHT"] - height) / 2 + padding
     move_pointer(window, geometry["WIDTH"] - 2, geometry["HEIGHT"] - 2)
     with tempfile.TemporaryDirectory(prefix="blastirc-settings-caption-", dir=SESSION.env["XDG_RUNTIME_DIR"]) as temporary:
@@ -796,8 +796,7 @@ def open_settings(window, preferences, *, from_icon=False, action="settings"):
             rendered = subprocess.run(["tesseract", str(caption), "stdout", "--psm", "6"],
                                       check=True, capture_output=True, text=True, timeout=15)
             words = set(re.findall(r"[a-z]+", rendered.stdout.casefold()))
-            expected = {"appearance", "keyboard", "chat", "effects", "sounds", "networks", "identities"} if compact else {"settings"}
-            return bool(words & expected)
+            return {"add", "connection"} <= words if adding else "settings" in words
 
         SESSION.until("actual rendered Settings caption", visible_caption)
     SETTINGS_OPEN[window] = True
@@ -2007,7 +2006,7 @@ def save_preferences(proc, preferences, window):
         # snapshot must not move their active field or category focus.
         return tomllib.loads(preferences.read_text())
     open_settings(window, preferences)
-    framed_keys(window, "shift+Tab")
+    focus_settings_navigation(window, tomllib.loads(preferences.read_text())["appearance"]["scale"])
     saved = save_settings_footer(window, saved_path=preferences)
     close_settings_navigation(window)
     # A retained text-input transaction can belong to a retired palette field.
@@ -2413,30 +2412,35 @@ def wait_preference(proc, path, section, name, value):
     SESSION.until(f"real Settings Save persisted {section}.{name}={value!r}", saved)
 
 
-def settings_category(window, zoom, index, destination=None):
-    """Select a root category with an empty query, from navigation or Search.
-
-    Collapse roots while walking the wide tree so expanded descendants cannot
-    change the public root indices. Compact callers land on Search so their
-    next Tab reaches the first detail control, just as wide navigation does.
-    """
-    assert 0 <= index < 7, index
+def compact_settings(window, zoom):
     bounds = window_geometry(window)
-    compact = (min(1000 * zoom, bounds["WIDTH"] - 24) < 760 * zoom or
-               min(720 * zoom, bounds["HEIGHT"] - 24) < 440 * zoom)
+    return (min(1000 * zoom, bounds["WIDTH"] - 24) < 760 * zoom or
+            min(720 * zoom, bounds["HEIGHT"] - 24) < 440 * zoom)
+
+
+def focus_settings_navigation(window, zoom):
+    framed_keys(window, "ctrl+f", "shift+Tab" if compact_settings(window, zoom) else "Tab")
+
+
+def settings_category(window, zoom, index, destination=None):
+    """Select a root and leave the next Tab on its first detail control."""
+    categories = ("Appearance", "Keyboard shortcuts", "Chat", "Effects", "Sounds",
+                  "Networks", "Identities", "Data & Storage")
+    assert 0 <= index < len(categories), index
+    framed_keys(window, "ctrl+f")
     search = native_input_state(window)
-    if search is not None:
-        assert search["text"] == "", "Count-based category helpers require an empty Settings query"
-        framed_keys(window, "shift+Tab" if compact else "Tab")
-    if compact:
-        popup = open_native_popup(window, lambda: key("Return"))
+    assert search is not None and search["text"] == "", "Expected an empty Settings search"
+    if compact_settings(window, zoom):
+        type_text(categories[index])
+        framed_keys(window, "Return")
         if destination is not None:
+            popup = open_native_popup(window, lambda: key("Return"))
             capture_window(window, destination, f"settings-compact-category-selector-{index}")
             capture_native_popup(window, popup, destination, f"settings-compact-category-selector-{index}")
-        popup_keys(window, popup, "Home", *(["Down"] * index), "Return", root_changed=False)
+            popup_keys(window, popup, "Escape", root_changed=False)
         framed_keys(window, "Tab")
     else:
-        framed_keys(window, "Home", "Left", *(["Down", "Left"] * index))
+        framed_keys(window, "Tab", "Home", "Left", *(["Down", "Left"] * index))
 
 
 def settings_select(window, index):
@@ -2462,13 +2466,9 @@ def save_settings_footer(window, *, saved_path, destination=None, label="setting
     before = saved_path.stat()
     preferences = Path(SESSION.env["XDG_CONFIG_HOME"]) / "blastirc/settings.toml"
     scale = tomllib.loads(preferences.read_text())["appearance"]["scale"]
-    bounds = window_geometry(window)
-    compact = (min(1000 * scale, bounds["WIDTH"] - 24) < 760 * scale or
-               min(720 * scale, bounds["HEIGHT"] - 24) < 440 * scale)
-    # Category callers keep an empty query. From Search, Save/Close precede
-    # the field even when a nonempty query exposes Matching settings after it.
+    compact = compact_settings(window, scale)
     search = native_input_state(window)
-    footer_stops = (2 if (compact and search is None) or
+    footer_stops = (2 if (compact and (search is None or search["text"].strip())) or
                     (not compact and search is not None) else 3)
     framed_keys(window, *(["shift+Tab"] * footer_stops))
     framed_keys(window, "Return")
@@ -2502,7 +2502,6 @@ def set_native_cursor_preferences(proc, window, prefs, db, args, dest, *,
     assert style is None or style in styles
     baseline = tomllib.loads(prefs.read_text())
     open_settings(window, prefs)
-    framed_keys(window, "shift+Tab")
     settings_category(window, args.zoom, 0)
     shape_stop = 12
     framed_keys(window, *(["Tab"] * shape_stop))
@@ -3299,7 +3298,6 @@ def probe_settings_categories(proc, window, preferences, config, database_path, 
         ).fetchall()
         wire_start = roundtrip("before-ui")
         open_settings(window, preferences)
-        framed_keys(window, "shift+Tab")
         categories = ("appearance", "keyboard", "chat", "effects", "sounds", "networks", "identities")
         for index, category in enumerate(categories):
             settings_category(window, args.zoom, index)
@@ -3362,7 +3360,6 @@ def probe_settings_categories(proc, window, preferences, config, database_path, 
                 framed_keys(window, "Escape")
                 _composer_native(window, original_draft, draft_end, draft_end)
                 open_settings(window, preferences)
-                framed_keys(window, "shift+Tab")
                 settings_category(window, args.zoom, 1)
                 framed_keys(window, "Tab")
                 settings_field(window, chord, destination, "settings-key-original-restored-in-real-field")
@@ -3525,7 +3522,6 @@ def probe_settings_categories(proc, window, preferences, config, database_path, 
 
         # Save the retained, genuinely changed private field BEFORE reconnecting.
         open_settings(window, preferences)
-        framed_keys(window, "shift+Tab")
         settings_category(window, args.zoom, 5)
         framed_keys(window, "Tab")
         settings_select(window, names.index("Local"))
@@ -5113,7 +5109,6 @@ def probe_cursor_controls_dpi(proc, window, prefs, db, args, dest):
     def policy(fx, reduced, label):
         current = tomllib.loads(prefs.read_text())
         open_settings(window, prefs)
-        framed_keys(window, 'shift+Tab')
         settings_category(window, args.zoom, 3)
         framed_keys(window, 'Tab')
         settings_select(window, ('off', 'subtle', 'full').index(fx))
@@ -5561,7 +5556,6 @@ def probe_menu_reachability(proc, window, preferences, database_path, args, dest
         closed()
         zoom = tomllib.loads(preferences.read_text())['appearance']['scale']
         open_settings(window, preferences)
-        framed_keys(window, 'shift+Tab')
         settings_category(window, zoom, 0)
         if scale is not None and not math.isclose(zoom, scale, abs_tol=1e-6):
             # Theme source, transparency, opacity, then Interface scale.
@@ -6405,7 +6399,7 @@ def run_advanced_scope(*, proc, window, binary, env, screenshot, logs, preferenc
             # The first real dialog records native_dialog_rect. Establish that
             # genuine original-bounds geometry before exact before/after checks.
             open_settings(window, preferences)
-            framed_keys(window, "shift+Tab")
+            focus_settings_navigation(window, args.zoom)
             save_settings_footer(window, saved_path=preferences)
             framed_keys(window, "shift+Tab", "Return")  # Sticky Close from navigation.
             SETTINGS_OPEN[window] = False
@@ -6529,7 +6523,6 @@ def run_advanced_scope(*, proc, window, binary, env, screenshot, logs, preferenc
             editor = observe_native_input(
                 window, destination, "cursor-restart-actual-editor", draft, end, end)
             open_settings(window, preferences)
-            framed_keys(window, "shift+Tab")
             settings_category(window, args.zoom, 0)
             shape_stop = 12
             framed_keys(window, *(["Tab"] * shape_stop))
@@ -7170,7 +7163,7 @@ def run(*, allow_focused_geometry=False):
                 open_settings(window, preferences, from_icon=True)
                 # Dialog metadata is live model state until a real user save;
                 # observing disk is not a promise of save-on-open/autosave timing.
-                framed_keys(window, "shift+Tab")
+                focus_settings_navigation(window, args.zoom)
                 settings_saved = save_settings_footer(window, saved_path=preferences)
                 assert settings_saved["workspace"]["native_dialog"] == "settings", settings_saved["workspace"]
                 settings_window = {"rect": tuple(float(value) for value in

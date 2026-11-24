@@ -1692,7 +1692,6 @@ def _policy_settings(ctx, category, edits):
     """Drive real controls; edits are (tab stop, kind, value, section, key)."""
     w, prefs = ctx['window'], Path(ctx['preferences'])
     gui.open_settings(w, prefs)
-    gui.framed_keys(w, 'shift+Tab')
     gui.settings_category(w, ctx['args'].zoom, category)
     for stop, kind, value, section, name in edits:
         gui.framed_keys(w, *(['Tab'] * stop))
@@ -1726,22 +1725,12 @@ def _policy_settings(ctx, category, edits):
     return saved
 
 
-def _policy_appearance(ctx, *, fool=None, unread=None, wrap=None):
-    edits = []
-    if wrap is not None:
-        edits.append((24, 'slider', (0, 1, wrap), 'appearance', 'message_wrap_columns'))
-    if fool is not None:
-        edits.append((25, 'select', ('minimized', 'blurred', 'dimmed', 'hidden').index(fool),
-                      'appearance', 'fool_display'))
-    if unread is not None:
-        edits.append((26, 'toggle', unread, 'appearance', 'fool_unread'))
-    saved = _policy_settings(ctx, 0, edits)
-    if fool is not None:
-        assert saved['appearance']['fool_display'] == fool, saved['appearance']
-    return saved
+def _policy_appearance(ctx, *, wrap):
+    return _policy_settings(ctx, 0, [
+        (24, 'slider', (0, 1, wrap), 'appearance', 'message_wrap_columns')])
 
 
-def _policy_chat(ctx, *, fools=None, receive=None):
+def _policy_chat(ctx, *, fools=None, receive=None, treatment=None, unread=None):
     saved = tomllib.loads(Path(ctx['preferences']).read_text())
     provider = saved['uploads']['provider']
     upload_stops = 2 + (2 if provider in ('crafterbin', 'custom') else 0)
@@ -1751,7 +1740,16 @@ def _policy_chat(ctx, *, fools=None, receive=None):
         edits.append((upload_stops + 3, 'toggle', receive, 'typing', 'receive'))
     if fools is not None:
         edits.append((upload_stops + 5, 'text', ' '.join(fools), '', 'fools'))
-    return _policy_settings(ctx, 2, edits)
+    if treatment is not None:
+        edits.append((upload_stops + 6, 'select',
+                      ('minimized', 'blurred', 'dimmed', 'hidden').index(treatment),
+                      'appearance', 'fool_display'))
+    if unread is not None:
+        edits.append((upload_stops + 7, 'toggle', unread, 'appearance', 'fool_unread'))
+    saved = _policy_settings(ctx, 2, edits)
+    if treatment is not None:
+        assert saved['appearance']['fool_display'] == treatment, saved['appearance']
+    return saved
 
 
 def _policy_effects(ctx, *, motion='none', reveal='none', fx='full', reduced=False):
@@ -2085,8 +2083,7 @@ def run_activity_blur(ctx):
     channel, identity = ctx['channel'], ctx['channel_id']
     _policy_focus(ctx, identity)
     _policy_effects(ctx, fx='off')
-    _policy_chat(ctx, fools=[])
-    _policy_appearance(ctx, fool='dimmed')
+    _policy_chat(ctx, fools=[], treatment='dimmed')
     gui.set_message_style(p, w, prefs, db, ctx['args'], ctx['destination'],
                           identity, 'irc', label='activity-blur-irc')
     root = gui.open_title_menu(w, gui.title_actions(gui.read_layout(prefs), ctx['args'].zoom))
@@ -2161,8 +2158,7 @@ def run_activity_blur(ctx):
         # A genuinely painted summary, not an empty/offscreen gap, must contain ink.
         assert len(set(tuple(original[i:i + 3]) for i in range(0, len(original), 3))) > 12
         reference_path = _policy_capture(ctx, 'ordinary-activity-reference')
-        _policy_chat(ctx, fools=[fool])
-        _policy_appearance(ctx, fool='blurred')
+        _policy_chat(ctx, fools=[fool], treatment='blurred')
         current_flanks = gui.SESSION.until('visible flanks after concealment policy', anchors)
         dx, dy = current_flanks[0][0] - before[0], current_flanks[0][1] - before[1]
         translated = [tuple(value + (dx if index % 2 == 0 else dy)
@@ -2257,7 +2253,7 @@ def run_fools(ctx):
     modes = {}
     for mode in ('minimized', 'blurred', 'dimmed', 'hidden'):
         # Readable reference gives real native hit geometry, not guessed font metrics.
-        _policy_appearance(ctx, fool='dimmed', unread=False)
+        _policy_chat(ctx, treatment='dimmed', unread=False)
         # Dim opacity deliberately changes swatch RGB, so obtain the reference
         # without a fool list, then restore the same list before applying policy.
         _policy_chat(ctx, fools=[])
@@ -2268,8 +2264,7 @@ def run_fools(ctx):
         left = max((item['bbox'] for item in components), key=lambda box: box[1])
         reference = gui.native_rgb_capture(ctx['window'])
         text_box = (left[2] + 6, left[1], left[2] + 140, left[3])
-        _policy_chat(ctx, fools=[ctx['query_target'].swapcase()])
-        _policy_appearance(ctx, fool=mode, unread=False)
+        _policy_chat(ctx, fools=[ctx['query_target'].swapcase()], treatment=mode, unread=False)
         words = _policy_words(ctx, 'fools-' + mode)
         rendered = ' '.join(word for word, _ in words)
         modes[mode] = {'rendered_words': words, 'reference_body_marker': left}
@@ -2340,7 +2335,7 @@ def run_fools(ctx):
             preview = _policy_words(ctx, 'fool-reply-readable', reply_region)
             assert secret.casefold() in ' '.join(word for word, _ in preview).casefold(), (
                 'Actual readable reply preview never showed retained source body', preview)
-            _policy_appearance(ctx, fool='blurred')
+            _policy_chat(ctx, treatment='blurred')
             preview = _policy_words(ctx, 'fool-reply-remasked',
                                     _policy_reply_region(ctx, 'fool-reply-remasked'))
             assert secret.casefold() not in ' '.join(word for word, _ in preview).casefold(), (
@@ -2358,7 +2353,7 @@ def run_fools(ctx):
         _policy_capture(ctx, 'fools-' + mode + '-readable')
     # Leave query unread in background. Same read marker must survive changing
     # count policy; recount must recover the real retained message, not drop it.
-    _policy_appearance(ctx, fool='hidden', unread=False)
+    _policy_chat(ctx, treatment='hidden', unread=False)
     gui.wait_read_marker(ctx['proc'], ctx['database_path'], ctx['query_id'])
     _policy_focus(ctx, ctx['channel_id'])
     before = gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
@@ -2369,10 +2364,10 @@ def run_fools(ctx):
     after = gui.save_state(ctx['proc'], ctx['preferences'], ctx['database_path'])
     row_after = next(row for row in after[2] if row[0] == ctx['query_id'])
     assert row_after[1:3] == row_before[1:3], (row_before, row_after)
-    _policy_appearance(ctx, unread=True)
+    _policy_chat(ctx, unread=True)
     gui.wait_rows(ctx['proc'], ctx['database_path'], 'SELECT unread,read_marker FROM buffers WHERE id=?',
                   (ctx['query_id'],), [(row_before[1] + 1, row_before[2])])
-    _policy_appearance(ctx, unread=False)
+    _policy_chat(ctx, unread=False)
     gui.wait_rows(ctx['proc'], ctx['database_path'], 'SELECT unread,read_marker FROM buffers WHERE id=?',
                   (ctx['query_id'],), [(row_before[1], row_before[2])])
     _policy_focus(ctx, ctx['query_id'])
@@ -3270,8 +3265,7 @@ def run_incoming(ctx):
         _policy_capture(ctx, f'incoming-{index}-{motion}-{reveal}-{fx}-{reduced}')
     # Dim is explicitly readable, so it gives an observable body on which to
     # prove fool suppression rather than trivially testing an invisible row.
-    _policy_chat(ctx, fools=[ctx['query_target']])
-    _policy_appearance(ctx, fool='dimmed')
+    _policy_chat(ctx, fools=[ctx['query_target']], treatment='dimmed')
     _policy_effects(ctx, motion='slide', reveal='fade')
     gui.move_pointer(ctx['window'], 5, 5)
     started = time.monotonic()
@@ -5076,7 +5070,6 @@ def run_spelling(ctx):
     _refresh_restart(ctx, 'composer', {'spellcheck': 'true', 'spellcheck_language': '"zz_ZZ"'})
     w = ctx['window']
     gui.open_settings(w, preferences)
-    gui.framed_keys(w, 'shift+Tab')
     gui.settings_category(w, ctx['args'].zoom, 0)
     # Category navigation owns focus; nine theme/typography controls precede these.
     gui.framed_keys(w, *(['Tab'] * 10))
@@ -5652,7 +5645,7 @@ def run_settings_refinements(ctx, *, tree_only=False):
     scale = ctx['args'].zoom
     evidence, captures = [], []
     initial_size = gui.window_geometry(w)
-    search_query = ''
+    last_query = None
 
     def capture(label):
         path = gui.capture_window(w, destination, 'settings-refinements-' + label)
@@ -5663,27 +5656,18 @@ def run_settings_refinements(ctx, *, tree_only=False):
         return gui.read_layout(prefs)['settings']['rect']
 
     def caption_box(label):
+        # Ignore the search input and (in wide layout) the tree. Callers
+        # only look for form captions after the result list is dismissed.
         bounds = region()
-        if label.casefold() not in ('search settings', 'matching settings'):
-            # A query's text is not a setting caption, even when it says the
-            # same words. Restrict form captions below the visible search chrome.
-            matching = upload.label_rect(w, destination, 'Matching settings',
-                                         region=bounds, exact_caption=True)
-            boundary = matching or upload.label_rect(w, destination, 'Search settings',
-                                                     region=bounds, exact_caption=True)
-            if boundary is None:
-                return None
-            rx, ry, rw, rh = bounds
-            top = boundary[1] + boundary[3]
-            if matching is None:
-                # Empty queries hide the whole results group; the body begins
-                # below the Search input's bounded native caption band instead.
-                top += max(56 * scale, 56)
-            # Exclude the new tree from detail-caption OCR; its adjacent rows
-            # are unrelated text columns, not part of the form's captions.
-            compact = rw < 760 * scale or rh < 440 * scale
-            inset = 0 if compact else 260 * scale  # panel padding + sidebar + body gap
-            bounds = (rx + inset, top, rw - inset, ry + rh - top)
+        search_caption = upload.label_rect(w, destination, 'Search settings',
+                                           region=bounds, exact_caption=True)
+        if search_caption is None:
+            return None
+        rx, ry, rw, rh = bounds
+        top = search_caption[1] + search_caption[3] + max(44 * scale, 44)
+        compact = rw < 760 * scale or rh < 440 * scale
+        inset = 0 if compact else 295 * scale  # Exclude the tree without clipping detail labels.
+        bounds = (rx + inset, top, rw - inset, ry + rh - top)
         box = upload.label_rect(w, destination, label, region=bounds, exact_caption=True)
         if box is None and '–' in label:
             # Tesseract renders the visible range dash as ASCII "-", as in
@@ -5692,15 +5676,13 @@ def run_settings_refinements(ctx, *, tree_only=False):
                                     region=bounds, exact_caption=True)
         return box
 
-    def field(label, expected=None):
+    def field(label, expected=None, *, focused_only=False):
         # Locate ordinary user-facing labels, never font names or technical IDs.
         box = gui.SESSION.until('visible Settings field ' + label,
             lambda: caption_box(label))
         x, y, width, height = box
-        following = {'search settings': 'Matching settings',
-                     'ui font family': 'Installed UI fonts',
+        following = {'ui font family': 'Installed UI fonts',
                      'message font family': 'Installed message fonts'}.get(label.casefold())
-        rx, ry, rw, rh = region()
         stop = y + height + max(56 * scale, 56)
         if following:
             next_box = caption_box(following)
@@ -5726,6 +5708,11 @@ def run_settings_refinements(ctx, *, tree_only=False):
             if not (fresh_x - 4 * scale <= cx and cx + cw <= rx + rw):
                 return False
             return state if expected is None or state['text'] == expected else False
+        if focused_only:
+            return gui.SESSION.until('Search focused the native field ' + label, focused)
+        state = focused()
+        if state:
+            return state
         # Font metrics can enlarge the gap between caption and Input. Stay in
         # the observed caption band and require actual native text/caret proof.
         probes = [round((y + height + stop) / 2),
@@ -5742,9 +5729,9 @@ def run_settings_refinements(ctx, *, tree_only=False):
         return gui.settings_field(w, value, destination, 'settings-refinements-' + label)
 
     def query(value, label):
-        nonlocal search_query
-        field('Search settings', search_query)
-        gui.framed_keys(w, 'ctrl+a', 'BackSpace')
+        nonlocal last_query
+        gui.framed_keys(w, 'ctrl+f')
+        gui._composer_native(w, '', 0, 0)
         # Separate real edits catch a query field destroyed/recreated by filtering.
         for index, character in enumerate(value):
             gui.type_text(character)
@@ -5752,27 +5739,30 @@ def run_settings_refinements(ctx, *, tree_only=False):
             end = len(prefix.encode('utf-8'))
             gui._composer_native(w, prefix, end, end)
         end = len(value.encode('utf-8'))
-        search_query = value
-        gui.framed_keys(w, 'Return')
         state = gui.observe_native_input(w, destination,
             'settings-refinements-search-' + label, value, end, end)
-        evidence.append({'search_query': value, 'after_jump': state})
-        return state
+        last_query = value
+        gui.framed_keys(w, 'Return')
+        evidence.append({'search_query': value, 'search_input': state})
 
     def jump(value, label, caption, expected=None):
         query(value, label)
-        # Seeing the target in the native detail viewport proves jump/scroll;
-        # filtering alone cannot satisfy this observation.
-        return field(caption, expected)
+        # Prove the destination received native focus without clicking or
+        # tabbing to it; filtering alone cannot satisfy this.
+        return field(caption, expected, focused_only=True)
 
     def save(label):
         # Search has a stable native route to the sticky footer; locating its
         # plain caption avoids OCR of dark Save text on a pastel button.
-        field('Search settings', search_query)
+        gui.framed_keys(w, 'ctrl+f')
+        gui._composer_native(w, '', 0, 0)
         result = gui.save_settings_footer(w, saved_path=prefs)
-        # Save can rebuild the detail viewport at its top. Search retains its
-        # exact query/focus: activate the real jump again before reading a field.
-        gui.framed_keys(w, 'Return')
+        # Save feedback may scroll the form. Repeat the cleared query to
+        # restore the user's last destination before reading it.
+        if last_query:
+            gui.framed_keys(w, 'ctrl+f')
+            gui.type_text(last_query)
+            gui.framed_keys(w, 'Return')
         capture(label)
         return result
 
@@ -5804,7 +5794,6 @@ def run_settings_refinements(ctx, *, tree_only=False):
     retention = baseline['history']['retention_days']
     jump('retention days', 'unvisited-history', 'Retention days (1–3650)', str(retention))
     replace('not-a-number', 'invalid-retention')
-    query('', 'clear-before-tree')
     gui.settings_category(w, scale, 0)
     gui.framed_keys(w, 'Right')
     gui.move_pointer(w, 8, initial_size['HEIGHT'] - 8)
@@ -5847,9 +5836,8 @@ def run_settings_refinements(ctx, *, tree_only=False):
         gui.framed_keys(w, 'shift+Tab')  # Search -> native location selector.
         popup = gui.open_native_popup(w, lambda: gui.key('Return'))
         gui.capture_native_popup(w, popup, destination, 'settings-refinements-compact-leaf-paths')
-        # The first seven options retain public root indices, followed by
-        # real leaves. Select the second leaf (fonts) through the native popup.
-        gui.popup_keys(w, popup, 'Home', *(['Down'] * 8), 'Return', root_changed=False)
+        # Appearance's leaves follow its root; Fonts is its second leaf.
+        gui.popup_keys(w, popup, 'Home', 'Down', 'Down', 'Return', root_changed=False)
         gui.framed_keys(w, 'Tab')
         gui._composer_native(w, '', 0, 0)
         gui.framed_keys(w, 'Tab', 'End')
@@ -6028,7 +6016,7 @@ def run_settings_refinements(ctx, *, tree_only=False):
     try:
         gui.resize_panel_viewport(w, (round(680 * scale), round(620 * scale)))
         query(action, 'compact-jump')
-        field(action, original_binding)
+        field(action, original_binding, focused_only=True)
         capture('keyboard-compact-wrapped-row')
     finally:
         gui.resize_panel_viewport(w, (initial_size['WIDTH'], initial_size['HEIGHT']))
@@ -6038,13 +6026,13 @@ def run_settings_refinements(ctx, *, tree_only=False):
         # so restore through native focus and the distinct committed family value.
         query(caption, 'restore-' + caption.replace(' ', '-'))
         for _ in range(64):
-            gui.framed_keys(w, 'Tab')
             state = gui.native_input_state(w)
             if state and state['text'] == current and state['caret']:
                 cx, cy, cw, ch = state['caret']
                 rx, ry, rw, rh = region()
                 if rx <= cx < cx + cw <= rx + rw and ry <= cy < cy + ch <= ry + rh:
                     break
+            gui.framed_keys(w, 'Tab')
         else:
             raise AssertionError(('Native family restoration Input not found', caption, current))
         replace(value, 'restore-family')
@@ -6273,8 +6261,7 @@ def run_transcript_refinements(ctx):
         gui.set_people(p, w, prefs, db, 'hidden')
         send(5, 2, ' concealed private body ')
         send(6, 1, ' after summary ')
-        _policy_chat(ctx, fools=[clients[2][0]])
-        _policy_appearance(ctx, fool='minimized')
+        _policy_chat(ctx, fools=[clients[2][0]], treatment='minimized')
         raster, mask, flanks, rect, frame = observe('minimized-flanked', (4, 6))
         before, after = flanks
         x, y, width, height = rect
@@ -6984,8 +6971,7 @@ def run_messaging_refinements(ctx):
     # One author is a fool in both sources. Opposite explicit policies must
     # resolve per original source, never from the currently active aggregate.
     _policy_focus(ctx, channel, expected=channel_edit)
-    _policy_chat(ctx, fools=[ctx['query_target']])
-    _policy_appearance(ctx, fool='hidden')
+    _policy_chat(ctx, fools=[ctx['query_target']], treatment='hidden')
     policy('show-fools', channel)
     marker(0)
     marker(2)
@@ -8098,7 +8084,6 @@ def run_minimum_height(ctx):
     def settings(interface=None, message=None, expected=None):
         prior = tomllib.loads(prefs.read_text())['appearance']['scale']
         gui.open_settings(w, prefs, from_icon=True)
-        gui.framed_keys(w, 'shift+Tab')
         gui.settings_category(w, prior, 0)
         for stop, target in ((4, interface), (5, message)):
             if target is None:
@@ -8198,7 +8183,6 @@ def run_minimum_height(ctx):
     bounds = gui.window_geometry(w)
     assert all(0 <= box[0] < box[2] <= bounds['WIDTH'] and
                0 <= box[1] < box[3] <= bounds['HEIGHT'] for box in save), (save, bounds)
-    gui.framed_keys(w, 'shift+Tab')
     saved = gui.save_settings_footer(w, saved_path=prefs)
     assert saved['appearance']['scale'] == saved['appearance']['message_scale'] == 2
     gui.close_settings_navigation(w)

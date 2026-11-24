@@ -4950,7 +4950,12 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
     if (chord.empty() && !paletteOpen && !dialogs->active() &&
         editors.handleCompletionKey(event.sym, event.modifiers))
         return consume();
+    auto *area = dispatcher ? dispatcher->focusedArea() : nullptr;
+    auto *nativeInput = area ? dynamic_cast<Input *>(area->textInputClient()) : nullptr;
     if (isConsumed() && !(paletteOpen && (listUp || listDown))) {
+        if (dialogs->settingsOpen() && (listUp || listDown) && area && !area->capturesAllKeys() &&
+            (!nativeInput || !nativeInput->composing()) && dialogs->handleKey(event))
+            return true;
         if (const auto repeat = repeatCommands.find(keyId);
             repeat != repeatCommands.end() && !paletteOpen && !dialogs->active()) {
             if (repeat->second == "scroll-up" || repeat->second == "scroll-down" ||
@@ -4988,8 +4993,6 @@ bool Ui::Impl::key(const InputArea::KeyData &event, std::uint32_t physicalKey) {
         }
         return true;
     }
-    auto *area = dispatcher ? dispatcher->focusedArea() : nullptr;
-    auto *nativeInput = area ? dynamic_cast<Input *>(area->textInputClient()) : nullptr;
     if ((nativeInput && nativeInput->composing()) || editors.composing()) {
         if (keyStroke == "c-g" || event.sym == XKB_KEY_Escape) {
             if (editors.ownsFocus(area)) {

@@ -3175,14 +3175,16 @@ void initialHistoryConsumerCheck() {
     auto &background = model.buffers.at(edgeBuffers[1]);
     background.initialHistorySync = HistorySyncState::Queued;
     frame();
-    auto *remaining = visibleLabelContaining(*line, "1");
-    assert(remaining && !status());
+    auto *history = areaWithKey(*line, "status-history");
+    assert(history && visible(*history) && !status());
+    auto *remaining = visibleLabelContaining(*history, "History ");
+    assert(remaining &&
+           areaWithTooltip(*history, "History 1 left\nShow queued and loading conversations") ==
+               history);
     buffer.initialHistorySync = HistorySyncState::Loading;
     frame();
-    assert(visible(*remaining) && remaining->text().find("2") != std::string::npos);
-    auto *history = areaWithKey(*line, "status-history");
-    assert(history &&
-           areaWithTooltip(*line, remaining->text() + "\nShow queued and loading conversations") ==
+    assert(visible(*remaining) &&
+           areaWithTooltip(*history, "History 2 left\nShow queued and loading conversations") ==
                history);
     buffer.initialHistorySync = background.initialHistorySync = HistorySyncState::Idle;
     frame();
@@ -3254,7 +3256,7 @@ void statusIdentityCheck() {
     };
     frame();
     assert(visibleLabelContaining(line, "CurrentLocal") && visibleLabelContaining(line, "test") &&
-           visibleLabelContaining(line, "Connected"));
+           visibleLabelContaining(line, "Online"));
     assert(visibleCount<Glyph>(line) == 3);
     assert(!visibleLabelContaining(line, model.buffers.at(edgeBuffers[0]).target));
     assert(!visibleLabelContaining(line, "ConfiguredLocal"));
@@ -3410,26 +3412,94 @@ void statusActionsCheck() {
         return area;
     };
     frame();
+    auto *nick = control("status-nick");
+    auto *networkName = control("status-network");
     auto *connection = control("status-connection");
+    auto *line = connection->parent();
+    assert(dynamic_cast<ModeLine *>(line));
+    assert(areaWithTooltip(*connection, "Online\nShow connection actions") == connection);
+    const auto roundedPlate = [](Node &node) {
+        Box *plate = nullptr;
+        for (const auto &child : node.children())
+            if (auto *box = dynamic_cast<Box *>(child.get());
+                box && visible(*box) && box->style().radius != 0.f && box->style().fill.a > 0) {
+                assert(!plate && !box->hitTestVisible());
+                plate = box;
+            }
+        assert(plate);
+        return plate;
+    };
+    const auto bounds = [](const Node &node) {
+        std::array<float, 4> rect{};
+        Node::transformedBounds(&node, rect[0], rect[1], rect[2], rect[3]);
+        return rect;
+    };
+    const auto fitsInside = [&](const Node &outer, const Node &inner) {
+        const auto [l, t, r, b] = bounds(outer);
+        const auto [x, y, endX, endY] = bounds(inner);
+        return l <= x && t <= y && endX <= r && endY <= b;
+    };
+    auto *identityPlate = roundedPlate(*line);
+    const std::array segments{nick, networkName, connection};
+    for (auto *area : segments) {
+        assert(area->parent() == line && area->hitTestVisible() && area->focusable());
+        auto *label = visibleNode<Label>(*area);
+        auto *icon = visibleNode<Glyph>(*area);
+        assert(label && icon && fitsInside(*identityPlate, *label) &&
+               fitsInside(*identityPlate, *icon));
+    }
+    std::vector<const Box *> dividers;
+    for (const auto &child : identityPlate->children())
+        if (const auto *box = dynamic_cast<const Box *>(child.get()); box && visible(*box)) {
+            assert(!box->hitTestVisible() && box->style().fill.a > 0 && box->width() > 0 &&
+                   box->width() < box->height() && box->height() < identityPlate->height() &&
+                   fitsInside(*identityPlate, *box));
+            dividers.push_back(box);
+        }
+    assert(dividers.size() == 2);
+    std::ranges::sort(dividers, {}, [](const Box *rule) { return rule->x(); });
+    for (size_t i = 0; i < dividers.size(); ++i) {
+        const float left = bounds(*segments[i])[2], right = bounds(*segments[i + 1])[0];
+        const auto rule = bounds(*dividers[i]);
+        assert(left <= right + .5f && std::abs(rule[0] + rule[2] - left - right) <= 2.f);
+    }
+    const auto segmentHighlighted = [](const InputArea &area) {
+        return std::ranges::any_of(area.children(), [&](const auto &node) {
+            auto *box = dynamic_cast<Box *>(node.get());
+            return box && visible(*box) && box->style().fill.a > 0 && box->height() > 1 &&
+                   box->x() >= 0 && box->x() + box->width() <= area.width() + .5f;
+        });
+    };
+    const auto noneHighlighted = [&] {
+        return std::ranges::none_of(segments,
+                                    [&](const auto *area) { return segmentHighlighted(*area); });
+    };
+    assert(noneHighlighted());
     const auto hasUnderline = [&] {
         return std::ranges::any_of(connection->children(), [&](const auto &node) {
             return node->visible() && node->width() == connection->width() && node->height() == 1 &&
                    node->y() == connection->height() - 1;
         });
     };
-    dispatcher.setFocus(control("status-network"));
+    dispatcher.setFocus(networkName);
     nativeKey(ui, dispatcher, XKB_KEY_Tab);
     frame();
     assert(dispatcher.focusedArea() == connection && hasUnderline());
+    assert(segmentHighlighted(*connection) && !segmentHighlighted(*networkName) &&
+           !segmentHighlighted(*nick));
+    dispatcher.setFocus(nullptr);
+    assert(!hasUnderline() && noneHighlighted());
     float x = 0, y = 0;
     Node::mapToScene(connection, connection->width() / 2, connection->height() / 2, x, y);
     dispatcher.pointerMotion(x, y, 1);
+    assert(connection->hovered() && segmentHighlighted(*connection) &&
+           !segmentHighlighted(*networkName) && !segmentHighlighted(*nick));
+    dispatcher.setFocus(connection);
     assert(hasUnderline());
     dispatcher.pointerButton(x, y, BTN_LEFT, true, 2, 2, false);
     assert(!hasUnderline());
     dispatcher.cancelPointerCapture();
     dispatcher.pointerLeave();
-    auto *nick = control("status-nick");
     click(dispatcher, *nick);
     frame();
     auto *composer = inputWithText(ui.root(), "/nick ");
@@ -3452,7 +3522,17 @@ void statusActionsCheck() {
     model.status = "Retained feedback";
     nativeKey(ui, dispatcher, 'x', KeyMod::Ctrl);
     frame();
-    dispatcher.setFocus(control("status-chord"));
+    auto *pendingChord = control("status-chord");
+    auto *rightPlate = identityPlate;
+    for (auto *area : {pendingChord, control("status-feedback"), control("status-history")}) {
+        auto *plate = roundedPlate(*area);
+        auto *label = visibleNode<Label>(*area);
+        assert(label && fitsInside(*plate, *label));
+        const auto rect = bounds(*plate), right = bounds(*rightPlate);
+        assert(rect[2] < right[0] && rect[1] == right[1] && rect[3] == right[3]);
+        rightPlate = plate;
+    }
+    dispatcher.setFocus(pendingChord);
     nativeKey(ui, dispatcher, XKB_KEY_space);
     frame();
     auto *chord = areaWithKey(ui.root(), "status-chord");
@@ -8595,7 +8675,7 @@ void hiddenUnreadStatusCheck(
     for (size_t i = 1; i < plates.size(); ++i)
         assert(bounds(*plates[i - 1])[2] < bounds(*plates[i])[0]);
     assert(!activity(archived) && !activity(system));
-    assert(fits(segment("Connected")) && fits(statusLabel("status-nick", "Me")) &&
+    assert(fits(segment("Online")) && fits(statusLabel("status-nick", "Me")) &&
            fits(statusLabel("status-network", "Local")));
     const auto nickBounds = bounds(*statusLabel("status-nick", "Me"));
     assert(bounds(*plates.back())[2] < nickBounds[0]);
@@ -8816,8 +8896,12 @@ void hiddenUnreadStatusCheck(
     history = HistorySyncState::Queued;
     width = 720;
     frame();
-    assert(fits(segment(model.status)) && fits(segment("History: 1 remaining")));
-    auto *healthy = segment("Connected");
+    auto *historyArea = areaWithKey(*line, "status-history");
+    assert(fits(segment(model.status)) && historyArea && visible(*historyArea));
+    assert(visibleLabelContaining(*historyArea, "History ") &&
+           areaWithTooltip(*historyArea, "History 1 left\nShow queued and loading conversations") ==
+               historyArea);
+    auto *healthy = segment("Online");
     assert(fits(healthy) && identityFits());
     const auto healthyInk = healthy->color();
     assert(!segment(model.buffers.at(edgeBuffers[0]).target));
@@ -8832,7 +8916,7 @@ void hiddenUnreadStatusCheck(
     auto *failed = segment("Failed");
     assert(fits(failed) && failed->color() != healthyInk);
     assert(fits(segment(network.error)) && fits(segment("c-x")) && identityFits());
-    assert(!fits(segment("History: 1 remaining")));
+    assert(!visible(*historyArea));
     network.error.clear();
     for (const auto state : {"Reconnecting", "Disconnected"}) {
         network.state = state;
@@ -8846,10 +8930,10 @@ void hiddenUnreadStatusCheck(
     history = HistorySyncState::Idle;
     for (width = 220; width >= 80; width -= 4) {
         frame();
-        if (identityFits() && !fits(segment("Connected")))
+        if (identityFits() && !fits(segment("Online")))
             break;
     }
-    assert(width >= 80 && identityFits() && !fits(segment("Connected")));
+    assert(width >= 80 && identityFits() && !fits(segment("Online")));
     for (const auto &child : line->children())
         if (visible(*child))
             assert(child->x() >= 0 && child->x() + child->width() <= line->width() + .5f);

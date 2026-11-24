@@ -47,8 +47,17 @@ void style(Label &label, const TextFont &font, float scale) {
     label.setFontWeight(font.weight);
     label.setFontSize(12 * scale);
 }
-float textWidth(Renderer &renderer, std::string_view value, float scale, const TextFont &font) {
-    return value.empty() ? 0 : std::ceil(renderer.measureText(value, 12 * scale, font, 0, 1).width);
+Color statusAccent(Color fill, Color normal, Color preferred, std::string_view fallback) {
+    const auto ink = themePairedForeground(fill, preferred);
+    return ink == normal ? themePairedForeground(fill, themeForegroundColor(fallback)) : ink;
+}
+float textWidth(Renderer &renderer, std::string_view value, float scale, const TextFont &font,
+                bool markup = false) {
+    return value.empty() ? 0
+                         : std::ceil(renderer
+                                         .measureText(value, 12 * scale, font, 0, 1,
+                                                      TextAlign::Start, TextEllipsize::End, markup)
+                                         .width);
 }
 void placeLabel(Label &label, Renderer &renderer, float x, float width, float height) {
     label.setVisible(width > 0);
@@ -85,6 +94,7 @@ ContextMenuEntry menuEntry(size_t value, std::string label, std::string_view ico
 
 struct ModeLine::Impl {
     enum Group { History, Feedback, Chord, Nick, NetworkName, State, GroupCount };
+    static constexpr bool identityGroup(Group group) { return group >= Nick; }
     struct Activity {
         std::string name, target, readMarker, caseMapping, caption, chatTitle, countText;
         size_t size = 0;
@@ -146,6 +156,8 @@ struct ModeLine::Impl {
     std::vector<Slot> slots;
     std::vector<std::array<float, 3>> measuredChips;
     Button overflow;
+    Box *identityPlate;
+    std::array<Box *, 2> identityRules;
     Box *tip;
     Label *tipText;
     Timer hoverTimer;
@@ -156,13 +168,20 @@ struct ModeLine::Impl {
     bool foolUnread = false, visible = false, allowed = true, layoutReady = false;
     bool healthy = false, failureFeedback = false;
     float scale = 1, contentBottomInset = 0;
-    Color activityInk{}, mentionInk{}, focusInk{};
+    Color activityInk{}, focusInk{};
     Color hoverFill{};
     struct CardColors {
         Color fill, network, text, count, mention, divider;
     };
     std::array<CardColors, 2> cardColors{};
-    std::array<Color, GroupCount> controlInks{};
+    struct ControlColors {
+        Color fill, ink;
+    };
+    std::array<std::array<ControlColors, 2>, GroupCount> controlColors{};
+    std::array<Color, 2> historyCountInks{};
+    Color historyInk{};
+    size_t paintedHistoryCount = 0;
+    std::string historyCaption;
     std::string shownBuffer, shownServer, shownState;
     uint64_t shownSession = 0;
     bool shownProfile = false, shownWritable = false;
@@ -180,9 +199,19 @@ struct ModeLine::Impl {
                                    "user",    "server",      "plug-connected-x"};
         constexpr std::array keys{"status-history", "status-feedback", "status-chord",
                                   "status-nick",    "status-network",  "status-connection"};
+        identityPlate = child<Box>(owner);
+        identityPlate->setHitTestVisible(false);
+        identityPlate->setZIndex(-1);
+        identityPlate->setVisible(false);
+        for (auto &rule : identityRules) {
+            rule = child<Box>(*identityPlate);
+            rule->setHitTestVisible(false);
+        }
         for (size_t i = controls.size(); i-- > 0;) {
             const auto group = static_cast<Group>(i);
             auto &button = controls[i] = makeButton(group);
+            if (group == History)
+                button.title->setUseMarkup(true);
             auto *area = button.area;
             icons[i] = child<Glyph>(*button.content);
             icons[i]->setGlyph(names[i]);
@@ -237,23 +266,26 @@ struct ModeLine::Impl {
             }
         });
     }
-    void updateFocus(const Button &button) const {
+    void updateFocus(const Button &button) {
         const auto &area = *button.area;
         button.focus->setVisible(allowed && area.enabled() && area.focused() &&
                                  pointerFocused != &area);
+        if (button.group)
+            updateHover(button);
     }
     bool hovered(const Button &button) const {
         const auto &area = *button.area;
         return allowed && !popupButton && area.visible() && area.enabled() && area.hovered();
     }
-    void updateHover(const Button &button) const {
-        const bool shown = hovered(button);
-        if (button.network || button.highlight->visible() != shown) {
-            button.highlight->setVisible(button.network || shown);
+    void updateHover(const Button &button) {
+        const bool active = hovered(button) || (button.group && button.focus->visible());
+        const bool plate = button.network || (button.group && !identityGroup(*button.group));
+        if (button.group || button.network || button.highlight->visible() != active) {
+            button.highlight->setVisible(plate || active);
             updateInk(button);
         }
     }
-    void updateInk(const Button &button) const {
+    void updateInk(const Button &button) {
         if (button.network) {
             const auto &colors = cardColors[hovered(button)];
             button.highlight->setFill(colors.fill);
@@ -265,16 +297,34 @@ struct ModeLine::Impl {
                 divider->setFill(colors.divider);
             return;
         }
-        const auto ink = [&](Color normal) {
-            return button.highlight->visible() ? themePairedForeground(hoverFill, normal) : normal;
-        };
-        const auto normal = button.group ? controlInks[*button.group] : activityInk;
-        const auto foreground = ink(normal);
-        button.title->setColor(foreground);
-        if (button.group)
-            icons[*button.group]->setColor(foreground);
+        if (button.group) {
+            const auto group = *button.group;
+            const bool active = hovered(button) || button.focus->visible();
+            const auto &colors = controlColors[group][active];
+            button.highlight->setFill(colors.fill);
+            button.title->setColor(colors.ink);
+            icons[group]->setColor(colors.ink);
+            if (group == History) {
+                const auto countInk = historyCountInks[active];
+                if (paintedHistoryCount != historyRemaining || historyInk != countInk) {
+                    paintedHistoryCount = historyRemaining;
+                    historyInk = countInk;
+                    button.title->setText(
+                        historyRemaining ? "History <span weight=\"bold\" foreground=\"" +
+                                               formatRgbHex(countInk) + "\">" +
+                                               std::to_string(historyRemaining) + "</span> left"
+                                         : "");
+                }
+            }
+            return;
+        }
+        button.title->setColor(button.highlight->visible()
+                                   ? themePairedForeground(hoverFill, activityInk)
+                                   : activityInk);
     }
-    std::string_view caption(Group group) const { return controls[group].title->text(); }
+    std::string_view caption(Group group) const {
+        return group == History ? std::string_view(historyCaption) : controls[group].title->text();
+    }
     void updateTipText(Group group) {
         const auto hint = hints[group];
         const auto value = caption(group);
@@ -286,7 +336,11 @@ struct ModeLine::Impl {
     void setControl(Group group, std::string_view value, std::string_view hint) {
         auto &button = controls[group];
         auto &area = *button.area;
-        if (button.title->setText(value) || hints[group] != hint) {
+        const bool changed =
+            group == History ? historyCaption != value : button.title->setText(value);
+        if (group == History && changed)
+            historyCaption = value;
+        if (changed || hints[group] != hint) {
             if (popupButton == &button)
                 closePopup();
             hints[group] = hint;
@@ -382,7 +436,11 @@ struct ModeLine::Impl {
             pointerFocused = nullptr;
             updateFocus(button);
         });
-        area->setOnFocusLoss([focus] { focus->setVisible(false); });
+        area->setOnFocusLoss([this, button] {
+            button.focus->setVisible(false);
+            if (button.group)
+                updateHover(button);
+        });
         area->setOnEnter([this, button, group](const InputArea::PointerData &) {
             updateHover(button);
             if (group)
@@ -416,10 +474,14 @@ struct ModeLine::Impl {
         const float highlightHeight = contentHeight - 2 * inset;
         button.highlight->setPosition(0, inset);
         button.highlight->setFrameSize(width, highlightHeight);
-        const float radius = button.network ? 7 * scale : themeCornerRadius();
-        button.highlight->setRadius(std::min(radius, std::min(width, highlightHeight) / 2));
-        if (!button.network)
+        if (!button.group || !identityGroup(*button.group)) {
+            const float radius = button.network || button.group ? 7 * scale : themeCornerRadius();
+            button.highlight->setRadius(std::min(radius, std::min(width, highlightHeight) / 2));
+        }
+        if (!button.network && !button.group)
             button.highlight->setFill(hoverFill);
+        if (button.group)
+            updateHover(button);
         button.focus->setFill(focusInk);
         const float rule = std::max(1.f, scale);
         button.focus->setPosition(0, height - rule);
@@ -437,7 +499,8 @@ struct ModeLine::Impl {
             retire(*button.area);
         button.area->setEnabled(enabled);
         updateFocus(button);
-        updateHover(button);
+        if (!button.group)
+            updateHover(button);
     }
     const Buffer *eligibleBuffer(const std::string &id) const {
         const auto found = model.buffers.find(id);
@@ -572,7 +635,7 @@ struct ModeLine::Impl {
             closePopup();
         if (count != historyRemaining) {
             historyRemaining = count;
-            setControl(History, count ? "History: " + std::to_string(count) + " remaining" : "",
+            setControl(History, count ? "History " + std::to_string(count) + " left" : "",
                        "Show queued and loading conversations");
         }
     }
@@ -753,7 +816,7 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     p.setControl(NetworkName, name,
                  !mentions && config ? "Open network settings" : "Manage networks");
     p.setControl(State,
-                 p.healthy          ? "Connected"
+                 p.healthy          ? "Online"
                  : state == "Ready" ? "Failed"
                                     : state,
                  !mentions && config ? "Show connection actions" : "Open status details");
@@ -768,7 +831,6 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
         return themePairedForeground(backdrop, themeForegroundColor(role));
     };
     p.activityInk = ink("primary");
-    p.mentionInk = ink("error");
     if (const auto hover = themeForegroundColor("hover"); p.hoverFill != hover) {
         p.hoverFill = hover;
         markLayoutDirty();
@@ -777,23 +839,50 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
         p.focusInk = secondary;
         markLayoutDirty();
     }
-    const auto contextualInk = ink("on_surface_variant");
-    const auto contextInk = ink("on_surface");
+    const auto text = themeForegroundColor("on_surface");
+    const auto variant = themeForegroundColor("on_surface_variant");
+    const auto primary = themeForegroundColor("primary");
+    const auto error = themeForegroundColor("error");
+    const auto restingFill = lerpColor(backdrop, text, .07f);
+    p.identityPlate->setFill(restingFill);
+    const auto divider = lerpColor(restingFill, themePairedForeground(restingFill, text), .22f);
+    for (auto *rule : p.identityRules)
+        rule->setFill(divider);
+    const bool stateError = state != "Retrying" && (state == "Failed" || connectionError);
     for (size_t i = 0; i < p.controls.size(); ++i) {
         auto &button = p.controls[i];
-        const bool hasCaption = !button.title->text().empty();
+        const auto group = static_cast<Impl::Group>(i);
+        const bool hasCaption = !p.caption(group).empty();
+        auto fill = restingFill;
+        auto preferred = group == Nick ? text : variant;
+        std::string_view fallback;
+        if ((group == Feedback && p.failureFeedback) || (group == State && stateError)) {
+            if (group == Feedback)
+                fill = lerpColor(fill, error, .10f);
+            preferred = error;
+            fallback = "on_error_container";
+        } else if (group == Chord) {
+            fill = lerpColor(fill, primary, .12f);
+            preferred = primary;
+            fallback = "on_primary_container";
+        } else if (group == State && !p.healthy && !mentions) {
+            preferred = themeForegroundColor("tertiary");
+            fallback = "on_tertiary_container";
+        }
+        for (size_t active = 0; active < 2; ++active) {
+            const auto plate = active ? lerpColor(fill, p.hoverFill, .16f) : fill;
+            const auto normal = themePairedForeground(plate, text);
+            const auto foreground = fallback.empty()
+                                        ? themePairedForeground(plate, preferred)
+                                        : statusAccent(plate, normal, preferred, fallback);
+            p.controlColors[group][active] = {plate, foreground};
+            if (group == History)
+                p.historyCountInks[active] =
+                    statusAccent(plate, normal, primary, "on_primary_container");
+        }
         button.area->setHitTestVisible(allowActivityMenu && hasCaption);
         p.enableButton(button, hasCaption);
-        const auto color = i == State                           ? (state == "Retrying"                    ? p.focusInk
-                                                                   : state == "Failed" || connectionError ? p.mentionInk
-                                                                   : p.healthy                            ? p.activityInk
-                                                                                                          : p.focusInk)
-                           : i == Feedback && p.failureFeedback ? p.mentionInk
-                           : i == Chord || i == Nick            ? contextInk
-                                                                : contextualInk;
-        p.controlInks[i] = color;
         style(*button.title, font, p.scale);
-        p.updateInk(button);
         p.icons[i]->setGlyphSize(14 * p.scale);
     }
     if (!ledgerVisible) {
@@ -803,26 +892,17 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
         return;
     }
 
-    const auto text = themeForegroundColor("on_surface");
-    const auto variant = themeForegroundColor("on_surface_variant");
-    const auto restingFill = lerpColor(backdrop, text, .07f);
     for (size_t i = 0; i < p.cardColors.size(); ++i) {
         const auto fill = i ? lerpColor(restingFill, p.hoverFill, .16f) : restingFill;
         const auto foreground = themePairedForeground(fill, text);
         auto network = themePairedForeground(fill, lerpColor(variant, fill, .18f));
         if (network == foreground)
             network = themePairedForeground(fill, lerpColor(foreground, fill, .18f));
-        const auto accent = [&](std::string_view role, std::string_view fallback) {
-            const auto resolved = themePairedForeground(fill, themeForegroundColor(role));
-            return resolved == foreground
-                       ? themePairedForeground(fill, themeForegroundColor(fallback))
-                       : resolved;
-        };
         p.cardColors[i] = {fill,
                            network,
                            foreground,
-                           accent("primary", "on_primary_container"),
-                           accent("error", "on_error_container"),
+                           statusAccent(fill, foreground, primary, "on_primary_container"),
+                           statusAccent(fill, foreground, error, "on_error_container"),
                            lerpColor(fill, foreground, .22f)};
     }
     const bool foolRulesChanged =
@@ -943,7 +1023,7 @@ void ModeLine::doLayout(Renderer &renderer) {
     const float iconPrefix = std::round(14 * p.scale) + std::ceil(4 * p.scale);
     std::array<float, GroupCount> ideal{}, used{}, labelWidths{}, iconWidths{};
     for (size_t i = 0; i < ideal.size(); ++i)
-        ideal[i] = measure(p.controls[i].title->text());
+        ideal[i] = textWidth(renderer, p.controls[i].title->text(), p.scale, font, i == History);
     ideal[Nick] = std::min(ideal[Nick], std::ceil(140 * p.scale));
     ideal[NetworkName] = std::min(ideal[NetworkName], std::ceil(200 * p.scale));
     const size_t count = p.visible && height() > 0 ? p.ordered.size() : 0;
@@ -1119,8 +1199,16 @@ void ModeLine::doLayout(Renderer &renderer) {
         take(State, remaining, true);
     if (!used[Feedback])
         take(Feedback, remaining);
-    take(History, remaining);
+    take(History, remaining, true);
     x = width() - padding;
+    const float identityRight = x;
+    float identityLeft = x;
+    std::array<float, 2> boundaries{};
+    size_t identityCount = 0;
+    auto lastIdentity = GroupCount;
+    const float plateInset = std::min(2 * p.scale, contentHeight / 4);
+    const float plateHeight = contentHeight - 2 * plateInset;
+    const float radius = std::min(7 * p.scale, plateHeight / 2);
     for (size_t i = used.size(); i-- > 0;) {
         auto &button = p.controls[i];
         const auto group = static_cast<Impl::Group>(i);
@@ -1132,8 +1220,22 @@ void ModeLine::doLayout(Renderer &renderer) {
             continue;
         }
         const float buttonWidth = labelWidths[i] + iconWidths[i];
-        const float side = (used[i] - buttonWidth) / 2;
-        p.moveButton(button, x - used[i], used[i], contentHeight);
+        const float left = x - used[i];
+        const bool identity = Impl::identityGroup(group);
+        if (identity) {
+            if (identityCount)
+                boundaries[identityCount - 1] = x;
+            else
+                lastIdentity = group;
+            identityLeft = left;
+            ++identityCount;
+        }
+        const float cardSpacing =
+            !identity && x < identityRight ? std::min(cardGap, (used[i] - buttonWidth) / 2) : 0.f;
+        const float side = (used[i] - cardSpacing - buttonWidth) / 2;
+        p.moveButton(button, left, used[i], contentHeight);
+        if (cardSpacing > 0)
+            button.highlight->setFrameSize(used[i] - cardSpacing, plateHeight);
         placeLabel(*button.title, renderer, side + iconWidths[i], labelWidths[i], contentHeight);
         auto &icon = *p.icons[i];
         icon.setVisible(iconWidths[i] > 0);
@@ -1141,7 +1243,27 @@ void ModeLine::doLayout(Renderer &renderer) {
             icon.measure(renderer);
             icon.setPosition(side, (contentHeight - icon.height()) / 2);
         }
-        x -= used[i];
+        x = left;
+    }
+    p.identityPlate->setVisible(identityCount > 0);
+    p.identityPlate->setPosition(identityLeft, plateInset);
+    p.identityPlate->setFrameSize(identityRight - identityLeft, plateHeight);
+    p.identityPlate->setRadius(std::min(radius, (identityRight - identityLeft) / 2));
+    for (size_t i = 0; i < p.identityRules.size(); ++i) {
+        auto &rule = *p.identityRules[i];
+        rule.setVisible(i + 1 < identityCount);
+        if (rule.visible()) {
+            rule.setPosition(boundaries[i] - identityLeft - dividerWidth / 2, plateHeight / 4);
+            rule.setSize(dividerWidth, plateHeight / 2);
+        }
+    }
+    for (const auto group : {Nick, NetworkName, State}) {
+        auto &button = p.controls[group];
+        if (!button.area->visible())
+            continue;
+        const float left = button.area->x() == identityLeft ? radius : 0.f;
+        const float right = group == lastIdentity ? radius : 0.f;
+        button.highlight->setRadii({left, right, right, left});
     }
     if (p.popupButton &&
         (!p.popupButton->area->visible() || p.anchor(*p.popupButton) != p.popupAnchor))

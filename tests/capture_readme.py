@@ -206,7 +206,7 @@ people_mode = "compact"
             except RuntimeError as error:
                 raise RuntimeError(f"{error}; rendered text: {words}") from error
 
-        capture("screenshot.png", "First light", "rooftop session", "Connected")
+        capture("screenshot.png", "First light", "rooftop session", "Online")
         gui.key("ctrl+x", "b")
         capture("screenshot-chats.png", "Chats", "mission-control", "observatory")
         gui.type_text(QUERY)

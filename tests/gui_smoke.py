@@ -6119,7 +6119,7 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
     backdrop = Image.new("RGB", caption.size, caption.getpixel((0, caption.height - 1)))
     contrast = max_channel(ImageChops.difference(caption, backdrop))
     foreground = contrast.getextrema()[1]
-    assert foreground > 0, ("No Connected item ink at rest", bounds)
+    assert foreground > 0, ("No Online segment ink at rest", bounds)
     _, ink_top, _, ink_bottom = contrast.point(lambda value: 255 if 2 * value >= foreground else 0).getbbox()
     ink_center = 1 + (ink_top + ink_bottom) / 2
     assert abs(ink_center - row_center) <= 1, ("Status caption not centered", ink_center, row_center)
@@ -6143,16 +6143,16 @@ def probe_status_hover(window, preferences, reduced_motion, *, destination=None)
 
     move_pointer(window, *point)
     hover, delta, left, fill_right, fill_top, fill_bottom = SESSION.until(
-        "visible stable native Connected-item hover", visible)
+        "visible stable native Online-segment hover", visible)
     fill_center = (fill_top + fill_bottom) / 2
     assert fill_top > 0 and fill_bottom < rest.height and abs(fill_center - row_center) <= 1, (
         "Rounded hover fill not centered between the chat frame and bottom edge", delta.getbbox(), bounds)
     center_delta = delta.getpixel(((left + fill_right) // 2, fill_top + 1))
-    assert center_delta >= 3 and delta.getpixel((left, fill_top + 1)) < center_delta / 2, (
-        "Status hover does not fill the interior with rounded corners", delta.getbbox())
+    assert center_delta >= 3 and delta.getpixel((fill_right - 1, fill_top + 1)) < center_delta / 2, (
+        "Online-segment hover does not follow the shared card's outer corner", delta.getbbox())
 
     move_pointer(window, 0, 0)
-    SESSION.until("native Connected-item returns to its rest pixels", lambda: sample() == rest)
+    SESSION.until("native Online segment returns to its rest pixels", lambda: sample() == rest)
     captures = {}
     if destination is not None:
         for label, image in (("rest", rest), ("hover", hover)):

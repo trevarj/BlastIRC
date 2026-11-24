@@ -252,10 +252,9 @@ class Row final : public InputArea {
             return themePairedForeground(rowBackdrop, themeForegroundColor(role));
         };
         if (avatarBackground && showAvatar) {
-            RoundedRectStyle avatarStyle{};
+            auto avatarStyle = avatarBackground->style();
             avatarStyle.fill =
                 themeSurfaceColor(primary ? "surface_container_highest" : "surface_container_high");
-            avatarStyle.radius = themeCornerRadius();
             avatarBackground->setStyle(avatarStyle);
             const auto avatarBackdrop =
                 lerpColor(rowBackdrop, avatarStyle.fill, avatarStyle.fill.a);
@@ -372,11 +371,15 @@ class Row final : public InputArea {
             draftBackground->setVisible(false);
         }
         if (showAvatar) {
+            const float avatarRadius = nativeAvatarRadius(avatarSize);
             avatarBackground->setPosition(avatarLeft, avatarTop);
             avatarBackground->setSize(avatarSize, avatarSize);
+            auto avatarStyle = avatarBackground->style();
+            avatarStyle.radius = avatarRadius;
+            avatarBackground->setStyle(avatarStyle);
             avatarImage->setPosition(avatarLeft, avatarTop);
             avatarImage->setSize(avatarSize, avatarSize);
-            avatarImage->setRadius(themeCornerRadius());
+            avatarImage->setRadius(avatarRadius);
             const int target =
                 std::max(1, int(std::ceil(avatarSize * std::max(1.f, renderer.renderScale()))));
             if (spriteAvatar && avatarSource.empty()) {
@@ -397,7 +400,7 @@ class Row final : public InputArea {
                 loadedAvatarSize = target;
                 loadChannelAvatarRaster(*avatarImage, renderer, avatarSource, target);
             }
-            avatarBackground->setVisible(!(loadedSprite && avatarImage->hasImage()));
+            avatarBackground->setVisible(true);
             avatarImage->setVisible(avatarImage->hasImage());
             if (avatarImage->visible())
                 avatarImage->layout(renderer);
@@ -799,16 +802,22 @@ class Avatar final : public InputArea {
     void doLayout(Renderer &renderer) override {
         const auto box = serverAvatarBox(width() + 2 * railPadding * zoom, zoom);
         const float extent = box.width;
+        const float radius = nativeAvatarRadius(extent);
+        const float inset = 2 * zoom;
         const float left = box.x - railPadding * zoom;
         const float top = box.y - railPadding * zoom;
         background->setPosition(left, top);
         background->setSize(extent, extent);
+        auto avatarStyle = background->style();
+        avatarStyle.radius = radius;
+        background->setStyle(avatarStyle);
         const float markerHeight = std::min(20 * zoom, extent);
         selectionMarker->setPosition(0, top + (extent - markerHeight) / 2);
         selectionMarker->setSize(3 * zoom, markerHeight);
-        image->setPosition(left + 2 * zoom, top + 2 * zoom);
-        image->setSize(std::max(0.f, extent - 4 * zoom), std::max(0.f, extent - 4 * zoom));
-        image->setRadius(themeCornerRadius());
+        const float imageExtent = std::max(0.f, extent - 2 * inset);
+        image->setPosition(left + inset, top + inset);
+        image->setSize(imageExtent, imageExtent);
+        image->setRadius(std::max(0.f, radius - inset));
         const int target = std::max(1, int(std::ceil(image->width())));
         const float renderScale = renderer.renderScale();
         if (loadedSource != source || loadedSize != target || loadedScale != renderScale) {
@@ -849,7 +858,7 @@ class Avatar final : public InputArea {
   private:
     void paint() {
         const bool highlight = active || pressed();
-        RoundedRectStyle style{};
+        auto style = background->style();
         style.fill = themeSurfaceColor(highlight   ? "primary_container"
                                        : hovered() ? "hover"
                                                    : "surface_container_high");
@@ -857,7 +866,6 @@ class Avatar final : public InputArea {
                                             : active  ? "primary"
                                                       : "outline_variant");
         style.borderWidth = zoom;
-        style.radius = themeCornerRadius();
         background->setStyle(style);
         selectionMarker->setVisible(active || activeChild);
         RoundedRectStyle marker{};

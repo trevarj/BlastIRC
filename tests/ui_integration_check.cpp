@@ -34,6 +34,7 @@
 #include <render/animation/motion_service.h>
 #include <render/codecs/codecs.h>
 #include <render/core/texture_manager.h>
+#include <render/scene/image_node.h>
 #include <render/scene/input_dispatcher.h>
 #include <render/scene/rect_node.h>
 #include <render/scene/text_node.h>
@@ -1979,6 +1980,15 @@ void sidebarAvatarCheck() {
     assert(avatar && avatar->hasImage() && visible(*avatar));
     const auto targetPixels = int(std::ceil(avatar->width() * renderer.renderScale()));
     assert(avatar->sourceWidth() == targetPixels && avatar->sourceHeight() == targetPixels);
+    const auto *picture = visibleNode<ImageNode>(*avatar);
+    const auto radius = avatar->width() * (7.f / 24.f);
+    assert(picture && std::abs(picture->radius() - radius) < .01f);
+    assert(std::ranges::any_of(channel->children(), [&](const auto &child) {
+        const auto *plate = dynamic_cast<const RectNode *>(child.get());
+        return plate && visible(*plate) && plate->x() == avatar->x() && plate->y() == avatar->y() &&
+               plate->width() == avatar->width() && plate->height() == avatar->height() &&
+               std::abs(plate->style().radius.tl - radius) < .01f;
+    }));
     assert(draft && visible(*draft) && draft->width() < avatar->width() &&
            draft->height() < avatar->height());
     bool backedDraft = false;

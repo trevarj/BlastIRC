@@ -17,6 +17,8 @@
 
 namespace blast {
 
+constexpr float nativeAvatarRadius(float extent) { return extent * (7.f / 24.f); }
+
 inline std::string nativeAvatarInitials(std::string_view name, bool channel = false) {
     if (channel) {
         const auto first = name.find_first_not_of("#&+!");

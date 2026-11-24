@@ -1077,6 +1077,7 @@ struct TranscriptView::Impl {
         Glyph *friendBadge = nullptr;
         Glyph *actionMarker = nullptr;
         bool ownNickChip = false;
+        bool avatarSprite = false;
         TextNode *avatarInitial = nullptr;
         Spinner *statusSpinner = nullptr;
         Glyph *statusCheck = nullptr;
@@ -4419,9 +4420,41 @@ struct TranscriptView::Impl {
         Node &parent = *slot.content;
         const auto color =
             nickColor(model, entry.nick, sourceServer(model.buffers.at(active), entry));
-        slot.avatarBackground = rectangle(parent, x, y, size, size,
-                                          themeSurfaceFill(brighten(color, .18f)), size * .28f);
-        if (model.settings.avatarStyle == "monogram" || model.settings.avatarStyle == "initials") {
+        const bool monogram =
+            model.settings.avatarStyle == "monogram" || model.settings.avatarStyle == "initials";
+        const float radius = nativeAvatarRadius(size);
+        std::unique_ptr<Image> image;
+        if (!monogram)
+            if (const auto *source = sourceContext(model.buffers.at(active), entry)) {
+                const auto network = model.networks.find(source->server);
+                const std::string_view mapping =
+                    network == model.networks.end() ? std::string_view("rfc1459")
+                                                    : std::string_view(network->second.caseMapping);
+                image = std::make_unique<Image>();
+                const auto &g = cache->geometry;
+                const float spriteY =
+                    g.inlineChannel || (g.bubbles && !entry.action)
+                        ? y + size * (.5f - foundryAvatarBodyCenterY(entry.nick, mapping))
+                        : y;
+                image->setPosition(x, spriteY);
+                image->setSize(size, size);
+                image->setFit(ImageFit::Contain);
+                image->setRadius(radius);
+                image->setHitTestVisible(false);
+                if (setFoundryAvatar(*image, renderer, entry.nick, color, mapping))
+                    y = spriteY;
+                else
+                    image.reset();
+            }
+        slot.avatarSprite = bool(image);
+        slot.avatarBackground =
+            rectangle(parent, x, y, size, size,
+                      slot.avatarSprite ? themeSurfaceColor("surface_container_high")
+                                        : themeSurfaceFill(brighten(color, .18f)),
+                      radius);
+        if (image) {
+            parent.addChild(std::move(image));
+        } else if (monogram) {
             const auto initial = entry.nick.empty()
                                      ? std::string("?")
                                      : entry.nick.substr(0, ui_logic::next(entry.nick, 0));
@@ -4443,26 +4476,6 @@ struct TranscriptView::Impl {
                           std::max(1.f, metrics.bottom - metrics.top));
             text->setHitTestVisible(false);
             parent.addChild(std::move(text));
-        } else {
-            const auto *source = sourceContext(model.buffers.at(active), entry);
-            if (!source)
-                return;
-            const auto network = model.networks.find(source->server);
-            const std::string_view mapping = network == model.networks.end()
-                                                 ? std::string_view("rfc1459")
-                                                 : std::string_view(network->second.caseMapping);
-            auto image = std::make_unique<Image>();
-            const auto &g = cache->geometry;
-            if (g.inlineChannel || (g.bubbles && !entry.action))
-                y += size * (.5f - foundryAvatarBodyCenterY(entry.nick, mapping));
-            image->setPosition(x, y);
-            image->setSize(size, size);
-            image->setFit(ImageFit::Contain);
-            image->setHitTestVisible(false);
-            if (setFoundryAvatar(*image, renderer, entry.nick, color, mapping)) {
-                slot.avatarBackground->setVisible(false);
-                parent.addChild(std::move(image));
-            }
         }
     }
     static void addRowPaint(Node &content, std::unique_ptr<Node> child) {
@@ -5451,8 +5464,11 @@ struct TranscriptView::Impl {
                 reaction.button->setPosition(reaction.x, reaction.y + bounce);
             if (slot.avatarBackground) {
                 auto style = slot.avatarBackground->style();
-                style.fill = themeSurfaceFill(
-                    brighten(nickColor(model, entry.nick, sourceServer(*buffer, entry)), .18f));
+                style.fill =
+                    slot.avatarSprite
+                        ? themeSurfaceColor("surface_container_high")
+                        : themeSurfaceFill(brighten(
+                              nickColor(model, entry.nick, sourceServer(*buffer, entry)), .18f));
                 slot.avatarBackground->setStyle(style);
             }
             for (const auto &[rectangle, role] : slot.roleRects) {
@@ -6409,21 +6425,22 @@ struct TranscriptView::Impl {
                     setFoundryAvatar(*avatar.image, renderer, nick, color, typingMapping);
                 }
             }
+            const bool sprite = avatar.style == "sprite" && avatar.image->hasImage();
             auto style = avatar.background->style();
-            style.fill = themeSurfaceFill(brighten(color, .18f));
-            style.radius = avatarSize * .28f;
+            style.fill = sprite ? themeSurfaceColor("surface_container_high")
+                                : themeSurfaceFill(brighten(color, .18f));
+            style.radius = nativeAvatarRadius(avatarSize);
             avatar.background->setStyle(style);
             const float x = 4 * g.scale + avatarStep * i;
             const float y = std::max(0.f, (footerHeight - avatarSize) / 2);
             avatar.background->setPosition(x, y);
             avatar.background->setSize(avatarSize, avatarSize);
-            const bool sprite = avatar.style == "sprite" && avatar.image->hasImage();
-            avatar.background->setVisible(!sprite);
             avatar.image->setVisible(sprite);
             avatar.initial->setVisible(!sprite);
             if (sprite) {
                 avatar.image->setPosition(x, y);
                 avatar.image->setSize(avatarSize, avatarSize);
+                avatar.image->setRadius(style.radius.tl);
             } else {
                 avatar.initial->setColor(color);
                 avatar.initial->setFontFamily(themeUiFont().family);

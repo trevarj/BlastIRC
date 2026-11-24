@@ -3533,6 +3533,13 @@ def run_avatar_alignment(ctx):
             _refresh_restart(ctx, 'appearance',
                              {key: json.dumps(value) for key, value in appearance.items()},
                              focus=ctx['channel_id'])
+            preferences = Path(ctx['preferences'])
+            palette = preferences.with_name('noctalia.toml')
+            colors = (tomllib.loads(palette.read_text())['colors']
+                      if palette.is_file() and appearance.get('theme_source')
+                      not in ('builtin', 'built-in') else {})
+            plate_hex = colors.get('surface_container_high', '#272A31')
+            plate_rgb = tuple(int(plate_hex[index:index + 2], 16) for index in (1, 3, 5))
             for own in (False, True):
                 bump = 20 if message_scale > 1 else 0
                 rgb = (42 + bump, 185, 113) if not own else (179 + bump, 79, 213)
@@ -3600,8 +3607,10 @@ def run_avatar_alignment(ctx):
                     rows = []
                     for row in range(avatar.height):
                         points = [col for col in range(avatar.width)
-                                  if max(abs(a - b) for a, b in
-                                         zip(avatar.getpixel((col, row)), canvas)) > 8]
+                                  if any(pixel < min(backdrop, plate) - 4 or
+                                         pixel > max(backdrop, plate) + 4
+                                         for pixel, backdrop, plate in
+                                         zip(avatar.getpixel((col, row)), canvas, plate_rgb))]
                         rows.append(points)
                     broadest = max(map(len, rows), default=0)
                     broad = [row for row, points in enumerate(rows)

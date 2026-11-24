@@ -191,6 +191,10 @@ class ProfileAvatar final : public Node {
   public:
     ProfileAvatar() {
         setHitTestVisible(false);
+        auto plate = std::make_unique<Box>();
+        background = plate.get();
+        background->setHitTestVisible(false);
+        addChild(std::move(plate));
         auto picture = std::make_unique<Image>();
         image = picture.get();
         image->setHitTestVisible(false);
@@ -231,7 +235,9 @@ class ProfileAvatar final : public Node {
             bodyColor = color;
             markLayoutDirty();
         }
-        initials->setColor(color);
+        const auto fill = themeForegroundColor("surface_container_high");
+        background->setFill(fill);
+        initials->setColor(themePairedForeground(fill, color));
         initials->setFontFamily(themeUiFont().family);
         initials->setFontFeatures(themeUiFont().features);
         initials->setFontSize(17 * scale);
@@ -255,6 +261,10 @@ class ProfileAvatar final : public Node {
         const bool picture = useSprite && image->hasImage();
         image->setVisible(picture);
         initials->setVisible(!picture);
+        const float radius = nativeAvatarRadius(std::min(width(), height()));
+        background->setSize(width(), height());
+        background->setRadius(radius);
+        image->setRadius(radius);
         image->setSize(width(), height());
         if (picture)
             image->layout(renderer);
@@ -262,6 +272,7 @@ class ProfileAvatar final : public Node {
             placement.place(*initials, renderer, 0, 0, width(), height());
     }
 
+    Box *background = nullptr;
     Image *image = nullptr;
     Label *initials = nullptr;
     NativeAvatarLabelPlacement placement;

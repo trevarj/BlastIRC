@@ -26,6 +26,7 @@
 #include <render/core/renderer.h>
 #include <render/core/texture_manager.h>
 #include <render/scene/glyph_node.h>
+#include <render/scene/image_node.h>
 #include <render/scene/input_dispatcher.h>
 #include <render/scene/rect_node.h>
 #include <render/scene/text_node.h>
@@ -900,15 +901,19 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
         view.arrange(renderer, viewport);
     };
     const auto avatar = [&](const Body &rendered, float size) {
-        Node *result = nullptr;
-        for (const auto &child : rendered.content.children())
-            if ((dynamic_cast<RectNode *>(child.get()) || dynamic_cast<Image *>(child.get())) &&
-                child->visible() && std::abs(child->width() - size) < .02f &&
-                std::abs(child->height() - size) < .02f) {
-                assert(!result);
-                result = child.get();
+        Node *plate = nullptr;
+        for (const auto &child : rendered.content.children()) {
+            if (!child->visible() || std::abs(child->width() - size) >= .02f ||
+                std::abs(child->height() - size) >= .02f)
+                continue;
+            if (dynamic_cast<Image *>(child.get()))
+                return child.get();
+            if (dynamic_cast<RectNode *>(child.get())) {
+                assert(!plate);
+                plate = child.get();
             }
-        return result;
+        }
+        return plate;
     };
     const auto geometry = [&](bool enabled, bool monogram) {
         for (int i : {0, 1, 2}) {
@@ -4620,9 +4625,13 @@ void channelActivity(TranscriptTestRenderer &renderer, float zoom, float message
     event.presence = false;
     ++buffer.messagesRevision;
     arrange();
-    for (const auto &child : body(view, original[0]).content.children())
-        if (const auto *rect = dynamic_cast<RectNode *>(child.get()))
-            assert(!rect->visible() || rect->style().fill.a == 0);
+    const auto action = body(view, original[0]);
+    const auto *avatar = find<Image>(action.content);
+    for (const auto &child : action.content.children())
+        if (const auto *rect = dynamic_cast<RectNode *>(child.get());
+            rect && rect->visible() && rect->style().fill.a > 0)
+            assert(avatar && rect->x() == avatar->x() && rect->y() == avatar->y() &&
+                   rect->width() == avatar->width() && rect->height() == avatar->height());
     event.action = false;
     event.presence = true;
     ++buffer.messagesRevision;
@@ -10501,12 +10510,20 @@ void foundryTranscriptAvatars(TranscriptTestRenderer &renderer) {
         assert(avatarBounds.width > 0);
         near(avatarBounds.width, avatarBounds.height);
         containedBounds(avatarBounds, sceneBounds(rendered.row));
+        const float radius = avatarBounds.width * (7.f / 24.f);
+        const auto *picture = find<ImageNode>(*image);
+        assert(picture);
+        near(picture->radius(), radius);
+        bool backed = false;
         for (const auto &child : rendered.content.children())
             if (const auto *rect = dynamic_cast<RectNode *>(child.get());
                 rect && rect->visible() && rect->width() == image->width() &&
-                rect->height() == image->height())
-                assert(sceneBounds(*rect).x != avatarBounds.x ||
-                       sceneBounds(*rect).y != avatarBounds.y);
+                rect->height() == image->height() && rect->x() == image->x() &&
+                rect->y() == image->y()) {
+                near(rect->style().radius.tl, radius);
+                backed = true;
+            }
+        assert(backed);
         const auto texture = image->textureId();
         hashes[variant] = renderer.textures.rgbaHash(texture);
         const auto uploads = renderer.textures.uploads;

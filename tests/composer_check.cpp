@@ -2184,12 +2184,19 @@ void checkComposerColors(Renderer &renderer) {
             return std::abs(a.r - b.r) < .005f && std::abs(a.g - b.g) < .005f &&
                    std::abs(a.b - b.b) < .005f && std::abs(a.a - b.a) < 1e-6f;
         };
+        const auto composerBackdrop = [] {
+            const auto fill = themeSurfaceColor("surface_container_high");
+            return withAlpha(lerpColor(themeConversationBackdrop(), fill, fill.a), 1);
+        };
+        const auto expectedNickColor = [&](const std::string &nick) {
+            return nickTextColor(model, nick, buffer.server, composerBackdrop());
+        };
         const auto expectNick = [&](std::string_view token, const std::string &nick) {
             const auto offset = input->value().find(token);
             assert(offset != std::string::npos);
             for (std::size_t i = 0; i < token.size(); ++i) {
                 const auto color = colorAt(offset + i, PANGO_ATTR_FOREGROUND);
-                assert(color && sameColor(*color, nickColor(model, nick, buffer.server)));
+                assert(color && sameColor(*color, expectedNickColor(nick)));
             }
         };
         const std::string raw = "😀 Alice Me {peer} Unknown https://host/Alice AliceSuffix xAlice "
@@ -2231,8 +2238,7 @@ void checkComposerColors(Renderer &renderer) {
         }
         const auto styled = raw.find("\x02\x1d\x1f\x1e\x11") + 5;
         assert(colorAt(styled, PANGO_ATTR_FOREGROUND) &&
-               sameColor(*colorAt(styled, PANGO_ATTR_FOREGROUND),
-                         nickColor(model, "Alice", buffer.server)));
+               sameColor(*colorAt(styled, PANGO_ATTR_FOREGROUND), expectedNickColor("Alice")));
         PangoAttrList *attributes = nullptr;
         char *plain = nullptr;
         GError *error = nullptr;
@@ -2286,12 +2292,11 @@ void checkComposerColors(Renderer &renderer) {
         assert(sameColor(*colorAt(hexadecimal, PANGO_ATTR_FOREGROUND), rgbHex(0x12ab34)) &&
                sameColor(*colorAt(hexadecimal, PANGO_ATTR_BACKGROUND), rgbHex(0x56789a)));
         const auto reversed = raw.find("\x16") + 1;
-        assert(sameColor(*colorAt(reversed, PANGO_ATTR_FOREGROUND),
-                         themeSurfaceColor("surface_container_high")) &&
-               sameColor(*colorAt(reversed, PANGO_ATTR_BACKGROUND),
-                         themeForegroundColor("on_surface")));
-        const auto parsed = parseIrcFormatting(input->value(), themeForegroundColor("on_surface"),
-                                               themeSurfaceColor("surface_container_high"));
+        const auto backdrop = composerBackdrop();
+        const auto foreground = themePairedForeground(backdrop, themeForegroundColor("on_surface"));
+        assert(sameColor(*colorAt(reversed, PANGO_ATTR_FOREGROUND), backdrop) &&
+               sameColor(*colorAt(reversed, PANGO_ATTR_BACKGROUND), foreground));
+        const auto parsed = parseIrcFormatting(input->value(), foreground, backdrop);
         assert(input->displayProjection()->text == parsed.text && map == parsed.rawToDisplay);
         buffer.nicks[0].name = "Unknown"; // Same-sized nicklist mutation.
         frame();

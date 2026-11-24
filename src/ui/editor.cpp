@@ -2825,10 +2825,12 @@ EditorStore::Impl::Composer::Composer(Impl &impl, PaneState &state)
     replyText = replyContext.get();
     auto heading = std::make_unique<Label>();
     heading->setMaxLines(1);
+    heading->setBaselineMode(LabelBaselineMode::InkCentered);
     heading->setUseMarkup(true);
     replyHeading = static_cast<Label *>(replyContext->addChild(std::move(heading)));
     auto label = std::make_unique<Label>();
     label->setMaxLines(1);
+    label->setBaselineMode(LabelBaselineMode::InkCentered);
     label->setUseMarkup(true);
     replyLabel = static_cast<Label *>(replyContext->addChild(std::move(label)));
     reply->addChild(std::move(replyContext));

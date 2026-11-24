@@ -7116,21 +7116,26 @@ void runComposerNativeCheck(bool predictionOnly) {
                     rich->setTextColors(rgbHex(0xff00ff), {}, {}, {});
                     rich->layout(renderer);
                     const auto magenta = captureRich();
-                    size_t changedBaseInk = 0;
+                    size_t unchangedRedInk = 0, unchangedGreenInk = 0, changedBaseInk = 0;
                     for (int y = 0; y < 100; ++y)
                         for (int x = 0; x < 360; ++x) {
                             const auto offset = (size_t(479 - y) * 360 + x) * 4;
                             const auto r = blue[offset], g = blue[offset + 1], b = blue[offset + 2];
-                            if ((r > 200 && g < 30 && b < 30) || (g > 200 && r < 30 && b < 30))
+                            const bool redInk = r == 255 && g == 0 && b == 0;
+                            const bool greenInk = g == 255 && r == 0 && b == 0;
+                            if (redInk || greenInk) {
                                 assert(std::equal(blue.begin() + offset, blue.begin() + offset + 4,
                                                   magenta.begin() + offset));
+                                unchangedRedInk += redInk;
+                                unchangedGreenInk += greenInk;
+                            }
                             if (b > 200 && r < 30 && g < 30) {
                                 assert(magenta[offset] > 200 && magenta[offset + 1] < 30 &&
                                        magenta[offset + 2] > 200);
                                 ++changedBaseInk;
                             }
                         }
-                    assert(changedBaseInk > 8);
+                    assert(unchangedRedInk > 8 && unchangedGreenInk > 8 && changedBaseInk > 8);
                     auto half = rgbHex(0xff00ff);
                     half.a = .5f;
                     rich->setTextColors(half, {}, {}, {});

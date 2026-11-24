@@ -2007,8 +2007,9 @@ void sidebarAvatarCheck() {
     ui.execute("toggle-navigation");
     frame();
     assert(headerAvatar->hasImage() && visible(*headerAvatar) && !visible(*headerInitials));
-    assert(headerAvatar->width() == 28 && headerAvatar->height() == 28);
-    assert(headerAvatar->sourceWidth() == 28 && headerAvatar->sourceHeight() == 28);
+    assert(headerAvatar->width() == 24 && headerAvatar->height() == 24);
+    assert(headerAvatar->sourceWidth() == 24 && headerAvatar->sourceHeight() == 24);
+    assert(headerAvatar->parent()->x() == headerAvatar->y());
     float avatarRight = 0, avatarY = 0, nameLeft = 0, nameY = 0;
     Node::mapToScene(headerAvatar, headerAvatar->width(), 0, avatarRight, avatarY);
     Node::mapToScene(headerName, 0, 0, nameLeft, nameY);
@@ -2016,7 +2017,8 @@ void sidebarAvatarCheck() {
     model.settings.scale = 2;
     theme.update(model);
     frame();
-    assert(headerAvatar->width() == 56 && headerAvatar->sourceWidth() == 56);
+    assert(headerAvatar->width() == 48 && headerAvatar->sourceWidth() == 48);
+    assert(headerAvatar->parent()->x() == headerAvatar->y());
     model.settings.scale = 1;
     theme.update(model);
     frame();
@@ -2117,7 +2119,7 @@ void serverLogConsumerCheck() {
     assert(logInput && visible(*logInput));
     auto *header = headerFor(*logInput);
     auto *title = labelWithText(*header, "Server log");
-    auto *network = labelWithText(*header, log.server);
+    auto *network = labelWithText(*header, "· " + log.server);
     assert(title && network && visible(*title) && visible(*network));
     float titleRight = 0, titleY = 0, networkLeft = 0, networkY = 0;
     Node::mapToScene(title, title->width(), 0, titleRight, titleY);
@@ -2299,7 +2301,7 @@ void queuedServerLogPaletteCheck() {
                     : nullptr;
             assert(!visible(*query) && logInput && logInput != query && visible(*logInput) &&
                    logInput->value().empty());
-            auto *network = labelWithText(*headerFor(*logInput), log.server);
+            auto *network = labelWithText(*headerFor(*logInput), "· " + log.server);
             assert(network && visible(*network));
             assert(model.activeBuffer == log.id &&
                    model.settings.workspace.at("selected_server") == log.server);
@@ -2377,7 +2379,7 @@ void sojuDisplayNameConsumerCheck() {
     ui.setWindowActions(std::move(actions));
     ui.execute("buffer:" + childId);
     frame();
-    const auto consumers = [&](std::string_view caption, bool allowElidedHeader = false) {
+    const auto consumers = [&](std::string_view caption) {
         assert(model.activeBuffer == childId && buffer.id == childId && buffer.server == childKey);
         assert(model.settings.workspace.at("selected_server") == childKey);
         auto *placeholder =
@@ -2389,31 +2391,22 @@ void sojuDisplayNameConsumerCheck() {
         auto *input = dynamic_cast<Input *>(editor);
         assert(input && input->value().empty() && visible(*input));
         auto *header = headerFor(*input);
-        // Expanded navigation owns network identity; the header chip is shown
+        // Expanded navigation owns network identity; the header label is shown
         // only once navigation is compact/hidden.
         assert(!visibleLabelContaining(*header, caption));
         ui.execute("toggle-navigation");
         frame();
         assert(model.settings.workspace.at("native_navigation_mode") == "compact");
-        if (!visibleLabelContaining(*header, caption)) {
-            assert(allowElidedHeader);
-            const auto captionChip = [&](auto &&self, Node &node) -> Label * {
-                if (!visible(node))
-                    return nullptr;
-                if (auto *label = dynamic_cast<Label *>(&node); label && label->hasTooltip()) {
-                    const auto content = label->tooltipContent();
-                    if (const auto *text = std::get_if<std::string>(&content);
-                        text && *text == caption)
-                        return label;
-                }
-                for (const auto &child : node.children())
-                    if (auto *label = self(self, *child))
-                        return label;
-                return nullptr;
-            };
-            auto *chip = captionChip(captionChip, *header);
-            assert(chip && !chip->text().empty() &&
-                   chip->text().find(childKey) == std::string::npos);
+        auto *headerAlias = labelWithText(*header, "· " + std::string(caption));
+        assert(headerAlias && visible(*headerAlias));
+        assert(visibleCount<Box>(*headerAlias->parent()) == 1);
+        const auto metrics =
+            renderer.measureText(headerAlias->text(), headerAlias->fontSize(), headerAlias->font(),
+                                 0, 1, TextAlign::Start, TextEllipsize::End, false);
+        if (headerAlias->width() + .5f < metrics.width) {
+            const auto hint = headerAlias->tooltipContent();
+            const auto *text = std::get_if<std::string>(&hint);
+            assert(text && *text == caption);
         }
         assert(!visibleLabelContaining(*header, childKey));
         ui.execute("toggle-navigation");
@@ -2481,7 +2474,7 @@ void sojuDisplayNameConsumerCheck() {
     assert(visibleLabelContaining(*dialogs, "#label-proof · My personal network"));
     hostKey(ui, dispatcher, XKB_KEY_Escape);
     frame();
-    consumers("My personal network", true);
+    consumers("My personal network");
 
     for (const std::string &search :
          {std::string("My personal network"), "#label-proof " + childKey}) {
@@ -2503,7 +2496,7 @@ void sojuDisplayNameConsumerCheck() {
         hostKey(ui, dispatcher, XKB_KEY_Return);
         frame();
         assert(!visible(*query) && model.activeBuffer == childId);
-        consumers("My personal network", true);
+        consumers("My personal network");
     }
     dispatcher.setFocus(nullptr);
     dispatcher.setSceneRoot(nullptr);

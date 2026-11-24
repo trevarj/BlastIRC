@@ -29,13 +29,14 @@ void place(Node &node, float x, float y, float width, float height) {
     node.setSize(std::max(0.f, width), std::max(0.f, height));
 }
 float hitExtent(float scale) { return std::max(32.f, 32 * scale); }
-void labelStyle(Label &label, float size, Color ink) {
+void labelStyle(Label &label, float size, Color ink, FontWeight minimum = FontWeight::Thin) {
     if (label.font().family != themeUiFont().family)
         label.setFontFamily(themeUiFont().family);
     if (label.font().features != themeUiFont().features)
         label.setFontFeatures(themeUiFont().features);
-    if (label.font().weight != themeUiFont().weight)
-        label.setFontWeight(themeUiFont().weight);
+    const auto weight = std::max(themeUiFont().weight, minimum);
+    if (label.font().weight != weight)
+        label.setFontWeight(weight);
     label.setFontSize(size);
     label.setColor(ink);
     label.setBaselineMode(LabelBaselineMode::TextFixedHeight);
@@ -121,7 +122,6 @@ struct BufferTitleLine::Impl {
     BufferChromeCallbacks callbacks;
     InputDispatcher *dispatcher = nullptr;
     InputArea *identity;
-    Box *networkChip;
     Box *avatarBackground;
     Image *avatarImage;
     Label *avatarInitials;
@@ -144,8 +144,7 @@ struct BufferTitleLine::Impl {
     std::uint64_t measuredGeneration = 0;
     TextFont measuredFont;
     float titleNaturalWidth = 0, readableTitleWidth = 0, minimumTitleWidth = 0;
-    float networkNaturalWidth = 0, networkInitialsWidth = 0;
-    std::string networkInitials;
+    float networkNaturalWidth = 0, minimumNetworkWidth = 0;
     SidebarMode cachedPeoplePreferred = SidebarMode::Hidden;
     SidebarMode cachedPeopleEffective = SidebarMode::Hidden;
     std::string cachedBuffer, cachedTitle, cachedNetwork, cachedTopic, tooltip;
@@ -172,8 +171,6 @@ struct BufferTitleLine::Impl {
         avatarInitials->setMaxLines(1);
         avatarInitials->setHitTestVisible(false);
         title = static_cast<Label *>(identity->addChild(ui::label({.text = "Conversation"})));
-        networkChip = static_cast<Box *>(identity->addChild(std::make_unique<Box>()));
-        networkChip->setHitTestVisible(false);
         network = static_cast<Label *>(identity->addChild(ui::label({.text = ""})));
         for (auto *label : {title, network}) {
             label->setMaxLines(1);
@@ -303,11 +300,10 @@ struct BufferTitleLine::Impl {
             cachedTitle = name;
             cachedNetwork = server;
             cachedTopic = description;
-            networkInitials = nativeAvatarInitials(cachedNetwork);
             network->clearTooltip();
             measuredScale = 0;
             title->setText(name);
-            network->setText(server);
+            network->setText(server.empty() ? "" : "· " + cachedNetwork);
             avatarInitials->setText(nativeAvatarInitials(cachedTitle, channel));
             owner.markLayoutDirty();
             tooltip = cachedTitle;
@@ -334,17 +330,15 @@ struct BufferTitleLine::Impl {
         const auto chipBackdrop = lerpColor(backdrop, chipFill, chipFill.a);
         const auto chipInk =
             themePairedForeground(chipBackdrop, themeForegroundColor("on_surface_variant"));
-        labelStyle(*avatarInitials, 13 * scale, chipInk);
-        avatarInitials->setFontWeight(FontWeight::SemiBold);
+        labelStyle(*avatarInitials, 13 * scale, chipInk, FontWeight::SemiBold);
         avatarBackground->setFill(chipFill);
-        avatarBackground->setRadius(themeCornerRadius());
-        const auto titleInk =
-            active ? themePairedForeground(backdrop, themeForegroundColor("on_surface"))
-                   : statusInk;
-        labelStyle(*title, 14 * scale, titleInk);
-        labelStyle(*network, 11 * scale, chipInk);
-        networkChip->setFill(chipFill);
-        networkChip->setRadius(themeCornerRadius());
+        const auto titleInk = themePairedForeground(backdrop, themeForegroundColor("on_surface"));
+        labelStyle(*title, 14 * scale, active ? titleInk : statusInk, FontWeight::SemiBold);
+        const auto networkInk =
+            statusInk == titleInk
+                ? themePairedForeground(backdrop, lerpColor(titleInk, backdrop, .18f))
+                : statusInk;
+        labelStyle(*network, 11 * scale, networkInk);
         for (std::size_t i = 0; i < tools.size(); ++i)
             tools[i]->sync(scale, backdrop, i == 0 && peopleEffective != SidebarMode::Hidden);
         topic->sync(scale, backdrop);
@@ -366,13 +360,12 @@ struct BufferTitleLine::Impl {
     }
     float desiredHeight(Renderer &renderer, bool shortTitle) const {
         const float identityHeight =
-            std::max(renderer.fontRowExtent(14 * scale, themeUiFont()),
-                     renderer.fontRowExtent(11 * scale, themeUiFont()) + 8 * scale);
+            std::max(24 * scale, renderer.fontRowExtent(14 * scale, title->font()));
         return std::max(hitExtent(scale) + (shortTitle ? 0.f : 2 * scale),
                         identityHeight + 4 * scale);
     }
     void layout(Renderer &renderer) {
-        const float gap = 6 * scale, extent = hitExtent(scale), avatarExtent = 28 * scale;
+        const float gap = 6 * scale, extent = hitExtent(scale), avatarExtent = 24 * scale;
         const float chromeHeight = owner.height();
         if (measuredScale != scale || measuredRenderScale != renderer.renderScale() ||
             measuredGeneration != renderer.textMetricsGeneration() ||
@@ -392,20 +385,16 @@ struct BufferTitleLine::Impl {
                 std::ceil(
                     renderer.measureText(channel ? "#M…" : "M…", 14 * scale, title->font()).width));
             networkNaturalWidth =
-                std::ceil(renderer.measureText(cachedNetwork, 11 * scale, network->font()).width);
-            networkInitialsWidth =
-                std::ceil(renderer.measureText(networkInitials, 11 * scale, network->font()).width);
+                std::ceil(renderer.measureText(network->text(), 11 * scale, network->font()).width);
+            minimumNetworkWidth = std::min(
+                networkNaturalWidth,
+                std::ceil(renderer.measureText("· M…", 11 * scale, network->font()).width));
         }
         const int fullCount = channel ? 4 : 2;
         const float fullReserved = fullCount * extent + (fullCount - 1) * gap;
         const float padding =
             std::min(8 * scale, std::max(0.f, (owner.width() - fullReserved) / 2));
         const float available = std::max(0.f, owner.width() - 2 * padding);
-        const float chipPadding = 6 * scale;
-        const float minimumNetworkWidth =
-            cachedNetwork.empty()
-                ? 0.f
-                : std::min(networkNaturalWidth, networkInitialsWidth) + 2 * chipPadding;
         const float networkReserve = minimumNetworkWidth > 0 ? minimumNetworkWidth + gap : 0.f;
         const float readableIdentity = avatarExtent + gap + readableTitleWidth + networkReserve;
         hiddenTools = wantsIdentity && available - fullReserved - gap < readableIdentity;
@@ -443,7 +432,9 @@ struct BufferTitleLine::Impl {
             placeLabel(*historyStatus, renderer, 18 * scale, 0, textWidth, chromeHeight);
         }
         const bool showIdentity = wantsIdentity && identityBudget > 0;
-        place(*identity, padding, 0, identityBudget, chromeHeight);
+        const float avatarTop = (chromeHeight - avatarExtent) / 2;
+        const float identityX = std::clamp(avatarTop, 0.f, padding);
+        place(*identity, identityX, 0, identityBudget + padding - identityX, chromeHeight);
         identity->setVisible(showIdentity);
         if (!showIdentity) {
             if (avatarImage->hasImage())
@@ -453,10 +444,12 @@ struct BufferTitleLine::Impl {
             avatarImage->setVisible(false);
         }
         if (showIdentity) {
-            const float avatarTop = (chromeHeight - avatarExtent) / 2;
             place(*avatarBackground, 0, avatarTop, avatarExtent, avatarExtent);
             place(*avatarImage, 0, avatarTop, avatarExtent, avatarExtent);
-            avatarImage->setRadius(themeCornerRadius());
+            const float avatarRadius =
+                std::clamp(themeCornerRadius() - identityX, 4 * scale, avatarExtent / 2);
+            avatarBackground->setRadius(avatarRadius);
+            avatarImage->setRadius(avatarRadius);
             const int target =
                 std::max(1, int(std::ceil(avatarExtent * std::max(1.f, renderer.renderScale()))));
             if (loadedAvatarSource != avatarSource || loadedAvatarSize != target) {
@@ -471,34 +464,20 @@ struct BufferTitleLine::Impl {
                                               avatarExtent);
             const float titleX = avatarExtent + gap;
             const float textBudget = std::max(0.f, identityBudget - titleX);
-            // Keep only a meaningful network minimum; the title owns all remaining space.
-            const float titleBudget = textBudget >= minimumTitleWidth + networkReserve
-                                          ? textBudget - networkReserve
-                                          : textBudget;
-            const float titleWidth = std::min(titleNaturalWidth, titleBudget);
+            const float titleWidth = std::min(titleNaturalWidth, textBudget);
             placeLabel(*title, renderer, titleX, 0, titleWidth, chromeHeight);
-            const float chipBudget =
-                std::min(120 * scale, std::max(0.f, textBudget - titleWidth - gap));
-            const bool fullNetwork = networkNaturalWidth + 2 * chipPadding <= chipBudget;
-            const bool showNetwork =
-                !cachedNetwork.empty() &&
-                (fullNetwork || networkInitialsWidth + 2 * chipPadding <= chipBudget);
+            const float networkWidth = std::min(
+                {120 * scale, networkNaturalWidth, std::max(0.f, textBudget - titleWidth - gap)});
+            const bool showNetwork = networkWidth > 0 && networkWidth >= minimumNetworkWidth;
             network->setVisible(showNetwork);
-            networkChip->setVisible(showNetwork);
             if (showNetwork) {
-                network->setText(fullNetwork ? cachedNetwork : networkInitials);
-                if (fullNetwork)
+                if (networkWidth < networkNaturalWidth) {
+                    if (!network->hasTooltip())
+                        network->setTooltip(cachedNetwork);
+                } else
                     network->clearTooltip();
-                else if (!network->hasTooltip())
-                    network->setTooltip(cachedNetwork);
-                const float textWidth = fullNetwork ? networkNaturalWidth : networkInitialsWidth;
-                const float chipWidth = textWidth + 2 * chipPadding;
-                network->setMaxWidth(textWidth);
-                network->measure(renderer);
-                const float chipX = titleX + titleWidth + gap;
-                const float chipHeight = network->height() + 8 * scale;
-                place(*networkChip, chipX, (chromeHeight - chipHeight) / 2, chipWidth, chipHeight);
-                placeLabel(*network, renderer, chipX + chipPadding, 0, textWidth, chromeHeight);
+                placeLabel(*network, renderer, titleX + titleWidth + gap, 0, networkWidth,
+                           chromeHeight);
             }
         }
         float x = std::max(0.f, owner.width() - padding - reserved);

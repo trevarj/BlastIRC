@@ -17,6 +17,7 @@
   "icons": {
     "Search": "search",
     "People": "users",
+    "Channel": "hash",
     "Split": "columns-2",
     "More": "ellipsis",
     "Settings": "settings",
@@ -46,6 +47,7 @@
     "LICENSE": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57",
     "search.svg": "0a5fddb26288ba22ab25c78725c52f7320560f807a720aff43d7e2d69256c881",
     "users.svg": "53bdf117a91d7db52e228d3fb390ee95975c845d455f43f72437993257d13afd",
+    "hash.svg": "72878b0c4c5cd95a2fc2b11012b1446481d6ea85a489c92bc3e3d4d3e76fb654",
     "columns-2.svg": "5a26f1b9706e0a8adc196dc115c127d8e491e26edc2f9c3b0ecf080643e56655",
     "ellipsis.svg": "4c1e9da7ba80ed782e448634a538959c74a227a50821a1761e5feaf62d977ac6",
     "settings.svg": "a625464806e2de82e3cba39cf19c8c596fe88f4e36f58538c0fe4a3eac27b83e",

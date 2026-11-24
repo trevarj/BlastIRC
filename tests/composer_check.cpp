@@ -1426,6 +1426,9 @@ void checkComposerSpellcheck(Renderer &renderer) {
     input->setValue("/kick ");
     frame();
     assert(input->displayProjection()->text == "/kick " && errors().empty());
+    assert(menu.open && !contextText(*input, "nick"));
+    menu.closeSelectDropdown();
+    frame();
     auto *ghost = contextText(*input, "nick");
     assert(ghost && nativeVisible(*ghost) && !ghost->useMarkup() &&
            !ghost->participatesInLayout() && !ghost->hitTestVisible());
@@ -1878,7 +1881,7 @@ void checkComposerWordPrediction(Renderer &renderer) {
     input->setValue("#ot");
     frame();
     openMixed();
-    expectRows({{"#other", "/users.svg"}});
+    expectRows({{"#other", "/hash.svg"}});
     assert(editors.handleCompletionKey(XKB_KEY_Return, 0) && input->value() == "#other");
 
     // The same prefix follows this chat's sent context, not alphabetical order.

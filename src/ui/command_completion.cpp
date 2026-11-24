@@ -85,7 +85,7 @@ class Row final : public InputArea {
             icon->setName("at-sign");
             break;
         case Source::Channel:
-            icon->setName("users");
+            icon->setName("hash");
             break;
         case Source::Word:
             icon->setName("type");

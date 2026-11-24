@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <linux/input-event-codes.h>
 #include <pango/pango.h>
 #include <render/animation/animation_manager.h>
@@ -1460,6 +1461,43 @@ void checkComposerSpellcheck(Renderer &renderer) {
            input->editingState().current == committedBeforeIme.current &&
            committedBeforeIme.history->undo == imeUndo &&
            committedBeforeIme.history->redo == imeRedo);
+
+    char directory[] = "/tmp/blastirc-composer-dictionaries-XXXXXX";
+    assert(mkdtemp(directory));
+    const auto path = std::filesystem::path(directory);
+    std::ofstream(path / "en_US.aff") << "SET UTF-8\n";
+    std::ofstream(path / "en_US.dic") << "1\nteh\n";
+    const auto second = path / "other";
+    std::filesystem::create_directory(second);
+    std::ofstream(second / "zz_custom.aff") << "SET UTF-8\n";
+    std::ofstream(second / "zz_custom.dic") << "1\nqzxylophonic\n";
+    readyTypo();
+    model.settings.spellcheckDictionaryPaths = {(path / "en_US.dic").string(), second.string()};
+    menu.select("Spelling/the");
+    assert(input->value() == "teh");
+    input->setValue("teh qzxylophonic");
+    const auto beforeReload = input->editingState();
+    const auto beforeReloadUndo = beforeReload.history->undo;
+    const Ranges unknownSecond{{4, beforeReload.current.value.size()}};
+    await([&] { return errors() == unknownSecond; });
+    model.settings.spellcheckLanguage = Spellcheck::allLanguages;
+    frame();
+    assert(errors().empty());
+    std::ofstream(second / "zz_custom.dic") << "1\nqzreplacement\n";
+    ++model.spellcheckDictionaryRevision;
+    await([&] { return errors() == unknownSecond; });
+    std::ofstream(second / "zz_custom.dic") << "1\nqzxylophonic\n";
+    ++model.spellcheckDictionaryRevision;
+    await([&] {
+        openKeyboard();
+        return errors().empty() && std::ranges::none_of(menu.request.menu, [](const auto &entry) {
+                   return entry.label == "Spelling";
+               });
+    });
+    menu.closeSelectDropdown();
+    assert(input->editingStateMatches(beforeReload) &&
+           beforeReload.history->undo == beforeReloadUndo);
+    std::filesystem::remove_all(path);
     input->setPopupContext(nullptr);
     editors.setOverlayHost(nullptr);
     dispatcher.setFocus(nullptr);

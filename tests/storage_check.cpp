@@ -1027,7 +1027,9 @@ static void sendBoundaries(const fs::path &database, int64_t now) {
 static void spellingPreferences(const fs::path &config) {
     const auto preferences = config / "settings.toml";
     // Old settings keep the new defaults; safe unavailable IDs survive a restart.
-    for (const string language : {"", "auto", "en_US", "missing_dictionary-42"}) {
+    const vector<string> paths{(config / "missing dictionaries").string(),
+                               (config / "missing.dic").string()};
+    for (const string language : {"", "auto", "en_US", "missing_dictionary-42", "*"}) {
         {
             std::ofstream output(preferences);
             output << "schema_version = 1\n";
@@ -1041,16 +1043,18 @@ static void spellingPreferences(const fs::path &config) {
             storage.load(model);
             assert(model.settings.spellcheck == language.empty());
             assert(model.settings.spellcheckLanguage == (language.empty() ? "auto" : language));
+            if (language == "*" && reopen) {
+                assert(model.settings.spellcheckDictionaryPaths == paths);
+            } else {
+                assert(model.settings.spellcheckDictionaryPaths.empty());
+                if (language == "*")
+                    model.settings.spellcheckDictionaryPaths = paths;
+            }
             storage.save(model);
         }
     }
     const auto valid = contents(preferences);
-    for (const string language : {"", "../en_US", "/en_US", "en/US", "en\\US", ".hidden",
-                                  "en_US.dic", "en US", "_en", "-en", "é"}) {
-        Storage storage;
-        Model model;
-        storage.load(model);
-        model.settings.spellcheckLanguage = language;
+    const auto rejectsSave = [&](Storage &storage, const Model &model) {
         bool failed = false;
         try {
             storage.save(model);
@@ -1058,10 +1062,28 @@ static void spellingPreferences(const fs::path &config) {
             failed = true;
         }
         assert(failed && contents(preferences) == valid);
+    };
+    for (const string language : {"", "../en_US", "/en_US", "en/US", "en\\US", ".hidden",
+                                  "en_US.dic", "en US", "_en", "-en", "é"}) {
+        Storage storage;
+        Model model;
+        storage.load(model);
+        model.settings.spellcheckLanguage = language;
+        rejectsSave(storage, model);
     }
-    for (const string source :
-         {"spellcheck = 'true'\n", "spellcheck_language = 12\n",
-          "spellcheck_language = '../en_US'\n", "spellcheck_language = ''\n"}) {
+    for (const auto &path :
+         vector<string>{"relative.dic", "/bad\rpath", "/bad\npath", string("/bad\0path", 9)}) {
+        Storage storage;
+        Model model;
+        storage.load(model);
+        model.settings.spellcheckDictionaryPaths = {paths.front(), path};
+        rejectsSave(storage, model);
+    }
+    for (const string source : {"spellcheck = 'true'\n", "spellcheck_language = 12\n",
+                                "spellcheck_language = '../en_US'\n", "spellcheck_language = ''\n",
+                                "spellcheck_dictionary_paths = '/absolute'\n",
+                                "spellcheck_dictionary_paths = ['/absolute', 12]\n",
+                                "spellcheck_dictionary_paths = ['/absolute', 'relative.dic']\n"}) {
         {
             std::ofstream output(preferences);
             output << "schema_version = 1\n[composer]\n" << source;

@@ -4,8 +4,12 @@
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
+
+#include <sys/stat.h>
 
 using namespace std::chrono_literals;
 
@@ -26,6 +30,71 @@ blast::SpellResult await(blast::Spellcheck &checker, std::uint64_t ticket) {
 bool contains(const std::vector<std::string> &words, const std::string &word) {
     return std::find(words.begin(), words.end(), word) != words.end();
 }
+
+void customDictionaries() {
+    namespace fs = std::filesystem;
+    using blast::Spellcheck;
+    auto rootName = (fs::temp_directory_path() / "blastirc-spellcheck-XXXXXX").string();
+    const auto *created = mkdtemp(rootName.data());
+    assert(created);
+    const fs::path root(created);
+    const auto folder = root / "first", other = root / "second";
+    fs::create_directory(folder);
+    fs::create_directory(other);
+    auto writePair = [](const fs::path &base, std::string_view words) {
+        std::ofstream aff(base.string() + ".aff");
+        std::ofstream dic(base.string() + ".dic");
+        aff << "SET UTF-8\nTRY abcdefghijklmnopqrstuvwxyz\nREP 1\nREP ziggno ziggon\n";
+        dic << words;
+        assert(aff && dic);
+    };
+    const auto first = folder / "xx_AA", second = other / "xx_BB";
+    writePair(first, "2\nziggon\nfroblen\n");
+    writePair(second, "2\nziggon\nquarnen\n");
+    writePair(other / "xx_AA", "1\ndribnen\n");
+    writePair(folder / "bad.id", "1\ndribnen\n");
+    writePair(folder / "auto", "1\ndribnen\n");
+    std::ofstream(folder / "xx_FIFO.aff") << "SET UTF-8\n";
+    assert(mkfifo((folder / "xx_FIFO.dic").c_str(), 0600) == 0);
+
+    const auto missing = (root / "missing").string();
+    const std::vector<std::string> paths{missing, folder.string(), second.string() + ".dic",
+                                         (other / "xx_AA.aff").string()};
+    const auto installed = Spellcheck::languages(paths);
+    assert(std::count(installed.begin(), installed.end(), "xx_AA") == 1);
+    assert(contains(installed, "xx_BB") && contains(installed, "en_US"));
+    assert(!contains(installed, "auto") && !contains(installed, "bad.id") &&
+           !contains(installed, "xx_FIFO"));
+    assert(Spellcheck::hasDictionaryPair(folder.string()));
+    assert(Spellcheck::hasDictionaryPair(first.string() + ".aff"));
+    assert(Spellcheck::hasDictionaryPair(paths[2]));
+    assert(!Spellcheck::hasDictionaryPair(missing));
+    assert(!Spellcheck::hasDictionaryPair((folder / "xx_FIFO.dic").string()));
+
+    Spellcheck checker;
+    const std::string all(Spellcheck::allLanguages);
+    checker.setDictionaryPaths(paths);
+    checker.request(1, "froblen quarnen dribnen", all);
+    auto result = await(checker, 1);
+    assert(result.language == all && result.error.empty() && result.misspelled.size() == 1);
+    assert(result.misspelled.front().begin == 16 && result.misspelled.front().end == 23);
+    const auto suggestions = checker.suggest("ziggno", all);
+    assert(std::count(suggestions.begin(), suggestions.end(), "ziggon") == 1);
+    assert(suggestions.size() <= 8);
+
+    writePair(first, "1\ntwirlen\n");
+    checker.request(2, "froblen", all);
+    checker.setDictionaryPaths(paths);
+    assert(!checker.poll());
+    assert(checker.suggest("ziggno", all).empty());
+    checker.request(3, "froblen twirlen quarnen", all);
+    result = await(checker, 3);
+    assert(result.error.empty() && result.misspelled.size() == 1);
+    assert(result.misspelled.front().begin == 0 && result.misspelled.front().end == 7);
+    assert(contains(checker.suggest("ziggno", all), "ziggon"));
+
+    fs::remove_all(root);
+}
 } // namespace
 
 int main() {
@@ -37,6 +106,8 @@ int main() {
                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") ==
                std::string::npos);
     }
+
+    customDictionaries();
 
     blast::Spellcheck checker;
     checker.request(1, "hello world wrold", "en_US");

@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -54,33 +55,61 @@ std::string resolveLanguage(std::string_view requested) {
     return id;
 }
 
-std::filesystem::path dictionaryPath(std::string_view id, std::string_view extension) {
-    return std::filesystem::path(BLASTIRC_SPELL_DICT_DIR) /
-           (std::string(id) + std::string(extension));
+namespace fs = std::filesystem;
+
+struct DictionaryPair {
+    fs::path aff, dic;
+    std::size_t source;
+};
+
+using Dictionaries = std::map<std::string, DictionaryPair, std::less<>>;
+
+bool regularFile(const fs::path &path) {
+    std::error_code error;
+    return fs::is_regular_file(path, error);
 }
 
-const std::vector<std::string> &installedLanguages() {
-    static const auto installed = [] {
-        std::vector<std::string> ids;
-        if (std::string_view(BLASTIRC_SPELL_DICT_DIR).empty())
-            return ids;
-        std::error_code error;
-        for (std::filesystem::directory_iterator it(BLASTIRC_SPELL_DICT_DIR, error), end;
-             !error && it != end; it.increment(error)) {
-            const auto &path = it->path();
-            if (path.extension() != ".aff")
-                continue;
-            auto id = path.stem().string();
-            if (!safeId(id))
-                continue;
-            if (std::filesystem::is_regular_file(path, error) && !error &&
-                std::filesystem::is_regular_file(dictionaryPath(id, ".dic"), error) && !error)
-                ids.push_back(std::move(id));
-            error.clear();
-        }
-        std::sort(ids.begin(), ids.end());
-        return ids;
-    }();
+template <class Visitor> bool visitDictionaryPairs(const fs::path &root, Visitor visit) {
+    auto visitMember = [&](const fs::path &member) {
+        const auto extension = member.extension();
+        if (extension != ".aff" && extension != ".dic")
+            return false;
+        auto id = member.stem().string();
+        if (!safeId(id) || id == "auto" || !regularFile(member))
+            return false;
+        const bool isAff = extension == ".aff";
+        auto sibling = member;
+        sibling.replace_extension(isAff ? ".dic" : ".aff");
+        if (!regularFile(sibling))
+            return false;
+        return isAff ? visit(std::move(id), member, sibling)
+                     : visit(std::move(id), sibling, member);
+    };
+
+    std::error_code error;
+    if (!fs::is_directory(root, error))
+        return visitMember(root);
+    for (fs::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
+        const auto &path = it->path();
+        if (path.extension() == ".aff" && visitMember(path))
+            return true;
+    }
+    return false;
+}
+
+Dictionaries discoverDictionaries(const std::vector<std::string> &paths) {
+    Dictionaries installed;
+    auto scan = [&](const fs::path &root, std::size_t source) {
+        visitDictionaryPairs(root, [&](std::string id, const fs::path &aff, const fs::path &dic) {
+            installed.try_emplace(std::move(id), aff, dic, source);
+            return false;
+        });
+    };
+    for (std::size_t source = 0; source < paths.size(); ++source)
+        if (Spellcheck::validDictionaryPath(paths[source]))
+            scan(paths[source], source);
+    if (!std::string_view(BLASTIRC_SPELL_DICT_DIR).empty())
+        scan(BLASTIRC_SPELL_DICT_DIR, paths.size());
     return installed;
 }
 
@@ -100,6 +129,40 @@ std::optional<std::string> convert(std::string_view text, const char *to, const 
     return converted;
 }
 
+struct DictionaryEngine {
+    std::unique_ptr<Hunspell> dictionary;
+    std::string encoding;
+};
+
+std::optional<DictionaryEngine> loadDictionary(const std::string &language,
+                                               const DictionaryPair &pair, std::string &error) {
+    if (!regularFile(pair.aff) || !regularFile(pair.dic) ||
+        std::ifstream(pair.aff).peek() == std::char_traits<char>::eof() ||
+        std::ifstream(pair.dic).peek() == std::char_traits<char>::eof()) {
+        error = "Could not read spelling dictionary: " + language;
+        return std::nullopt;
+    }
+    try {
+        auto dictionary = std::make_unique<Hunspell>(pair.aff.c_str(), pair.dic.c_str());
+        std::string encoding = dictionary->get_dic_encoding();
+        auto converter = g_iconv_open(encoding.c_str(), "UTF-8");
+        auto reverse = g_iconv_open("UTF-8", encoding.c_str());
+        const auto failed = reinterpret_cast<GIConv>(-1);
+        if (converter != failed)
+            g_iconv_close(converter);
+        if (reverse != failed)
+            g_iconv_close(reverse);
+        if (converter == failed || reverse == failed) {
+            error = "Spelling dictionary encoding unavailable: " + language;
+            return std::nullopt;
+        }
+        return DictionaryEngine{std::move(dictionary), std::move(encoding)};
+    } catch (...) {
+        error = "Could not load spelling dictionary: " + language;
+        return std::nullopt;
+    }
+}
+
 } // namespace
 
 struct Spellcheck::State {
@@ -115,8 +178,11 @@ struct Spellcheck::State {
     std::optional<SpellResult> result;
     std::atomic<std::uint64_t> generation{0};
     std::atomic<bool> stopping{false};
-    std::unique_ptr<Hunspell> dictionary;
-    std::string dictionaryLanguage, encoding;
+    std::vector<std::string> paths;
+    std::atomic<std::uint64_t> revision{0};
+    std::uint64_t loadedRevision = 0;
+    std::vector<DictionaryEngine> engines;
+    std::string loadedLanguage;
     std::thread worker;
 
     State() : worker([this] { run(); }) {}
@@ -134,56 +200,72 @@ struct Spellcheck::State {
         return !stopping.load() && generation.load() == request.generation;
     }
 
-    bool load(const std::string &language, std::string &error) {
-        // Loading stays off the dictionary lock: explicit suggestions wait at most for one checked
-        // word.
-        {
-            std::lock_guard lock(dictionaryMutex);
-            if (dictionary && dictionaryLanguage == language)
-                return true;
-        }
-        const auto &ids = installedLanguages();
-        if (!safeId(language) || std::find(ids.begin(), ids.end(), language) == ids.end()) {
+    bool currentRevision(std::uint64_t checkRevision) const {
+        return !stopping.load() && revision.load() == checkRevision;
+    }
+
+    bool load(const Dictionaries &installed, std::uint64_t checkRevision, bool all,
+              const std::string &language, std::string &error) {
+        if (!all && !safeId(language)) {
             error = "Spelling dictionary unavailable: " + language;
             return false;
         }
-        std::ifstream aff(dictionaryPath(language, ".aff"));
-        std::ifstream dic(dictionaryPath(language, ".dic"));
-        if (aff.peek() == std::char_traits<char>::eof() ||
-            dic.peek() == std::char_traits<char>::eof()) {
-            error = "Could not read spelling dictionary: " + language;
-            return false;
+        {
+            std::lock_guard lock(dictionaryMutex);
+            if (loadedRevision == checkRevision && loadedLanguage == language)
+                return true;
         }
-        try {
-            auto loaded = std::make_unique<Hunspell>(dictionaryPath(language, ".aff").c_str(),
-                                                     dictionaryPath(language, ".dic").c_str());
-            std::string loadedEncoding = loaded->get_dic_encoding();
-            auto converter = g_iconv_open(loadedEncoding.c_str(), "UTF-8");
-            auto reverse = g_iconv_open("UTF-8", loadedEncoding.c_str());
-            const bool valid = converter != reinterpret_cast<GIConv>(-1) &&
-                               reverse != reinterpret_cast<GIConv>(-1);
-            if (converter != reinterpret_cast<GIConv>(-1))
-                g_iconv_close(converter);
-            if (reverse != reinterpret_cast<GIConv>(-1))
-                g_iconv_close(reverse);
-            if (!valid) {
-                error = "Spelling dictionary encoding unavailable: " + language;
+        std::vector<DictionaryEngine> loaded;
+        if (all) {
+            std::vector<Dictionaries::const_iterator> order;
+            order.reserve(installed.size());
+            for (auto it = installed.begin(); it != installed.end(); ++it)
+                order.push_back(it);
+            std::sort(order.begin(), order.end(), [](auto a, auto b) {
+                if (a->second.source != b->second.source)
+                    return a->second.source < b->second.source;
+                return a->first < b->first;
+            });
+            loaded.reserve(order.size());
+            for (auto it : order) {
+                if (!currentRevision(checkRevision))
+                    return false;
+                if (auto engine = loadDictionary(it->first, it->second, error))
+                    loaded.push_back(std::move(*engine));
+            }
+            if (loaded.empty()) {
+                error = "No spelling dictionaries available";
                 return false;
             }
-            std::lock_guard lock(dictionaryMutex);
-            dictionary.swap(loaded);
-            encoding = std::move(loadedEncoding);
-            dictionaryLanguage = language;
-            return true;
-        } catch (...) {
-            error = "Could not load spelling dictionary: " + language;
-            return false;
+            error.clear();
+        } else {
+            const auto it = installed.find(language);
+            if (it == installed.end()) {
+                error = "Spelling dictionary unavailable: " + language;
+                return false;
+            }
+            if (!currentRevision(checkRevision))
+                return false;
+            auto engine = loadDictionary(language, it->second, error);
+            if (!engine)
+                return false;
+            loaded.push_back(std::move(*engine));
         }
+        std::lock_guard lock(dictionaryMutex);
+        if (!currentRevision(checkRevision))
+            return false;
+        engines.swap(loaded);
+        loadedRevision = checkRevision;
+        loadedLanguage = language;
+        return true;
     }
 
-    SpellResult check(const Request &request) {
+    SpellResult check(const Request &request, const Dictionaries &installed,
+                      std::uint64_t checkRevision) {
         SpellResult checked{request.ticket, resolveLanguage(request.language), {}, {}};
-        if (!load(checked.language, checked.error))
+        const bool all = request.language == Spellcheck::allLanguages;
+        if (!load(installed, checkRevision, all, checked.language, checked.error) ||
+            !current(request))
             return checked;
         if (request.text.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             !g_utf8_validate(request.text.data(), request.text.size(), nullptr)) {
@@ -192,9 +274,10 @@ struct Spellcheck::State {
         }
         const auto characters = g_utf8_strlen(request.text.data(), request.text.size());
         std::vector<PangoLogAttr> attributes(static_cast<std::size_t>(characters) + 1);
+        auto *language = all ? pango_language_get_default()
+                             : pango_language_from_string(checked.language.c_str());
         pango_get_log_attrs(request.text.data(), static_cast<int>(request.text.size()), -1,
-                            pango_language_from_string(checked.language.c_str()), attributes.data(),
-                            static_cast<int>(attributes.size()));
+                            language, attributes.data(), static_cast<int>(attributes.size()));
         const char *origin = request.text.data();
         const char *cursor = origin;
         std::optional<std::size_t> begin;
@@ -212,15 +295,22 @@ struct Spellcheck::State {
                 if (hasLetter && !excluded) {
                     const std::string_view word(origin + range.begin, range.end - range.begin);
                     std::lock_guard lock(dictionaryMutex);
-                    auto encoded = convert(word, encoding.c_str(), "UTF-8");
-                    if (!encoded) {
-                        checked.error =
-                            "Text cannot be represented in spelling dictionary encoding: " +
-                            checked.language;
-                        checked.misspelled.clear();
-                        return checked;
+                    bool accepted = false;
+                    for (auto &engine : engines) {
+                        auto encoded = convert(word, engine.encoding.c_str(), "UTF-8");
+                        if (!encoded && !all) {
+                            checked.error =
+                                "Text cannot be represented in spelling dictionary encoding: " +
+                                checked.language;
+                            checked.misspelled.clear();
+                            return checked;
+                        }
+                        if (encoded && engine.dictionary->spell(*encoded)) {
+                            accepted = true;
+                            break;
+                        }
                     }
-                    if (!dictionary->spell(*encoded))
+                    if (!accepted)
                         checked.misspelled.push_back(range);
                 }
                 begin.reset();
@@ -238,6 +328,8 @@ struct Spellcheck::State {
     }
 
     void run() {
+        Dictionaries installed;
+        std::optional<std::uint64_t> scannedRevision;
         while (!stopping.load()) {
             std::unique_lock lock(mutex);
             wake.wait(lock, [&] { return stopping.load() || pending.has_value(); });
@@ -245,8 +337,16 @@ struct Spellcheck::State {
                 return;
             auto request = std::move(*pending);
             pending.reset();
-            lock.unlock();
-            auto checked = check(request);
+            const auto checkRevision = revision.load();
+            if (scannedRevision != checkRevision) {
+                auto scanPaths = paths;
+                lock.unlock();
+                installed = discoverDictionaries(scanPaths);
+                scannedRevision = checkRevision;
+            } else {
+                lock.unlock();
+            }
+            auto checked = check(request, installed, checkRevision);
             lock.lock();
             if (current(request))
                 result = std::move(checked);
@@ -282,23 +382,51 @@ std::vector<std::string> Spellcheck::suggest(std::string_view word, std::string_
         if (!g_unichar_isalpha(c) && !g_unichar_ismark(c) && c != '\'' && c != 0x2019 && c != '-')
             return suggestions;
     }
+    const auto resolved = resolveLanguage(language);
+    if (language != allLanguages && !safeId(resolved))
+        return suggestions;
     std::lock_guard lock(state_->dictionaryMutex);
-    if (!state_->dictionary || state_->dictionaryLanguage != resolveLanguage(language))
+    if (state_->loadedRevision != state_->revision.load() || state_->loadedLanguage != resolved)
         return suggestions;
-    const auto encoded = convert(word, state_->encoding.c_str(), "UTF-8");
-    if (!encoded)
-        return suggestions;
-    for (const auto &candidate : state_->dictionary->suggest(*encoded)) {
-        auto decoded = convert(candidate, "UTF-8", state_->encoding.c_str());
-        if (decoded && decoded->size() <= 256 &&
-            g_utf8_validate(decoded->data(), decoded->size(), nullptr))
-            suggestions.push_back(std::move(*decoded));
-        if (suggestions.size() == 8)
-            break;
+    for (auto &engine : state_->engines) {
+        const auto encoded = convert(word, engine.encoding.c_str(), "UTF-8");
+        if (!encoded)
+            continue;
+        for (const auto &candidate : engine.dictionary->suggest(*encoded)) {
+            auto decoded = convert(candidate, "UTF-8", engine.encoding.c_str());
+            if (decoded && decoded->size() <= 256 &&
+                g_utf8_validate(decoded->data(), decoded->size(), nullptr) &&
+                std::find(suggestions.begin(), suggestions.end(), *decoded) == suggestions.end())
+                suggestions.push_back(std::move(*decoded));
+            if (suggestions.size() == 8)
+                return suggestions;
+        }
     }
     return suggestions;
 }
 
-std::vector<std::string> Spellcheck::languages() { return installedLanguages(); }
+void Spellcheck::setDictionaryPaths(const std::vector<std::string> &paths) {
+    std::scoped_lock lock(state_->mutex, state_->dictionaryMutex);
+    state_->paths = paths;
+    state_->revision.fetch_add(1);
+    state_->generation.fetch_add(1);
+    state_->pending.reset();
+    state_->result.reset();
+}
+
+std::vector<std::string> Spellcheck::languages(const std::vector<std::string> &paths) {
+    const auto installed = discoverDictionaries(paths);
+    std::vector<std::string> ids;
+    ids.reserve(installed.size());
+    for (const auto &entry : installed)
+        ids.push_back(entry.first);
+    return ids;
+}
+
+bool Spellcheck::hasDictionaryPair(std::string_view path) {
+    return validDictionaryPath(path) &&
+           visitDictionaryPairs(fs::path(path),
+                                [](const auto &, const auto &, const auto &) { return true; });
+}
 
 } // namespace blast

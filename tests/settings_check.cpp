@@ -10,6 +10,7 @@
 #include "../src/ui/transcript.hpp"
 #include "../src/ui/ui.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <chrono>
@@ -324,9 +325,85 @@ void spellingControls(blast::Model &model, blast::Dialogs &dialogs, InputDispatc
     const auto installed = blast::Spellcheck::languages();
     assert(!installed.empty()); // The packaged test environment supplies a real dictionary.
     for (std::size_t index = 0; index < installed.size(); ++index) {
-        language->setSelectedIndex(index + 1);
+        language->setSelectedIndex(index + 2);
         assert(model.settings.spellcheckLanguage == installed[index]);
     }
+    language->setSelectedIndex(1);
+    assert(language->selectedText() == "All dictionaries" &&
+           model.settings.spellcheckLanguage == blast::Spellcheck::allLanguages);
+
+    const auto folder =
+        std::filesystem::path(std::getenv("XDG_CONFIG_HOME")) / "settings check dictionaries";
+    const auto second = folder / "second";
+    const auto member = second / "zz_settings_second.aff";
+    const auto firstDic = folder / "zz_settings_first.dic";
+    std::filesystem::create_directories(second);
+    std::ofstream(folder / "zz_settings_first.aff") << "SET UTF-8\n";
+    std::ofstream(firstDic) << "1\nfirstword\n";
+    std::ofstream(member) << "SET UTF-8\n";
+
+    auto *field = named<Input>(dialogs, "Dictionary path");
+    auto *saved = named<Select>(dialogs, "Saved dictionary paths");
+    auto *add = button(dialogs, "Add dictionary path");
+    auto *remove = button(dialogs, "Remove dictionary path");
+    auto *reload = button(dialogs, "Reload dictionaries");
+    const auto &paths = model.settings.spellcheckDictionaryPaths;
+    const auto &revision = model.spellcheckDictionaryRevision;
+    const auto initialRevision = revision;
+    const auto shows = [&](std::string_view message) {
+        return find<Label>(dialogs, [&](const Label &label) {
+            return label.text().find(message) != std::string_view::npos;
+        });
+    };
+    assert(paths.empty() && !saved->enabled() && !remove->enabled());
+    edit(dispatcher, *field, "relative");
+    press(dispatcher, *add);
+    assert(field->invalid() && shows("absolute local dictionary path") && paths.empty() &&
+           revision == initialRevision);
+    edit(dispatcher, *field, member.string());
+    dialogKey(dialogs, dispatcher, XKB_KEY_Return);
+    assert(field->invalid() && shows("No matching .aff and .dic") && paths.empty() &&
+           revision == initialRevision);
+    edit(dispatcher, *field, folder.string());
+    assert(!field->invalid() && paths.empty() && revision == initialRevision);
+    dialogKey(dialogs, dispatcher, XKB_KEY_Return);
+    assert(paths.size() == 1 && paths.front() == folder.string() &&
+           saved->selectedText() == folder.string() && remove->enabled() &&
+           field->value().empty() && revision == initialRevision + 1);
+
+    std::ofstream(second / "zz_settings_second.dic") << "1\nsecondword\n";
+    edit(dispatcher, *field, member.string());
+    press(dispatcher, *add);
+    assert(paths.size() == 2 && paths.front() == folder.string() &&
+           paths.back() == member.string() && saved->selectedText() == member.string() &&
+           revision == initialRevision + 2 && language->selectedText() == "All dictionaries");
+    const auto options = blast::Spellcheck::languages(paths);
+    const auto first = std::find(options.begin(), options.end(), "zz_settings_first");
+    assert(first != options.end() &&
+           std::find(options.begin(), options.end(), "zz_settings_second") != options.end());
+    language->setSelectedIndex(std::size_t(first - options.begin()) + 2);
+    assert(model.settings.spellcheckLanguage == "zz_settings_first");
+    saved->setSelectedIndex(0);
+
+    assert(std::filesystem::remove(firstDic));
+    edit(dispatcher, *field, second.string());
+    assert(language->selectedText() == "zz_settings_first");
+    press(dispatcher, *reload);
+    assert(revision == initialRevision + 3 && paths.size() == 2 &&
+           saved->selectedText() == folder.string() && field->value() == second.string() &&
+           model.settings.spellcheckLanguage == "zz_settings_first" &&
+           language->selectedText().empty() &&
+           shows("Dictionary zz_settings_first is unavailable"));
+    std::ofstream(firstDic) << "1\nfirstword\n";
+    press(dispatcher, *reload);
+    assert(revision == initialRevision + 4 && language->selectedText() == "zz_settings_first" &&
+           !shows("Dictionary zz_settings_first is unavailable"));
+    press(dispatcher, *remove);
+    assert(revision == initialRevision + 5 && paths.size() == 1 &&
+           saved->selectedText() == member.string() && language->selectedText().empty());
+    press(dispatcher, *remove);
+    assert(revision == initialRevision + 6 && paths.empty() && !saved->enabled() &&
+           !remove->enabled());
     language->setSelectedIndex(0);
     assert(model.settings.spellcheckLanguage == "auto");
 }
@@ -1953,6 +2030,14 @@ void runSettingsCheck() {
     // All pages use their production value callbacks. Compact pixel layout
     // and clipping are checked by the real Wayland workflow, not a fake renderer.
     category("Appearance");
+    search("Dictionary path");
+    assert(settingResult(dialogs, 0)->label()->text().starts_with("Dictionary path · "));
+    openResult();
+    assert(dispatcher.focusedArea() == named<Input>(dialogs, "Dictionary path")->inputArea());
+    search("Reload dictionaries");
+    assert(settingResult(dialogs, 0)->label()->text().starts_with("Reload dictionaries · "));
+    openResult();
+    assert(dispatcher.focusedArea() == button(dialogs, "Reload dictionaries")->inputArea());
     spellingControls(model, dialogs, dispatcher);
     predictionControls(model, dialogs, dispatcher);
     model.settings.spellcheckLanguage = "unavailable_dictionary_for_settings_check";
@@ -1971,7 +2056,7 @@ void runSettingsCheck() {
                    std::string_view::npos;
     });
     assert(availability);
-    missingLanguage->setSelectedIndex(1);
+    missingLanguage->setSelectedIndex(2);
     assert(model.settings.spellcheckLanguage == Spellcheck::languages().front());
     assert(availability->text().find("unavailable_dictionary_for_settings_check") ==
            std::string_view::npos);

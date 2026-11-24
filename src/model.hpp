@@ -110,6 +110,7 @@ struct Settings {
     string themeSource = "auto", pitchVariation = "natural";
     bool spellcheck = true;
     string spellcheckLanguage = "auto";
+    vector<string> spellcheckDictionaryPaths;
     bool wordPrediction = false;
     string cursorShape = "line", cursorBlink = "step";
     int cursorSmoothBlinkMs = 1500;
@@ -407,6 +408,7 @@ struct Model {
     std::optional<ConnectionSetup> connectionSetup;
     string onboardingNetwork;
     uint64_t draftResetRevision = 0, preferencesResetRevision = 0, cacheResetRevision = 0;
+    uint64_t spellcheckDictionaryRevision = 0;
     double now = 0;
     vector<Event> effects;
     vector<Action> actions;

@@ -373,13 +373,13 @@ struct EditorStore::Impl {
         std::optional<SpellRange> spellingEdit;
         std::vector<std::string> spellNames, spellFoldedNames;
         std::vector<SpellRange> spellExcluded, spellScratch, spellMisspelled;
-        std::uint64_t spellTicket = 0;
+        std::uint64_t spellTicket = 0, spellPathGeneration = 0;
         bool spellNeedsCheck = false;
         std::chrono::steady_clock::time_point spellDue;
         struct SpellingCycle {
             std::string buffer, language, raw;
             std::weak_ptr<int> identity;
-            std::uint64_t revision = 0, ticket = 0;
+            std::uint64_t revision = 0, ticket = 0, pathGeneration = 0;
             size_t caret = 0, presses = 0, index = 0;
             SpellRange range{};
             std::vector<std::string> suggestions{};
@@ -443,6 +443,21 @@ struct EditorStore::Impl {
     std::vector<Composer *> views;
     Spellcheck spelling;
     std::uint64_t spellCounter = 0, spellInFlight = 0;
+    std::uint64_t spellPathRevision = 0, spellPathGeneration = 0;
+    std::vector<std::string> spellPaths;
+    bool spellPathsCurrent() const {
+        return spellPathRevision == model.spellcheckDictionaryRevision &&
+               spellPaths == model.settings.spellcheckDictionaryPaths;
+    }
+    void syncSpellPaths() {
+        if (spellPathsCurrent())
+            return;
+        spellPathRevision = model.spellcheckDictionaryRevision;
+        spellPaths = model.settings.spellcheckDictionaryPaths;
+        spelling.setDictionaryPaths(spellPaths);
+        ++spellPathGeneration;
+        spellInFlight = 0;
+    }
     void syncSpelling();
     std::unique_ptr<WordCompletion> words;
     Node *overlayHost = nullptr;
@@ -1460,10 +1475,10 @@ Input::DisplayProjection EditorStore::Impl::Composer::project(std::string_view r
         raw.starts_with('/') && !raw.starts_with("//")
             ? formatDocument.rawToDisplay[rawEnd == raw.npos ? raw.size() : rawEnd]
             : 0;
-    const bool annotate = owner.model.settings.spellcheck && !input->composing() &&
-                          spellBuffer == buffer &&
-                          spellLanguage == owner.model.settings.spellcheckLanguage &&
-                          spellText == formatDocument.text;
+    const bool annotate =
+        owner.model.settings.spellcheck && !input->composing() && spellBuffer == buffer &&
+        spellLanguage == owner.model.settings.spellcheckLanguage &&
+        spellPathGeneration == owner.spellPathGeneration && spellText == formatDocument.text;
     const auto markup = [&](bool colors) {
         std::string result;
         for (const auto &run : formatDocument.runs) {
@@ -1680,9 +1695,10 @@ void EditorStore::Impl::Composer::updateSpelling() {
     const auto identity = owner.draft(buffer).identity;
     const bool sourceChanged = spellBuffer != buffer || spellIdentity.lock() != identity;
     const bool textChanged = spellText != projection->text;
-    const bool languageChanged = spellLanguage != settings.spellcheckLanguage;
+    const bool dictionaryChanged = spellLanguage != settings.spellcheckLanguage ||
+                                   spellPathGeneration != owner.spellPathGeneration;
     const bool rawChanged = spellRaw != input->value();
-    if (!sourceChanged && !textChanged && !languageChanged && !rawChanged && !namesChanged &&
+    if (!sourceChanged && !textChanged && !dictionaryChanged && !rawChanged && !namesChanged &&
         !channelsChanged)
         return;
     spellRaw = input->value();
@@ -1691,12 +1707,13 @@ void EditorStore::Impl::Composer::updateSpelling() {
     spellChannelTypes = channelTypes;
     spellBuffer = buffer;
     spellLanguage = settings.spellcheckLanguage;
+    spellPathGeneration = owner.spellPathGeneration;
     excludeSpelling();
     const bool exclusionsChanged =
         spellScratch.size() != spellExcluded.size() ||
         !std::equal(spellScratch.begin(), spellScratch.end(), spellExcluded.begin(),
                     [](auto a, auto b) { return a.begin == b.begin && a.end == b.end; });
-    if (!sourceChanged && !textChanged && !languageChanged && !exclusionsChanged)
+    if (!sourceChanged && !textChanged && !dictionaryChanged && !exclusionsChanged)
         return;
     spellExcluded.swap(spellScratch);
     spellTicket = ++owner.spellCounter;
@@ -1719,7 +1736,8 @@ bool EditorStore::Impl::Composer::spellingCycleValid() const {
     const auto draft = owner.drafts.find(buffer);
     return source != owner.model.buffers.end() && draft != owner.drafts.end() &&
            buffer == pane.buffer && buffer == cycle.buffer &&
-           cycle.language == owner.model.settings.spellcheckLanguage &&
+           cycle.language == owner.model.settings.spellcheckLanguage && owner.spellPathsCurrent() &&
+           cycle.pathGeneration == owner.spellPathGeneration &&
            cycle.identity.lock() == draft->second.identity &&
            cycle.revision == draft->second.revision && revision == cycle.revision &&
            source->second.draft == draft->second.published &&
@@ -1746,6 +1764,7 @@ std::optional<SpellRange> EditorStore::Impl::Composer::rawSpellingRange(SpellRan
 
 void EditorStore::Impl::Composer::cycleSpelling() {
     owner.capture(*this);
+    owner.syncSpellPaths();
     if (!spellingCycleValid())
         spellingCycle.reset();
     if (!spellingCycle) {
@@ -1755,6 +1774,7 @@ void EditorStore::Impl::Composer::cycleSpelling() {
                                       .raw = input->value(),
                                       .identity = draft.identity,
                                       .revision = revision,
+                                      .pathGeneration = owner.spellPathGeneration,
                                       .caret = input->cursorPosition()};
         if (!spellingCycleValid()) {
             spellingCycle.reset();
@@ -1857,6 +1877,7 @@ void EditorStore::Impl::Composer::applySpellingCycle() {
 }
 
 void EditorStore::Impl::syncSpelling() {
+    syncSpellPaths();
     for (auto *view : views) {
         if (view->spellingCycle && !view->spellingCycleValid())
             view->spellingCycle.reset();
@@ -1868,6 +1889,7 @@ void EditorStore::Impl::syncSpelling() {
         for (auto *view : views)
             if (view->spellTicket == result->ticket && model.settings.spellcheck &&
                 view->spellLanguage == model.settings.spellcheckLanguage &&
+                view->spellPathGeneration == spellPathGeneration &&
                 view->buffer == view->pane.buffer) {
                 view->spellError = std::move(result->error);
                 view->spellMisspelled = std::move(result->misspelled);
@@ -1886,7 +1908,7 @@ void EditorStore::Impl::syncSpelling() {
     const auto now = std::chrono::steady_clock::now();
     for (auto *view : views)
         if (view->spellNeedsCheck && !view->input->composing() && visibleInScene(*view) &&
-            now >= view->spellDue) {
+            view->spellPathGeneration == spellPathGeneration && now >= view->spellDue) {
             view->spellNeedsCheck = false;
             spellInFlight = view->spellTicket;
             spelling.request(view->spellTicket, view->spellText, view->spellLanguage,
@@ -1918,6 +1940,7 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
     size_t correctionFirst = std::numeric_limits<size_t>::max();
     const auto spellingLanguage = owner.model.settings.spellcheckLanguage;
     const auto spellingTicket = spellTicket;
+    const auto spellingPathGeneration = spellPathGeneration;
     const std::weak_ptr<int> sourceIdentity = draft.identity;
     SelectPopupContext::DropdownRequest request;
     const auto add = [&](std::vector<ContextMenuEntry> &entries, std::string label,
@@ -2002,8 +2025,7 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
         spellingMenu.label = "Spelling";
         spellingMenu.icon = "typography";
         if (!spellError.empty()) {
-            add(spellingMenu.children, spellLanguage + ": " + spellError, "", "alert-circle",
-                false);
+            add(spellingMenu.children, spellError, "", "alert-circle", false);
         } else if (spellNeedsCheck || owner.spellInFlight == spellTicket) {
             add(spellingMenu.children, "Checking spelling…", "", "clock", false);
         } else if (const auto *projection = input->displayProjection();
@@ -2057,7 +2079,7 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
         {
             .onSelect =
                 [this, token, generation, source, version, sourceIdentity, spellingLanguage,
-                 spellingTicket, correctionFirst, correctionRange,
+                 spellingTicket, spellingPathGeneration, correctionFirst, correctionRange,
                  corrections = std::move(corrections),
                  operations = std::move(operations)](size_t index) {
                     if (token.expired() || generation != menuGeneration)
@@ -2079,6 +2101,8 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
                     if (index >= correctionFirst && index - correctionFirst < corrections.size()) {
                         if (!owner.model.settings.spellcheck ||
                             owner.model.settings.spellcheckLanguage != spellingLanguage ||
+                            !owner.spellPathsCurrent() ||
+                            owner.spellPathGeneration != spellingPathGeneration ||
                             spellTicket != spellingTicket || !correctionRange ||
                             sourceIdentity.lock() != current.identity)
                             return;

@@ -2,6 +2,7 @@
 #include "irc/protocol.hpp"
 #include "irc/sts.hpp"
 #include "key_bindings.hpp"
+#include "spellcheck.hpp"
 #include "ui/logic.hpp"
 #include <algorithm>
 #include <cctype>
@@ -547,11 +548,14 @@ void validate(const Settings &settings) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
     };
     const auto &language = settings.spellcheckLanguage;
-    if (language.empty() || !asciiAlnum(language.front()) ||
-        !std::all_of(language.begin(), language.end(),
-                     [&](unsigned char c) { return asciiAlnum(c) || c == '_' || c == '-'; }))
+    if (language != Spellcheck::allLanguages &&
+        (language.empty() || !asciiAlnum(language.front()) ||
+         !std::all_of(language.begin(), language.end(),
+                      [&](unsigned char c) { return asciiAlnum(c) || c == '_' || c == '-'; })))
         invalid("composer.spellcheck_language",
-                "auto or a dictionary basename (letters, digits, _ or -)");
+                "auto, *, or a dictionary basename (letters, digits, _ or -)");
+    if (!std::ranges::all_of(settings.spellcheckDictionaryPaths, Spellcheck::validDictionaryPath))
+        invalid("composer.spellcheck_dictionary_paths", "absolute paths without NUL, CR, or LF");
     if (settings.cursorShape != "line" && settings.cursorShape != "box" &&
         settings.cursorShape != "underline")
         invalid("cursor.shape", "line, box, or underline");
@@ -917,6 +921,9 @@ void parseSettings(const toml::table &document, Settings &settings) {
     if (const auto *row = table(document, "composer")) {
         exactField(*row, "spellcheck", settings.spellcheck);
         exactField(*row, "spellcheck_language", settings.spellcheckLanguage);
+        if (const auto *paths = row->get("spellcheck_dictionary_paths"))
+            settings.spellcheckDictionaryPaths =
+                stringArray(*paths, "composer.spellcheck_dictionary_paths");
         exactField(*row, "word_prediction", settings.wordPrediction);
     }
     if (const auto *row = table(document, "cursor")) {
@@ -1178,9 +1185,11 @@ toml::table settingsDocument(const Settings &settings) {
                                                          "presentation.direct_message_layout")},
              {"message_layouts", std::move(messageLayouts)},
              {"pinned_buffers", array(settings.pinnedBuffers)}}},
-        {"composer", toml::table{{"spellcheck", settings.spellcheck},
-                                 {"spellcheck_language", settings.spellcheckLanguage},
-                                 {"word_prediction", settings.wordPrediction}}},
+        {"composer",
+         toml::table{{"spellcheck", settings.spellcheck},
+                     {"spellcheck_language", settings.spellcheckLanguage},
+                     {"spellcheck_dictionary_paths", array(settings.spellcheckDictionaryPaths)},
+                     {"word_prediction", settings.wordPrediction}}},
         {"cursor", toml::table{{"shape", settings.cursorShape},
                                {"blink", settings.cursorBlink},
                                {"smooth_blink_ms", settings.cursorSmoothBlinkMs},

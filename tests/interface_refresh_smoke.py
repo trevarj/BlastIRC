@@ -5074,7 +5074,8 @@ def run_spelling(ctx):
     # Category navigation owns focus; nine theme/typography controls precede these.
     gui.framed_keys(w, *(['Tab'] * 10))
     saved_unavailable = tomllib.loads(preferences.read_text())
-    assert saved_unavailable['composer'] == {'spellcheck': True, 'spellcheck_language': 'zz_ZZ', 'word_prediction': False}
+    assert saved_unavailable['composer'] == {'spellcheck': True, 'spellcheck_language': 'zz_ZZ',
+                                             'spellcheck_dictionary_paths': [], 'word_prediction': False}
     dialog = tuple(float(value) for value in saved_unavailable['workspace']['native_dialog_rect'].split())
     status_words = []
     status_raster = {}
@@ -5155,7 +5156,8 @@ def run_spelling(ctx):
                       lambda: unavailable_status(require_error=False))
     gui.framed_keys(w, *(['shift+Tab'] * 10))
     saved = gui.save_settings_footer(w, saved_path=preferences)
-    assert saved['composer'] == {'spellcheck': True, 'spellcheck_language': 'en_US', 'word_prediction': False}, saved['composer']
+    assert saved['composer'] == {'spellcheck': True, 'spellcheck_language': 'en_US',
+                                 'spellcheck_dictionary_paths': [], 'word_prediction': False}, saved['composer']
     gui.close_settings_navigation(w)
     upload.focus_composer(w)
     gui._composer_native(w, '', 0, 0)

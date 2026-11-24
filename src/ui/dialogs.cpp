@@ -2012,50 +2012,7 @@ struct Dialogs::Impl {
         label(*typography, "Type to find installed fonts and choose one to apply, or press Enter "
                            "for a custom family; each font is independent, empty uses sans-serif, "
                            "and closing discards unapplied text.");
-        auto *spelling = section("appearance.spellcheck", "Spelling & prediction");
-        auto *spellingStatus = label(*spelling, "");
-        auto languages = Spellcheck::languages();
-        const auto updateSpellingStatus = [this, spellingStatus, languages] {
-            const auto &language = model.settings.spellcheckLanguage;
-            const bool unavailable =
-                language != "auto" &&
-                std::find(languages.begin(), languages.end(), language) == languages.end();
-            spellingStatus->setText(
-                !model.settings.spellcheck ? "Spelling is disabled."
-                : unavailable
-                    ? "Dictionary " + language + " is unavailable. Choose an installed dictionary."
-                : language == "auto" ? "Auto uses LANG (en_US for C/POSIX). A missing dictionary "
-                                       "is reported in the composer."
-                                     : "Uses the local " + language +
-                                           " dictionary. No text is sent over the network.");
-            spellingStatus->setColor(colorSpecFromRole(model.settings.spellcheck && unavailable
-                                                           ? ColorRole::Error
-                                                           : ColorRole::OnSurfaceVariant));
-        };
-        toggle(*spelling, "Check spelling", model.settings.spellcheck,
-               [this, updateSpellingStatus](bool value) {
-                   model.settings.spellcheck = value;
-                   updateSpellingStatus();
-               });
-        std::vector<std::string> languageOptions{"Auto"};
-        languageOptions.insert(languageOptions.end(), languages.begin(), languages.end());
-        const auto &savedLanguage = model.settings.spellcheckLanguage;
-        auto *languagePicker = select(
-            *spelling, "Spelling language", std::move(languageOptions),
-            savedLanguage == "auto" ? std::string_view("Auto") : std::string_view(savedLanguage),
-            [this, updateSpellingStatus](std::size_t index, std::string_view value) {
-                model.settings.spellcheckLanguage = index == 0 ? "auto" : std::string(value);
-                updateSpellingStatus();
-            });
-        if (savedLanguage != "auto" &&
-            std::find(languages.begin(), languages.end(), savedLanguage) == languages.end())
-            languagePicker->setPlaceholder(savedLanguage + " (unavailable)");
-        updateSpellingStatus();
-        toggle(*spelling, "Predict words", model.settings.wordPrediction,
-               [this](bool value) { model.settings.wordPrediction = value; });
-        label(*spelling, "Predicts words using English word frequencies and the context of recent "
-                         "messages you sent in the current chat. Local only; no text is sent over "
-                         "the network for prediction.");
+        spellingSettings(*section("appearance.spellcheck", "Spelling & prediction"));
         auto *cursor = section("appearance.cursor", "Cursor");
         static constexpr const char *shapeIds[] = {"line", "box", "underline"};
         static constexpr const char *shapeNames[] = {"Line", "Solid box", "Underline"};
@@ -2195,6 +2152,132 @@ struct Dialogs::Impl {
               "Your People preference is kept when the panel temporarily needs to hide.");
         label(*workspace, commandLabel(model, "Channel hints", "jump-channel") + " · " +
                               commandLabel(model, "All conversations", "switch-buffer"));
+    }
+
+    void spellingSettings(Flex &parent) {
+        auto *status = label(parent, "");
+        const auto updateStatus = [this, status](bool unavailable) {
+            const auto &language = model.settings.spellcheckLanguage;
+            status->setText(
+                !model.settings.spellcheck ? "Spelling is disabled."
+                : unavailable
+                    ? "Dictionary " + language + " is unavailable. Choose an installed dictionary."
+                : language == "auto" ? "Auto uses LANG (en_US for C/POSIX). A missing dictionary "
+                                       "is reported in the composer."
+                : language == Spellcheck::allLanguages
+                    ? "Uses all installed local dictionaries. No text is sent over the network."
+                    : "Uses the local " + language +
+                          " dictionary. No text is sent over the network.");
+            status->setColor(colorSpecFromRole(model.settings.spellcheck && unavailable
+                                                   ? ColorRole::Error
+                                                   : ColorRole::OnSurfaceVariant));
+        };
+        auto *enabled = toggle(parent, "Check spelling", model.settings.spellcheck, {});
+        auto *languagePicker = select(parent, "Spelling language", {}, "", {});
+        enabled->setOnChange([this, languagePicker, updateStatus](bool value) {
+            model.settings.spellcheck = value;
+            updateStatus(languagePicker->selectedText().empty());
+        });
+        languagePicker->setOnSelectionChanged(
+            [this, updateStatus](std::size_t index, std::string_view value) {
+                const auto language = index == 0   ? std::string_view{"auto"}
+                                      : index == 1 ? Spellcheck::allLanguages
+                                                   : value;
+                model.settings.spellcheckLanguage = language;
+                updateStatus(false);
+            });
+        const auto refreshLanguages = [this, languagePicker, updateStatus] {
+            auto languages = Spellcheck::languages(model.settings.spellcheckDictionaryPaths);
+            const auto &saved = model.settings.spellcheckLanguage;
+            const auto found = std::find(languages.begin(), languages.end(), saved);
+            const auto index = std::size_t(found - languages.begin()) + 2;
+            const bool unavailable =
+                saved != "auto" && saved != Spellcheck::allLanguages && found == languages.end();
+            languages.insert(languages.begin(), {"Auto", "All dictionaries"});
+            languagePicker->setOptions(std::move(languages));
+            if (unavailable) {
+                languagePicker->clearSelection();
+                languagePicker->setPlaceholder(saved + " (unavailable)");
+            } else {
+                const auto selected = saved == "auto"                     ? 0
+                                      : saved == Spellcheck::allLanguages ? 1
+                                                                          : index;
+                languagePicker->setSelectedIndexSilently(selected);
+            }
+            updateStatus(unavailable);
+        };
+        refreshLanguages();
+        const auto reload = [this, refreshLanguages] {
+            ++model.spellcheckDictionaryRevision;
+            refreshLanguages();
+        };
+
+        toggle(parent, "Predict words", model.settings.wordPrediction,
+               [this](bool value) { model.settings.wordPrediction = value; });
+        label(parent, "Predicts words using English word frequencies and the context of recent "
+                      "messages you sent in the current chat. Local only; no text is sent over "
+                      "the network for prediction.");
+
+        label(parent, "Add an absolute path to a Hunspell folder or to one member of a matching "
+                      ".aff/.dic pair. Saved paths are used in order before bundled dictionaries.");
+        auto *field = text(parent, "Dictionary path", "", {});
+        field->setSubmitOnFocusLoss(false);
+        auto *error = label(parent, "");
+        error->setColor(colorSpecFromRole(ColorRole::Error));
+        const auto showError = [this, field, error](std::string_view message) {
+            field->setInvalid(!message.empty());
+            error->setText(message);
+            error->setVisible(!message.empty());
+            error->setParticipatesInLayout(!message.empty());
+            if (!message.empty() && scroll)
+                scroll->requestScrollIntoView(error);
+        };
+        showError("");
+        field->setOnChange([showError](const std::string &) { showError(""); });
+
+        auto *add = button(parent, "Add dictionary path", {});
+        auto *pathsPicker = select(parent, "Saved dictionary paths", {}, "", {});
+        pathsPicker->setPlaceholder("No saved dictionary paths");
+        auto *actions = row(parent);
+        auto *remove = button(*actions, "Remove dictionary path", {});
+        button(*actions, "Reload dictionaries", reload);
+        const auto updatePaths = [this, pathsPicker, remove](std::size_t index) {
+            const auto &paths = model.settings.spellcheckDictionaryPaths;
+            pathsPicker->setOptions(paths);
+            if (!paths.empty())
+                pathsPicker->setSelectedIndexSilently(std::min(index, paths.size() - 1));
+            pathsPicker->setEnabled(!paths.empty());
+            remove->setEnabled(!paths.empty());
+        };
+        updatePaths(0);
+        const auto addPath = [this, field, showError, updatePaths,
+                              reload](const std::string &path) {
+            auto &paths = model.settings.spellcheckDictionaryPaths;
+            if (!Spellcheck::validDictionaryPath(path))
+                showError("Enter an absolute local dictionary path.");
+            else if (std::find(paths.begin(), paths.end(), path) != paths.end())
+                showError("This dictionary path is already saved.");
+            else if (!Spellcheck::hasDictionaryPair(path))
+                showError("No matching .aff and .dic files were found at this path.");
+            else {
+                paths.push_back(path);
+                reload();
+                updatePaths(paths.size() - 1);
+                field->setValue("");
+                showError("");
+            }
+        };
+        field->setOnSubmit(addPath);
+        add->setOnClick([field, addPath] { addPath(field->value()); });
+        remove->setOnClick([this, pathsPicker, updatePaths, reload] {
+            auto &paths = model.settings.spellcheckDictionaryPaths;
+            const auto index = pathsPicker->selectedIndex();
+            if (index < paths.size()) {
+                paths.erase(paths.begin() + index);
+                reload();
+                updatePaths(index);
+            }
+        });
     }
 
     void fontPicker(Flex &parent, std::string_view familyLabel, std::string_view installedLabel,

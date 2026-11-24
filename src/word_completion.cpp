@@ -3,6 +3,7 @@
 #include <glib.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <cmath>
@@ -24,6 +25,11 @@ constexpr std::size_t maxSnippetBytes = 512;
 constexpr std::size_t maxSnippets = 32;
 using Counts = std::map<std::string, double, std::less<>>;
 using Contexts = std::map<std::string, Counts, std::less<>>;
+
+struct RankedWord {
+    std::string_view word;
+    double score;
+};
 
 bool validUtf8(std::string_view text) {
     if (text.empty())
@@ -124,6 +130,10 @@ struct WordCompletion::State {
     double localTotal = 0;
     std::jthread worker;
 
+    std::size_t complete(std::string_view before, std::string_view prefix,
+                         std::span<RankedWord> ranks, std::span<std::string> output,
+                         bool extensionsOnly);
+
     explicit State(std::string path)
         : worker([this, path = std::move(path)] {
               try {
@@ -218,9 +228,12 @@ void WordCompletion::setHistory(std::span<const std::string> newestFirst) {
     }
 }
 
-std::string WordCompletion::complete(std::string_view before, std::string_view prefix) {
-    if (!validWord(prefix) || !validUtf8(before))
-        return {};
+std::size_t WordCompletion::State::complete(std::string_view before, std::string_view prefix,
+                                            std::span<RankedWord> ranks,
+                                            std::span<std::string> output, bool extensionsOnly) {
+    if (output.empty() || !validWord(prefix) || !validUtf8(before))
+        return 0;
+    ranks = ranks.first(std::min(ranks.size(), output.size()));
     if (before.size() > maxSnippetBytes) {
         before.remove_prefix(before.size() - maxSnippetBytes);
         while (!before.empty() && (static_cast<unsigned char>(before.front()) & 0xc0) == 0x80)
@@ -245,8 +258,8 @@ std::string WordCompletion::complete(std::string_view before, std::string_view p
         const auto found = contexts.find(key);
         return found == contexts.end() ? nullptr : &found->second;
     };
-    const auto *bigram = context(state_->bigrams, previous1);
-    const auto *trigram = context(state_->trigrams, contextKey(previous2, previous1));
+    const auto *bigram = context(bigrams, previous1);
+    const auto *trigram = context(trigrams, contextKey(previous2, previous1));
     const auto scale = [](const Counts *counts, double weight) {
         double total = 0;
         if (counts)
@@ -256,7 +269,7 @@ std::string WordCompletion::complete(std::string_view before, std::string_view p
     };
     const double bigramScale = scale(bigram, 0.65);
     const double trigramScale = scale(trigram, 1.5);
-    const double localScale = state_->localTotal ? 0.2 / state_->localTotal : 0;
+    const double localScale = localTotal ? 0.2 / localTotal : 0;
     const auto count = [](const Counts *counts, std::string_view word) {
         if (counts) {
             const auto found = counts->find(word);
@@ -266,30 +279,40 @@ std::string WordCompletion::complete(std::string_view before, std::string_view p
         return 0.0;
     };
     static const Counts empty;
-    const auto &prior = ready() ? state_->prior : empty;
-    auto general = prior.lower_bound(folded);
-    auto local = state_->local.lower_bound(folded);
-    std::string_view best;
-    double score = 0;
-    while ((general != prior.end() && general->first.starts_with(folded)) ||
-           (local != state_->local.end() && local->first.starts_with(folded))) {
-        const bool useGeneral = general != prior.end() && general->first.starts_with(folded) &&
-                                (local == state_->local.end() || general->first <= local->first);
-        const std::string_view word = useGeneral ? general->first : local->first;
-        const double value = count(&prior, word) + count(&state_->local, word) * localScale +
+    const auto &generalCounts = loaded.load(std::memory_order_acquire) ? prior : empty;
+    auto general = generalCounts.lower_bound(folded);
+    auto recent = local.lower_bound(folded);
+    std::size_t ranked = 0;
+    while ((general != generalCounts.end() && general->first.starts_with(folded)) ||
+           (recent != local.end() && recent->first.starts_with(folded))) {
+        const bool useGeneral = general != generalCounts.end() &&
+                                general->first.starts_with(folded) &&
+                                (recent == local.end() || general->first <= recent->first);
+        const std::string_view word = useGeneral ? general->first : recent->first;
+        if (general != generalCounts.end() && general->first == word)
+            ++general;
+        if (recent != local.end() && recent->first == word)
+            ++recent;
+        if (extensionsOnly && word == folded)
+            continue;
+        const double score = count(&generalCounts, word) + count(&local, word) * localScale +
                              count(bigram, word) * bigramScale +
                              count(trigram, word) * trigramScale;
-        if (value > score) {
-            score = value;
-            best = word;
-        }
-        if (general != prior.end() && general->first == word)
-            ++general;
-        if (local != state_->local.end() && local->first == word)
-            ++local;
+        // Candidates arrive in lexical order, so tied scores retain that order.
+        auto slot = ranks.begin();
+        while (slot != ranks.begin() + ranked && slot->score >= score)
+            ++slot;
+        if (slot == ranks.end())
+            continue;
+        const auto oldEnd = ranks.begin() + ranked;
+        if (ranked < ranks.size())
+            ++ranked;
+        std::move_backward(slot, std::min(oldEnd, ranks.begin() + ranked - 1),
+                           ranks.begin() + ranked);
+        *slot = {word, score};
     }
-    if (best.empty() || best == folded)
-        return {};
+    if (!ranked || ranks[0].word == folded)
+        return 0;
     bool uppercase = true;
     bool cased = false;
     for (const char *p = prefix.data(), *end = p + prefix.size(); p < end;
@@ -299,16 +322,32 @@ std::string WordCompletion::complete(std::string_view before, std::string_view p
             uppercase = false;
         cased = cased || g_unichar_isupper(ch) || g_unichar_islower(ch);
     }
-    const auto suffix = best.substr(folded.size());
-    std::string result(prefix);
-    if (uppercase && cased) {
-        auto *upper = g_utf8_strup(suffix.data(), static_cast<gssize>(suffix.size()));
-        result += upper;
-        g_free(upper);
-    } else {
-        result += suffix;
+    for (std::size_t i = 0; i < ranked; ++i) {
+        const auto suffix = ranks[i].word.substr(folded.size());
+        auto &result = output[i];
+        result.assign(prefix);
+        if (uppercase && cased) {
+            auto *upper = g_utf8_strup(suffix.data(), static_cast<gssize>(suffix.size()));
+            result += upper;
+            g_free(upper);
+        } else {
+            result += suffix;
+        }
     }
+    return ranked;
+}
+
+std::string WordCompletion::complete(std::string_view before, std::string_view prefix) {
+    RankedWord rank;
+    std::string result;
+    state_->complete(before, prefix, {&rank, 1}, {&result, 1}, false);
     return result;
+}
+
+std::size_t WordCompletion::completions(std::string_view before, std::string_view prefix,
+                                        std::span<std::string> output) {
+    std::array<RankedWord, 8> ranks;
+    return state_->complete(before, prefix, ranks, output, true);
 }
 
 } // namespace blast

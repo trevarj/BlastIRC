@@ -68,16 +68,29 @@ class Row final : public InputArea {
 
     void bind(Match match, bool selected) {
         active = selected;
-        const bool changedMode = literal != match.literal;
-        literal = match.literal;
-        if (changedMode || caption.empty() ||
-            std::string_view(caption).substr(literal ? 0 : 1) != match.name) {
-            caption.assign(literal ? "" : "/");
+        const bool slash = match.source == Source::Command;
+        if (commandRow != slash || caption.empty() ||
+            std::string_view(caption).substr(slash ? 1 : 0) != match.name) {
+            caption.assign(slash ? "/" : "");
             caption.append(match.name);
             command->setText(caption);
         }
         description->setText(match.description);
-        icon->setVisible(!literal);
+        commandRow = slash;
+        switch (match.source) {
+        case Source::Command:
+            icon->setName("terminal");
+            break;
+        case Source::Nick:
+            icon->setName("at-sign");
+            break;
+        case Source::Channel:
+            icon->setName("users");
+            break;
+        case Source::Word:
+            icon->setName("type");
+            break;
+        }
         paint();
     }
 
@@ -108,9 +121,9 @@ class Row final : public InputArea {
         icon->setPosition(8 * zoom, (height() - iconSize) / 2);
         icon->setSize(iconSize, iconSize);
         icon->layout(renderer);
-        const float textX = (literal ? 8 : 32) * zoom;
+        const float textX = 32 * zoom;
         const float available = std::max(0.f, width() - textX - 8 * zoom);
-        command->setMaxWidth(literal ? available : available * .45f);
+        command->setMaxWidth(commandRow ? available * .45f : available);
         command->measure(renderer);
         command->setPosition(textX, (height() - command->height()) / 2);
         const float descriptionX = textX + command->width() + 12 * zoom;
@@ -156,7 +169,7 @@ class Row final : public InputArea {
     std::string caption;
     float zoom = 1;
     bool active = false;
-    bool literal = false;
+    bool commandRow = true;
 };
 } // namespace
 

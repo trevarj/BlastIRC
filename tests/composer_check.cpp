@@ -42,6 +42,7 @@
 #include <tuple>
 #include <ui/controls/button.h>
 #include <ui/controls/flex.h>
+#include <ui/controls/image.h>
 #include <ui/controls/input.h>
 #include <ui/controls/label.h>
 #include <ui/controls/scroll_view.h>
@@ -1761,6 +1762,125 @@ void checkComposerWordPrediction(Renderer &renderer) {
     assert(editors.execute("complete", pane));
     assert(input->value() == "quartzNick: ");
 
+    // Deterministic history fixture: lexical order disagrees with score order, and a
+    // nick and dictionary word deliberately have the same visible spelling.
+    Message mixed;
+    mixed.own = true;
+    mixed.text = "qzwordalpha qzwordalpha qzwordalpha qzwordalpha qzwordalpha "
+                 "qzwordbeta qzwordbeta qzwordbeta qzwordbeta "
+                 "qzwordgamma qzwordgamma qzwordgamma qzworddelta qzworddelta qzwordalphabet";
+    buffer.messages.push_back(mixed);
+    ++buffer.messagesRevision;
+    buffer.nicks = {{.name = "qzwordnick", .account = {}, .prefix = {}},
+                    {.name = "qzwordalpha", .account = {}, .prefix = {}}};
+    command_completion::View *literalPopup = nullptr;
+    for (const auto &child : root.children())
+        if (auto *popup = dynamic_cast<command_completion::View *>(child.get()))
+            literalPopup = popup;
+    assert(literalPopup);
+    const auto rows = [&]() -> Node & {
+        auto *scroll = dynamic_cast<ScrollView *>(literalPopup->children().front().get());
+        assert(scroll);
+        return *scroll->content();
+    };
+    const auto openMixed = [&] {
+        const auto before = input->editingState();
+        const auto undo = before.history->undo, redo = before.history->redo;
+        assert(!visibleGhost(visibleGhost, *input) && !literalPopup->visible());
+        assert(editors.execute("complete", pane));
+        frame();
+        literalPopup->layout(renderer);
+        assert(literalPopup->visible() && input->editingStateMatches(before) &&
+               before.history->undo == undo && before.history->redo == redo &&
+               dispatcher.focusedArea() == input->inputArea());
+    };
+    using RowSource = std::pair<std::string_view, std::string_view>;
+    const auto expectRows = [&](std::initializer_list<RowSource> expected) {
+        assert(std::ranges::count_if(rows().children(), [](const auto &row) {
+                   return row->visible();
+               }) == static_cast<std::ptrdiff_t>(expected.size()));
+        size_t index = 0;
+        for (const auto &[name, asset] : expected) {
+            auto &row = *rows().children().at(index++);
+            auto *label = contextText(row, name);
+            assert(label && nativeVisible(*label) && !label->useMarkup());
+            LucideIcon *icon = nullptr;
+            for (const auto &child : row.children())
+                if (auto *candidate = dynamic_cast<LucideIcon *>(child.get()))
+                    icon = candidate;
+            assert(icon && nativeVisible(*icon) && icon->x() == 8 && icon->width() == 16);
+            auto *image = dynamic_cast<Image *>(icon->children().front().get());
+            assert(image && image->hasImage() && image->sourcePath().ends_with(asset));
+        }
+    };
+    constexpr std::string_view nickIcon = "/at-sign.svg", wordIcon = "/type.svg";
+    input->setValue("qzword");
+    frame();
+    openMixed();
+    expectRows({{"qzwordalpha", nickIcon},
+                {"qzwordnick", nickIcon},
+                {"qzwordalpha", wordIcon},
+                {"qzwordbeta", wordIcon},
+                {"qzwordgamma", wordIcon},
+                {"qzworddelta", wordIcon},
+                {"qzwordalphabet", wordIcon}});
+    assert(editors.handleCompletionKey(XKB_KEY_Return, 0) && input->value() == "qzwordalpha: ");
+    assert(editors.execute("undo", pane) && input->value() == "qzword");
+    frame();
+    openMixed();
+    assert(editors.handleCompletionKey(XKB_KEY_Escape, 0));
+    openMixed(); // Dismissal must not lose the cached dictionary token.
+
+    const std::string formatted = "qz\x02word";
+    input->setValue(formatted);
+    frame();
+    openMixed();
+    const auto beforeWord = input->editingState().current;
+    const auto undoBeforeWord = input->editingState().history->undo.size();
+    assert(editors.handleCompletionKey(XKB_KEY_Down, 0));
+    assert(editors.handleCompletionKey(XKB_KEY_Down, 0));
+    assert(editors.handleCompletionKey(XKB_KEY_Return, 0));
+    assert(input->value() == formatted + "alpha" && buffer.draft == input->value() &&
+           input->displayProjection()->text == "qzwordalpha" &&
+           input->editingState().history->undo.size() == undoBeforeWord + 1 &&
+           input->editingState().history->undo.back() == beforeWord &&
+           dispatcher.focusedArea() == input->inputArea() && !literalPopup->visible());
+    assert(editors.execute("undo", pane) && input->editingState().current == beforeWord);
+
+    for (int digit = 9; digit >= 0; --digit)
+        buffer.nicks.push_back(
+            {.name = "qzwordnick" + std::to_string(digit), .account = {}, .prefix = {}});
+    frame();
+    openMixed();
+    expectRows({{"qzwordalpha", nickIcon},
+                {"qzwordnick", nickIcon},
+                {"qzwordnick0", nickIcon},
+                {"qzwordnick1", nickIcon},
+                {"qzwordnick2", nickIcon},
+                {"qzwordalpha", wordIcon},
+                {"qzwordbeta", wordIcon},
+                {"qzwordgamma", wordIcon}});
+    auto *staleWordRow = dynamic_cast<InputArea *>(rows().children().at(5).get());
+    assert(staleWordRow);
+    staleWordRow->dispatchPress(1, 1, BTN_LEFT, true);
+    assert(staleWordRow->pressed());
+    model.settings.wordPrediction = false;
+    staleWordRow->dispatchPress(1, 1, BTN_LEFT, false);
+    assert(input->value() == formatted && !literalPopup->visible());
+    openMixed();
+    assert(contextText(*rows().children().at(5), "qzwordnick3")); // No rows reserved when disabled.
+    model.settings.wordPrediction = true;
+    buffer.nicks.clear();
+    input->setValue("qzwordalpha");
+    frame();
+    assert(!literalPopup->visible() && !visibleGhost(visibleGhost, *input));
+    assert(editors.execute("complete", pane) && input->value() == "qzwordalpha");
+    input->setValue("#ot");
+    frame();
+    openMixed();
+    expectRows({{"#other", "/users.svg"}});
+    assert(editors.handleCompletionKey(XKB_KEY_Return, 0) && input->value() == "#other");
+
     // The same prefix follows this chat's sent context, not alphabetical order.
     buffer.nicks.clear();
     buffer.messages.clear();
@@ -2234,8 +2354,9 @@ void checkComposerColors(Renderer &renderer) {
         dispatcher.setSceneRoot(nullptr);
 
         command_completion::View popup;
-        const std::array matches{command_completion::Match{"kick", "Remove a user"},
-                                 command_completion::Match{"Alice", "Nickname", true}};
+        const std::array matches{
+            command_completion::Match{"kick", "Remove a user"},
+            command_completion::Match{"Alice", "Nickname", command_completion::Source::Nick}};
         TextFont font{};
         font.family = "sans-serif";
         const auto checkRows = [&](std::size_t selected) {
@@ -3896,11 +4017,13 @@ void runComposerPaletteNativeCheck() {
 }
 
 // Invoked separately as composer-native in the private Wayland/EGL smoke environment.
-void runComposerNativeCheck() {
+void runComposerNativeCheck(bool predictionOnly) {
     using namespace blast;
     codecs::installImageDecoder();
     auto *display = wl_display_connect(nullptr);
     assert(display);
+    const std::unique_ptr<wl_display, decltype(&wl_display_disconnect)> connection(
+        display, wl_display_disconnect);
     {
         GlSharedContext shared;
         shared.initialize(display);
@@ -3908,6 +4031,10 @@ void runComposerNativeCheck() {
         RenderContext context;
         context.initialize(shared);
         ScaledRenderer renderer(context, 1.f);
+        if (predictionOnly) {
+            checkComposerWordPrediction(renderer);
+            return;
+        }
         checkIndependentMessageScales(renderer);
         checkComposerReplyCard(renderer);
         checkComposerEditingCommands(renderer);
@@ -7249,5 +7376,4 @@ void runComposerNativeCheck() {
             wl_registry_destroy(registry);
         }
     }
-    wl_display_disconnect(display);
 }

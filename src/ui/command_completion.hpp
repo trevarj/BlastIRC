@@ -12,9 +12,11 @@ struct TextFont;
 namespace blast::command_completion {
 inline constexpr std::size_t maxResults = 8;
 
+enum class Source { Command, Nick, Channel, Word };
+
 struct Match {
     std::string_view name, description;
-    bool literal = false;
+    Source source = Source::Command;
 };
 
 // Attach to an unclipped overlay host; the composer Input retains native focus.

@@ -44,10 +44,20 @@
 
 namespace blast {
 namespace {
-std::string lower(std::string value) {
-    for (char &c : value)
-        c = std::tolower(static_cast<unsigned char>(c));
-    return value;
+size_t literalTokenStart(std::string_view text, size_t caret) {
+    while (caret) {
+        const auto previous = ui_logic::previous(text, caret);
+        if (std::isspace(static_cast<unsigned char>(text[previous])))
+            break;
+        caret = previous;
+    }
+    return caret;
+}
+bool literalPrefixMatches(std::string_view name, std::string_view prefix) {
+    return !name.empty() && prefix.size() <= name.size() &&
+           std::ranges::equal(
+               prefix, name.substr(0, prefix.size()),
+               [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
 }
 void shown(Node &node, bool visible) {
     node.setVisible(visible);
@@ -320,7 +330,7 @@ struct EditorStore::Impl {
         std::uint64_t commandRevision = 0;
         size_t commandStart = 0;
         bool literalCompletion = false;
-        std::vector<std::string> completionCandidates;
+        size_t literalWordPrefixSize = 0;
         std::string completionKind, completionChannelTypes;
         std::string compositionChord;
         std::string predictedWord, predictionPrefix, predictionQuery;
@@ -443,6 +453,7 @@ struct EditorStore::Impl {
     command_completion::View *commandPopup = nullptr;
     Composer *commandOwner = nullptr;
     std::array<command_completion::Match, command_completion::maxResults> commandMatches{};
+    std::array<std::string, command_completion::maxResults> literalNames;
     size_t commandCount = 0;
     std::shared_ptr<int> alive = std::make_shared<int>(0);
     std::string kill;
@@ -2232,8 +2243,8 @@ void EditorStore::Impl::Composer::requestUpload(Node &anchor,
 }
 void EditorStore::Impl::Composer::hideCompletion() {
     literalCompletion = false;
+    literalWordPrefixSize = 0;
     predictedWord.clear();
-    predictionPrefix.clear();
     input->setInlineGhost({});
     if (owner.commandOwner == this) {
         owner.commandOwner = nullptr;
@@ -2279,23 +2290,19 @@ void EditorStore::Impl::Composer::openLiteralCompletion() {
     }
     if (acceptPrediction())
         return;
-    if (!owner.commandPopup || !emojiWasEligible)
+    if (!owner.commandPopup || owner.emojiOwner == this || !emojiWasEligible)
         return;
     const auto *projection = input->displayProjection();
     if (!projection || input->cursorPosition() >= projection->rawToDisplay.size())
         return;
     const std::string_view text = projection->text;
     const size_t caret = projection->rawToDisplay[input->cursorPosition()];
-    size_t start = caret;
-    while (start &&
-           !std::isspace(static_cast<unsigned char>(text[ui_logic::previous(text, start)])))
-        start = ui_logic::previous(text, start);
+    const size_t start = literalTokenStart(text, caret);
     const auto stop =
         std::upper_bound(projection->rawToDisplay.begin(),
                          projection->rawToDisplay.begin() + input->cursorPosition() + 1, start);
     if (stop == projection->rawToDisplay.begin())
         return;
-    hideCompletion();
     commandStart = static_cast<size_t>(stop - projection->rawToDisplay.begin() - 1);
     // Interior UTF-8 bytes share their scalar's display offset. Keep skipped IRC
     // controls outside the token, but never begin replacement inside a scalar.
@@ -2306,32 +2313,67 @@ void EditorStore::Impl::Composer::openLiteralCompletion() {
     commandToken = std::string_view(input->value()).substr(commandStart, commandEnd - commandStart);
     commandRevision = revision;
     commandSelected = 0;
-    completionCandidates.clear();
-    const auto prefix = lower(std::string(text.substr(start, caret - start)));
-    auto add = [&](std::string value) {
-        if (!value.empty() && lower(value).starts_with(prefix))
-            completionCandidates.push_back(std::move(value));
+    using command_completion::Source;
+    std::array<std::string, command_completion::maxResults> words;
+    size_t wordCount = 0;
+    const auto prefix = text.substr(start, caret - start);
+    std::array<command_completion::Match, command_completion::maxResults> matches;
+    size_t count = 0;
+    auto add = [&](std::string_view name, std::string_view query, Source source) {
+        if (!literalPrefixMatches(name, query))
+            return;
+        const auto end = matches.begin() + count;
+        const auto slot = std::ranges::lower_bound(matches.begin(), end, name, {},
+                                                   &command_completion::Match::name);
+        if (slot == matches.end() || (slot != end && slot->name == name))
+            return;
+        if (count < matches.size())
+            ++count;
+        const auto newEnd = matches.begin() + count;
+        std::move_backward(slot, std::min(end, newEnd - 1), newEnd);
+        *slot = {name, {}, source};
     };
     if (!start && prefix.starts_with("/"))
         for (const auto &command : commandCatalog)
-            add("/" + std::string(command.name));
+            add(command.name, prefix.substr(1), Source::Command);
     const auto &context = owner.model.buffers.at(buffer);
     for (const auto &nick : context.nicks)
-        add(nick.name);
-    for (const auto &[id, target] : owner.model.buffers)
-        if (target.server == context.server)
-            add(target.target);
-    std::sort(completionCandidates.begin(), completionCandidates.end());
-    completionCandidates.erase(
-        std::unique(completionCandidates.begin(), completionCandidates.end()),
-        completionCandidates.end());
-    owner.commandCount = std::min(completionCandidates.size(), owner.commandMatches.size());
-    if (!owner.commandCount)
+        add(nick.name, prefix, Source::Nick);
+    for (const auto &[id, target] : owner.model.buffers) {
+        if (target.server != context.server || target.target.empty())
+            continue;
+        const auto type = target.target.front();
+        const bool channel =
+            type == '#' || type == '&' || completionChannelTypes.find(type) != std::string::npos;
+        add(target.target, prefix, channel ? Source::Channel : Source::Nick);
+    }
+    if (!count)
         return;
-    for (size_t i = 0; i < owner.commandCount; ++i)
-        owner.commandMatches[i] = {completionCandidates[i], {}, true};
+    const auto wordPrefixSize = predictionPrefix.size();
+    if (predictionCompeting && owner.words) {
+        // Reserve up to three extensions even on a crowded roster; spare slots go to words.
+        const auto available = std::max(size_t{3}, matches.size() - count);
+        owner.words->setHistory(predictionHistory);
+        wordCount = owner.words->completions(text.substr(0, caret - wordPrefixSize),
+                                             predictionPrefix, std::span(words).first(available));
+        count = std::min(count, matches.size() - wordCount);
+    }
+    if (owner.commandOwner)
+        owner.commandOwner->hideCompletion();
+    for (size_t i = 0; i < count; ++i) {
+        owner.literalNames[i] = matches[i].name;
+        owner.commandMatches[i] = {owner.literalNames[i], {}, matches[i].source};
+    }
+    for (size_t i = 0; i < wordCount; ++i) {
+        const auto row = count + i;
+        owner.literalNames[row] = std::move(words[i]);
+        owner.commandMatches[row] = {owner.literalNames[row], {}, Source::Word};
+    }
+    input->setInlineGhost({});
+    literalWordPrefixSize = wordCount ? wordPrefixSize : 0;
     literalCompletion = true;
     owner.commandOwner = this;
+    owner.commandCount = count + wordCount;
     owner.commandPopup->setMatches({owner.commandMatches.data(), owner.commandCount}, 0);
     placeCompletion();
     owner.commandPopup->setVisible(true);
@@ -2391,6 +2433,11 @@ bool EditorStore::Impl::Composer::acceptCommandCompletion(size_t index) {
         input->cursorPosition() != input->selectionAnchor() || buffer != pane.buffer ||
         !owner.model.buffers.contains(buffer) || !visibleInScene(*this) || formattingOpen)
         return false;
+    if (literalCompletion) {
+        updateCompletion();
+        if (!literalCompletion || owner.commandOwner != this || index >= owner.commandCount)
+            return false;
+    }
     owner.capture(*this);
     auto &draft = owner.draft(buffer);
     owner.recover(buffer, draft);
@@ -2402,19 +2449,27 @@ bool EditorStore::Impl::Composer::acceptCommandCompletion(size_t index) {
         updateCompletion(true);
         return false;
     }
-    std::string replacement = literalCompletion
-                                  ? std::string(owner.commandMatches[index].name)
-                                  : "/" + std::string(owner.commandMatches[index].name);
-    if (literalCompletion) {
-        const auto *projection = input->displayProjection();
-        if (projection && projection->rawToDisplay[commandStart] == 0 &&
-            !replacement.starts_with("/") && !replacement.starts_with("#") &&
-            !replacement.starts_with("&"))
-            replacement += ": ";
-    } else if (commandEnd == input->value().size())
-        replacement += ' ';
+    using command_completion::Source;
+    const auto match = owner.commandMatches[index];
     auto editor = owner.editor(draft);
-    editor.replace(commandStart, commandEnd, replacement);
+    if (match.source == Source::Word) {
+        // Like an inline ghost, extend the typed prefix without rewriting its raw IRC bytes.
+        editor.replace(commandEnd, commandEnd, match.name.substr(literalWordPrefixSize));
+    } else {
+        std::string replacement;
+        if (match.source == Source::Command)
+            replacement += '/';
+        replacement += match.name;
+        if (!literalCompletion && commandEnd == input->value().size())
+            replacement += ' ';
+        if (match.source == Source::Nick) {
+            const auto *projection = input->displayProjection();
+            if (projection && projection->rawToDisplay[commandStart] == 0 &&
+                !replacement.starts_with("/"))
+                replacement += ": ";
+        }
+        editor.replace(commandStart, commandEnd, replacement);
+    }
     Input::EditSnapshot candidate{std::move(editor.text), editor.cursor, editor.anchor};
     preserveIrcSuffix(committed(draft.state), candidate, projectionForeground,
                       projectionBackground);
@@ -2436,11 +2491,6 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
         input->cursorPosition() == input->selectionAnchor() && buffer == pane.buffer &&
         owner.model.buffers.contains(buffer) && !formattingOpen && !menuOpen &&
         visibleInScene(*this) && owner.overlayHost->width() > 0 && owner.overlayHost->height() > 0;
-    if (literalCompletion && owner.commandOwner == this && eligible &&
-        commandRevision == revision && input->cursorPosition() == commandEnd) {
-        placeCompletion();
-        return;
-    }
     const auto context = owner.model.buffers.find(buffer);
     const bool predict = owner.model.settings.wordPrediction;
     if (predict && !owner.words)
@@ -2477,6 +2527,14 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
         predictionMessagesRevision != messagesRevision || predictionServer != server ||
         predictionTarget != target || predictionMapping != mapping || predictionOwn != own ||
         predictionFools != owner.model.settings.fools || predictionFoolDisplay != foolDisplay;
+    if (literalCompletion && owner.commandOwner == this && eligible &&
+        commandRevision == revision && input->cursorPosition() == commandEnd &&
+        completionKind == kind && completionChannelTypes == channelTypes &&
+        predictionEnabled == predict &&
+        (!predict || (predictionReady == ready && !sourceChanged))) {
+        placeCompletion();
+        return;
+    }
     if (predict && (sourceChanged || !predictionEnabled)) {
         predictionHistory.clear();
         const bool concealFools =
@@ -2514,7 +2572,7 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
         }
     }
     const bool competing = predict && eligible && hasLiteralCandidate(predictionQuery);
-    if (!force && emojiRevision == revision && emojiWasEligible == eligible &&
+    if (!force && !literalCompletion && emojiRevision == revision && emojiWasEligible == eligible &&
         completionCaret == input->cursorPosition() &&
         completionAnchor == input->selectionAnchor() && completionKind == kind &&
         completionChannelTypes == channelTypes && predictionEnabled == predict &&
@@ -2544,6 +2602,7 @@ void EditorStore::Impl::Composer::updateCompletion(bool force) {
     // Rebinding a token cancels an already-held row press, even if its matches are unchanged.
     hideCompletion();
     predictionQuery.clear();
+    predictionPrefix.clear();
     predictionCompeting = false;
     if (updateCommandCompletion(eligible))
         return;
@@ -2627,14 +2686,11 @@ bool EditorStore::Impl::Composer::hasLiteralCandidate(std::string_view prefix) c
     const auto source = owner.model.buffers.find(buffer);
     if (prefix.empty() || source == owner.model.buffers.end())
         return false;
-    const auto matches = [prefix](std::string_view name) {
-        return name.size() >= prefix.size() && commandEqual(prefix, name.substr(0, prefix.size()));
-    };
     for (const auto &nick : source->second.nicks)
-        if (matches(nick.name))
+        if (literalPrefixMatches(nick.name, prefix))
             return true;
     for (const auto &[id, target] : owner.model.buffers)
-        if (target.server == source->second.server && matches(target.target))
+        if (target.server == source->second.server && literalPrefixMatches(target.target, prefix))
             return true;
     return false;
 }
@@ -2673,8 +2729,9 @@ void EditorStore::Impl::Composer::updatePrediction() {
     const auto &context = owner.model.buffers.at(buffer);
     if (context.kind != "channel" && context.kind != "query")
         return;
-    predictionQuery = prefix;
-    predictionCompeting = hasLiteralCandidate(prefix);
+    predictionQuery = std::string_view(text).substr(literalTokenStart(text, start));
+    predictionCompeting = hasLiteralCandidate(predictionQuery);
+    predictionPrefix = prefix;
     if (predictionCompeting)
         return;
     if (owner.words) {
@@ -2683,20 +2740,20 @@ void EditorStore::Impl::Composer::updatePrediction() {
     }
     if (predictedWord.empty())
         return;
-    predictionPrefix = prefix;
+    // Only an unambiguous prediction is rendered inline.
     predictionCaret = input->cursorPosition();
     input->setInlineGhost(predictedWord.substr(prefix.size()));
 }
 
 bool EditorStore::Impl::Composer::acceptPrediction() {
-    if (predictedWord.empty())
+    if (predictedWord.empty() || predictionCompeting)
         return false;
     const auto word = predictedWord, prefix = predictionPrefix;
     const auto caret = predictionCaret;
     updateCompletion(true);
-    if (predictedWord != word || predictionPrefix != prefix || predictionCaret != caret ||
-        input->cursorPosition() != caret || input->selectionAnchor() != caret ||
-        !input->editingStateMatches(owner.draft(buffer).state))
+    if (predictionCompeting || predictedWord != word || predictionPrefix != prefix ||
+        predictionCaret != caret || input->cursorPosition() != caret ||
+        input->selectionAnchor() != caret || !input->editingStateMatches(owner.draft(buffer).state))
         return false;
     const auto suffix = word.substr(prefix.size());
     spellingCycle.reset();

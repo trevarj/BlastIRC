@@ -368,7 +368,7 @@ struct ApplicationRegression {
 } // namespace blast
 
 void runComposerCheck();
-void runComposerNativeCheck();
+void runComposerNativeCheck(bool predictionOnly);
 void runComposerPaletteNativeCheck();
 void runSettingsCheck();
 void runTranscriptCheck();
@@ -392,8 +392,8 @@ int main(int argc, char **argv) {
         blast::ApplicationRegression::run();
     else if (check == "composer")
         runComposerCheck();
-    else if (check == "composer-native")
-        runComposerNativeCheck();
+    else if (check == "composer-native" || check == "composer-prediction-native")
+        runComposerNativeCheck(check == "composer-prediction-native");
     else if (check == "composer-palette-native")
         runComposerPaletteNativeCheck();
     else if (check == "settings")

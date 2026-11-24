@@ -8549,8 +8549,16 @@ void hiddenUnreadStatusCheck(
                 self(self, *child);
         };
         findBoxes(findBoxes, *area);
-        const auto fill = area->hovered() ? themeForegroundColor("hover") : restingFill;
-        assert(plate && plate->style().fill == fill && rules.size() == 2);
+        assert(plate && rules.size() == 2);
+        const auto fill = plate->style().fill;
+        assert((fill != restingFill) == area->hovered());
+        assert(name->color() != chat->color() && number->color() != chat->color());
+        assert(!at || at->color() == number->color());
+        const float background = relativeLuminance(fill);
+        for (const auto *label : {name, chat, number}) {
+            const float ink = relativeLuminance(label->color());
+            assert((std::max(ink, background) + .05f) / (std::min(ink, background) + .05f) >= 4.5f);
+        }
         std::ranges::sort(rules, {}, [&](const auto *rule) { return bounds(*rule)[0]; });
         const auto [left, top, right, bottom] = bounds(*plate);
         const auto hit = bounds(*area);

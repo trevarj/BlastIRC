@@ -159,7 +159,7 @@ struct ModeLine::Impl {
     Color activityInk{}, mentionInk{}, focusInk{};
     Color hoverFill{};
     struct CardColors {
-        Color fill, network, text, mention, divider;
+        Color fill, network, text, count, mention, divider;
     };
     std::array<CardColors, 2> cardColors{};
     std::array<Color, GroupCount> controlInks{};
@@ -260,7 +260,7 @@ struct ModeLine::Impl {
             button.network->setColor(colors.network);
             button.title->setColor(colors.text);
             button.marker->setColor(colors.mention);
-            button.suffix->setColor(button.marker->visible() ? colors.mention : colors.text);
+            button.suffix->setColor(button.marker->visible() ? colors.mention : colors.count);
             for (auto *divider : button.dividers)
                 divider->setFill(colors.divider);
             return;
@@ -805,12 +805,25 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
 
     const auto text = themeForegroundColor("on_surface");
     const auto variant = themeForegroundColor("on_surface_variant");
-    const auto mention = themeForegroundColor("error");
+    const auto restingFill = lerpColor(backdrop, text, .07f);
     for (size_t i = 0; i < p.cardColors.size(); ++i) {
-        const auto fill = i ? p.hoverFill : lerpColor(backdrop, text, .07f);
+        const auto fill = i ? lerpColor(restingFill, p.hoverFill, .16f) : restingFill;
         const auto foreground = themePairedForeground(fill, text);
-        p.cardColors[i] = {fill, themePairedForeground(fill, variant), foreground,
-                           themePairedForeground(fill, mention), lerpColor(fill, foreground, .22f)};
+        auto network = themePairedForeground(fill, lerpColor(variant, fill, .18f));
+        if (network == foreground)
+            network = themePairedForeground(fill, lerpColor(foreground, fill, .18f));
+        const auto accent = [&](std::string_view role, std::string_view fallback) {
+            const auto resolved = themePairedForeground(fill, themeForegroundColor(role));
+            return resolved == foreground
+                       ? themePairedForeground(fill, themeForegroundColor(fallback))
+                       : resolved;
+        };
+        p.cardColors[i] = {fill,
+                           network,
+                           foreground,
+                           accent("primary", "on_primary_container"),
+                           accent("error", "on_error_container"),
+                           lerpColor(fill, foreground, .22f)};
     }
     const bool foolRulesChanged =
         p.foolUnread != model.settings.foolUnread || p.fools != model.settings.fools;
@@ -892,7 +905,7 @@ void ModeLine::sync(float userScale, SidebarMode effectiveNavigation, std::strin
     for (auto &slot : p.slots) {
         p.enableButton(slot.button, allowActivityMenu);
         style(*slot.button.marker, bold, p.scale);
-        style(*slot.button.suffix, font, p.scale);
+        style(*slot.button.suffix, bold, p.scale);
         style(*slot.button.network, font, p.scale);
         p.styleButton(slot.button, font);
     }
@@ -973,7 +986,10 @@ void ModeLine::doLayout(Renderer &renderer) {
     if (p.failureFeedback)
         take(Feedback, remaining - overflowFloor - nickFloor - nameFloor);
 
-    const float marker = count ? textWidth(renderer, "@", p.scale, bold) : 0.f;
+    const auto measureBold = [&](std::string_view value) {
+        return textWidth(renderer, value, p.scale, bold);
+    };
+    const float marker = count ? measureBold("@") : 0.f;
     const float markerGap = 2 * p.scale;
     const auto markerSpan = [&](const Impl::Activity &entry) {
         return entry.mentioned ? marker + markerGap : 0.f;
@@ -988,7 +1004,7 @@ void ModeLine::doLayout(Renderer &renderer) {
         const auto &first = p.ordered.front()->second;
         const float firstMinimum = std::min(measure(first.name), ellipsis) +
                                    minTitle(first, measure(first.chatTitle)) +
-                                   measure(first.countText) + markerSpan(first) + cardChrome +
+                                   measureBold(first.countText) + markerSpan(first) + cardChrome +
                                    (count > 1 ? cardGap + menuWidth(count - 1) : 0.f);
         if (remaining >= firstMinimum + nickFloor + nameFloor)
             ledgerFloor = std::max(ledgerFloor, firstMinimum);
@@ -1007,7 +1023,7 @@ void ModeLine::doLayout(Renderer &renderer) {
         const auto &entry = p.ordered[i]->second;
         const auto name = measure(entry.name);
         const auto title = measure(entry.chatTitle);
-        const auto countWidth = measure(entry.countText);
+        const auto countWidth = measureBold(entry.countText);
         p.measuredChips.push_back({name, title, countWidth});
         naturalTotal += name + title + countWidth + markerSpan(entry) + cardChrome +
                         (i + 1 < count ? cardGap : 0.f);
@@ -1050,7 +1066,7 @@ void ModeLine::doLayout(Renderer &renderer) {
         style(*button.title, font, p.scale);
         style(*button.network, font, p.scale);
         style(*button.marker, bold, p.scale);
-        style(*button.suffix, font, p.scale);
+        style(*button.suffix, bold, p.scale);
         const float chipWidth = nameWidth + title + fixed - trailingGap;
         p.moveButton(button, x, chipWidth, contentHeight);
         float offset = cardInset;

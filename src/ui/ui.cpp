@@ -4660,7 +4660,7 @@ void Ui::Impl::refresh(bool panelResize) {
                 sourceJumpRevision = jumpRequest.revision;
             }
     }
-    media->update(width, height, scale);
+    media->update(width, height, scale, window.makePreviewContextCurrent);
     for (const auto &[id, view] : views)
         if (!view->visible() || !view->composer->visible())
             view->pane.focusComposer = false;

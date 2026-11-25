@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <curl/curl.h>
@@ -18,6 +19,8 @@
 #include <limits>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <render/codecs/codecs.h>
+#include <render/core/image_resize.h>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -32,6 +35,36 @@ constexpr std::uint64_t MiB = 1024 * 1024;
 constexpr std::size_t htmlLimit = 256 * 1024, headerLimit = 32 * 1024;
 constexpr std::uint64_t cacheLimit = PreviewService::maxAssetBytes;
 constexpr std::size_t slots = PreviewService::maxAssets;
+void decodeGif(PreviewService::Result &result, const std::vector<std::uint8_t> &bytes) {
+    constexpr int maxFrames = 120;
+    constexpr std::size_t decodeBytes = 64 * MiB, retainedBytes = 8 * MiB;
+    auto gif = codecs::decodeAnimatedGif(bytes.data(), bytes.size(), maxFrames, decodeBytes);
+    if (!gif || gif->width != static_cast<int>(result.raster.width) ||
+        gif->height != static_cast<int>(result.raster.height)) {
+        result.error = "GIF decode failed.";
+        return;
+    }
+    if (gif->truncated)
+        gif->frames.resize(1);
+    const double pixels = double(gif->width) * gif->height * gif->frames.size();
+    const double scale = std::min(
+        {1., 768. / std::max(gif->width, gif->height), std::sqrt(retainedBytes / (4 * pixels))});
+    if (scale < 1) {
+        const int w = std::max(1, static_cast<int>(gif->width * scale));
+        const int h = std::max(1, static_cast<int>(gif->height * scale));
+        for (auto &frame : gif->frames) {
+            frame.rgba = resizeToRgba(frame.rgba.data(), gif->width, gif->height,
+                                      ResizeSourceLayout::Rgba, w, h);
+            if (frame.rgba.empty()) {
+                result.error = "GIF resize failed.";
+                return;
+            }
+        }
+        gif->width = w;
+        gif->height = h;
+    }
+    result.gif = std::make_shared<codecs::DecodedRasterAnimation>(std::move(*gif));
+}
 bool ready() {
     static const bool ok = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
     return ok;
@@ -826,14 +859,21 @@ struct PreviewService::Impl {
                     return result;
                 }
                 result.raster = std::move(*info);
+                if (result.raster.extension == ".gif") {
+                    decodeGif(result, t.bytes);
+                    if (!result.gif)
+                        return result;
+                }
             }
             if (t.bytes.empty()) {
                 result.error = "empty asset";
                 return result;
             }
             result.asset = save(t.bytes, pending);
-            if (!result.asset)
+            if (!result.asset) {
+                result.gif.reset();
                 result.error = "cache capacity or write failure";
+            }
             return result;
         }
         result.error = "canceled";

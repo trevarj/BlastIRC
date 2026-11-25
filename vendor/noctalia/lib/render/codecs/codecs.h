@@ -28,6 +28,7 @@ namespace codecs {
   struct DecodedRasterAnimation {
     int width = 0;
     int height = 0;
+    std::uint32_t loops = 0; // Zero repeats indefinitely.
     std::vector<DecodedRasterFrame> frames;
     bool truncated = false; // hit cap; later frames omitted
   };

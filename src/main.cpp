@@ -319,6 +319,7 @@ int main(int argc, char **argv) {
                     return layoutScene();
                 },
             .requestFrame = [&] { window.requestFrameTick(); },
+            .makePreviewContextCurrent = [&] { return render.makeCurrent(window.renderTarget()); },
         });
         window.setPrepareFrameCallback([&](bool, bool needsLayout) {
             // Native animation ticks run after the core update and may change geometry again.

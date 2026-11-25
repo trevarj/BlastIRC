@@ -547,7 +547,11 @@ namespace codecs {
         if (result.frames.empty()) {
           return fail(fcStatus.repr);
         }
-        // Tolerate trailing decode noise after we already have valid frames.
+        result.truncated = true;
+        break;
+      }
+      if (static_cast<int>(result.frames.size()) >= maxFrames || canvasBytes > maxRgbaBytes - cumulativeBytes) {
+        result.truncated = true;
         break;
       }
 
@@ -572,6 +576,7 @@ namespace codecs {
         if (result.frames.empty()) {
           return fail(frameStatus.repr);
         }
+        result.truncated = true;
         break;
       }
 
@@ -584,11 +589,6 @@ namespace codecs {
       prevDisposal = currentDisposal;
       prevBounds = fc.bounds();
 
-      if (static_cast<int>(result.frames.size()) >= maxFrames || cumulativeBytes >= maxRgbaBytes) {
-        result.truncated = true;
-        break;
-      }
-
       if (frameStatus.repr == wuffs_base__note__end_of_data) {
         break;
       }
@@ -597,6 +597,7 @@ namespace codecs {
     if (result.frames.empty()) {
       return fail("GIF produced no frames");
     }
+    result.loops = dec->num_animation_loops();
     return result;
   }
 

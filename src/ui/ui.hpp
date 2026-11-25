@@ -26,6 +26,7 @@ struct WindowActions {
     std::function<bool()> synchronizeLayout;
     // Coalesces work on the host's native surface frame tick.
     std::function<void()> requestFrame;
+    std::function<bool()> makePreviewContextCurrent;
 };
 class Ui {
   public:

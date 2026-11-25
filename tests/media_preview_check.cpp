@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <glib.h>
+#include <map>
 #include <render/animation/animation_manager.h>
 #include <render/animation/motion_service.h>
 #include <render/codecs/codecs.h>
@@ -166,17 +167,22 @@ void consent(Certificate &certificate) {
 // capturing RGBA at the texture boundary, not claiming GPU pixel coverage.
 class PreviewTextureSink final : public TextureManager {
   public:
-    unsigned gifUploads = 0;
+    struct GifTexture {
+        unsigned updates = 0;
+        bool blue = false;
+        bool unloaded = false;
+    };
+    std::map<std::uint32_t, GifTexture> gifs;
     bool rejectUploads = false;
     TextureHandle loadFromRgba(const std::uint8_t *data, int width, int height, bool) override {
         if (rejectUploads)
             return {};
+        const auto id = TextureId(++uploads);
         if (width == 2 && height == 1) {
-            constexpr std::array<std::uint8_t, 8> firstFrame{255, 0, 0, 255, 255, 0, 0, 255};
-            assert(std::equal(firstFrame.begin(), firstFrame.end(), data));
-            ++gifUploads;
+            assert(!gifIsBlue(data));
+            gifs.emplace(id.value(), GifTexture{});
         }
-        return {.id = TextureId(++uploads),
+        return {.id = id,
                 .width = width,
                 .height = height,
                 .sourceWidth = width,
@@ -195,16 +201,35 @@ class PreviewTextureSink final : public TextureManager {
                  bool) override {
         std::abort();
     }
-    bool updateSubImage(TextureHandle &, const std::uint8_t *, int, int, int, int,
-                        TextureDataFormat) override {
-        std::abort();
+    bool updateSubImage(TextureHandle &handle, const std::uint8_t *data, int x, int y, int width,
+                        int height, TextureDataFormat format) override {
+        assert(x == 0 && y == 0 && width == 2 && height == 1 && format == TextureDataFormat::Rgba);
+        auto &gif = gifs.at(handle.id.value());
+        assert(!gif.unloaded);
+        ++gif.updates;
+        gif.blue = gifIsBlue(data);
+        return true;
     }
-    void unload(TextureHandle &handle) override { handle = {}; }
+    void unload(TextureHandle &handle) override {
+        if (auto gif = gifs.find(handle.id.value()); gif != gifs.end()) {
+            assert(!gif->second.unloaded);
+            gif->second.unloaded = true;
+        }
+        handle = {};
+    }
     void cleanup() override {}
     void abandonGpuResources() noexcept override {}
     void probeExtensions() override { std::abort(); }
 
   private:
+    static bool gifIsBlue(const std::uint8_t *data) {
+        constexpr std::array<std::uint8_t, 8> red{255, 0, 0, 255, 255, 0, 0, 255};
+        constexpr std::array<std::uint8_t, 8> blue{0, 0, 255, 255, 0, 0, 255, 255};
+        if (std::equal(blue.begin(), blue.end(), data))
+            return true;
+        assert(std::equal(red.begin(), red.end(), data));
+        return false;
+    }
     unsigned uploads = 0;
 };
 class PreviewImageRenderer final : public Renderer {
@@ -842,15 +867,23 @@ void htmlThumbnailConsumers(Certificate &certificate, const std::string &body) {
         root.removeChild(view);
     }
 }
-void gifConsumers(Certificate &certificate) {
+void gifConsumers(Certificate &certificate, bool web) {
     const auto body = gifBody();
     Server server(certificate, [&](std::string_view path) {
+        if (web && path == "/page")
+            return Reply{"<title>Animated thumbnail</title>"
+                         "<meta property='og:image' content='/animated.gif'>"};
         assert(path == "/animated.gif");
         return Reply{body, "Content-Type: image/gif\r\n"};
     });
     Model model;
     model.settings.previewAllowLocal = true;
-    model.settings.imagePreviews = PreviewMode::Automatic;
+    model.settings.linkPreviews = PreviewMode::Automatic;
+    model.settings.imagePreviews = web ? PreviewMode::Automatic : PreviewMode::Click;
+    model.settings.fx = FxLevel::Full;
+    auto &motion = MotionService::instance();
+    const bool wasEnabled = motion.enabled();
+    motion.setEnabled(true);
     RenderContext context;
     PreviewImageRenderer renderer(context);
     PreviewMenu menu;
@@ -858,37 +891,97 @@ void gifConsumers(Certificate &certificate) {
     root.setSize(800, 600);
     root.setPopupContext(&menu);
     MediaPreviewController controller(model, root, certificate.caPath);
+    auto *overlay = root.children().front().get();
     auto card = std::make_unique<MediaPreviewCard>(controller);
     auto *view = card.get();
     root.addChild(std::move(card));
-    const auto url = server.endpoint + "/animated.gif";
+    const auto url = server.endpoint + (web ? "/page" : "/animated.gif");
+    const unsigned requests = web ? 2 : 1;
+    auto tick = [&] {
+        controller.update(800, 600, 1);
+        root.layout(renderer);
+    };
+    auto *area = firstArea(*view);
+    assert(area);
     view->bind(42, url, true);
+    if (!web) {
+        view->sync(renderer, 400, 1);
+        tick();
+        assert(visibleLabelWithText(*view, "Load preview") && server.requests == 0);
+        area->dispatchKey(XKB_KEY_Return, 0, 0, true);
+        assert(controller.active());
+    }
     until([&] {
         controller.update(800, 600, 1);
         return controller.ready(42) || !controller.error(42).empty();
     });
-    assert(controller.ready(42) && controller.error(42).empty());
+    assert(controller.ready(42) && controller.error(42).empty() && server.requests == requests);
+    if (!web)
+        controller.close();
     view->sync(renderer, 400, 1);
     root.layout(renderer);
-    checkCaption(renderer, *view, url, 120);
+    if (web)
+        assert(visibleLabelWithText(*view, "Animated thumbnail") && !controller.replacesUrl(42));
+    else
+        checkCaption(renderer, *view, url, 120);
     auto *thumbnail = previewImage(*view);
     assert(thumbnail && thumbnail->visible() && thumbnail->hasImage());
     assert(thumbnail->sourceWidth() == 2 && thumbnail->sourceHeight() == 1);
-    assert(renderer.textures.gifUploads == 1 && controller.replacesUrl(42));
-    auto *area = firstArea(*view);
-    assert(area);
+    const auto thumbnailId = thumbnail->textureId();
+    const auto &inlineGif = renderer.textures.gifs.at(thumbnailId.value());
+    assert(renderer.textures.gifs.size() == 1 && !inlineGif.blue && !inlineGif.updates);
+    assert(controller.replacesUrl(42) == !web);
+    auto waitForFrame = [&](const PreviewTextureSink::GifTexture &gif, bool blue) {
+        until([&] {
+            tick();
+            return gif.blue == blue;
+        });
+        assert(gif.updates && !gif.unloaded);
+    };
+    auto observeStopped = [&](const PreviewTextureSink::GifTexture &gif) {
+        const auto updates = gif.updates;
+        const auto deadline = std::chrono::steady_clock::now() + 250ms;
+        until([&] {
+            tick();
+            assert(gif.updates == updates);
+            return std::chrono::steady_clock::now() >= deadline;
+        });
+    };
+    waitForFrame(inlineGif, true);
+    waitForFrame(inlineGif, false);
+    if (!web) {
+        view->setVisible(false);
+        observeStopped(inlineGif);
+        view->setVisible(true);
+        waitForFrame(inlineGif, true);
+    }
+    assert(renderer.textures.gifs.size() == 1 && thumbnail->textureId() == thumbnailId);
+
+    const auto inlineUpdates = inlineGif.updates;
     area->dispatchKey(XKB_KEY_Return, 0, 0, true);
-    controller.update(800, 600, 1);
-    root.layout(renderer);
+    tick();
     assert(controller.active() && controller.ready(42) && controller.error(42).empty());
-    // Overlay independently decodes the same first frame, not a ready-only placeholder.
-    assert(renderer.textures.gifUploads == 2 && server.requests == 1);
-    const auto texture = thumbnail->textureId();
-    std::this_thread::sleep_for(250ms); // Past the second frame's 100 ms deadline.
-    controller.update(800, 600, 1);
-    root.layout(renderer);
-    assert(renderer.textures.gifUploads == 2 && thumbnail->textureId() == texture);
+    auto *modal = previewImage(*overlay);
+    assert(modal && modal->visible() && modal->hasImage());
+    const auto modalId = modal->textureId();
+    const auto &modalGif = renderer.textures.gifs.at(modalId.value());
+    assert(modalId != thumbnailId && renderer.textures.gifs.size() == 2);
+    assert(!modalGif.blue && !modalGif.updates);
+    waitForFrame(modalGif, true);
+    waitForFrame(modalGif, false);
+    assert(modal->textureId() == modalId && thumbnail->textureId() == thumbnailId);
+    assert(inlineGif.updates == inlineUpdates);
+    if (!web) {
+        waitForFrame(modalGif, true);
+        model.settings.reducedMotion = true;
+        waitForFrame(modalGif, false);
+        observeStopped(modalGif);
+        assert(modal->textureId() == modalId);
+    }
+    assert(renderer.textures.gifs.size() == 2 && server.requests == requests);
     controller.close();
+    assert(modalGif.unloaded && !inlineGif.unloaded);
+    observeStopped(modalGif);
     area->dispatchPress(10, 10, BTN_RIGHT, true, 10, 10, 1);
     area->dispatchPress(10, 10, BTN_RIGHT, false, 10, 10, 1);
     assert(menu.opened);
@@ -896,9 +989,12 @@ void gifConsumers(Certificate &certificate) {
     auto *info = infoInput(root);
     assert(info && info->value().starts_with(url));
     assert(info->value().find("Dimensions: 2 × 1") != std::string::npos);
-    assert(info->value().find("Preview: static first frame") != std::string::npos);
+    assert(info->value().find("Preview: animated GIF") != std::string::npos);
+    assert(server.requests == requests);
     controller.close();
     root.removeChild(view);
+    assert(inlineGif.unloaded);
+    motion.setEnabled(wasEnabled);
 }
 void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     Server server(certificate, [&](std::string_view path) {
@@ -1131,7 +1227,8 @@ void checkMediaPreview() {
     Certificate certificate(directory.path);
     const auto body = imageBody();
     statusDiagnostics(certificate, body);
-    gifConsumers(certificate);
+    gifConsumers(certificate, false);
+    gifConsumers(certificate, true);
     captionConsumers(certificate, body);
     htmlThumbnailConsumers(certificate, body);
     consent(certificate);

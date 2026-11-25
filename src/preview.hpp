@@ -8,6 +8,10 @@
 #include <string_view>
 #include <vector>
 
+namespace codecs {
+struct DecodedRasterAnimation;
+}
+
 namespace blast {
 enum class PreviewKind { Link, Image, Audio, Video, Unsupported };
 struct PreviewMetadata {
@@ -46,6 +50,7 @@ class PreviewService {
         PreviewMetadata metadata;
         PreviewRaster raster;
         std::shared_ptr<const PreviewAsset> asset;
+        std::shared_ptr<const codecs::DecodedRasterAnimation> gif;
     };
     enum class Admission { Queued, Invalid, Full };
     static constexpr std::size_t maxAssets = 16;
@@ -73,8 +78,7 @@ class PreviewService {
     static std::optional<std::string> url(std::string_view value, bool allowLocal = false);
     static PreviewKind classify(std::string_view contentType);
     // Container/dimension preflight only, not pixel decoding. PNG/JPEG/static WebP and GIF;
-    // GIF consumers must use bounded first-frame decoding, never autoplay. Animated PNG/
-    // WebP remain unsupported. Downloads additionally require matching MIME and <=16 Mi pixels.
+    // animated PNG/WebP remain unsupported. Downloads require matching MIME and <=16 Mi pixels.
     static std::optional<PreviewRaster> raster(std::span<const std::uint8_t> bytes);
     static PreviewMetadata metadata(std::string_view html, std::string_view baseUrl,
                                     bool allowLocal = false);

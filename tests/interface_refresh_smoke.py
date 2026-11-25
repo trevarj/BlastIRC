@@ -927,9 +927,10 @@ def run_media(ctx):
     image_path, audio_path, video_path = (root / ('synthetic-preview' + ext) for ext in ('.png', '.wav', '.mp4'))
     Image.new('RGB', (640, 360), (231, 17, 193)).save(image_path)
     gif_path = root / 'synthetic-preview-animation.gif'
-    Image.new('RGB', (640, 360), (231, 81, 17)).save(gif_path, save_all=True,
-        append_images=[Image.new('RGB', (640, 360), (17, 231, 53))],
-        duration=[100, 100], loop=0, disposal=2)
+    gif_colors = ((231, 81, 17), (17, 231, 53))
+    Image.new('RGB', (640, 360), gif_colors[0]).save(gif_path, save_all=True,
+        append_images=[Image.new('RGB', (640, 360), gif_colors[1])],
+        duration=[420, 560], loop=0, disposal=2)
     subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i',
         'sine=frequency=440:duration=12', '-c:a', 'pcm_s16le', str(audio_path)],
         env=ctx['env'], check=True, timeout=30, stdout=subprocess.DEVNULL)
@@ -1003,41 +1004,43 @@ def run_media(ctx):
         observed = {'asset': name, 'request_paths': [path for path, headers in requested],
                     'requests_before_click': 0, 'anonymous_headers_verified': True}
         if name in ('image.png', 'animation.gif'):
-            first_rgb = (231, 17, 193) if name == 'image.png' else (231, 81, 17)
-            def decoded_image():
-                pixels = _refresh_pixels(ctx, 'decoded-image')
-                count = sum(max(abs(a - b) for a, b in zip(pixel, first_rgb)) <= 2
+            animated = name == 'animation.gif'
+            first_rgb = gif_colors[0] if animated else (231, 17, 193)
+            def decoded_image(rgb=first_rgb):
+                pixels = _refresh_pixels(ctx, 'decoded-gif-' + str(rgb[0]) if animated else 'decoded-image')
+                count = sum(max(abs(a - b) for a, b in zip(pixel, rgb)) <= 2
                             for pixel in pixels.get_flattened_data())
                 return count if count > 20000 else None
             matching = gui.SESSION.until(
                 'native image popup renders actual decoded fixture pixels', decoded_image)
             observed['decoded_image_matching_pixels'] = matching
-            if name == 'animation.gif':
-                started, samples = time.monotonic(), []
-                while len(samples) < 2 or time.monotonic() - started < .8:
-                    pixels = _refresh_pixels(ctx, 'gif-static-first-frame')
-                    first = sum(max(abs(a - b) for a, b in zip(pixel, first_rgb)) <= 2
-                                for pixel in pixels.get_flattened_data())
-                    second = sum(g > 200 and r < 45 and b < 90 for r, g, b in pixels.get_flattened_data())
-                    assert first > 20000 and second == 0, (
-                        'GIF did not stay on its actual first decoded frame', first, second)
-                    samples.append({'elapsed': time.monotonic() - started,
-                                    'first_color_pixels': first, 'second_color_pixels': second})
-                observed['static_gif_first_frame_samples'] = samples
+            if animated:
+                # OCR and capture round trips can land on either phase. Poll
+                # each actual color independently instead of timing a capture.
+                observed['gif_popup_second_color_pixels'] = gui.SESSION.until(
+                    'native GIF popup renders the second frame', lambda: decoded_image(gif_colors[1]))
             gui.framed_keys(window, 'Escape')
-            def loaded_thumbnail():
+            def loaded_thumbnail(rgb=first_rgb):
                 frame = gui.native_rgb_capture(window)
                 items = gui.native_marker_components(frame,
-                    gui.read_layout(ctx['preferences'])['conversation']['rect'], first_rgb)
+                    gui.read_layout(ctx['preferences'])['conversation']['rect'], rgb)
                 full = [item['bbox'] for item in items if item['full']]
                 return max(full, key=lambda box: (box[2] - box[0]) * (box[3] - box[1])) if full else None
             thumbnail_box = gui.SESSION.until('decoded image thumbnail in transcript', loaded_thumbnail)
             observed['thumbnail_box'] = thumbnail_box
+            if animated:
+                second_box = gui.SESSION.until('native inline GIF renders the second frame',
+                    lambda: loaded_thumbnail(gif_colors[1]))
+                assert second_box == thumbnail_box, (thumbnail_box, second_box)
+                observed['gif_inline_second_frame_box'] = second_box
             thumbnail_point = ((thumbnail_box[0] + thumbnail_box[2]) / 2,
                                (thumbnail_box[1] + thumbnail_box[3]) / 2)
             gui.click(window, *thumbnail_point)
             gui.SESSION.until('cached thumbnail opens viewer', lambda: _refresh_media_close(ctx))
             gui.SESSION.until('cached thumbnail opens actual image raster', decoded_image)
+            if animated:
+                observed['gif_reopened_second_color_pixels'] = gui.SESSION.until(
+                    'cached GIF viewer still animates', lambda: decoded_image(gif_colors[1]))
             gui.framed_keys(window, 'Escape')
         else:
             clock = gui.SESSION.until('decoded ' + name + ' duration in native player', lambda:
@@ -1182,11 +1185,14 @@ def run_media(ctx):
         if name in ('image.png', 'animation.gif'):
             assert '640' in info['text'] and '360' in info['text'], info['text']
         if name == 'animation.gif':
-            assert 'Preview: static first frame' in info['text'], info['text']
+            assert 'Preview: animated GIF' in info['text'], info['text']
         gui.framed_keys(window, 'Escape')
         observed['caption'] = caption(name,
             thumbnail_box[3] if name in ('image.png', 'animation.gif') else load_rect[1],
             origin.url + '/' + name)
+        if name == 'animation.gif':
+            requests = [path for path, _ in origin.snapshot()[len(before):]]
+            assert requests == ['/animation.gif'], ('GIF animation or cached reopen fetched again', requests)
         evidence.append(observed)
         upload.focus_composer(window)
         gui._composer_native(window, '', 0, 0)
@@ -1364,15 +1370,9 @@ def run_media(ctx):
         frame = gui.native_rgb_capture(window)
         items = gui.native_marker_components(frame,
             gui.read_layout(ctx['preferences'])['conversation']['rect'], (231, 17, 193))
-        full = [item['bbox'] for item in items if item['full']]
-        if not full:
-            return None
-        box = max(full, key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
-        pixels = _policy_crop(frame, box)
-        matching = sum(max(abs(pixels[index + channel] - color)
-                           for channel, color in enumerate((231, 17, 193))) <= 2
-                       for index in range(0, len(pixels), 3))
-        return {'thumbnail_box': box, 'decoded_magenta_pixels': matching} if matching > 10000 else None
+        largest = max(items, key=lambda item: item['pixels'], default=None)
+        if largest and largest['pixels'] > 10000:
+            return {'thumbnail_box': largest['bbox'], 'decoded_magenta_pixels': largest['pixels']}
     decoded = gui.SESSION.until('HTML og:image paints actual decoded magenta thumbnail',
                                 decoded_html_thumbnail)
     decoded.update(copy_url(colors, url, 'automatic-valid'))

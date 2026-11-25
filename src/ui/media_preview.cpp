@@ -7,6 +7,7 @@
 #include <GLES2/gl2.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <core/input/key_modifiers.h>
 #include <core/text_clipboard.h>
@@ -113,16 +114,7 @@ std::optional<DecodedRasterImage> readRaster(const PreviewAsset &asset, int targ
     if (!raster || !raster->width || !raster->height ||
         static_cast<std::uint64_t>(raster->width) * raster->height > 16ULL * 1024 * 1024)
         return std::nullopt;
-    auto decoded = [&]() -> std::expected<DecodedRasterImage, std::string> {
-        if (raster->extension != ".gif")
-            return decodeRasterImage(bytes.data(), bytes.size());
-        // Static first frame only: never hand remote GIFs to the unbounded animation path.
-        auto gif = codecs::decodeAnimatedGif(bytes.data(), bytes.size(), 1, 64ULL * 1024 * 1024);
-        if (!gif || gif->width != static_cast<int>(raster->width) ||
-            gif->height != static_cast<int>(raster->height) || gif->frames.size() != 1)
-            return std::unexpected("GIF first frame could not be decoded safely");
-        return DecodedRasterImage{std::move(gif->frames.front().rgba), gif->width, gif->height};
-    }();
+    auto decoded = decodeRasterImage(bytes.data(), bytes.size());
     if (!decoded ||
         !((decoded->width == static_cast<int>(raster->width) &&
            decoded->height == static_cast<int>(raster->height)) ||
@@ -148,6 +140,148 @@ bool loadRaster(Image &image, Renderer &renderer, const PreviewAsset &asset, int
     return decoded && image.setSourceRaw(renderer, decoded->pixels.data(), decoded->pixels.size(),
                                          decoded->width, decoded->height, 0, PixmapFormat::RGBA);
 }
+class GifPlayback {
+  public:
+    using Clock = std::chrono::steady_clock;
+
+    ~GifPlayback() { reset(); }
+
+    bool matches(const std::shared_ptr<const codecs::DecodedRasterAnimation> &gif) const {
+        return source == gif && image && generation == image->gpuResourceGeneration();
+    }
+
+    void reset() {
+        if (image && generation == image->gpuResourceGeneration()) {
+            image->clear(*renderer);
+            renderer->textureManager().unload(texture);
+        }
+        texture = {};
+        image = nullptr;
+        source.reset();
+        deadline = {};
+        frame = 0;
+        loops = 0;
+        finished = false;
+    }
+
+    bool load(Image &view, Renderer &r,
+              const std::shared_ptr<const codecs::DecodedRasterAnimation> &gif) {
+        reset();
+        if (!gif)
+            return false;
+        texture = r.textureManager().loadFromRgba(gif->frames.front().rgba.data(), gif->width,
+                                                  gif->height, false);
+        if (!texture.valid())
+            return false;
+        image = &view;
+        renderer = &r;
+        generation = view.gpuResourceGeneration();
+        source = gif;
+        view.setExternalTexture(r, texture);
+        return true;
+    }
+
+    void rebind(Renderer &r) { renderer = &r; }
+    void pause() { deadline = {}; }
+
+    void tick(Clock::time_point now, bool animate, const std::function<bool()> &makeCurrent) {
+        if (!source || source->frames.size() < 2 || generation != image->gpuResourceGeneration() ||
+            (animate && finished) || (!animate && !frame && deadline == Clock::time_point{}))
+            return;
+        if (!inViewport()) {
+            pause();
+            return;
+        }
+        if (animate && now < deadline)
+            return;
+        if (!animate) {
+            if (!frame || upload(0, makeCurrent)) {
+                deadline = {};
+                loops = 0;
+                finished = false;
+            }
+            return;
+        }
+        if (deadline == Clock::time_point{}) {
+            deadline = now + duration(frame);
+            return;
+        }
+        auto next = frame;
+        auto nextLoops = loops;
+        auto nextDeadline = std::max(deadline, now - std::chrono::milliseconds(250));
+        while (now >= nextDeadline) {
+            if (next + 1 == source->frames.size()) {
+                if (source->loops && nextLoops + 1 >= source->loops) {
+                    finished = true;
+                    break;
+                }
+                if (source->loops)
+                    ++nextLoops;
+                next = 0;
+            } else {
+                ++next;
+            }
+            nextDeadline += duration(next);
+        }
+        if (next == frame || upload(next, makeCurrent)) {
+            loops = nextLoops;
+            deadline = nextDeadline;
+        } else {
+            finished = false;
+        }
+    }
+
+  private:
+    bool inViewport() const {
+        float left, top, right, bottom;
+        Node::transformedBounds(image, left, top, right, bottom);
+        for (const Node *node = image; node; node = node->parent()) {
+            if (!node->visible() || node->opacity() <= 0)
+                return false;
+            if (node->clipChildren()) {
+                float x, y, r, b;
+                Node::transformedBounds(node, x, y, r, b);
+                left = std::max(left, x);
+                top = std::max(top, y);
+                right = std::min(right, r);
+                bottom = std::min(bottom, b);
+            }
+        }
+        return left < right && top < bottom;
+    }
+
+    std::chrono::milliseconds duration(std::size_t index) const {
+        return std::chrono::milliseconds(std::max(20u, source->frames[index].durationMs));
+    }
+
+    bool upload(std::size_t index, const std::function<bool()> &makeCurrent) {
+        if (makeCurrent && !makeCurrent())
+            return false;
+        GLint binding = 0, unpack = 4;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &binding);
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack);
+        const bool ok = renderer->textureManager().updateSubImage(
+            texture, source->frames[index].rgba.data(), 0, 0, source->width, source->height,
+            TextureDataFormat::Rgba);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(binding));
+        glPixelStorei(GL_UNPACK_ALIGNMENT, unpack);
+        if (ok) {
+            frame = index;
+            image->markPaintDirty();
+        }
+        return ok;
+    }
+
+    TextureHandle texture;
+    Image *image = nullptr;
+    Renderer *renderer = nullptr;
+    std::uint64_t generation = 0;
+    std::shared_ptr<const codecs::DecodedRasterAnimation> source;
+    Clock::time_point deadline{};
+    std::size_t frame = 0;
+    std::uint32_t loops = 0;
+    bool finished = false;
+};
 std::string clockText(double seconds) {
     const auto n = static_cast<unsigned>(std::max(0., std::isfinite(seconds) ? seconds : 0.));
     char text[32];
@@ -164,6 +298,7 @@ struct MediaPreviewController::Impl {
         PreviewRaster raster;
         double duration = 0;
         std::shared_ptr<const PreviewAsset> asset;
+        std::shared_ptr<const codecs::DecodedRasterAnimation> gif;
         std::uint64_t ticket = 0, assetRevision = 0;
         std::optional<DecodedRasterImage> thumbnail;
         std::uint64_t decodedRevision = 0;
@@ -184,6 +319,7 @@ struct MediaPreviewController::Impl {
         Slider *seek, *volume;
         Renderer *renderer = nullptr;
         TextureHandle texture{};
+        GifPlayback gif;
         std::uint64_t uploadedRevision = 0;
         const PreviewAsset *shown = nullptr;
         float scale = 1;
@@ -244,6 +380,7 @@ struct MediaPreviewController::Impl {
         }
         ~Overlay() override { release(); }
         void release() {
+            gif.reset();
             if (renderer) {
                 image->clear(*renderer);
                 if (texture.valid())
@@ -259,7 +396,10 @@ struct MediaPreviewController::Impl {
             uploadedRevision = 0;
             renderer = nullptr;
         }
-        void doRebindRenderer(Renderer &r) override { renderer = &r; }
+        void doRebindRenderer(Renderer &r) override {
+            renderer = &r;
+            gif.rebind(r);
+        }
         void doLayout(Renderer &r) override {
             renderer = &r;
             blocker->setSize(width(), height());
@@ -330,13 +470,15 @@ struct MediaPreviewController::Impl {
                 button->setControlHeight(32 * scale);
             seek->setControlHeight(32 * scale);
             volume->setControlHeight(32 * scale);
+            const auto gifSource = entry != state.entries.end() ? entry->second.gif : nullptr;
             if (state.overlayKind == PreviewKind::Image && state.overlayAsset &&
                 shown != state.overlayAsset.get()) {
                 release();
                 renderer = &r;
-                status->setText(loadRaster(*image, r, *state.overlayAsset)
-                                    ? "Click outside or Escape to close"
-                                    : "This image could not be decoded safely.");
+                const bool loaded = gifSource ? gif.load(*image, r, gifSource)
+                                              : loadRaster(*image, r, *state.overlayAsset);
+                status->setText(loaded ? "Click outside or Escape to close"
+                                       : "This image could not be decoded safely.");
                 shown = state.overlayAsset.get();
             }
             const auto frame = state.player.frame();
@@ -440,12 +582,15 @@ struct MediaPreviewController::Impl {
         Node *node = nullptr;
         std::uint64_t id = 0;
         std::shared_ptr<const PreviewAsset> asset;
+        GifPlayback *gif = nullptr;
     };
     std::vector<std::weak_ptr<CardPin>> cardPins;
     void releaseCardPins(std::uint64_t id) {
         for (const auto &weak : cardPins)
-            if (auto pin = weak.lock(); pin && pin->id == id)
+            if (auto pin = weak.lock(); pin && pin->id == id) {
                 pin->asset.reset();
+                pin->gif->reset();
+            }
     }
     bool pinned(std::uint64_t id) const {
         if (overlay->visible() && (overlayId == id || (overlayId == 0 && directSourceId == id)))
@@ -498,9 +643,11 @@ struct MediaPreviewController::Impl {
                     oldest = it;
             }
             if (oldest != entries.end()) {
+                releaseCardPins(oldest->first);
                 oldest->second.asset.reset();
                 oldest->second.assetRevision = 0;
                 oldest->second.thumbnail.reset();
+                oldest->second.gif.reset();
                 oldest->second.decodedRevision = 0;
                 oldest->second.fetched = false;
                 continue;
@@ -653,8 +800,10 @@ struct MediaPreviewController::Impl {
             if (entry.raster.width && entry.raster.height)
                 text += "\nDimensions: " + std::to_string(entry.raster.width) + " × " +
                         std::to_string(entry.raster.height);
-            if (entry.raster.extension == ".gif")
-                text += "\nPreview: static first frame";
+            if (entry.gif)
+                text += entry.gif->frames.size() > 1 ? "\nPreview: animated GIF"
+                        : entry.gif->truncated       ? "\nPreview: static first frame"
+                                                     : "\nPreview: still GIF";
         }
         if (entry.kind == PreviewKind::Link && entry.fetched && entry.error.empty())
             text += "\n\nType: Web page";
@@ -722,8 +871,10 @@ void MediaPreviewController::invalidate() {
     s.close(false);
     s.policy = s.currentPolicy();
     for (const auto &weak : s.cardPins)
-        if (auto pin = weak.lock())
+        if (auto pin = weak.lock()) {
             pin->asset.reset();
+            pin->gif->reset();
+        }
 }
 void MediaPreviewController::retainMessages(std::span<const std::uint64_t> ids) {
     auto &s = *impl_;
@@ -809,7 +960,7 @@ float MediaPreviewController::measure(Renderer &renderer, std::uint64_t id, floa
         if (entry.kind != PreviewKind::Image || !entry.asset || entry.pending ||
             entry.needsConsent || !entry.error.empty())
             return 0;
-        if (entry.decodedRevision != entry.assetRevision) {
+        if (!entry.gif && entry.decodedRevision != entry.assetRevision) {
             entry.decodedRevision = entry.assetRevision;
             entry.thumbnail =
                 readRaster(*entry.asset, std::clamp(static_cast<int>(240 * scale), 64, 512));
@@ -818,7 +969,7 @@ float MediaPreviewController::measure(Renderer &renderer, std::uint64_t id, floa
                 s.decodeChanged = true;
             }
         }
-        if (!entry.thumbnail)
+        if (!entry.gif && !entry.thumbnail)
             return 0;
     }
     const auto &raster = it->second.raster;
@@ -896,7 +1047,8 @@ std::string_view MediaPreviewController::error(std::uint64_t id) const {
     auto it = impl_->entries.find(id);
     return it == impl_->entries.end() ? std::string_view{} : it->second.error;
 }
-void MediaPreviewController::update(float width, float height, float scale) {
+void MediaPreviewController::update(float width, float height, float scale,
+                                    const std::function<bool()> &makeCurrent) {
     auto &s = *impl_;
     if (s.model.settings.fx == FxLevel::Off || s.model.settings.reducedMotion ||
         !MotionService::instance().enabled()) {
@@ -936,6 +1088,7 @@ void MediaPreviewController::update(float width, float height, float scale) {
             entry.imageUrl = std::move(result.metadata.imageUrl);
         }
         entry.asset = std::move(result.asset);
+        entry.gif = std::move(result.gif);
         entry.thumbnail.reset();
         entry.decodedRevision = 0;
         entry.raster = std::move(result.raster);
@@ -979,8 +1132,20 @@ void MediaPreviewController::update(float width, float height, float scale) {
         }
         s.notify();
     }
-    if (active()) {
+    const auto now = GifPlayback::Clock::now();
+    const bool animate = s.model.settings.fx != FxLevel::Off && !s.model.settings.reducedMotion &&
+                         MotionService::instance().enabled();
+    const bool overlayActive = active();
+    for (const auto &weak : s.cardPins)
+        if (const auto pin = weak.lock(); pin && pin->asset) {
+            if (overlayActive)
+                pin->gif->pause();
+            else
+                pin->gif->tick(now, animate, makeCurrent);
+        }
+    if (overlayActive) {
         s.player.poll();
+        s.overlay->gif.tick(now, animate, makeCurrent);
         if (!s.showingInfo &&
             (s.overlayKind == PreviewKind::Audio || s.overlayKind == PreviewKind::Video)) {
             auto it = s.entries.find(s.overlayId);
@@ -1004,8 +1169,8 @@ void MediaPreviewController::update(float width, float height, float scale) {
             if (!s.overlay->volume->dragging())
                 s.overlay->volume->setValue(s.player.volume());
             s.overlay->settingControls = false;
+            s.overlay->markLayoutDirty();
         }
-        s.overlay->markLayoutDirty();
     }
 }
 bool MediaPreviewController::handleKey(const InputArea::KeyData &key) {
@@ -1037,6 +1202,7 @@ struct MediaPreviewCard::Impl {
     LucideIcon *typeIcon;
     std::shared_ptr<int> alive = std::make_shared<int>(0);
     std::uint64_t shownRevision = 0;
+    GifPlayback gif;
     std::shared_ptr<MediaPreviewController::Impl::CardPin> visibleAsset;
     float scale = 1;
     std::optional<Color> backdrop;
@@ -1045,6 +1211,7 @@ struct MediaPreviewCard::Impl {
     explicit Impl(MediaPreviewController &c, Node &owner) : controller(c) {
         visibleAsset = std::make_shared<MediaPreviewController::Impl::CardPin>();
         visibleAsset->node = &owner;
+        visibleAsset->gif = &gif;
         controller.impl_->cardPins.push_back(visibleAsset);
         background = child<Box>(owner);
         background->setHitTestVisible(false);
@@ -1188,10 +1355,12 @@ void MediaPreviewCard::setBackdrop(Color backdrop) {
     s.paintInk(themeSurfaceColor("surface_container"));
 }
 MediaPreviewCard::~MediaPreviewCard() = default;
+void MediaPreviewCard::doRebindRenderer(Renderer &renderer) { impl_->gif.rebind(renderer); }
 void MediaPreviewCard::bind(std::uint64_t id, std::string_view url, bool readable,
                             bool automaticAllowed) {
     if (impl_->id != id || !readable) {
         impl_->shownRevision = 0;
+        impl_->gif.reset();
         impl_->visibleAsset->asset.reset();
     }
     impl_->visibleAsset->id = id;
@@ -1214,6 +1383,7 @@ void MediaPreviewCard::sync(Renderer &renderer, float width, float scale) {
 }
 void MediaPreviewCard::doLayout(Renderer &renderer) {
     auto &s = *impl_;
+    s.gif.rebind(renderer);
     auto &controller = *s.controller.impl_;
     auto it = controller.entries.find(s.id);
     if (it == controller.entries.end())
@@ -1239,10 +1409,16 @@ void MediaPreviewCard::doLayout(Renderer &renderer) {
     s.image->setFit(web ? ImageFit::Cover : ImageFit::Contain);
     // Native Image rounds uniformly; the card surface shows through its two inner corners.
     s.image->setRadius(web ? radius : 0);
-    if (entry.asset && entry.kind == PreviewKind::Image && s.shownRevision != entry.assetRevision) {
-        s.image->clear(renderer);
+    if (entry.asset && entry.kind == PreviewKind::Image &&
+        (s.shownRevision != entry.assetRevision ||
+         (entry.gif && entry.error.empty() && !s.gif.matches(entry.gif)))) {
+        if (!entry.gif) {
+            s.gif.reset();
+            s.image->clear(renderer);
+        }
         const bool loaded =
-            entry.confirmedLink
+            entry.gif ? s.gif.load(*s.image, renderer, entry.gif)
+            : entry.confirmedLink
                 ? entry.thumbnail &&
                       s.image->setSourceRaw(renderer, entry.thumbnail->pixels.data(),
                                             entry.thumbnail->pixels.size(), entry.thumbnail->width,

@@ -23,7 +23,8 @@ class MediaPreviewController {
     MediaPreviewController &operator=(const MediaPreviewController &) = delete;
     void setInputDispatcher(InputDispatcher &);
     void setChanged(std::function<void()>);
-    void update(float width, float height, float scale);
+    void update(float width, float height, float scale,
+                const std::function<bool()> &makeCurrent = {});
     bool openUrl(std::string_view, std::uint64_t messageId = 0);
     bool handleKey(const InputArea::KeyData &);
     bool active() const;
@@ -59,6 +60,7 @@ class MediaPreviewCard final : public Node {
 
   protected:
     void doLayout(Renderer &) override;
+    void doRebindRenderer(Renderer &) override;
 
   private:
     struct Impl;

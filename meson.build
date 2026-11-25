@@ -70,12 +70,12 @@ avatar_dep = declare_dependency(
 )
 preview_lib = static_library('blastirc-preview', 'src/preview.cpp',
   include_directories: src_inc,
-  dependencies: [avatar_dep, curl_dep, webp_dep, xml_dep, json_dep, threads_dep],
+  dependencies: [avatar_dep, curl_dep, webp_dep, xml_dep, json_dep, threads_dep, noctalia_ui_codecs_dep],
 )
 preview_dep = declare_dependency(
   link_with: preview_lib,
   include_directories: src_inc,
-  dependencies: [avatar_dep, curl_dep, webp_dep, xml_dep, json_dep, threads_dep],
+  dependencies: [avatar_dep, curl_dep, webp_dep, xml_dep, json_dep, threads_dep, noctalia_ui_codecs_dep],
 )
 upload_lib = static_library('blastirc-upload', 'src/upload.cpp',
   include_directories: src_inc,

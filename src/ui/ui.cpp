@@ -5300,6 +5300,7 @@ void Ui::setWindowActive(bool active) {
         impl_->repeatCommands.clear();
     }
     impl_->windowActive = active;
+    impl_->media->setWindowActive(active);
     if (impl_->dispatcher)
         if (auto *input = nativeInputFor(impl_->dispatcher->focusedArea()))
             input->setWindowActive(active);

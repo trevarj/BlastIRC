@@ -1,6 +1,7 @@
 #pragma once
 
 #include "render/core/image_decoder.h"
+#include "render/core/image_resize.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -34,10 +35,10 @@ namespace codecs {
   };
 
   // Decode an animated GIF into RGBA frames with composited disposal/blend.
-  // `maxFrames` and `maxRgbaBytes` cap the resident decoded size; on overrun the
-  // returned `truncated` flag is set and the partial frames are returned (caller
-  // may fall back to first-frame-only display).
-  std::expected<DecodedRasterAnimation, std::string>
-  decodeAnimatedGif(const std::uint8_t* data, std::size_t size, int maxFrames, std::size_t maxRgbaBytes);
+  // The frame/byte caps apply to returned frames, optionally resized after compositing.
+  // If a cap is exceeded, `truncated` is set and the partial frames are returned.
+  std::expected<DecodedRasterAnimation, std::string> decodeAnimatedGif(
+      const std::uint8_t* data, std::size_t size, int maxFrames, std::size_t maxRgbaBytes, ImageExtent target = {}
+  );
 
 } // namespace codecs

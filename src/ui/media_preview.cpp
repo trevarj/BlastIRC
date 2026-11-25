@@ -523,6 +523,7 @@ struct MediaPreviewController::Impl {
     std::uint64_t directSourceId = 0;
     bool showingInfo = false;
     bool decodeChanged = false;
+    bool windowActive = false;
     using Policy = std::tuple<PreviewMode, PreviewMode, PreviewMode, int, int, int, bool>;
     Policy policy;
     explicit Impl(Model &m, Node &root, std::string caBundle)
@@ -1047,6 +1048,15 @@ std::string_view MediaPreviewController::error(std::uint64_t id) const {
     auto it = impl_->entries.find(id);
     return it == impl_->entries.end() ? std::string_view{} : it->second.error;
 }
+void MediaPreviewController::setWindowActive(bool active) {
+    const bool wasActive = std::exchange(impl_->windowActive, active);
+    if (!wasActive || active)
+        return;
+    for (const auto &weak : impl_->cardPins)
+        if (const auto pin = weak.lock())
+            pin->gif->pause();
+    impl_->overlay->gif.pause();
+}
 void MediaPreviewController::update(float width, float height, float scale,
                                     const std::function<bool()> &makeCurrent) {
     auto &s = *impl_;
@@ -1132,20 +1142,23 @@ void MediaPreviewController::update(float width, float height, float scale,
         }
         s.notify();
     }
-    const auto now = GifPlayback::Clock::now();
-    const bool animate = s.model.settings.fx != FxLevel::Off && !s.model.settings.reducedMotion &&
-                         MotionService::instance().enabled();
     const bool overlayActive = active();
-    for (const auto &weak : s.cardPins)
-        if (const auto pin = weak.lock(); pin && pin->asset) {
-            if (overlayActive)
-                pin->gif->pause();
-            else
-                pin->gif->tick(now, animate, makeCurrent);
-        }
+    if (s.windowActive) {
+        const auto now = GifPlayback::Clock::now();
+        const bool animate = s.model.settings.fx != FxLevel::Off &&
+                             !s.model.settings.reducedMotion && MotionService::instance().enabled();
+        for (const auto &weak : s.cardPins)
+            if (const auto pin = weak.lock(); pin && pin->asset) {
+                if (overlayActive)
+                    pin->gif->pause();
+                else
+                    pin->gif->tick(now, animate, makeCurrent);
+            }
+        if (overlayActive)
+            s.overlay->gif.tick(now, animate, makeCurrent);
+    }
     if (overlayActive) {
         s.player.poll();
-        s.overlay->gif.tick(now, animate, makeCurrent);
         if (!s.showingInfo &&
             (s.overlayKind == PreviewKind::Audio || s.overlayKind == PreviewKind::Video)) {
             auto it = s.entries.find(s.overlayId);

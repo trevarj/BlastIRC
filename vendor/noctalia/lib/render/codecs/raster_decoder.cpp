@@ -469,8 +469,9 @@ namespace codecs {
 
   } // namespace
 
-  std::expected<DecodedRasterAnimation, std::string>
-  decodeAnimatedGif(const std::uint8_t* data, std::size_t size, int maxFrames, std::size_t maxRgbaBytes) {
+  std::expected<DecodedRasterAnimation, std::string> decodeAnimatedGif(
+      const std::uint8_t* data, std::size_t size, int maxFrames, std::size_t maxRgbaBytes, ImageExtent target
+  ) {
     auto fail = [](const char* msg) -> std::expected<DecodedRasterAnimation, std::string> {
       return std::unexpected(msg);
     };
@@ -503,7 +504,9 @@ namespace codecs {
       return fail("GIF has zero dimensions");
     }
     const std::uint64_t canvasBytes64 = static_cast<std::uint64_t>(width) * height * 4;
-    if (canvasBytes64 > maxRgbaBytes) {
+    constexpr std::uint64_t maxSourceBytes = 64ULL * 1024 * 1024;
+    const bool resize = target.width > 0 && target.height > 0;
+    if (canvasBytes64 > (resize ? maxSourceBytes : maxRgbaBytes)) {
       return fail("GIF canvas exceeds size cap");
     }
     const auto canvasBytes = static_cast<std::size_t>(canvasBytes64);
@@ -530,8 +533,9 @@ namespace codecs {
     wuffs_base__slice_u8 workbufSlice = wuffs_base__make_slice_u8(workbuf.data(), workbuf.size());
 
     DecodedRasterAnimation result;
-    result.width = static_cast<int>(width);
-    result.height = static_cast<int>(height);
+    result.width = resize ? std::min(static_cast<int>(width), target.width) : static_cast<int>(width);
+    result.height = resize ? std::min(static_cast<int>(height), target.height) : static_cast<int>(height);
+    const auto frameBytes = static_cast<std::size_t>(result.width) * result.height * 4;
 
     wuffs_base__animation_disposal prevDisposal = WUFFS_BASE__ANIMATION_DISPOSAL__NONE;
     wuffs_base__rect_ie_u32 prevBounds = wuffs_base__empty_rect_ie_u32();
@@ -550,7 +554,7 @@ namespace codecs {
         result.truncated = true;
         break;
       }
-      if (static_cast<int>(result.frames.size()) >= maxFrames || canvasBytes > maxRgbaBytes - cumulativeBytes) {
+      if (static_cast<int>(result.frames.size()) >= maxFrames || frameBytes > maxRgbaBytes - cumulativeBytes) {
         result.truncated = true;
         break;
       }
@@ -581,9 +585,19 @@ namespace codecs {
       }
 
       DecodedRasterFrame frame;
-      frame.rgba.assign(canvas.begin(), canvas.end());
+      if (frameBytes == canvasBytes) {
+        frame.rgba.assign(canvas.begin(), canvas.end());
+      } else {
+        frame.rgba = resizeToRgba(
+            canvas.data(), static_cast<int>(width), static_cast<int>(height), ResizeSourceLayout::Rgba, result.width,
+            result.height
+        );
+        if (frame.rgba.empty()) {
+          return fail("GIF resize failed");
+        }
+      }
       frame.durationMs = clampGifDurationMs(fc.duration());
-      cumulativeBytes += canvasBytes;
+      cumulativeBytes += frameBytes;
       result.frames.push_back(std::move(frame));
 
       prevDisposal = currentDisposal;

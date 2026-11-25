@@ -20,6 +20,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <poll.h>
+#include <render/codecs/codecs.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -170,7 +171,7 @@ Bytes validJpeg() {
     };
 }
 Bytes animatedGif() {
-    // Two distinct red/blue frames; consumers decode only the first, cache retains both.
+    // Two distinct red/blue frames.
     return {
         0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x02, 0x00, 0x01, 0x00, 0x81, 0x00, 0x00, 0xff,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0xff, 0x0b,
@@ -181,6 +182,27 @@ Bytes animatedGif() {
         0x00, 0x01, 0x00, 0x81, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x08, 0x05, 0x00, 0x01, 0x00, 0x08, 0x08, 0x00, 0x3b,
     };
+}
+Bytes largeGif(std::uint16_t width, std::uint16_t height, std::size_t frameCount) {
+    constexpr std::size_t red = 44, blue = 70;
+    auto source = animatedGif();
+    source[6] = static_cast<std::uint8_t>(width);
+    source[7] = static_cast<std::uint8_t>(width >> 8);
+    source[8] = static_cast<std::uint8_t>(height);
+    source[9] = static_cast<std::uint8_t>(height >> 8);
+    source[red + 4] = 5;
+    source[blue + 4] = 7;
+
+    Bytes bytes(source.begin(), source.begin() + red);
+    bytes.reserve(red + frameCount * (source.size() - 1 - blue) + 1);
+    for (std::size_t i = 0; i < frameCount; ++i) {
+        if (i % 2 == 0)
+            bytes.insert(bytes.end(), source.begin() + red, source.begin() + blue);
+        else
+            bytes.insert(bytes.end(), source.begin() + blue, source.end() - 1);
+    }
+    bytes.push_back(source.back());
+    return bytes;
 }
 Bytes animatedWebp() {
     // SDK webp_decoder_test's valid 16x16 red/blue animation.
@@ -231,6 +253,8 @@ void successfulResponses(Certificate &cert) {
         std::uint32_t width = 0, height = 0;
         std::string extension{};
     };
+    constexpr std::uint16_t gifWidth = 1000, gifHeight = 788;
+    constexpr std::size_t gifFrames = 239;
     const std::vector<Case> cases{
         {"/html", "text/html; charset=UTF-8", html, PreviewKind::Link},
         {"/xhtml", "application/xhtml+xml", html, PreviewKind::Link},
@@ -238,6 +262,8 @@ void successfulResponses(Certificate &cert) {
         {"/jpeg", "image/jpeg", binary(validJpeg()), PreviewKind::Image, 2, 1, ".jpg"},
         {"/webp", "image/webp", binary(webp()), PreviewKind::Image, 1, 1, ".webp"},
         {"/gif", "image/gif", binary(animatedGif()), PreviewKind::Image, 2, 1, ".gif"},
+        {"/large.gif", "image/gif", binary(largeGif(gifWidth, gifHeight, gifFrames)),
+         PreviewKind::Image, gifWidth, gifHeight, ".gif"},
         {"/audio", "audio/ogg", std::string("OggS\0audio\xff", 11), PreviewKind::Audio},
         {"/video", "video/mp4",
          std::string("\0\0\0\x18"
@@ -274,6 +300,25 @@ void successfulResponses(Certificate &cert) {
             if (test.kind == PreviewKind::Image) {
                 assert(result.raster.width == test.width && result.raster.height == test.height);
                 assert(result.raster.extension == test.extension);
+                if (test.path == "/large.gif") {
+                    assert(result.gif && !result.gif->truncated);
+                    const auto &gif = *result.gif;
+                    assert(gif.frames.size() == gifFrames);
+                    assert(gif.width > 0 && gif.width < gifWidth);
+                    assert(gif.height > 0 && gif.height < gifHeight);
+                    const auto frameBytes = static_cast<std::size_t>(gif.width) * gif.height * 4;
+                    assert(frameBytes * gif.frames.size() <= 16 * 1024 * 1024);
+                    for (std::size_t i = 0; i < gif.frames.size(); ++i) {
+                        const auto &frame = gif.frames[i];
+                        assert(frame.rgba.size() == frameBytes);
+                        assert(frame.durationMs == (i % 2 == 0 ? 50u : 70u));
+                        assert(frame.rgba[3] > 0);
+                        if (i % 2 == 0)
+                            assert(frame.rgba[0] > frame.rgba[2]);
+                        else
+                            assert(frame.rgba[2] > frame.rgba[0]);
+                    }
+                }
             }
         }
     }

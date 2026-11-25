@@ -891,6 +891,7 @@ void gifConsumers(Certificate &certificate, bool web) {
     root.setSize(800, 600);
     root.setPopupContext(&menu);
     MediaPreviewController controller(model, root, certificate.caPath);
+    controller.setWindowActive(true);
     auto *overlay = root.children().front().get();
     auto card = std::make_unique<MediaPreviewCard>(controller);
     auto *view = card.get();
@@ -948,6 +949,12 @@ void gifConsumers(Certificate &certificate, bool web) {
         });
     };
     waitForFrame(inlineGif, true);
+    if (!web) {
+        controller.setWindowActive(false);
+        observeStopped(inlineGif);
+        assert(inlineGif.blue);
+        controller.setWindowActive(true);
+    }
     waitForFrame(inlineGif, false);
     if (!web) {
         view->setVisible(false);
@@ -968,6 +975,12 @@ void gifConsumers(Certificate &certificate, bool web) {
     assert(modalId != thumbnailId && renderer.textures.gifs.size() == 2);
     assert(!modalGif.blue && !modalGif.updates);
     waitForFrame(modalGif, true);
+    if (!web) {
+        controller.setWindowActive(false);
+        observeStopped(modalGif);
+        assert(modalGif.blue);
+        controller.setWindowActive(true);
+    }
     waitForFrame(modalGif, false);
     assert(modal->textureId() == modalId && thumbnail->textureId() == thumbnailId);
     assert(inlineGif.updates == inlineUpdates);

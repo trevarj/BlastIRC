@@ -23,6 +23,7 @@ class MediaPreviewController {
     MediaPreviewController &operator=(const MediaPreviewController &) = delete;
     void setInputDispatcher(InputDispatcher &);
     void setChanged(std::function<void()>);
+    void setWindowActive(bool active);
     void update(float width, float height, float scale,
                 const std::function<bool()> &makeCurrent = {});
     bool openUrl(std::string_view, std::uint64_t messageId = 0);

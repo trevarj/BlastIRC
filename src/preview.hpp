@@ -20,6 +20,7 @@ struct PreviewMetadata {
 struct PreviewRaster {
     std::uint32_t width = 0, height = 0;
     std::string extension;
+    std::uint32_t gifFrames = 0;
 };
 // Private cache lifetime follows the last asset owner, including an open player.
 struct PreviewAsset {

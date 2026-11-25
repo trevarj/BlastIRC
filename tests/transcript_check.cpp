@@ -837,24 +837,20 @@ float baseline(const TextNode &text) {
 LayoutRect sceneBounds(const Node &node);
 LayoutRect nativeTextInk(TranscriptTestRenderer &renderer, const TextNode &text);
 
-const GlyphNode *actionGlyph(const Node &node) {
-    if (const auto *glyph = dynamic_cast<const GlyphNode *>(&node);
-        glyph && glyph->codepoint() == GlyphRegistry::lookup("asterisk"))
-        return glyph;
+const Image *findActionMarker(const Node &node) {
+    if (const auto *image = dynamic_cast<const Image *>(&node);
+        image && image->sourcePath().ends_with("/action-star.svg"))
+        return image;
     for (const auto &child : node.children())
-        if (const auto *glyph = actionGlyph(*child))
-            return glyph;
+        if (const auto *marker = findActionMarker(*child))
+            return marker;
     return nullptr;
 }
 
 TextNode *actionActor(const Body &rendered, std::string_view nick) {
-    assert(GlyphRegistry::contains("activity"));
     auto *actor = plainText(rendered.content, nick);
-    const auto *glyph = actionGlyph(rendered.row);
-    assert(actor && glyph && glyph->visible());
-    // The native Glyph control owns the layout box; its child holds the codepoint.
-    const auto *marker = dynamic_cast<const Glyph *>(glyph->parent());
-    assert(marker && marker->visible());
+    const auto *marker = findActionMarker(rendered.row);
+    assert(actor && marker && marker->visible() && marker->hasImage());
     const auto bounds = sceneBounds(*marker);
     assert(bounds.width > 0 && bounds.x + bounds.width <= sceneBounds(*actor).x + .02f);
     return actor;
@@ -2568,7 +2564,7 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
             if (buffer.messages[i].action) {
                 assert(!bubbleSurface(rendered));
                 auto *actor = actionActor(rendered, buffer.messages[i].nick);
-                assert(actor->fontWeight() == FontWeight::Bold &&
+                assert(actor->fontWeight() == FontWeight::Normal &&
                        actor->color() ==
                            blast::nickTextColor(model, buffer.messages[i].nick, buffer.server,
                                                 blast::themeSurfaceColor("surface_container_low")));
@@ -2579,7 +2575,7 @@ void bubbleConversation(TranscriptTestRenderer &renderer, float zoom, const char
                 containedBounds(nativeTextInk(renderer, rendered.text), sceneBounds(rendered.row));
                 containedBounds(nativeTextInk(renderer, *clock), sceneBounds(rendered.row));
             } else {
-                assert(!actionGlyph(rendered.row));
+                assert(!findActionMarker(rendered.row));
                 bubbleGeometry(renderer, rendered, zoom,
                                i == 1 || i == 3 ? "" : "12:" + std::to_string(34 + i));
             }
@@ -5218,6 +5214,7 @@ void messageTextSelection(TranscriptTestRenderer &renderer, float zoom) {
     // Advance native drag autoscroll until the next message is actually painted,
     // rather than assuming a fixed frame count crosses font- and layout-sized gaps.
     for (int frame = 0; frame < 240 && !nextMessageExposed(); ++frame) {
+        view.clearDirty();
         model.now += .016;
         arrange();
     }
@@ -10783,7 +10780,10 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
             for (const auto token : {"ActionPlain", "OwnEmote"}) {
                 const auto rendered = body(view, token);
                 auto *actor = actionActor(rendered, "A");
-                assert(actor->font().weight == FontWeight::Bold);
+                assert(actor->font().weight == FontWeight::Normal);
+                assert(actor->font().family == rendered.text.font().family);
+                near(actor->fontSize(), rendered.text.fontSize());
+                assert(findActionMarker(rendered.row)->width() < actor->fontSize());
                 const float actorNatural =
                     renderer.measureText(actor->text(), actor->fontSize(), actor->font()).width;
                 assert(actor->maxWidth() + .02f >= actorNatural);
@@ -10841,11 +10841,11 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
                        blast::parseIrcFormatting(message.text, {}, {}).text);
             }
             const auto normal = body(view, "NormalBody");
-            assert(plainText(normal.content, "Peer") && !actionGlyph(normal.row));
+            assert(plainText(normal.content, "Peer") && !findActionMarker(normal.row));
             assert(normal.text.text().find("style=\"italic\"") == std::string::npos);
             assert(bool(bubbleSurface(normal)) == !traditional);
             const auto presence = body(view, "PresenceBody");
-            assert(!actionGlyph(presence.row) && !bubbleSurface(presence));
+            assert(!findActionMarker(presence.row) && !bubbleSurface(presence));
             model.settings.avatars = true;
             for (const float width : {1100.f, 240.f}) {
                 view.sync();
@@ -10878,7 +10878,8 @@ void actionPresentation(TranscriptTestRenderer &renderer) {
                             assert(intersectBounds(bodyBounds, avatarBounds).width <= .02f ||
                                    intersectBounds(bodyBounds, avatarBounds).height <= .02f);
                         }
-                    if (auto *image = find<Image>(rendered.content)) {
+                    if (auto *image = find<Image>(rendered.content);
+                        image && image != findActionMarker(rendered.content)) {
                         const auto avatarBounds = sceneBounds(*image);
                         assert(intersectBounds(actorBounds, avatarBounds).width <= .02f ||
                                intersectBounds(actorBounds, avatarBounds).height <= .02f);

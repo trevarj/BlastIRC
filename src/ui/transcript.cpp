@@ -18,6 +18,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cmath>
+#include <core/files/resource_paths.h>
 #include <core/input/key_modifiers.h>
 #include <core/text_clipboard.h>
 #include <cstdio>
@@ -683,6 +684,12 @@ void remapMessageFocusKeys(Node &node, std::string_view oldPrefix, std::string_v
         remapMessageFocusKeys(*child, oldPrefix, newPrefix);
 }
 
+TextFont messagePrefixFont(bool action) {
+    auto font = action ? themeMessageFont() : themeUiFont();
+    font.weight = action ? FontWeight::Normal : FontWeight::Bold;
+    return font;
+}
+
 struct Geometry {
     PresentationMetrics metrics{};
     float scale = 1, font = 16, uiFont = 14, metadataFont = 14, nickFont = 12, activityFont = 12,
@@ -718,8 +725,9 @@ struct Geometry {
         return shown ? activityClockWidth + activityClockGap() : 0;
     }
     float activityChevron() const { return 16 * scale; }
-    float actionMarkerWidth(float fontSize, float available) const {
-        const float width = std::round(fontSize) + 3 * scale;
+    float actionMarkerSize() const { return std::round(.8f * font); }
+    float actionMarkerWidth(float available) const {
+        const float width = actionMarkerSize() + 3 * scale;
         return width + 1 <= available ? width : 0;
     }
     float footerGap() const { return (tight ? 1 : 2) * scale; }
@@ -1075,7 +1083,7 @@ struct TranscriptView::Impl {
         RectNode *nickChip = nullptr;
         Label *nickChipText = nullptr;
         Glyph *friendBadge = nullptr;
-        Glyph *actionMarker = nullptr;
+        Image *actionMarker = nullptr;
         bool ownNickChip = false;
         bool avatarSprite = false;
         TextNode *avatarInitial = nullptr;
@@ -3985,21 +3993,20 @@ struct TranscriptView::Impl {
             availableBody = std::max(1.f, availableBody + row.prefixWidth - prefix);
             row.prefixWidth = prefix;
         }
-        auto emoteFont = themeMessageFont();
-        emoteFont.weight = FontWeight::Bold;
         const float friendExtent = row.friendAuthor ? 18 * g.scale : 0;
         row.emotePrefix = 0;
         if (emote && (g.bubbles || stackedEmote)) {
             const float avatarInset = g.authorAvatarInset();
             const float width = std::max(0.f, availableBody - avatarInset);
             const float trailing = friendExtent + 8 * g.scale;
-            const float name = std::ceil(renderer.measureText(entry.nick, g.font, emoteFont).width);
-            const float shortPrefix = std::min(name, g.font) +
-                                      g.actionMarkerWidth(g.font, width) + trailing;
+            const float name =
+                std::ceil(renderer.measureText(entry.nick, g.font, messagePrefixFont(true)).width);
+            const float shortPrefix =
+                std::min(name, g.font) + g.actionMarkerWidth(width) + trailing;
             const float limit = std::max(width * .45f, std::min(shortPrefix, width - 3 * g.font));
             row.emotePrefix =
-                avatarInset + std::min(limit, name + g.actionMarkerWidth(g.font, limit - trailing) +
-                                                  trailing);
+                avatarInset +
+                std::min(limit, name + g.actionMarkerWidth(limit - trailing) + trailing);
         }
         row.prefixWidth += row.emotePrefix;
         const float bodyMax = std::max(1.f, availableBody - row.emotePrefix);
@@ -4185,11 +4192,11 @@ struct TranscriptView::Impl {
              (entry.presence && row.showClock))) {
             float descent = 0, nickInkCenter = 0;
             auto include = [&](std::string_view text, float width, TextAlign align, bool nick) {
-                auto font = notice && !nick ? g.activityStyle : themeUiFont();
-                if (nick)
-                    font.weight = FontWeight::Bold;
+                const auto font = nick     ? messagePrefixFont(emote)
+                                  : notice ? g.activityStyle
+                                           : themeUiFont();
                 const float size =
-                    nick     ? g.metadataFont
+                    nick     ? (emote ? g.font : g.metadataFont)
                     : notice ? g.activityClockFont()
                     : g.channel && !g.inlineChannel && !stackedEmote && !entry.presence
                         ? g.timeFont
@@ -4207,8 +4214,7 @@ struct TranscriptView::Impl {
                     std::max(1.f, g.channelNickWidth(row.showClock) -
                                       g.compactAvatarInset(g.inlineChannel) - friendExtent -
                                       (entry.own && !entry.action ? 2 * g.chipPadding() : 0));
-                const float marker =
-                    entry.action ? g.actionMarkerWidth(g.metadataFont, nickWidth) : 0;
+                const float marker = emote ? g.actionMarkerWidth(nickWidth) : 0;
                 include(entry.nick, nickWidth - marker, align, true);
             }
             if (row.showClock) {
@@ -4337,13 +4343,13 @@ struct TranscriptView::Impl {
         return row.height - oldHeight;
     }
 
-    Glyph *renderActionMarker(Node &parent, float x, float centerY, float fontSize, Color ink) {
-        auto marker = std::make_unique<Glyph>();
+    Image *renderActionMarker(Renderer &renderer, Node &parent, float x, float centerY, float size,
+                              Color ink) {
+        static const auto path = paths::assetPath("action-star.svg").string();
+        auto marker = std::make_unique<Image>();
         auto *result = marker.get();
-        const float size = std::round(fontSize);
-        marker->setGlyph("asterisk");
-        marker->setGlyphSize(fontSize);
-        marker->setColor(ink);
+        marker->setSourceFile(renderer, path, static_cast<int>(size));
+        marker->setTint(ink);
         marker->setPosition(x, centerY - size * .5f);
         marker->setSize(size, size);
         marker->setHitTestVisible(false);
@@ -4697,7 +4703,8 @@ struct TranscriptView::Impl {
         const float x = surfaceX + padding + row.prefixWidth;
         slot.bodyX = x;
         float y = top + (notice ? g.activityPaddingY() : g.paddingY(entry.presence));
-        const bool stackedEmote = entry.action && !entry.presence && g.channel && !g.inlineChannel;
+        const bool emote = entry.action && !entry.presence;
+        const bool stackedEmote = emote && g.channel && !g.inlineChannel;
         if (!collapsed && g.bubbles && g.avatars && !row.grouped && !entry.presence)
             avatar(renderer, slot, entry,
                    g.tight ? x - row.emotePrefix
@@ -4740,14 +4747,13 @@ struct TranscriptView::Impl {
                     const float avatarInset = g.compactAvatarInset(g.inlineChannel);
                     const float chipPadding = entry.own && !entry.action ? g.chipPadding() : 0;
                     const float available = width - avatarInset - 2 * chipPadding - friendExtent;
-                    const float marker =
-                        entry.action ? g.actionMarkerWidth(g.metadataFont, available) : 0;
+                    const float marker = emote ? g.actionMarkerWidth(available) : 0;
                     const float textLimit = std::max(1.f, available - marker);
-                    auto actorFont = themeUiFont();
-                    actorFont.weight = FontWeight::Bold;
+                    const float nickSize = emote ? g.font : g.metadataFont;
+                    const auto actorFont = messagePrefixFont(emote);
                     const float textWidth = std::min(
                         textLimit,
-                        std::ceil(renderer.measureText(text, g.metadataFont, actorFont).width));
+                        std::ceil(renderer.measureText(text, nickSize, actorFont).width));
                     const float chipWidth = textWidth + 2 * chipPadding + friendExtent;
                     const float clusterWidth = avatarInset + marker + chipWidth;
                     if (stacked) {
@@ -4767,11 +4773,11 @@ struct TranscriptView::Impl {
                     }
                     const auto ink = !slot.ownNickChip ? senderInk(entry) : std::array<Color, 2>{};
                     if (marker > 0)
-                        slot.actionMarker = renderActionMarker(*area, nameX - marker,
+                        slot.actionMarker = renderActionMarker(renderer, *area, nameX - marker,
                                                                row.prefixHeight * .5f,
-                                                               g.metadataFont, ink[0]);
+                                                               g.actionMarkerSize(), ink[0]);
                     auto *name = label(
-                        *area, text, nameX + chipPadding, 0, textWidth, g.metadataFont,
+                        *area, text, nameX + chipPadding, 0, textWidth, nickSize,
                         slot.ownNickChip ? themeForegroundColor("on_primary") : ink[0], actorFont);
                     name->setMinWidth(textWidth);
                     name->setTextAlign(g.inlineChannel ? TextAlign::End : TextAlign::Start);
@@ -4788,7 +4794,7 @@ struct TranscriptView::Impl {
                                area->y() + g.stackedAvatarY(row.prefixHeight), avatarSize);
                     } else if (avatarSize > 0) {
                         const auto ink =
-                            renderer.measureText(text, g.metadataFont, actorFont, textLimit, 1);
+                            renderer.measureText(text, nickSize, actorFont, textLimit, 1);
                         const float center =
                             slot.ownNickChip
                                 ? row.prefixHeight * .5f
@@ -4850,8 +4856,6 @@ struct TranscriptView::Impl {
                                              entry.time),
                                        row.metadataInk);
         if (!collapsed && entry.action && !entry.presence && (g.bubbles || stackedEmote)) {
-            auto actorFont = themeMessageFont();
-            actorFont.weight = FontWeight::Bold;
             const auto ink = senderInk(entry);
             if (stackedEmote && g.avatars)
                 avatar(renderer, slot, entry, surfaceX + (row.showClock ? g.timeGutter : 0),
@@ -4859,14 +4863,14 @@ struct TranscriptView::Impl {
             const float left = x - row.emotePrefix + g.authorAvatarInset();
             const float available = row.emotePrefix - g.authorAvatarInset() - friendExtent -
                                     8 * g.scale;
-            const float marker = g.actionMarkerWidth(g.font, available);
+            const float marker = g.actionMarkerWidth(available);
             if (marker > 0)
-                slot.actionMarker = renderActionMarker(*slot.content, left,
-                                                       row.bodyOffset + g.bodyLine * .5f, g.font,
-                                                       ink[0]);
+                slot.actionMarker = renderActionMarker(renderer, *slot.content, left,
+                                                       row.bodyOffset + g.bodyLine * .5f,
+                                                       g.actionMarkerSize(), ink[0]);
             auto *name = label(*slot.content, entry.nick, left + marker, row.bodyOffset,
-                               std::max(1.f, available - marker), g.font, ink[0], actorFont,
-                               entry.nick);
+                               std::max(1.f, available - marker), g.font, ink[0],
+                               messagePrefixFont(true), entry.nick);
             name->measure(renderer);
             name->setPosition(name->x(), row.prefixBaseline - name->baselineOffset());
             rememberSender(name, ink);
@@ -5416,7 +5420,7 @@ struct TranscriptView::Impl {
             for (auto &[label, ink] : slot.labelInk)
                 label->setColor(ink[hovered]);
             if (slot.actionMarker)
-                slot.actionMarker->setColor(slot.leadingNick->color());
+                slot.actionMarker->setTint(slot.leadingNick->color());
             if (slot.nickChip) {
                 const auto color =
                     slot.ownNickChip

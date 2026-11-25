@@ -317,7 +317,7 @@ install_subdir(noctalia_fonts, install_dir: asset_dir)
 install_data(noctalia_emoji, install_dir: asset_dir)
 install_subdir('assets/lucide', install_dir: asset_dir)
 install_subdir('assets/sfx', install_dir: asset_dir)
-install_data('assets/icon.png', install_dir: asset_dir)
+install_data('assets/icon.png', 'assets/action-star.svg', install_dir: asset_dir)
 install_data('assets/foundry/atlas.png', install_dir: asset_dir / 'foundry')
 install_data('assets/icon.png',
   install_dir: get_option('datadir') / 'icons' / 'hicolor' / '512x512' / 'apps',
@@ -346,6 +346,7 @@ foreach bundle_dir : [
   meson.project_source_root() / 'assets' / 'sfx',
   meson.project_source_root() / 'assets' / 'foundry',
   meson.project_source_root() / 'assets' / 'icon.png',
+  meson.project_source_root() / 'assets' / 'action-star.svg',
 ]
   run_command('ln', '-sfn', bundle_dir, build_assets, check: true)
 endforeach

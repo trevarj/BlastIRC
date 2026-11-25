@@ -43,6 +43,8 @@ Preserve preferred sidebar modes separately from effective geometry. On narrow w
 
 Explicit network-rail visibility and channel/member mode changes use 180ms cubic-out width transitions, retiring outgoing input immediately. Animation frames update panel geometry and the visible conversation; normal UI updates continue to reconcile incoming data. Snap direct resizing, responsive refitting and Avy changes. Dialogs, popovers, formatting toolbar and native menus fade in over 150ms; icon/menu hover colors transition over 100ms. Closing, editing and selection remain immediate. Effects Off and reduced motion settle transitions without changing saved preferences.
 
+An unchanged connected window submits no Wayland frames after active effects settle. Continue polling IRC and servicing input timers; invalidate layout or paint only when visible state changes.
+
 One active conversation is visible and read-eligible at a time. Retained per-buffer views are state caches, not hidden tabs or keyboard-focus destinations. Restore selection before focusing native composers; publish only the actual visible conversation.
 
 Reconcile queued Core buffer selections without dismissing a newer open global palette or disturbing its query, selection, preedit, undo history or native focus. Apply the underlying conversation change without stealing focus; Escape returns to that newly selected conversation. Ordinary explicit buffer navigation still dismisses the palette.

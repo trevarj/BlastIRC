@@ -4442,17 +4442,17 @@ void Ui::Impl::refresh(bool panelResize) {
     const float controls = controlCount * extent + (controlCount - 1) * gap;
     const float controlsLeft = width - outer - controls;
     const float titleLeft = outer + logoExtent + gap;
-    const float titleWidth = std::max(0.f, controlsLeft - gap - titleLeft - 64 * scale);
+    const auto placeTitleControl = [](Node &node, float x, float y, float h) {
+        node.setPosition(x, y);
+        node.setSize(node.width(), h);
+    };
     place(*logo, outer, (titleHeight - logoExtent) / 2, logoExtent, logoExtent);
-    place(*applicationMenu, outer, (titleHeight - extent) / 2, titleLeft + titleWidth - outer,
-          extent);
-    place(*titleMove, titleLeft + titleWidth, 0,
-          std::max(0.f, controlsLeft - gap - titleLeft - titleWidth), titleHeight);
+    placeTitleControl(*applicationMenu, outer, (titleHeight - extent) / 2, extent);
+    titleMove->setSize(titleMove->width(), titleHeight);
     // The rounded body spans approximately y=340..1074 in the 1254px master; exclude collar,
     // fuse, spark and tail.
     constexpr float logoBodyCenter = 707.f / 1254.f;
-    place(*titleRow, titleLeft, logoExtent * (logoBodyCenter - .5f), titleWidth, titleHeight);
-    title->setMaxWidth(titleWidth);
+    placeTitleControl(*titleRow, titleLeft, logoExtent * (logoBodyCenter - .5f), titleHeight);
     if (title->font().family != themeUiFont().family)
         title->setFontFamily(themeUiFont().family);
     title->setFontSize(16 * scale);

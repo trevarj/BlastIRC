@@ -175,7 +175,7 @@ def main():
                                  "minimum-height", "message-links", "typing-focus", "mentions-unread",
                                  "startup-history-sync", "jump-bottom", "scrollbar", "buffer-boundaries",
                                  "conversation-history", "soju-search-context", "mention-highlight", "avatar-alignment",
-                                 "muted-unread", "network-sidebar"))
+                                 "muted-unread", "network-sidebar", "idle-redraw"))
     options, remaining = parser.parse_known_args()
     if any(option in remaining for option in ("--probe", "--probes", "--layout-only", "--ime-only", "--raw-only")):
         parser.error("--scope selects the focused fixture; do not combine other GUI scopes")
@@ -277,6 +277,33 @@ def _refresh_restart(ctx, section, values, *, focus=None):
 def _refresh_return(ctx, scope, evidence):
     return {'scope': scope, 'native_consumer': True, 'private_fixture_only': True,
             'evidence': evidence}
+
+
+def run_idle_redraw(ctx):
+    """A settled connected window stops drawing, then paints the next wire message."""
+    proc, window = ctx['proc'], ctx['window']
+    _policy_effects(ctx, fx='off')
+    _policy_chat(ctx, friends=[ctx['query_target']])
+    _policy_send(ctx, 'Open a friend DM on this network')
+    _policy_focus(ctx, ctx['channel_id'])
+    gui.set_navigation(proc, window, ctx['preferences'], ctx['database_path'], 'expanded',
+                       'idle-expanded')
+    gui.set_people(proc, window, ctx['preferences'], ctx['database_path'], 'expanded')
+    _policy_send(ctx, '\x042AB971,2AB971IDLESTART', target=ctx['channel'])
+    _policy_wait_box(ctx, (42, 185, 113))
+    gui.wait_read_marker(proc, ctx['database_path'], ctx['channel_id'])
+    debug = proc.native_debug_path
+    surface, _, _ = gui.main_surface_ids(debug)
+    commit = re.compile(rb'wl_surface[@#]%d\.commit\(' % surface)
+    time.sleep(.5)
+    offset = debug.stat().st_size
+    time.sleep(.5)
+    idle = len(commit.findall(debug.read_bytes()[offset:]))
+    assert idle == 0, ('Unchanged connected window committed frames', idle)
+    _policy_send(ctx, '\x04B34FD5,B34FD5IDLEWAKE', target=ctx['channel'])
+    _policy_wait_box(ctx, (179, 79, 213))
+    assert commit.search(debug.read_bytes()[offset:])
+    return _refresh_return(ctx, 'idle-redraw', {'idle_commits': idle, 'painted_incoming': True})
 
 
 def run_network_sidebar(ctx):
@@ -1718,7 +1745,7 @@ def _policy_settings(ctx, category, edits):
             expected = value[3] if len(value) == 4 else value[2]
             assert abs(actual - expected) < .001, (name, actual, value)
         elif kind != 'select':
-            expected = value.split() if not section and name == 'fools' else value
+            expected = value.split() if not section and name in ('friends', 'fools') else value
             assert actual == expected, (name, actual, expected)
     gui.close_settings_navigation(w)
     gui.wait_layout(ctx['proc'], prefs, predicate=lambda layout: 'settings' not in layout)
@@ -1730,7 +1757,7 @@ def _policy_appearance(ctx, *, wrap):
         (24, 'slider', (0, 1, wrap), 'appearance', 'message_wrap_columns')])
 
 
-def _policy_chat(ctx, *, fools=None, receive=None, treatment=None, unread=None):
+def _policy_chat(ctx, *, friends=None, fools=None, receive=None, treatment=None, unread=None):
     saved = tomllib.loads(Path(ctx['preferences']).read_text())
     provider = saved['uploads']['provider']
     upload_stops = 2 + (2 if provider in ('crafterbin', 'custom') else 0)
@@ -1738,6 +1765,8 @@ def _policy_chat(ctx, *, fools=None, receive=None, treatment=None, unread=None):
     edits = []
     if receive is not None:
         edits.append((upload_stops + 3, 'toggle', receive, 'typing', 'receive'))
+    if friends is not None:
+        edits.append((upload_stops + 4, 'text', ' '.join(friends), '', 'friends'))
     if fools is not None:
         edits.append((upload_stops + 5, 'text', ' '.join(fools), '', 'fools'))
     if treatment is not None:

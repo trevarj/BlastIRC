@@ -1178,6 +1178,20 @@ struct TranscriptView::Impl {
     std::string active, composerFocusKey;
     Cache *cache = nullptr;
     bool arranging = false, readEligible = false, windowActive = false, switched = false;
+    struct LayoutInputs {
+        uint64_t theme, metrics, mentions;
+        float renderScale, scale, textSize;
+        MessageLayout layout;
+        PresenceMode presence;
+        int wrapColumns;
+        bool timestamps, avatars, foolUnread, motion, historyReady, historyPending;
+        bool operator==(const LayoutInputs &) const = default;
+    };
+    std::optional<LayoutInputs> lastLayoutInputs;
+    std::string lastAvatarStyle, lastNickPalette, lastGapState;
+    TextFont lastUiFont, lastMessageFont;
+    decltype(Settings::nickColors) lastNickColors;
+    std::vector<std::string> lastNickNames;
     std::optional<std::pair<float, float>> composerOrigin;
     Node *motionHost = nullptr;
     float replyInset = 0;
@@ -3851,9 +3865,7 @@ struct TranscriptView::Impl {
                              std::to_string(buffer.messagesRevision) + ":" +
                              std::to_string(c.rows.size()) + ":" +
                              std::to_string(buffer.participationRevision);
-        for (const auto &gap : buffer.historyState.gaps)
-            gapKey += "|" + std::to_string(gap.id) + ":" + gap.newer.id + ":" + gap.newer.time +
-                      ":" + std::to_string(gap.unavailable);
+        gapKey += gapState(buffer);
         if (gapKey != c.gapKey) {
             const auto setGapHeight = [&](size_t index, float height) {
                 auto &row = c.rows[index];
@@ -3954,19 +3966,8 @@ struct TranscriptView::Impl {
         const auto &g = c.geometry;
         const bool stackedEmote = emote && g.channel && !g.inlineChannel;
         rowState(row, buffer, index);
-        size_t fingerprint = signature(entry, index ? &buffer.messages[index - 1] : nullptr);
-        fingerprint ^= size_t(row.showClock) << 17 | size_t(row.grouped) << 19;
         const bool friendAuthor = this->friendAuthor(buffer, entry) && readable(buffer, index);
-        fingerprint ^= size_t(friendAuthor) << 18;
-        if (collapsed)
-            fingerprint ^= std::hash<std::string>{}(row.activityLabel);
-        if (entry.text.find('\x16') != std::string::npos)
-            fingerprint ^= themeRevision();
-        if (const auto *quoted = quotedMessage(buffer, entry)) {
-            fingerprint ^= std::hash<std::string>{}(quoted->text) +
-                           std::hash<std::string>{}(quoted->nick) + size_t(quoted->deleted);
-            fingerprint ^= size_t(quoteReadable(buffer, entry, *quoted)) << 10;
-        }
+        const auto fingerprint = rowFingerprint(buffer, index, row, friendAuthor);
         if (row.measured && row.signature == fingerprint && row.fragmentsReady)
             return 0;
         const double oldHeight = row.height;
@@ -5416,9 +5417,6 @@ struct TranscriptView::Impl {
                 label->setColor(ink[hovered]);
             if (slot.actionMarker)
                 slot.actionMarker->setColor(slot.leadingNick->color());
-            if (slot.friendBadge)
-                slot.friendBadge->setColor(
-                    nickColor(model, entry.nick, sourceServer(*buffer, entry)));
             if (slot.nickChip) {
                 const auto color =
                     slot.ownNickChip
@@ -5435,7 +5433,9 @@ struct TranscriptView::Impl {
                 slot.nickChipText->setColor(ink);
                 if (slot.friendBadge)
                     slot.friendBadge->setColor(ink);
-            }
+            } else if (slot.friendBadge)
+                slot.friendBadge->setColor(
+                    nickColor(model, entry.nick, sourceServer(*buffer, entry)));
             if (slot.avatarInitial)
                 slot.avatarInitial->setColor(
                     nickColor(model, entry.nick, sourceServer(*buffer, entry)));
@@ -5643,6 +5643,102 @@ struct TranscriptView::Impl {
         if (affected)
             view.markLayoutDirty();
     }
+    bool historyPending(const Buffer &buffer) const {
+        return buffer.loading ||
+               std::any_of(model.actions.begin(), model.actions.end(), [&](const auto &action) {
+                   return action.buffer == buffer.id &&
+                          (action.type == "history" || action.type == "history-gap");
+               });
+    }
+
+    size_t rowFingerprint(const Buffer &buffer, size_t index, const Row &row,
+                          bool friendAuthor) const {
+        const auto &entry = buffer.messages[index];
+        size_t result = signature(entry, index ? &buffer.messages[index - 1] : nullptr);
+        result ^= size_t(row.showClock) << 17 | size_t(row.grouped) << 19;
+        result ^= size_t(friendAuthor) << 18;
+        if (row.activitySummary && !row.activityExpanded)
+            result ^= std::hash<std::string>{}(row.activityLabel);
+        if (entry.text.find('\x16') != std::string::npos)
+            result ^= themeRevision();
+        if (const auto *quoted = entry.reply.empty() ? nullptr : quotedMessage(buffer, entry)) {
+            result ^= std::hash<std::string>{}(quoted->text) +
+                      std::hash<std::string>{}(quoted->nick) + size_t(quoted->deleted);
+            result ^= size_t(quoteReadable(buffer, entry, *quoted)) << 10;
+        }
+        return result;
+    }
+
+    std::string gapState(const Buffer &buffer) const {
+        std::string result;
+        for (const auto &gap : buffer.historyState.gaps)
+            result += "|" + std::to_string(gap.id) + ":" + gap.newer.id + ":" +
+                      gap.newer.time + ":" + std::to_string(gap.unavailable);
+        return result;
+    }
+
+    bool layoutInputsChanged(const Buffer &buffer, const Renderer &renderer) {
+        const auto &settings = model.settings;
+        const bool hasGaps = !buffer.historyState.gaps.empty();
+        uint64_t mentions = 0;
+        if (buffer.unread > 0)
+            if (const auto feed = model.buffers.find(GlobalMentionsBufferId);
+                feed != model.buffers.end())
+                mentions = feed->second.messagesRevision;
+        const LayoutInputs next{
+            themeRevision(), renderer.textMetricsGeneration(), mentions, renderer.renderScale(),
+            themeScale(), messageTextSize(settings, buffer), messageLayout(settings, buffer),
+            effectivePresenceMode(settings, buffer.id, buffer.target), settings.messageWrapColumns,
+            settings.timestamps, settings.avatars, settings.foolUnread,
+            !settings.reducedMotion && settings.fx != FxLevel::Off,
+            hasGaps && historyReady(model, buffer),
+            (hasGaps || cache->historyDemandActive) && historyPending(buffer)};
+        auto gaps = gapState(buffer);
+        const bool namesChanged = !std::ranges::equal(buffer.nicks, lastNickNames,
+                                                     {}, &Nick::name);
+        if (namesChanged) {
+            lastNickNames.clear();
+            lastNickNames.reserve(buffer.nicks.size());
+            for (const auto &nick : buffer.nicks)
+                lastNickNames.push_back(nick.name);
+        }
+        const bool changed =
+            lastLayoutInputs != next || namesChanged || lastGapState != gaps ||
+            lastNickColors != settings.nickColors || lastNickPalette != settings.nickPalette ||
+            lastAvatarStyle != settings.avatarStyle || lastUiFont != themeUiFont() ||
+            lastMessageFont != themeMessageFont();
+        if (changed) {
+            lastLayoutInputs = next;
+            lastGapState = std::move(gaps);
+            lastNickColors = settings.nickColors;
+            lastNickPalette = settings.nickPalette;
+            lastAvatarStyle = settings.avatarStyle;
+            lastUiFont = themeUiFont();
+            lastMessageFont = themeMessageFont();
+        }
+        return changed;
+    }
+
+    bool needsModelLayout(const Buffer &buffer) {
+        const bool inputsChanged =
+            !selectionRenderer || layoutInputsChanged(buffer, *selectionRenderer);
+        const auto network = model.networks.find(buffer.server);
+        const auto mapping = network == model.networks.end()
+                                 ? std::string_view("rfc1459")
+                                 : std::string_view(network->second.caseMapping);
+        return inputsChanged || switched || cache->messagesRevision != buffer.messagesRevision ||
+               cache->rows.size() != buffer.messages.size() ||
+               cache->marker != buffer.readMarker || cache->unreadCount != buffer.unread ||
+               cache->participationRevision != buffer.participationRevision ||
+               cache->smartCaseMapping != mapping ||
+               cache->foolPolicy != privacyPolicy(buffer) ||
+               std::ranges::any_of(cache->materialized, [&](size_t index) {
+                   const auto &row = cache->rows[index];
+                   const bool isFriend =
+                       friendAuthor(buffer, buffer.messages[index]) && readable(buffer, index);
+                   return !row.measured || row.signature != rowFingerprint(buffer, index, row, isFriend);
+               });
+    }
     void sync() {
         retireDeletedMedia();
         std::erase_if(urlOpeners, [](pid_t process) {
@@ -5713,7 +5809,10 @@ struct TranscriptView::Impl {
             typing->setVisible(false);
             showAffordance(*mentionFooter, false);
             showAffordance(*unseen, false);
-            view.markLayoutDirty();
+            if (switched) {
+                switched = false;
+                view.markLayoutDirty();
+            }
             return;
         }
         if (buffer->kind == "mentions" && !cache->initialized) {
@@ -5768,7 +5867,8 @@ struct TranscriptView::Impl {
             !typingActive && typingExpansion > 0 && model.settings.typingReceive &&
             std::none_of(typingParticipants.begin(), typingParticipants.end(),
                          [&](const auto &nick) { return isFool(model, buffer->server, nick); });
-        if ((typersChanged || typerCount != typingParticipants.size()) && !retainPaint) {
+        typersChanged |= typerCount != typingParticipants.size();
+        if (typersChanged && !retainPaint) {
             typingColorKey.clear();
             closeTypingList();
             typingShown = absent;
@@ -5783,21 +5883,22 @@ struct TranscriptView::Impl {
                                                   (i == 0 && typerCount > 1 ? "," : "")
                                             : "");
         }
-        for (size_t i = 0; i < typingDots.size(); ++i)
-            if (typingDots[i])
-                typingDots[i]->setOpacity(
-                    model.settings.reducedMotion || model.settings.fx == FxLevel::Off
-                        ? .65f
-                        : .35f + .65f * float((1 + std::sin(model.now * 2.1 - i * .9)) * .5));
+        if (typingActive || typingExpansion > 0)
+            for (size_t i = 0; i < typingDots.size(); ++i)
+                if (typingDots[i])
+                    typingDots[i]->setOpacity(
+                        model.settings.reducedMotion || model.settings.fx == FxLevel::Off
+                            ? .65f
+                            : .35f + .65f * float((1 + std::sin(model.now * 2.1 - i * .9)) * .5));
         if (!typingActive)
             setTypingOverflowInteractive(false);
-        // Signature checks and shaping happen during the next native layout and only
-        // for the viewport. An unchanged offscreen history is never walked here.
-        if (cache->messagesRevision == buffer->messagesRevision &&
-            cache->rows.size() == buffer->messages.size())
+        if (typersChanged || needsModelLayout(*buffer))
+            view.markLayoutDirty();
+        else if (!view.layoutDirty()) {
             tickTextSelection();
+            markRead(*buffer);
+        }
         tickAutoscroll();
-        view.markLayoutDirty();
         visuals();
     }
 
@@ -6198,12 +6299,7 @@ struct TranscriptView::Impl {
                 slots[i].area->setVisible(false);
             }
         bool visibleGap = false;
-        bool historyPending =
-            buffer->loading ||
-            std::any_of(model.actions.begin(), model.actions.end(), [&](const auto &action) {
-                return action.buffer == buffer->id &&
-                       (action.type == "history" || action.type == "history-gap");
-            });
+        bool historyPending = this->historyPending(*buffer);
         const bool gapReady = effectivelyVisible() && historyReady(model, *buffer);
         float edgeOffset = olderExtent;
         // The newest visible event is stable across inserts and body remeasurement.

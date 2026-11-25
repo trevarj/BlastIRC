@@ -150,10 +150,6 @@ class Row final : public InputArea {
         labelFont(*title, 14 * scale, monospace, active || emphasized);
         labelFont(*subtitle, 12 * scale);
         labelFont(*badge, (avatarOnly ? 11.f : 12.f) * scale);
-        if (avatarInitials) {
-            labelFont(*avatarInitials, 13 * scale);
-            avatarInitials->setFontWeight(FontWeight::SemiBold);
-        }
         paint();
     }
 
@@ -786,11 +782,8 @@ class Avatar final : public InputArea {
             tooltipText = scratch;
             setTooltip(tooltipText);
         }
-        labelFont(*initials, 17 * scale);
-        initials->setFontWeight(FontWeight::SemiBold);
         labelFont(*alias, 11 * scale);
-        labelFont(*unreadBadge, 10 * scale);
-        unreadBadge->setFontWeight(FontWeight::SemiBold);
+        labelFont(*unreadBadge, 10 * scale, false, true);
         paint();
     }
 
@@ -1675,8 +1668,6 @@ struct Sidebar::Impl {
             });
             group.orderDirty = false;
         }
-        group.friendsHeader->setVisible(false);
-        group.conversationsHeader->setVisible(false);
         bool friendsPlaced = false, conversationsPlaced = false;
         for (auto *row : group.order) {
             if (!row->matched || row->pinnedCurrent)
@@ -1684,7 +1675,6 @@ struct Sidebar::Impl {
             if (row->friendNick && !row->pinned && !friendsPlaced) {
                 friendsPlaced = true;
                 if (details) {
-                    group.friendsHeader->setVisible(true);
                     group.friendsHeader->style(zoom);
                     place(*group.friendsHeader, y, std::max(28.f, 28 * zoom), 4 * zoom);
                 }
@@ -1692,7 +1682,6 @@ struct Sidebar::Impl {
             if (friendsPlaced && !row->friendNick && !conversationsPlaced) {
                 conversationsPlaced = true;
                 if (details) {
-                    group.conversationsHeader->setVisible(true);
                     group.conversationsHeader->style(zoom);
                     place(*group.conversationsHeader, y, std::max(28.f, 28 * zoom), 4 * zoom);
                 }
@@ -1700,13 +1689,57 @@ struct Sidebar::Impl {
             ++matched;
             place(*row, y, conversationHeight(), expanded ? 4 * zoom : 0);
         }
+        group.friendsHeader->setVisible(details && friendsPlaced);
+        group.conversationsHeader->setVisible(details && conversationsPlaced);
         y += 6 * zoom;
     }
 
     void layoutFilters(Renderer &renderer) {
-        if (mode != SidebarMode::Expanded)
-            return;
+        const bool expanded = mode == SidebarMode::Expanded;
+        const bool shortHeader = owner.height() < 360 * zoom;
+        const float searchHeight = std::max(32.f, (shortHeader ? 36.f : 40.f) * zoom);
+        const float filterHeight = std::max(32.f, 32 * zoom);
+        const float filterTop = searchHeight + 8 * zoom;
+        const float available = filterHeader->width();
         const std::array buttons{all, unread, dms, archived};
+        compactFilter->setFontSize(12 * zoom);
+        for (const auto &node : compactFilter->children())
+            if (auto *label = dynamic_cast<Label *>(node.get()))
+                labelFont(*label, 12 * zoom);
+        compactFilter->setHorizontalPadding(8 * zoom);
+        compactFilter->setGlyphSize(12 * zoom);
+        compactFilter->setRadius(themeCornerRadius());
+        search->setVisible(expanded);
+        search->setExcludeSubtreeFromTabOrder(!expanded || !expandedInteractive);
+        searchIcon->setVisible(expanded);
+        searchIcon->setPosition(10 * zoom, (searchHeight - 18 * zoom) / 2);
+        searchIcon->setSize(18 * zoom, 18 * zoom);
+        search->setPosition(0, 0);
+        search->setControlHeight(searchHeight);
+        search->setHorizontalPadding(34 * zoom);
+        search->setFrameRadius(themeCornerRadius());
+        search->setFontSize(14 * zoom);
+        search->setFontFamily(themeUiFont().family);
+        search->setFontFeatures(themeUiFont().features);
+        search->setFontWeight(themeUiFont().weight);
+        for (auto *button : buttons) {
+            button->setPadding(0, 6 * zoom);
+            button->setControlHeight(filterHeight);
+            button->setRadius(themeCornerRadius());
+            labelFont(*button->label(), 12 * zoom);
+        }
+        if (!expanded) {
+            compactFilter->setVisible(true);
+            compactFilter->setExcludeSubtreeFromTabOrder(false);
+            compactFilter->setPosition(0, 0);
+            compactFilter->setSize(available, searchHeight);
+            compactFilter->setControlHeight(searchHeight);
+            for (auto *button : buttons) {
+                button->setVisible(false);
+                button->setExcludeSubtreeFromTabOrder(true);
+            }
+            return;
+        }
         if (measuredFilterScale != zoom || measuredFilterRenderScale != renderer.renderScale() ||
             measuredFilterGeneration != renderer.textMetricsGeneration() ||
             measuredFilterFont != all->label()->font() || measuredArchiveUnread != archivedUnread) {
@@ -1724,34 +1757,30 @@ struct Sidebar::Impl {
             }
         }
         const float gap = 6 * zoom;
-        const float available = filterHeader->width();
         const float required =
             filterWidths[0] + filterWidths[1] + filterWidths[2] + filterWidths[3] + 3 * gap;
-        const bool shortHeader = owner.height() < 360 * zoom;
-        if (shortHeader) {
-            const float selectorWidth =
-                std::min(available, std::max(96 * zoom, filterWidths[3] + 20 * zoom));
-            const float searchWidth = std::max(0.f, available - selectorWidth - gap);
-            search->setSize(searchWidth, search->height());
-            compactFilter->setPosition(available - selectorWidth, 0);
-            compactFilter->setSize(selectorWidth, compactFilter->height());
-            return;
-        }
-        const bool tabsFit = required <= available;
+        const bool tabsFit = !shortHeader && required <= available;
+        float selectorWidth = available;
+        if (shortHeader)
+            selectorWidth = std::min(available, std::max(96 * zoom, filterWidths[3] + 20 * zoom));
+        search->setSize(shortHeader ? std::max(0.f, available - selectorWidth - gap) : available,
+                        searchHeight);
         compactFilter->setVisible(!tabsFit);
         compactFilter->setExcludeSubtreeFromTabOrder(tabsFit);
         if (!tabsFit) {
-            compactFilter->setPosition(0, all->y());
-            compactFilter->setSize(available, all->height());
-            compactFilter->setControlHeight(all->height());
+            const float selectorHeight = shortHeader ? searchHeight : filterHeight;
+            compactFilter->setPosition(shortHeader ? available - selectorWidth : 0,
+                                       shortHeader ? 0 : filterTop);
+            compactFilter->setSize(selectorWidth, selectorHeight);
+            compactFilter->setControlHeight(selectorHeight);
         }
         float x = 0;
         for (std::size_t i = 0; i < buttons.size(); ++i) {
             auto *button = buttons[i];
             button->setVisible(tabsFit);
             button->setExcludeSubtreeFromTabOrder(!tabsFit || !expandedInteractive);
-            button->setPosition(x, button->y());
-            button->setSize(filterWidths[i], button->height());
+            button->setPosition(x, filterTop);
+            button->setSize(filterWidths[i], filterHeight);
             x += filterWidths[i] + gap;
         }
     }
@@ -1759,6 +1788,8 @@ struct Sidebar::Impl {
     void sync(std::string_view selected, std::string_view focused, float width, float height,
               float scale, SidebarMode effectiveMode) {
         zoom = scale;
+        if (mode != effectiveMode)
+            owner.markLayoutDirty();
         mode = effectiveMode;
         const bool expanded = mode == SidebarMode::Expanded;
         owner.setVisible(mode != SidebarMode::Hidden);
@@ -1786,7 +1817,7 @@ struct Sidebar::Impl {
             archived->setText(label);
             compactFilter->setOptions({"All", "Unread", "DMs", label});
         }
-        const float padding = (expanded ? 8.f : 4.f) * scale, gap = 6 * scale;
+        const float padding = (expanded ? 8.f : 4.f) * scale;
         const float verticalPadding = padding;
         const float inner = std::max(0.f, width - 2 * padding);
         const float searchHeight = std::max(32.f, (shortHeader ? 36.f : 40.f) * scale);
@@ -1811,57 +1842,15 @@ struct Sidebar::Impl {
         filterHeader->setExcludeSubtreeFromTabOrder(false);
         filterHeader->setPosition(padding, verticalPadding);
         filterHeader->setSize(headerWidth, headerHeight);
-        const float selectorWidth = std::min(96 * scale, std::max(64 * scale, inner * .25f));
-        const float searchWidth = shortHeader ? std::max(0.f, inner - selectorWidth - gap) : inner;
-        compactFilter->setVisible(!expanded || shortHeader);
-        compactFilter->setExcludeSubtreeFromTabOrder(expanded && !shortHeader);
-        compactFilter->setPosition(expanded ? searchWidth + gap : 0, 0);
-        compactFilter->setSize(expanded ? selectorWidth : inner, searchHeight);
-        compactFilter->setControlHeight(searchHeight);
-        compactFilter->setFontSize(12 * scale);
-        for (const auto &node : compactFilter->children())
-            if (auto *label = dynamic_cast<Label *>(node.get()))
-                labelFont(*label, 12 * scale);
-        compactFilter->setHorizontalPadding(8 * scale);
-        compactFilter->setGlyphSize(12 * scale);
-        compactFilter->setRadius(themeCornerRadius());
         compactFilter->setSelectedIndexSilently(filter == ui_logic::SidebarFilter::Unread     ? 1
                                                 : filter == ui_logic::SidebarFilter::Dms      ? 2
                                                 : filter == ui_logic::SidebarFilter::Archived ? 3
                                                                                               : 0);
-        search->setVisible(expanded);
-        search->setExcludeSubtreeFromTabOrder(!expanded);
-        searchIcon->setVisible(expanded);
-        searchIcon->setPosition(10 * scale, (searchHeight - 18 * scale) / 2);
-        searchIcon->setSize(18 * scale, 18 * scale);
-        searchIcon->setColor(themeForegroundColor("on_surface_variant"));
-        search->setPosition(0, 0);
-        search->setSize(searchWidth, searchHeight);
-        search->setControlHeight(searchHeight);
-        search->setHorizontalPadding(34 * scale);
-        search->setFrameRadius(themeCornerRadius());
-        search->setFontSize(14 * scale);
-        search->setFontFamily(themeUiFont().family);
-        search->setFontFeatures(themeUiFont().features);
-        search->setFontWeight(themeUiFont().weight);
-        const float filterPadding = 6 * scale;
         for (auto [button, value] : {std::pair{all, ui_logic::SidebarFilter::All},
                                      std::pair{unread, ui_logic::SidebarFilter::Unread},
                                      std::pair{dms, ui_logic::SidebarFilter::Dms},
-                                     std::pair{archived, ui_logic::SidebarFilter::Archived}}) {
-            button->setVisible(expanded && !shortHeader);
-            button->setExcludeSubtreeFromTabOrder(!expanded || shortHeader);
-            button->setPosition(0, filterTop);
-            button->setSize(button->width(), filterHeight);
-            button->setPadding(0, filterPadding);
-            button->setControlHeight(filterHeight);
-            button->setRadius(themeCornerRadius());
-            button->setFontSize(12 * scale);
-            button->label()->setFontFamily(themeUiFont().family);
-            button->label()->setFontFeatures(themeUiFont().features);
-            button->label()->setFontWeight(themeUiFont().weight);
+                                     std::pair{archived, ui_logic::SidebarFilter::Archived}})
             button->setSelected(filter == value);
-        }
         for (auto it = conversations.begin(); it != conversations.end();) {
             const auto buffer = model.buffers.find(it->first);
             if (buffer == model.buffers.end() || buffer->second.kind == "server") {

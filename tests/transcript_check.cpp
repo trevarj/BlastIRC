@@ -977,13 +977,25 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                     assert(std::abs((ay + picture->height() * .5f) - (hy + hit->height() * .5f)) <=
                            hit->height());
                 }
+                const float borderWidth = stacked && i == 1 ? zoom : 0;
+                const auto accent = blast::themePairedForeground(
+                    blast::themeConversationBackdrop(), blast::themeForegroundColor("primary"));
                 if (monogram) {
-                    assert(dynamic_cast<RectNode *>(picture));
+                    auto *plate = dynamic_cast<RectNode *>(picture);
+                    assert(plate);
+                    near(plate->style().borderWidth, borderWidth);
+                    if (borderWidth > 0)
+                        assert(plate->style().border == accent);
                     auto *initial = plainText(rendered.content, i == 1 ? "M" : i == 2 ? "P" : "א");
                     assert(initial && initial->visible());
                 } else {
                     auto *image = dynamic_cast<Image *>(picture);
                     assert(image && image->hasImage());
+                    const auto *sprite = find<ImageNode>(*image);
+                    assert(sprite);
+                    near(sprite->borderWidth(), borderWidth);
+                    if (borderWidth > 0)
+                        assert(sprite->borderColor() == accent);
                 }
                 if (stacked)
                     assert(ax + picture->width() + 5.9f * zoom <= bodyBounds.x);
@@ -993,6 +1005,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 auto *chip = find<RectNode>(*hit);
                 if (stacked) {
                     assert(!chip);
+                    assert(!plainText(rendered.content, "(you)"));
                     const auto backdrop = blast::themeConversationBackdrop();
                     const auto accent = blast::themeForegroundColor("primary");
                     assert(nick->color() == blast::themePairedForeground(backdrop, accent));
@@ -2847,7 +2860,6 @@ void minuteAuthorGroups(TranscriptTestRenderer &renderer, const char *kind) {
     arrange();
     header("RunContinues", true, "pEER{"); // Wide Traditional keeps its inline author policy.
     header("OwnContinues", true);
-    assert(!plainText(body(view, "OwnStart").content, "(you)"));
     near(baseline(*plainText(body(view, "OwnContinues").content, "Peer[")),
          baseline(body(view, "OwnContinues").text));
     for (const auto &[layout, width] : {std::pair{blast::MessageLayout::Stacked, 900.f},
@@ -2867,20 +2879,13 @@ void minuteAuthorGroups(TranscriptTestRenderer &renderer, const char *kind) {
                 header(token, true);
             header("RunContinues", false, "pEER{");
             header("OwnContinues", false);
-            const bool stacked = layout != blast::MessageLayout::Bubbles;
-            assert(bool(plainText(body(view, "OwnStart").content, "(you)")) == stacked);
-            assert(!plainText(body(view, "OwnContinues").content, "(you)"));
-            assert(!plainText(body(view, "IncomingAgain").content, "(you)"));
-            const auto own = body(view, "OwnNextMinute");
-            const auto *tag = plainText(own.content, "(you)");
-            assert(bool(tag) == stacked);
-            if (tag && timestamps) {
+            if (layout != blast::MessageLayout::Bubbles && timestamps) {
+                const auto own = body(view, "OwnNextMinute");
+                const auto *sender = plainText(own.content, "Peer[");
                 const auto *time = plainText(own.content, "12:36");
-                assert(time);
-                near(tag->fontSize(), time->fontSize());
-                near(baseline(*tag), baseline(*time));
-                const auto box = sceneBounds(*tag->parent());
-                assert(box.x + box.width < sceneBounds(*time).x);
+                assert(sender && time);
+                near(baseline(*sender), baseline(*time));
+                assert(sceneBounds(*sender).x + sceneBounds(*sender).width < sceneBounds(*time).x);
             }
             const auto lead = body(view, "RunStart");
             const auto next = body(view, "RunContinues");

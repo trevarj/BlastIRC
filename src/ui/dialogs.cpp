@@ -2545,9 +2545,9 @@ struct Dialogs::Impl {
         label(*master, "Plays short keyboard taps for typing and edits in the composer. "
                        "Uses Master volume; Effects Off mutes it.");
         auto *cues = section("sounds.cues", "Event cues");
-        label(*cues,
-              "Each event has its own switch, volume and pitch; master volume applies to all.");
-        for (const auto &[name, cue] : model.settings.cues) {
+        label(*cues, "Each event has its own switch, volume and pitch. Play previews the selected "
+                     "sound even if its event is off. Sound enabled, Effects and volume still apply.");
+        const auto addCue = [&](const std::string &name, const Cue &cue, bool selectable) {
             auto caption = name;
             if (!caption.empty())
                 caption.front() =
@@ -2555,12 +2555,34 @@ struct Dialogs::Impl {
             auto group = column(12);
             toggle(*group, caption + " sounds", cue.enabled,
                    [this, name](bool value) { model.settings.cues.at(name).enabled = value; });
+            if (selectable) {
+                auto *picker = row(*group, false);
+                picker->setAlign(FlexAlign::End);
+                auto *sound = select(*picker, caption + " sound", {"Soft", "Clear"},
+                                     cue.sound == CueSound::Clear ? "Clear" : "Soft",
+                                     [this, name](std::size_t choice, std::string_view) {
+                                         model.settings.cues.at(name).sound =
+                                             choice == 1 ? CueSound::Clear : CueSound::Soft;
+                                     });
+                auto *field = static_cast<Flex *>(sound->parent());
+                field->setFillWidth(false);
+                field->setFlexGrow(1);
+                button(*picker, "Play " + name,
+                       [this, name] { model.cuePreviewPending = name; });
+            }
             slider(*group, caption + " volume", cue.volume, 0, 1, .01,
                    [this, name](float value) { model.settings.cues.at(name).volume = value; });
             slider(*group, caption + " pitch", cue.pitch, .25, 4, .01,
                    [this, name](float value) { model.settings.cues.at(name).pitch = value; });
             cues->addChild(std::move(group));
-        }
+        };
+        for (const auto event : chatSoundEvents)
+            if (const auto it = model.settings.cues.find(std::string(event));
+                it != model.settings.cues.end())
+                addCue(it->first, it->second, true);
+        for (const auto &[name, cue] : model.settings.cues)
+            if (!hasCueSoundChoice(name))
+                addCue(name, cue, false);
     }
 
     void color(Flex &parent, const std::string &name) {

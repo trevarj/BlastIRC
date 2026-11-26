@@ -76,9 +76,15 @@ struct ConnectionSetup {
     std::optional<Identity> identity;
 };
 enum class LocalData { ChatHistory, ServerLogs, Drafts, Connections, Preferences, Cache, All };
+enum class CueSound { Soft, Clear };
+inline constexpr std::array<std::string_view, 3> chatSoundEvents{"message", "send", "mention"};
+inline bool hasCueSoundChoice(std::string_view event) {
+    return std::ranges::find(chatSoundEvents, event) != chatSoundEvents.end();
+}
 struct Cue {
     bool enabled = true;
     float volume = .5f, pitch = 1.f;
+    CueSound sound = CueSound::Soft;
 };
 // Ordered like Input::CaretTrailStyle.
 inline constexpr std::array<std::string_view, 7> cursorTrailStyleIds{
@@ -414,6 +420,7 @@ struct Model {
     double now = 0;
     vector<Event> effects;
     std::optional<TypingSound> typingSoundPending;
+    string cuePreviewPending;
     vector<Action> actions;
     uint64_t settingsSaveRequest = 0;
     SettingsSaveResult settingsSaveResult;

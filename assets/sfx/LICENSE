@@ -1,10 +1,9 @@
 BlastIRC original sound set
 
-boom.ogg, rumble.ogg, ding.ogg, blip.ogg, tick.ogg, whoosh.ogg,
-click.ogg, pop.ogg, hush.ogg, power_down.ogg, keytap.ogg, keytap_space.ogg,
-keytap_delete.ogg, and keytap_delete_word.ogg were synthesized for
-BlastIRC by assets/generate-sfx.mjs. They contain no samples, recordings,
-melodies, or other material from third parties.
+boom.ogg, rumble.ogg, blip.ogg, whoosh.ogg, pop.ogg, hush.ogg,
+power_down.ogg, keytap.ogg, keytap_space.ogg, keytap_delete.ogg, and
+keytap_delete_word.ogg were synthesized for BlastIRC by assets/generate-sfx.mjs.
+They contain no samples, recordings, melodies, or other third-party material.
 
 To the extent possible under law, the creators have waived all copyright
 and related or neighboring rights to these sound assets and their synthesis
@@ -13,3 +12,18 @@ the work, even for commercial purposes, without asking permission.
 
 CC0 1.0 Universal: https://creativecommons.org/publicdomain/zero/1.0/
 The sounds are provided without warranty.
+
+Imported cues: SFX Kit by Wyzowl (CC0 1.0 Universal)
+
+Source: https://github.com/wyzowl/sfx-kit/tree/92780e7ab0cdfb557497a988089c47f46e8c7412/sounds/notifications
+Upstream license: https://github.com/wyzowl/sfx-kit/blob/92780e7ab0cdfb557497a988089c47f46e8c7412/LICENSE
+
+tick.ogg        <- notification-message-in-soft.wav
+click.ogg       <- notification-message-out-soft.wav
+ding.ogg        <- notification-alert-soft.wav
+tick_clear.ogg  <- notification-message-in-clear.wav
+click_clear.ogg <- notification-message-out-clear.wav
+ding_clear.ogg  <- notification-alert-clear.wav
+
+Transcoded to Ogg Vorbis (ffmpeg -c:a libvorbis -q:a 5) without changing
+the samples' level, duration, or channel layout.

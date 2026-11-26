@@ -133,40 +133,47 @@ float random01() {
 }
 float random(float low, float high) { return low + (high - low) * random01(); }
 enum class Effect { None, Kick, Split, React, Redact, Join, Part, Disconnect };
-struct Directive {
-    std::string_view event;
-    Effect effect;
-    const char *clip;
-};
-constexpr Directive director[] = {{"kick", Effect::Kick, "boom"},
-                                  {"ban", Effect::Kick, "boom"},
-                                  {"netsplit", Effect::Split, "rumble"},
-                                  {"mention", Effect::None, "ding"},
-                                  {"reaction", Effect::React, "pop"},
-                                  {"redact", Effect::Redact, "hush"},
-                                  {"join", Effect::Join, "blip"},
-                                  {"part", Effect::Part, "whoosh"},
-                                  {"quit", Effect::Part, "whoosh"},
-                                  {"send", Effect::None, "click"},
-                                  {"echo", Effect::None, "tick"},
-                                  {"unread", Effect::None, "tick"},
-                                  {"disconnect", Effect::Disconnect, "power_down"},
-                                  {"message", Effect::None, "tick"},
-                                  {"action", Effect::None, "tick"},
-                                  {"notice", Effect::None, "tick"}};
 constexpr const char *clipNames[] = {"boom",          "rumble",
                                      "ding",          "blip",
                                      "tick",          "whoosh",
                                      "click",         "pop",
                                      "hush",          "power_down",
                                      "keytap",        "keytap_space",
-                                     "keytap_delete", "keytap_delete_word"};
-consteval std::size_t typingClipIndex(std::string_view name) {
+                                     "keytap_delete", "keytap_delete_word",
+                                     "tick_clear",    "click_clear",
+                                     "ding_clear"};
+constexpr std::size_t clipIndex(std::string_view name) {
     const auto clip = std::ranges::find(clipNames, name);
     if (clip == std::end(clipNames))
-        throw "unknown typing clip";
+        throw "unknown audio clip";
     return clip - std::begin(clipNames);
 }
+struct Directive {
+    std::string event;
+    Effect effect;
+    std::string clipKey;
+    std::size_t clip, clearClip;
+
+    Directive(const char *type, Effect motion, const char *soft, const char *clear = nullptr)
+        : event(type), effect(motion), clipKey(soft), clip(clipIndex(soft)),
+          clearClip(clear ? clipIndex(clear) : clip) {}
+};
+const Directive director[] = {{"kick", Effect::Kick, "boom"},
+                              {"ban", Effect::Kick, "boom"},
+                              {"netsplit", Effect::Split, "rumble"},
+                              {"mention", Effect::None, "ding", "ding_clear"},
+                              {"reaction", Effect::React, "pop"},
+                              {"redact", Effect::Redact, "hush"},
+                              {"join", Effect::Join, "blip"},
+                              {"part", Effect::Part, "whoosh"},
+                              {"quit", Effect::Part, "whoosh"},
+                              {"send", Effect::None, "click", "click_clear"},
+                              {"echo", Effect::None, "tick"},
+                              {"unread", Effect::None, "tick"},
+                              {"disconnect", Effect::Disconnect, "power_down"},
+                              {"message", Effect::None, "tick", "tick_clear"},
+                              {"action", Effect::None, "tick"},
+                              {"notice", Effect::None, "tick"}};
 struct NativeState {
     GLint framebuffer = 0;
     std::array<GLint, 4> viewport{}, scissor{};
@@ -382,6 +389,8 @@ struct Effects::Impl {
     std::array<MIX_Audio *, std::size(clipNames)> audio{};
     MIX_Track *composerTrack = nullptr;
     bool composerSoundEnabled = false;
+    MIX_Track *previewTrack = nullptr;
+    std::optional<std::size_t> previewDirective;
     struct Voice {
         MIX_Track *track = nullptr;
         std::size_t directive = 0;
@@ -455,6 +464,8 @@ struct Effects::Impl {
                 MIX_DestroyTrack(v.track);
         if (composerTrack)
             MIX_DestroyTrack(composerTrack);
+        if (previewTrack)
+            MIX_DestroyTrack(previewTrack);
         for (auto *a : audio)
             if (a)
                 MIX_DestroyAudio(a);
@@ -479,35 +490,90 @@ struct Effects::Impl {
         jitter = {};
         setVisualImpulse(0, 0, -100);
     }
+    void stopPreview() {
+        if (previewDirective) {
+            MIX_StopTrack(previewTrack, 0);
+            previewDirective.reset();
+        }
+    }
     void stop() {
         clearMotion();
+        stopPreview();
         for (auto &v : voices)
             if (v.track)
                 MIX_StopTrack(v.track, 0);
         if (mixer)
             MIX_SetMixerGain(mixer, 0);
     }
-    Cue cue(const Settings &s, const Directive &d) const {
-        if (auto i = s.cues.find(std::string(d.event)); i != s.cues.end())
+    const Cue &cue(const Settings &s, const Directive &d) const {
+        static constexpr Cue defaults;
+        if (auto i = s.cues.find(d.event); i != s.cues.end())
             return i->second;
-        if (auto i = s.cues.find(d.clip); i != s.cues.end())
+        if (auto i = s.cues.find(d.clipKey); i != s.cues.end())
             return i->second;
-        return {};
+        return defaults;
+    }
+    MIX_Audio *cueAudio(const Directive &d, const Cue &config) const {
+        return audio[config.sound == CueSound::Clear ? d.clearClip : d.clip];
+    }
+    void updatePreview(const Settings &s, const std::string &pending, bool enabled) {
+        if (!enabled) {
+            stopPreview();
+            return;
+        }
+        if (previewDirective) {
+            if (!MIX_TrackPlaying(previewTrack)) {
+                previewDirective.reset();
+            } else {
+                const float volume = cue(s, director[*previewDirective]).volume;
+                if (volume <= 0)
+                    stopPreview();
+                else
+                    MIX_SetTrackGain(previewTrack, std::clamp(volume, 0.f, 1.f));
+            }
+        }
+        if (!mixer || pending.empty())
+            return;
+        const auto *d = std::ranges::find(director, pending, &Directive::event);
+        if (d == std::end(director) || d->clip == d->clearClip)
+            return;
+        const auto &config = cue(s, *d);
+        auto *clip = cueAudio(*d, config);
+        if (!clip || config.volume <= 0)
+            return;
+        if (!previewTrack) {
+            previewTrack = MIX_CreateTrack(mixer);
+            if (!previewTrack) {
+                audioError = SDL_GetError();
+                return;
+            }
+        }
+        if (MIX_GetTrackAudio(previewTrack) != clip) {
+            stopPreview();
+            if (!MIX_SetTrackAudio(previewTrack, clip)) {
+                audioError = SDL_GetError();
+                return;
+            }
+        }
+        MIX_SetTrackGain(previewTrack, std::clamp(config.volume, 0.f, 1.f));
+        MIX_SetTrackFrequencyRatio(previewTrack, std::clamp(config.pitch, .25f, 4.f));
+        if (MIX_PlayTrack(previewTrack, 0))
+            previewDirective = d - std::begin(director);
+        else
+            audioError = SDL_GetError();
     }
     void sound(const Settings &s, const Directive &d, std::size_t index, double now) {
         if (!mixer || !s.sound)
             return;
-        const Cue config = cue(s, d);
+        const auto &config = cue(s, d);
         if (!config.enabled || config.volume <= 0)
             return;
         // ponytail: the existing per-cue 45ms budget caps burst spam within 24 voices.
         if (now - lastCue[index] < .045)
             return;
         lastCue[index] = now;
-        std::size_t clip = 0;
-        while (clip < std::size(clipNames) && std::string_view(clipNames[clip]) != d.clip)
-            ++clip;
-        if (clip == audio.size() || !audio[clip])
+        auto *clip = cueAudio(d, config);
+        if (!clip)
             return;
         Voice *voice = nullptr;
         for (auto &candidate : voices)
@@ -520,7 +586,7 @@ struct Effects::Impl {
         if (!voice->track)
             return;
         MIX_StopTrack(voice->track, 0);
-        MIX_SetTrackAudio(voice->track, audio[clip]);
+        MIX_SetTrackAudio(voice->track, clip);
         float variation = 1;
         if (s.pitchVariation == "natural")
             variation = random(.96f, 1.04f);
@@ -537,16 +603,16 @@ struct Effects::Impl {
         MIX_Audio *clip;
         switch (sound) {
         case TypingSound::Character:
-            clip = audio[typingClipIndex("keytap")];
+            clip = audio[clipIndex("keytap")];
             break;
         case TypingSound::Space:
-            clip = audio[typingClipIndex("keytap_space")];
+            clip = audio[clipIndex("keytap_space")];
             break;
         case TypingSound::DeleteCharacter:
-            clip = audio[typingClipIndex("keytap_delete")];
+            clip = audio[clipIndex("keytap_delete")];
             break;
         case TypingSound::DeleteWord:
-            clip = audio[typingClipIndex("keytap_delete_word")];
+            clip = audio[clipIndex("keytap_delete_word")];
             break;
         default:
             return;
@@ -884,8 +950,10 @@ void Effects::draw(Model &model) {
         p.audioError.clear();
     }
     const auto typingPending = std::exchange(model.typingSoundPending, std::nullopt);
-    const bool composerSound = model.settings.fx != FxLevel::Off && model.settings.sound &&
-                               model.settings.typingSounds && model.settings.masterVolume > 0;
+    const auto previewPending = std::exchange(model.cuePreviewPending, {});
+    const bool audioEnabled = model.settings.fx != FxLevel::Off && model.settings.sound &&
+                              model.settings.masterVolume > 0;
+    const bool composerSound = audioEnabled && model.settings.typingSounds;
     if (!composerSound && p.composerSoundEnabled && p.composerTrack)
         MIX_StopTrack(p.composerTrack, 0);
     p.composerSoundEnabled = composerSound;
@@ -900,9 +968,10 @@ void Effects::draw(Model &model) {
             p.mixer, model.settings.sound ? std::clamp(model.settings.masterVolume, 0.f, 1.f) : 0);
     if (composerSound && typingPending)
         p.soundTyping(*typingPending);
+    p.updatePreview(model.settings, previewPending, audioEnabled);
     for (auto &voice : p.voices)
         if (voice.track && MIX_TrackPlaying(voice.track)) {
-            const auto config = p.cue(model.settings, director[voice.directive]);
+            const auto &config = p.cue(model.settings, director[voice.directive]);
             if (!model.settings.sound || !config.enabled || config.volume <= 0)
                 MIX_StopTrack(voice.track, 0);
             else

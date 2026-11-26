@@ -3735,7 +3735,7 @@ int main() {
             assert(failed && contents(config / "settings.toml") == invalidSource &&
                    contents(config / "config.toml") == originalConfig);
         }
-        // Effects policy and all cursor preferences survive restart.
+        // Effects policy, cursor options, and audio preferences survive restart.
         const FxLevel levels[] = {FxLevel::Off, FxLevel::Subtle, FxLevel::Full};
         const char *shapes[] = {"line", "box", "underline"};
         const char *blinks[] = {"off", "step", "smooth"};
@@ -3754,6 +3754,10 @@ int main() {
             s.reducedMotion = true;
             s.sound = true;
             s.typingSounds = index % 2 == 0;
+            for (std::size_t i = 0; i < chatSoundEvents.size(); ++i)
+                s.cues.at(string(chatSoundEvents[i])).sound =
+                    (index & (1u << i)) ? CueSound::Clear : CueSound::Soft;
+            s.cues.at("join").sound = CueSound::Clear;
             Storage storage;
             storage.save(configured);
             const string saved = contents(config / "settings.toml");
@@ -3762,6 +3766,14 @@ int main() {
             assert(document["cursor"]["smooth_blink_ms"].value_exact<int64_t>() ==
                    s.cursorSmoothBlinkMs);
             assert(document["audio"]["typing_sounds"].value_exact<bool>() == s.typingSounds);
+            const auto cues = document["audio"]["cues"];
+            for (const auto event : chatSoundEvents) {
+                if (s.cues.at(string(event)).sound == CueSound::Clear)
+                    assert(cues[event]["sound"].value_exact<std::string_view>() == "clear");
+                else
+                    assert(!cues[event]["sound"]);
+            }
+            assert(!cues["join"]["sound"]);
             Model actual;
             storage.load(actual);
             assert(actual.settings.fx == s.fx && actual.settings.cursorShape == s.cursorShape &&
@@ -3770,6 +3782,10 @@ int main() {
                    actual.settings.cursorTrail == s.cursorTrail &&
                    actual.settings.cursorTrailStyle == s.cursorTrailStyle);
             assert(actual.settings.typingSounds == s.typingSounds);
+            for (const auto event : chatSoundEvents)
+                assert(actual.settings.cues.at(string(event)).sound ==
+                       s.cues.at(string(event)).sound);
+            assert(actual.settings.cues.at("join").sound == CueSound::Soft);
             assert(actual.settings.reducedMotion && actual.settings.sound &&
                    contents(config / "settings.toml") == saved &&
                    contents(config / "config.toml") == originalConfig);
@@ -3785,6 +3801,32 @@ int main() {
                 storage.load(actual);
             } catch (const std::runtime_error &) {
                 failed = true;
+            }
+            assert(failed && contents(file) == source);
+        }
+        {
+            const auto file = config / "settings.toml";
+            std::ofstream(file) << "[audio.cues.message]\nsound = 'soft'\n";
+            Storage storage;
+            Model actual;
+            storage.load(actual);
+            assert(actual.settings.cues.at("message").sound == CueSound::Soft);
+        }
+        for (const auto &[event, sound] :
+             {std::pair{"message", "'Clear'"}, std::pair{"send", "1"},
+              std::pair{"mention", "{}"}, std::pair{"join", "'clear'"},
+              std::pair{"custom", "'soft'"}}) {
+            const auto file = config / "settings.toml";
+            const string key = "audio.cues." + string(event);
+            const string source = "[" + key + "]\nsound = " + sound + "\n";
+            std::ofstream(file) << source;
+            Storage storage;
+            Model actual;
+            bool failed = false;
+            try {
+                storage.load(actual);
+            } catch (const std::runtime_error &error) {
+                failed = string(error.what()).find("'" + key + ".sound'") != string::npos;
             }
             assert(failed && contents(file) == source);
         }

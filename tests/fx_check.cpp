@@ -27,16 +27,19 @@ class EffectsTestAccess {
                 count += MIX_TrackPlaying(voice.track);
             return count;
         };
-        const auto expectClip = [&](std::string_view name) {
+        const auto findClip = [&](std::string_view name) {
+            const auto clip = std::ranges::find(clipNames, name);
+            assert(clip != std::end(clipNames));
+            auto *audio = p.audio[clip - std::begin(clipNames)];
+            assert(audio);
+            return audio;
+        };
+        const auto expectClip = [&](std::string_view name, float gain = .5f) {
             assert(playing() == 1);
             for (const auto &voice : p.voices)
                 if (MIX_TrackPlaying(voice.track)) {
-                    std::size_t clip = 0;
-                    while (clip < std::size(clipNames) && name != clipNames[clip])
-                        ++clip;
-                    assert(clip < p.audio.size());
-                    assert(MIX_GetTrackAudio(voice.track) == p.audio[clip]);
-                    assert(MIX_GetTrackGain(voice.track) > 0);
+                    assert(MIX_GetTrackAudio(voice.track) == findClip(name));
+                    assert(MIX_GetTrackGain(voice.track) == gain);
                 }
         };
         Event mention;
@@ -106,6 +109,80 @@ class EffectsTestAccess {
         assert(playing() == 0 && p.count == 0);
         model.effects.clear();
         model.settings.fx = FxLevel::Full;
+        const auto checkLive = [&](const char *type, std::string_view clip, float gain = .5f) {
+            p.stop();
+            model.effects.assign(1, Event{});
+            model.effects.front().type = type;
+            ++model.now;
+            effects.draw(model);
+            expectClip(clip, gain);
+        };
+        for (const auto &[event, soft, clear] :
+             {std::array{"message", "tick", "tick_clear"},
+              std::array{"send", "click", "click_clear"},
+              std::array{"mention", "ding", "ding_clear"}}) {
+            checkLive(event, soft);
+            model.settings.cues[event].sound = CueSound::Clear;
+            checkLive(event, clear);
+        }
+        // Both variants use the original clip key when the event has no settings.
+        model.settings.cues.erase("message");
+        model.settings.cues["tick"] = {.volume = .3125f, .sound = CueSound::Clear};
+        model.settings.cues["tick_clear"].enabled = false;
+        checkLive("message", "tick_clear", .3125f);
+        checkLive("notice", "tick", .3125f);
+        model.settings.cues["tick"].sound = CueSound::Soft;
+        checkLive("message", "tick", .3125f);
+        p.stop();
+        model.effects.clear();
+
+        const auto drawPreview = [&](const char *event = "") {
+            model.cuePreviewPending = event;
+            ++model.now;
+            effects.draw(model);
+            assert(model.cuePreviewPending.empty() && playing() == 0);
+        };
+        drawPreview("notice");
+        assert(!p.previewTrack);
+        auto &mentionCue = model.settings.cues["mention"];
+        mentionCue = {.enabled = false, .volume = .375f, .pitch = .875f, .sound = CueSound::Clear};
+        model.settings.masterVolume = .625f;
+        model.settings.pitchVariation = "natural";
+        drawPreview("mention");
+        auto *preview = p.previewTrack;
+        assert(preview && MIX_TrackPlaying(preview));
+        assert(MIX_GetTrackAudio(preview) == findClip("ding_clear"));
+        assert(MIX_GetTrackGain(preview) == .375f && MIX_GetMixerGain(p.mixer) == .625f);
+        assert(MIX_GetTrackFrequencyRatio(preview) == .875f);
+        assert(MIX_SetTrackPlaybackPosition(preview, 100));
+        drawPreview();
+        assert(MIX_TrackPlaying(preview) && MIX_GetTrackPlaybackPosition(preview) == 100);
+        drawPreview("mention");
+        assert(p.previewTrack == preview && MIX_GetTrackPlaybackPosition(preview) == 0);
+        mentionCue.sound = CueSound::Soft;
+        assert(MIX_SetTrackPlaybackPosition(preview, 100));
+        drawPreview("mention");
+        assert(p.previewTrack == preview && MIX_TrackPlaying(preview));
+        assert(MIX_GetTrackAudio(preview) == findClip("ding"));
+        assert(MIX_GetTrackPlaybackPosition(preview) == 0);
+        const auto checkPreviewMute = [&](auto &setting, auto muted) {
+            drawPreview("mention");
+            assert(MIX_TrackPlaying(preview));
+            const auto original = setting;
+            setting = muted;
+            drawPreview();
+            assert(!MIX_TrackPlaying(preview));
+            drawPreview("mention");
+            assert(!MIX_TrackPlaying(preview));
+            setting = original;
+            drawPreview();
+            assert(!MIX_TrackPlaying(preview));
+        };
+        checkPreviewMute(model.settings.sound, false);
+        checkPreviewMute(model.settings.fx, FxLevel::Off);
+        checkPreviewMute(model.settings.masterVolume, 0.f);
+        checkPreviewMute(mentionCue.volume, 0.f);
+
         const auto drawTyping = [&](std::optional<TypingSound> tap = std::nullopt) {
             model.now += .1;
             model.typingSoundPending = tap;
@@ -130,10 +207,7 @@ class EffectsTestAccess {
         };
         MIX_Track *track = nullptr;
         for (const auto &[sound, name] : typingClips) {
-            const auto clip = std::ranges::find(clipNames, name);
-            assert(clip != std::end(clipNames));
-            auto *audio = p.audio[clip - std::begin(clipNames)];
-            assert(audio);
+            auto *audio = findClip(name);
             const auto duration = MIX_AudioFramesToMS(audio, MIX_GetAudioDuration(audio));
             assert(duration >= 20 && duration <= 50);
             for (int i = 0; i < 2; ++i) {

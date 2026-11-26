@@ -1,6 +1,6 @@
-// Original procedural BlastIRC sound design, dedicated to CC0 1.0 Universal.
+// Original procedural BlastIRC sounds, dedicated to CC0 1.0 Universal.
 // Regenerate: node assets/generate-sfx.mjs /path/to/ffmpeg
-// No downloaded samples, dependencies, temporary audio files, or musical sources.
+// All imported cues are documented in sfx/LICENSE and left untouched.
 import {mkdirSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
@@ -13,6 +13,7 @@ const output=path.join(path.dirname(fileURLToPath(import.meta.url)),'sfx');
 mkdirSync(output,{recursive:true});
 const ffmpeg=process.argv[2]||process.env.FFMPEG_BIN||'ffmpeg';
 const definitions={boom:1.45,rumble:2.4,ding:1.3,blip:.25,tick:.12,whoosh:.65,click:.13,pop:.3,hush:.7,power_down:1.4,keytap:.032,keytap_space:.036,keytap_delete:.026,keytap_delete_word:.032};
+const importedCues=new Set(['ding','tick','click']);
 const typing={
     keytap:             {pitch:320,sweep:240,body:.42,damping:410,contact:.32,reverse:0},
     keytap_space:       {pitch:265,sweep:180,body:.39,damping:365,contact:.22,reverse:0},
@@ -20,8 +21,14 @@ const typing={
     keytap_delete_word: {pitch:240,sweep:160,body:.45,damping:430,contact:.27,reverse:.013},
 };
 for(const [name,duration] of Object.entries(definitions)){
+    const samples=Math.ceil(duration*rate);
+    if(importedCues.has(name)){
+        // Preserve the deterministic noise stream for the remaining original cues.
+        for(let i=0;i<samples;i++)noise();
+        continue;
+    }
     const tap=typing[name];
-    const samples=Math.ceil(duration*rate),mono=new Float64Array(samples);
+    const mono=new Float64Array(samples);
     let phase=0,filtered=0,slow=0,fast=0;
     for(let i=0;i<samples;i++){
         const t=i/rate,u=t/duration,n=noise();
@@ -37,24 +44,15 @@ for(const [name,duration] of Object.entries(definitions)){
             const swell=smooth(t/.22)*(1-smooth((u-.5)/.5));
             value=(slow*2.4+Math.sin(tau*31*t)*.23+Math.sin(tau*43*t+Math.sin(t*3))*.13+Math.sin(tau*(94*t-12*t*t))*.06)*swell;
             break;}
-        case 'ding':
-            value=(Math.sin(tau*880*t)*.37*Math.exp(-t*4)+Math.sin(tau*1320*t)*.11*Math.exp(-t*5)+Math.sin(tau*2217*t)*.045*Math.exp(-t*8))*smooth(t/.025);
-            break;
         case 'blip':
             phase+=tau*(650+350*smooth(t/.14))/rate;
             value=(Math.sin(phase)+Math.sin(phase*2)*.12)*.3*Math.pow(Math.sin(Math.PI*u),2);
-            break;
-        case 'tick':
-            value=(Math.sin(tau*1700*t)*.22+filtered*.18)*Math.exp(-t*65)*smooth(t/.003);
             break;
         case 'whoosh':{
             phase+=tau*(1000-550*smooth(u))/rate;
             const reverse=Math.pow(Math.sin(Math.PI*u),2);
             value=(filtered*.48+Math.sin(phase)*.07)*reverse;
             break;}
-        case 'click':
-            value=(Math.sin(tau*610*t)*.32+Math.sin(tau*917*t)*.11+n*.06)*Math.exp(-t*52)*smooth(t/.003);
-            break;
         case 'pop':
             phase+=tau*(130+620*Math.exp(-t*25))/rate;
             value=(Math.sin(phase)*.5+filtered*.12)*Math.exp(-t*19)*smooth(t/.006);
@@ -86,7 +84,7 @@ for(const [name,duration] of Object.entries(definitions)){
     }
     // A small stereo room adds space to event cues; typing taps stay dry.
     const stereo=Buffer.alloc(samples*8);
-    const taps=tap?[]:name==='tick'||name==='click'?[[.021,.08]]:[[.057,.16],[.113,.10],[.193,.055],[.317,.025]];
+    const taps=tap?[]:[[.057,.16],[.113,.10],[.193,.055],[.317,.025]];
     for(let i=0;i<samples;i++){
         let left=mono[i],right=mono[i]*.96;
         for(const [delay,gain] of taps){

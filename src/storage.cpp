@@ -955,6 +955,16 @@ void parseSettings(const toml::table &document, Settings &settings) {
                 field(*cue, "enabled", config.enabled);
                 field(*cue, "volume", config.volume);
                 field(*cue, "pitch", config.pitch);
+                if (const auto *sound = cue->get("sound")) {
+                    if (!hasCueSoundChoice(name.str()))
+                        invalid("audio.cues." + string(name.str()) + ".sound",
+                                "a sound choice only for message, send, or mention");
+                    const auto choice = sound->value_exact<std::string_view>();
+                    if (!choice || (*choice != "soft" && *choice != "clear"))
+                        invalid("audio.cues." + string(name.str()) + ".sound",
+                                "the string 'soft' or 'clear'");
+                    config.sound = *choice == "clear" ? CueSound::Clear : CueSound::Soft;
+                }
                 settings.cues[string(name.str())] = config;
             }
         }
@@ -1116,10 +1126,12 @@ toml::table profileDocument(const Model &model) {
 }
 toml::table settingsDocument(const Settings &settings) {
     toml::table cues, channels, bufferFools, messageLayouts;
-    for (const auto &[name, cue] : settings.cues)
-        cues.insert(
-            name,
-            toml::table{{"enabled", cue.enabled}, {"volume", cue.volume}, {"pitch", cue.pitch}});
+    for (const auto &[name, cue] : settings.cues) {
+        toml::table row{{"enabled", cue.enabled}, {"volume", cue.volume}, {"pitch", cue.pitch}};
+        if (cue.sound == CueSound::Clear && hasCueSoundChoice(name))
+            row.insert("sound", "clear");
+        cues.insert(name, std::move(row));
+    }
     for (const auto &[name, mode] : settings.channelPresence)
         channels.insert(name, presenceName(mode));
     for (const auto &[name, shown] : settings.bufferFools)

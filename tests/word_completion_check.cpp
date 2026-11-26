@@ -154,6 +154,33 @@ int main() {
     bounded.push_back("excludedword");
     local.setHistory(bounded);
     assert(local.complete("", "excluded").empty());
+
+    local.setHistory(std::vector<std::string>{"quartzmeet after lunch"});
+    assert(local.complete("", "Quar") == "Quartzmeet after lunch");
+    assert(local.complete("", "quartzmeet") == "quartzmeet after lunch");
+    assert(local.complete("quartzmeet ", "") == "after lunch");
+    assert(local.complete("quartzmeet\t", "") == "after lunch");
+    assert(local.complete("quartzmeet\n", "").empty());
+    assert(local.complete("quartzmeet. ", "").empty());
+    std::string popupWord;
+    assert(local.completions("", "Quar", std::span(&popupWord, 1)) == 1 &&
+           popupWord == "Quartzmeet");
+    assert(local.completions("quartzmeet ", "", std::span(&popupWord, 1)) == 0);
+
+    local.setHistory(
+        std::vector<std::string>{"can you review the draft tomorrow morning", "please review this"});
+    // The exact trigram resolves the shared “review” bigram. Only new words count toward the cap.
+    assert(local.complete("can you ", "re") == "review the draft");
+    assert(local.complete("can you ", "review") == "review the draft tomorrow");
+    assert(local.complete("can you review ", "") == "the draft tomorrow");
+    assert(local.complete("you review the ", "") == "draft tomorrow morning");
+    assert(local.complete("review ", "").empty());
+
+    local.setHistory(std::vector<std::string>{"can you review the draft", "can you review this"});
+    assert(local.complete("can you ", "re") == "review"); // Conflicting next words.
+    local.setHistory(std::vector<std::string>{"can you review the draft", "can you review"});
+    assert(local.complete("can you ", "re") == "review"); // An observed end also stops the phrase.
+
     local.setHistory(std::span<const std::string>{});
     assert(local.complete("can you ", "re").empty());
 

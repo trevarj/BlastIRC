@@ -2048,6 +2048,50 @@ void checkComposerWordPrediction(Renderer &renderer) {
     expectRows({{"#other", "/hash.svg"}});
     assert(editors.handleCompletionKey(XKB_KEY_Return, 0) && input->value() == "#other");
 
+    // With a competing nick the phrase's first word remains a single-word popup row.
+    Message phrase;
+    phrase.own = true;
+    phrase.text = "qzphraseanchor qzphrasemeet after lunch";
+    buffer.messages.push_back(phrase);
+    ++buffer.messagesRevision;
+    buffer.nicks.push_back({.name = "qzphrasemeNick", .account = {}, .prefix = {}});
+    input->setValue("qzphraseanchor qzphraseme");
+    frame();
+    openMixed();
+    expectRows({{"qzphrasemeNick", nickIcon}, {"qzphrasemeet", wordIcon}});
+    assert(editors.handleCompletionKey(XKB_KEY_Down, 0));
+    assert(editors.handleCompletionKey(XKB_KEY_Return, 0) &&
+           input->value() == "qzphraseanchor qzphrasemeet");
+
+    buffer.nicks.clear();
+    await([&] { return ghost(" after lunch"); });
+    input->setValue("qzphraseanchor qzphrasemeet ");
+    await([&] { return ghost("after lunch"); });
+
+    // The native ghost is not committed text. Accepting the whole phrase is one undoable edit.
+    input->setValue("qzphraseanchor qzphraseme");
+    const auto beforePhrase = input->editingState().current;
+    const auto phraseUndo = input->editingState().history->undo;
+    const auto phraseRedo = input->editingState().history->redo;
+    const auto phraseActions = model.actions.size();
+    await([&] { return ghost("et after lunch"); });
+    assert(input->editingState().current == beforePhrase &&
+           input->editingState().history->undo == phraseUndo &&
+           input->editingState().history->redo == phraseRedo &&
+           buffer.draft == beforePhrase.value &&
+           input->textInputState().surroundingText == beforePhrase.value &&
+           input->displayProjection()->text == beforePhrase.value &&
+           model.actions.size() == phraseActions && !literalPopup->visible());
+    assert(editors.execute("complete", pane));
+    assert(input->value() == phrase.text && buffer.draft == phrase.text &&
+           input->textInputState().surroundingText == phrase.text &&
+           input->displayProjection()->text == phrase.text &&
+           input->editingState().history->undo.size() == phraseUndo.size() + 1 &&
+           input->editingState().history->undo.back() == beforePhrase);
+    assert(editors.execute("undo", pane));
+    assert(input->editingState().current == beforePhrase && buffer.draft == beforePhrase.value &&
+           input->editingState().history->undo == phraseUndo);
+
     // The same prefix follows this chat's sent context, not alphabetical order.
     buffer.nicks.clear();
     buffer.messages.clear();

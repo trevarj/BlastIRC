@@ -2767,7 +2767,10 @@ void EditorStore::Impl::Composer::updatePrediction() {
     if (!projection || projection->text.empty() || projection->text.starts_with('/'))
         return;
     const auto &text = projection->text;
-    size_t start = text.size(), letters = 0;
+    size_t end = text.size();
+    while (end && (text[end - 1] == ' ' || text[end - 1] == '\t'))
+        --end;
+    size_t start = end, letters = 0;
     while (start) {
         const auto previous = ui_logic::previous(text, start);
         const auto character = g_utf8_get_char(text.data() + previous);
@@ -2776,8 +2779,7 @@ void EditorStore::Impl::Composer::updatePrediction() {
         letters += g_unichar_isalpha(character) ? 1 : 0;
         start = previous;
     }
-    const auto prefix = std::string_view(text).substr(start);
-    if (!letters || prefix.size() > 128)
+    if (!letters || end - start > 128)
         return;
     if (start) {
         const auto previous = g_utf8_get_char(text.data() + ui_logic::previous(text, start));
@@ -2792,14 +2794,18 @@ void EditorStore::Impl::Composer::updatePrediction() {
     const auto &context = owner.model.buffers.at(buffer);
     if (context.kind != "channel" && context.kind != "query")
         return;
-    predictionQuery = std::string_view(text).substr(literalTokenStart(text, start));
-    predictionCompeting = hasLiteralCandidate(predictionQuery);
-    predictionPrefix = prefix;
-    if (predictionCompeting)
-        return;
+    const auto prefixStart = end == text.size() ? start : text.size();
+    const auto prefix = std::string_view(text).substr(prefixStart);
+    if (!prefix.empty()) {
+        predictionQuery = std::string_view(text).substr(literalTokenStart(text, start));
+        predictionCompeting = hasLiteralCandidate(predictionQuery);
+        predictionPrefix = prefix;
+        if (predictionCompeting)
+            return;
+    }
     if (owner.words) {
         owner.words->setHistory(predictionHistory);
-        predictedWord = owner.words->complete(std::string_view(text).substr(0, start), prefix);
+        predictedWord = owner.words->complete(std::string_view(text).substr(0, prefixStart), prefix);
     }
     if (predictedWord.empty())
         return;

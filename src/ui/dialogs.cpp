@@ -2226,9 +2226,8 @@ struct Dialogs::Impl {
 
         toggle(parent, "Predict words", model.settings.wordPrediction,
                [this](bool value) { model.settings.wordPrediction = value; });
-        label(parent, "Predicts words using English word frequencies and the context of recent "
-                      "messages you sent in the current chat. Local only; no text is sent over "
-                      "the network for prediction.");
+        label(parent, "Suggests words and short phrases using English word frequencies and recent "
+                      "messages you sent in this chat. All prediction stays on this device.");
 
         label(parent, "Add an absolute path to a Hunspell folder or to one member of a matching "
                       ".aff/.dic pair. Saved paths are used in order before bundled dictionaries.");

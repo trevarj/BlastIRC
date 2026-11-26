@@ -23,6 +23,7 @@ constexpr std::size_t maxWordBytes = 128;
 constexpr std::size_t maxFileBytes = 16 * 1024 * 1024;
 constexpr std::size_t maxSnippetBytes = 512;
 constexpr std::size_t maxSnippets = 32;
+constexpr std::size_t maxPredictedWords = 3;
 using Counts = std::map<std::string, double, std::less<>>;
 using Contexts = std::map<std::string, Counts, std::less<>>;
 
@@ -64,7 +65,7 @@ std::string lower(std::string_view text) {
     return result;
 }
 
-std::string boundedSnippet(std::string_view text) {
+std::string_view boundedSnippet(std::string_view text) {
     // Do not turn a truncated UTF-8 codepoint into a malformed history entry.
     if (text.size() > maxSnippetBytes) {
         text = text.substr(0, maxSnippetBytes);
@@ -78,7 +79,7 @@ std::string boundedSnippet(std::string_view text) {
                 text = text.substr(0, end - 1);
         }
     }
-    return validUtf8(text) ? std::string(text) : std::string{};
+    return validUtf8(text) ? text : std::string_view{};
 }
 
 template <typename Word, typename Boundary>
@@ -112,11 +113,9 @@ void tokenize(std::string_view text, Word word, Boundary boundary) {
     finish(end);
 }
 
-std::string contextKey(std::string_view previous2, std::string_view previous1) {
-    std::string key(previous2);
-    key += '\t';
-    key += previous1;
-    return key;
+const Counts *findContext(const Contexts &contexts, std::string_view key) {
+    const auto found = contexts.find(key);
+    return found == contexts.end() ? nullptr : &found->second;
 }
 } // namespace
 
@@ -126,13 +125,33 @@ struct WordCompletion::State {
     std::vector<std::string> history;
     Counts local;
     Contexts bigrams;
-    Contexts trigrams;
+    std::map<std::string, Contexts, std::less<>> trigrams;
     double localTotal = 0;
     std::jthread worker;
 
     std::size_t complete(std::string_view before, std::string_view prefix,
                          std::span<RankedWord> ranks, std::span<std::string> output,
                          bool extensionsOnly);
+
+    const Counts *trigram(std::string_view previous2, std::string_view previous1) const {
+        const auto found = trigrams.find(previous2);
+        return found == trigrams.end() ? nullptr : findContext(found->second, previous1);
+    }
+
+    void extend(std::string_view previous2, std::string_view previous1, std::size_t remaining,
+                std::string &result) const {
+        for (; remaining && !previous1.empty(); --remaining) {
+            const auto *next =
+                previous2.empty() ? findContext(bigrams, previous1) : trigram(previous2, previous1);
+            if (!next || next->size() != 1 || next->begin()->first.empty())
+                break;
+            if (!result.empty())
+                result += ' ';
+            previous2 = previous1;
+            previous1 = next->begin()->first;
+            result += previous1;
+        }
+    }
 
     explicit State(std::string path)
         : worker([this, path = std::move(path)] {
@@ -195,13 +214,13 @@ WordCompletion::~WordCompletion() = default;
 bool WordCompletion::ready() const { return state_->loaded.load(std::memory_order_acquire); }
 
 void WordCompletion::setHistory(std::span<const std::string> newestFirst) {
-    std::vector<std::string> history;
-    history.reserve(std::min(newestFirst.size(), maxSnippets));
-    for (const auto &text : newestFirst.first(std::min(newestFirst.size(), maxSnippets)))
-        history.push_back(boundedSnippet(text));
-    if (history == state_->history)
+    newestFirst = newestFirst.first(std::min(newestFirst.size(), maxSnippets));
+    if (std::ranges::equal(newestFirst, state_->history, {}, boundedSnippet))
         return;
-    state_->history = std::move(history);
+    state_->history.clear();
+    state_->history.reserve(newestFirst.size());
+    for (const auto &text : newestFirst)
+        state_->history.emplace_back(boundedSnippet(text));
     state_->local.clear();
     state_->bigrams.clear();
     state_->trigrams.clear();
@@ -209,6 +228,14 @@ void WordCompletion::setHistory(std::span<const std::string> newestFirst) {
     for (std::size_t i = 0; i < state_->history.size(); ++i) {
         const double weight = 1.0 / (1.0 + static_cast<double>(i) / 8.0);
         std::string previous1, previous2;
+        const auto boundary = [&] {
+            if (!previous1.empty())
+                state_->bigrams[previous1].try_emplace("", 0);
+            if (!previous2.empty())
+                state_->trigrams[previous2][previous1].try_emplace("", 0);
+            previous1.clear();
+            previous2.clear();
+        };
         tokenize(
             state_->history[i],
             [&](std::string word) {
@@ -217,22 +244,26 @@ void WordCompletion::setHistory(std::span<const std::string> newestFirst) {
                 if (!previous1.empty())
                     state_->bigrams[previous1][word] += weight;
                 if (!previous2.empty())
-                    state_->trigrams[contextKey(previous2, previous1)][word] += weight;
+                    state_->trigrams[previous2][previous1][word] += weight;
                 previous2 = std::move(previous1);
                 previous1 = std::move(word);
             },
-            [&] {
-                previous1.clear();
-                previous2.clear();
-            });
+            boundary);
+        boundary();
     }
 }
 
 std::size_t WordCompletion::State::complete(std::string_view before, std::string_view prefix,
                                             std::span<RankedWord> ranks,
                                             std::span<std::string> output, bool extensionsOnly) {
-    if (output.empty() || !validWord(prefix) || !validUtf8(before))
+    if (output.empty() || !validUtf8(before))
         return 0;
+    if (prefix.empty()) {
+        if (extensionsOnly || before.empty() || (before.back() != ' ' && before.back() != '\t'))
+            return 0;
+    } else if (!validWord(prefix)) {
+        return 0;
+    }
     ranks = ranks.first(std::min(ranks.size(), output.size()));
     if (before.size() > maxSnippetBytes) {
         before.remove_prefix(before.size() - maxSnippetBytes);
@@ -253,13 +284,13 @@ std::size_t WordCompletion::State::complete(std::string_view before, std::string
             previous1.clear();
             previous2.clear();
         });
+    if (prefix.empty()) {
+        extend(previous2, previous1, maxPredictedWords, output.front());
+        return !output.front().empty();
+    }
     const auto folded = lower(prefix);
-    const auto context = [&](const Contexts &contexts, const std::string &key) -> const Counts * {
-        const auto found = contexts.find(key);
-        return found == contexts.end() ? nullptr : &found->second;
-    };
-    const auto *bigram = context(bigrams, previous1);
-    const auto *trigram = context(trigrams, contextKey(previous2, previous1));
+    const auto *bigram = findContext(bigrams, previous1);
+    const auto *trigram = this->trigram(previous2, previous1);
     const auto scale = [](const Counts *counts, double weight) {
         double total = 0;
         if (counts)
@@ -289,15 +320,14 @@ std::size_t WordCompletion::State::complete(std::string_view before, std::string
                                 general->first.starts_with(folded) &&
                                 (recent == local.end() || general->first <= recent->first);
         const std::string_view word = useGeneral ? general->first : recent->first;
+        double score = 0;
         if (general != generalCounts.end() && general->first == word)
-            ++general;
+            score += (general++)->second;
         if (recent != local.end() && recent->first == word)
-            ++recent;
+            score += (recent++)->second * localScale;
         if (extensionsOnly && word == folded)
             continue;
-        const double score = count(&generalCounts, word) + count(&local, word) * localScale +
-                             count(bigram, word) * bigramScale +
-                             count(trigram, word) * trigramScale;
+        score += count(bigram, word) * bigramScale + count(trigram, word) * trigramScale;
         // Candidates arrive in lexical order, so tied scores retain that order.
         auto slot = ranks.begin();
         while (slot != ranks.begin() + ranked && slot->score >= score)
@@ -311,7 +341,7 @@ std::size_t WordCompletion::State::complete(std::string_view before, std::string
                            ranks.begin() + ranked);
         *slot = {word, score};
     }
-    if (!ranked || ranks[0].word == folded)
+    if (!ranked)
         return 0;
     bool uppercase = true;
     bool cased = false;
@@ -323,15 +353,22 @@ std::size_t WordCompletion::State::complete(std::string_view before, std::string
         cased = cased || g_unichar_isupper(ch) || g_unichar_islower(ch);
     }
     for (std::size_t i = 0; i < ranked; ++i) {
-        const auto suffix = ranks[i].word.substr(folded.size());
         auto &result = output[i];
         result.assign(prefix);
+        result += ranks[i].word.substr(folded.size());
+        if (!extensionsOnly) {
+            const auto remaining = maxPredictedWords - (result.size() > prefix.size());
+            extend(previous1, ranks[i].word, remaining, result);
+            if (result.size() == prefix.size()) {
+                result.clear();
+                return 0;
+            }
+        }
         if (uppercase && cased) {
-            auto *upper = g_utf8_strup(suffix.data(), static_cast<gssize>(suffix.size()));
-            result += upper;
+            auto *upper = g_utf8_strup(result.data() + prefix.size(),
+                                       static_cast<gssize>(result.size() - prefix.size()));
+            result.replace(prefix.size(), std::string::npos, upper);
             g_free(upper);
-        } else {
-            result += suffix;
         }
     }
     return ranked;

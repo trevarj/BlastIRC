@@ -2816,6 +2816,7 @@ void minuteAuthorGroups(TranscriptTestRenderer &renderer, const char *kind) {
     append("AfterGap");
     append("MinuteBreak", "Peer[", "2026-11-07T12:35:05Z");
     append("DayBreak", "Peer[", "2026-11-08T12:35:05Z");
+    append("OwnNextMinute", "Peer[", "2026-11-08T12:36:05Z").own = true;
     append("MissingTime", "Peer[", "");
     append("InvalidTimeA", "Peer[", "2026-11-08T25:35:05Z");
     append("InvalidTimeB", "Peer[", "2026-11-08T25:35:05Z");
@@ -2846,6 +2847,7 @@ void minuteAuthorGroups(TranscriptTestRenderer &renderer, const char *kind) {
     arrange();
     header("RunContinues", true, "pEER{"); // Wide Traditional keeps its inline author policy.
     header("OwnContinues", true);
+    assert(!plainText(body(view, "OwnStart").content, "(you)"));
     near(baseline(*plainText(body(view, "OwnContinues").content, "Peer[")),
          baseline(body(view, "OwnContinues").text));
     for (const auto &[layout, width] : {std::pair{blast::MessageLayout::Stacked, 900.f},
@@ -2865,6 +2867,21 @@ void minuteAuthorGroups(TranscriptTestRenderer &renderer, const char *kind) {
                 header(token, true);
             header("RunContinues", false, "pEER{");
             header("OwnContinues", false);
+            const bool stacked = layout != blast::MessageLayout::Bubbles;
+            assert(bool(plainText(body(view, "OwnStart").content, "(you)")) == stacked);
+            assert(!plainText(body(view, "OwnContinues").content, "(you)"));
+            assert(!plainText(body(view, "IncomingAgain").content, "(you)"));
+            const auto own = body(view, "OwnNextMinute");
+            const auto *tag = plainText(own.content, "(you)");
+            assert(bool(tag) == stacked);
+            if (tag && timestamps) {
+                const auto *time = plainText(own.content, "12:36");
+                assert(time);
+                near(tag->fontSize(), time->fontSize());
+                near(baseline(*tag), baseline(*time));
+                const auto box = sceneBounds(*tag->parent());
+                assert(box.x + box.width < sceneBounds(*time).x);
+            }
             const auto lead = body(view, "RunStart");
             const auto next = body(view, "RunContinues");
             assert(&lead.row != &next.row);
@@ -2889,6 +2906,7 @@ void minuteAuthorGroups(TranscriptTestRenderer &renderer, const char *kind) {
             for (const auto token :
                  {"RunContinues", "OwnStart", "OwnContinues", "IncomingAgain", "EmoteBreak"})
                 clock(token, "12:34", false);
+            clock("OwnNextMinute", "12:36", timestamps);
             clock("MinuteBreak", "12:35", timestamps);
             clock("DayBreak", "12:35", timestamps);
         }

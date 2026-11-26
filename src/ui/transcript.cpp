@@ -690,12 +690,14 @@ TextFont messagePrefixFont(bool action) {
     return font;
 }
 
+constexpr std::string_view ownHeaderLabel = "(you)";
+
 struct Geometry {
     PresentationMetrics metrics{};
     float scale = 1, font = 16, uiFont = 14, metadataFont = 14, nickFont = 12, activityFont = 12,
           timeFont = 11, timeGutter = 0, nickGutter = 0, clockWidth = 0, chatWidth = 0,
           cornerRadius = 0;
-    float activityClockWidth = 0;
+    float activityClockWidth = 0, ownLabelWidth = 0;
     TextFont nickStyle, activityStyle;
     float header = 20, footer = 14, quote = 24, reaction = 29, day = 36, unread = 30;
     float bodyLine = 0, nickLine = 0, nickHeader = 0, activityLine = 0, metadataHeader = 0;
@@ -772,6 +774,14 @@ struct Geometry {
     float channelNickWidth(bool clockVisible) const {
         return std::max(1.f, nickGutter -
                                  (!inlineChannel && clockVisible ? clockWidth + 8 * scale : 0));
+    }
+    float ownLabelExtent(const Message &entry, bool clockVisible, float friendExtent) const {
+        const float extent = ownLabelWidth + 4 * scale;
+        return ownLabelWidth > 0 && entry.own && !entry.action && !entry.presence &&
+                       extent + compactAvatarInset(false) + friendExtent + metadataFont <=
+                           channelNickWidth(clockVisible)
+                   ? extent
+                   : 0;
     }
     float prefixWidth(bool presence) const {
         return presence  ? timeGutter
@@ -918,6 +928,8 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
             result.nickGutter = inlineNick;
         else {
             result.nickGutter = available;
+            result.ownLabelWidth = std::ceil(
+                renderer.measureText(ownHeaderLabel, result.timeFont, themeUiFont()).width);
             result.metrics.rowGap += 2;
         }
     }
@@ -3996,6 +4008,7 @@ struct TranscriptView::Impl {
             row.prefixWidth = prefix;
         }
         const float friendExtent = row.friendAuthor ? 18 * g.scale : 0;
+        const float ownLabel = g.ownLabelExtent(entry, row.showClock, friendExtent);
         row.emotePrefix = 0;
         if (emote && (g.bubbles || stackedEmote)) {
             const float avatarInset = g.authorAvatarInset();
@@ -4212,11 +4225,14 @@ struct TranscriptView::Impl {
             };
             if (!stackedEmote && g.nickVisible(row.grouped, entry.presence)) {
                 const auto align = g.inlineChannel ? TextAlign::End : TextAlign::Start;
-                const float nickWidth = std::max(
-                    1.f, g.channelNickWidth(row.showClock) - g.compactAvatarInset(g.inlineChannel) -
-                             friendExtent - (g.ownNickPill(entry) ? 2 * g.chipPadding() : 0));
+                const float nickWidth =
+                    std::max(1.f, g.channelNickWidth(row.showClock) -
+                                      g.compactAvatarInset(g.inlineChannel) - friendExtent -
+                                      ownLabel - (g.ownNickPill(entry) ? 2 * g.chipPadding() : 0));
                 const float marker = emote ? g.actionMarkerWidth(nickWidth) : 0;
                 include(entry.nick, nickWidth - marker, align, true);
+                if (ownLabel > 0)
+                    include(ownHeaderLabel, g.ownLabelWidth, TextAlign::Start, false);
             }
             if (row.showClock) {
                 const auto clock = clockText(entry);
@@ -4281,15 +4297,14 @@ struct TranscriptView::Impl {
                 if (g.nickVisible(row.grouped, entry.presence)) {
                     const float adornments = g.compactAvatarInset(false) + friendExtent;
                     const float textLimit =
-                        std::max(1.f, g.channelNickWidth(row.showClock) - adornments);
+                        std::max(1.f, g.channelNickWidth(row.showClock) - adornments - ownLabel);
                     auto actorFont = themeUiFont();
                     actorFont.weight = FontWeight::Bold;
                     const float nickWidth = std::ceil(
                         renderer.measureText(entry.nick, g.metadataFont, actorFont).width);
                     metadataWidth = std::max(
-                        metadataWidth,
-                        adornments + std::min(textLimit, nickWidth) +
-                            (row.showClock ? g.clockWidth + 8 * g.scale : 0));
+                        metadataWidth, adornments + std::min(textLimit, nickWidth) + ownLabel +
+                                           (row.showClock ? g.clockWidth + 8 * g.scale : 0));
                 }
                 row.selectionWidth = std::max(row.selectionWidth, metadataWidth);
             }
@@ -4849,9 +4864,25 @@ struct TranscriptView::Impl {
                        g.activityClockWidth, false);
             } else if (row.showClock && !stacked)
                 prefix(clockText(entry), surfaceX + padding, g.timeGutter - 4 * g.scale, false);
-            if (!stackedEmote && g.nickVisible(row.grouped, entry.presence))
+            if (!stackedEmote && g.nickVisible(row.grouped, entry.presence)) {
+                const float ownLabel = g.ownLabelExtent(entry, row.showClock, friendExtent);
                 prefix(entry.nick, surfaceX + padding + (stacked ? 0 : g.timeGutter),
-                       g.channelNickWidth(row.showClock), true);
+                       g.channelNickWidth(row.showClock) - ownLabel, true);
+                if (ownLabel > 0) {
+                    const auto muted = themeForegroundColor("on_surface_variant");
+                    const auto ink = [&](Color backdrop) {
+                        return themePairedForeground(backdrop, lerpColor(muted, backdrop, .25f));
+                    };
+                    const std::array colors{ink(row.backdrop[0]), ink(row.backdrop[1])};
+                    auto *tag = label(*slot.content, ownHeaderLabel, clusterEnd + 4 * g.scale, 0,
+                                      g.ownLabelWidth, g.timeFont, colors[0], themeUiFont());
+                    tag->measure(renderer);
+                    tag->setPosition(tag->x(), row.prefixBaseline - tag->baselineOffset());
+                    tag->setHitTestVisible(false);
+                    slot.labelInk.emplace_back(tag, colors);
+                    clusterEnd += ownLabel;
+                }
+            }
             if (row.showClock && stacked)
                 prefix(clockText(entry), clusterEnd + 8 * g.scale, g.clockWidth, false);
             if (stacked && g.nickVisible(row.grouped, entry.presence))

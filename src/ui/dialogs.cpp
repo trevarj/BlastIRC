@@ -2065,7 +2065,7 @@ struct Dialogs::Impl {
         cursorStatus = label(*cursor, "");
         label(*cursor,
               "Step blinks on and off; Smooth uses milliseconds per fade (lower is faster). "
-              "Trail follows cursor movement and remembers its style when turned off. "
+              "Trail follows caret navigation, including short moves, but not typing. "
               "Effects Off or Reduced motion suppresses both without changing the shape.");
         button(*cursor, "Try in conversation", [this] { dismiss(); });
         auto *messages = section("appearance.messages", "Messages");

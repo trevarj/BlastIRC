@@ -671,7 +671,8 @@ bool Input::editingStateMatches(const EditingState& state) const noexcept {
 
 void Input::restoreEditingState(const EditingState& state, bool preserveScroll) {
   // Same-document model commands are real caret moves, not buffer switches.
-  if (!preserveScroll || state.history != m_editHistory) resetCaretEffects();
+  const bool sameDocument = preserveScroll && state.history == m_editHistory;
+  if (!sameDocument) resetCaretEffects();
   const bool textChanged = m_value != state.current.value;
   const auto previousCursor = m_cursorPos;
   const auto previousAnchor = m_selectionAnchor;
@@ -693,8 +694,11 @@ void Input::restoreEditingState(const EditingState& state, bool preserveScroll) 
     updateDisplayText();
     markTextContentChanged();
   } else {
-    if (m_cursorPos != previousCursor || m_selectionAnchor != previousAnchor)
+    if (m_cursorPos != previousCursor || m_selectionAnchor != previousAnchor) {
+      if (sameDocument && m_multiline && multilineStopsValid() && m_cursorPos != previousCursor)
+        ensureCursorVisibleY();
       m_revealCursorYPending = true;
+    }
     markLayoutDirty();
   }
   updateInteractiveGeometry();
@@ -1441,6 +1445,7 @@ void Input::textInputDeactivated(TextInputService& service) {
 }
 
 void Input::markTextContentChanged() {
+  resetCaretEffects();
   m_textMetricsDirty = true;
   m_revealCursorYPending = true;
   markLayoutDirty();
@@ -2431,14 +2436,6 @@ void Input::applyCaretStyle(Color color) {
 
 void Input::updateCaretPaint(float cellX, float cellWidth) {
   const auto viewport = caretViewport();
-  if (!input_caret::equal(viewport, m_caretTrailViewport) || m_caretTrailScale != m_cursorRenderScale ||
-      m_caretTrailScrollX != m_scrollOffset || m_caretTrailScrollY != m_scrollOffsetY) {
-    resetCaretEffects();
-    m_caretTrailViewport = viewport;
-    m_caretTrailScale = m_cursorRenderScale;
-    m_caretTrailScrollX = m_scrollOffset;
-    m_caretTrailScrollY = m_scrollOffsetY;
-  }
   auto rect = m_caretInsertionRect;
   if (m_caretShape != CaretShape::Line) {
     // Keep a thin insertion edge when an end slot lies entirely beyond either
@@ -2478,16 +2475,36 @@ void Input::updateCaretPaint(float cellX, float cellWidth) {
   if (m_textMetricsDirty)
     return;
 
-  if (m_trailTarget && input_caret::equal(rect, m_trailPending))
-    return;
-  m_trailPending = rect;
-  if (!m_trailTarget) {
-    m_trailTarget = rect;
-    m_trailCorners = input_caret::corners(rect);
+  const bool moved = m_trailTarget && m_trailCursorPos != m_cursorPos;
+  const bool viewportChanged =
+      !input_caret::equal(viewport, m_caretTrailViewport) || m_caretTrailScale != m_cursorRenderScale;
+  const float scrollX = m_caretTrailScrollX - m_scrollOffset;
+  const float scrollY = m_caretTrailScrollY - m_scrollOffsetY;
+  if (viewportChanged || scrollX != 0.0F || scrollY != 0.0F ||
+      (!moved && !input_caret::equal(rect, m_trailPending))) {
+    auto from = m_trailPending;
+    resetCaretEffects();
+    m_caretTrailViewport = viewport;
+    m_caretTrailScale = m_cursorRenderScale;
+    m_caretTrailScrollX = m_scrollOffset;
+    m_caretTrailScrollY = m_scrollOffsetY;
     m_caretTrailNode->setFrameSize(viewport.width, viewport.height);
+    if (moved && !viewportChanged) {
+      from.x = std::clamp(from.x + scrollX, -from.width, viewport.width);
+      from.y = std::clamp(from.y + scrollY, -from.height, viewport.height);
+      m_trailTarget = m_trailPending = from;
+      m_trailCorners = input_caret::corners(from);
+    }
+  }
+  m_trailCursorPos = m_cursorPos;
+  if (!m_trailTarget) {
+    m_trailTarget = m_trailPending = rect;
+    m_trailCorners = input_caret::corners(rect);
     return;
   }
-  m_trailCellWidth = cellWidth > 0.0F ? cellWidth : m_fontSize * 0.6F;
+  if (input_caret::equal(rect, m_trailPending))
+    return;
+  m_trailPending = rect;
   m_trailMovedAt = std::chrono::steady_clock::now();
   if (!m_trailTimer.active()) {
     m_trailSampledAt = m_trailMovedAt;
@@ -2517,13 +2534,6 @@ void Input::updateCaretTrail() {
   if (adopt) {
     const auto old = *m_trailTarget;
     m_trailTarget = m_trailPending;
-    if (!m_caretTrailNode->visible()
-        && std::round(std::abs(old.x - m_trailPending.x) / m_trailCellWidth) <= 2.0F
-        && std::round(std::abs(old.y - m_trailPending.y) / currentLineHeight()) <= 2.0F) {
-      m_trailCorners = input_caret::corners(m_trailPending);
-      m_trailTimer.stop();
-      return;
-    }
     if (!classic && !blur)
       m_caretTrailNode->effects().emit(old, m_trailPending, m_fontSize, pixel, m_trailMovedAt);
   }

@@ -156,9 +156,9 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
         ScaledRenderer renderer(context, 1.F);
         const bool motion = MotionService::instance().enabled();
         MotionService::instance().setEnabled(true);
-        const auto placeAtStart = [&] {
+        const auto placeAt = [&](std::size_t pos = 0) {
             auto state = editor.editingState();
-            state.current.cursorPos = state.current.selectionAnchor = 0;
+            state.current.cursorPos = state.current.selectionAnchor = pos;
             editor.restoreEditingState(state);
             editor.measure(renderer, LayoutConstraints::exact(64, 48));
             editor.layout(renderer);
@@ -167,7 +167,7 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
             for (int i = 0; i < cells; ++i)
                 editor.moveCaretRight();
         };
-        placeAtStart();
+        placeAt();
         moveRight(2);
         const auto shortPlain = capture(editor);
         moveRight(2);
@@ -178,12 +178,7 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
         const auto moved = editor.editingState();
 
         editor.setCaretStyle(Shape::Box, Blink::Off, true);
-        placeAtStart();
-        moveRight(2);
-        tickCursorTimers(2ms);
-        tickCursorTimers(15ms);
-        assert(capture(editor) == shortPlain); // Two measured cells from rest do not trail.
-        placeAtStart();
+        placeAt();
         moveRight(4);
         assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
         assert(capture(editor) == plain); // Destination moves immediately, before trail dwell.
@@ -194,18 +189,22 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
 
         Node *viewport = nullptr;
         Node *caret = nullptr;
+        Node *trail = nullptr;
         for (const auto &child : editor.children())
             if (child->clipChildren()) {
                 viewport = child.get();
-                for (const auto &layer : child->children())
+                for (const auto &layer : child->children()) {
                     if (layer->type() == NodeType::Rect && layer->zIndex() == 1)
                         caret = layer.get();
+                    if (layer->type() == NodeType::CustomDraw)
+                        trail = layer.get();
+                }
             }
-        assert(viewport && caret);
-        float cx = 0, cy = 0;
-        Node::absolutePosition(caret, cx, cy);
+        assert(viewport && caret && trail);
         enum Tone { Accent = 1, Flame = 2, Electric = 4, Violet = 8, Aqua = 16, Glitter = 32 };
-        const auto checkPixels = [&](const auto &frame) {
+        const auto checkPixels = [&](const auto &frame, const auto &baseline) {
+            float cx = 0, cy = 0;
+            Node::absolutePosition(caret, cx, cy);
             bool translucentTrailPixel = false;
             bool nativeOpacity = false;
             unsigned tones = 0;
@@ -220,13 +219,13 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
                     const bool masked = lx > cx + 1 && lx < cx + caret->width() - 1 &&
                                         ly > cy + 1 && ly < cy + caret->height() - 1;
                     nativeOpacity |=
-                        masked && std::abs(plain[pixel + 3] / 255.F - caretAlpha) <= 1.F / 255.F;
+                        masked && std::abs(baseline[pixel + 3] / 255.F - caretAlpha) <= 1.F / 255.F;
                     if (outside || masked)
                         assert(std::equal(frame.begin() + pixel, frame.begin() + pixel + 4,
-                                          plain.begin() + pixel));
+                                          baseline.begin() + pixel));
                     translucentTrailPixel |=
-                        plain[pixel + 3] == 0 && frame[pixel + 3] > 0 && frame[pixel + 3] < 255;
-                    if (plain[pixel + 3] == 0 && frame[pixel + 3] >= 36) {
+                        baseline[pixel + 3] == 0 && frame[pixel + 3] > 0 && frame[pixel + 3] < 255;
+                    if (baseline[pixel + 3] == 0 && frame[pixel + 3] >= 36) {
                         const float a = frame[pixel + 3];
                         const float r = frame[pixel] / a, g = frame[pixel + 1] / a,
                                     b = frame[pixel + 2] / a;
@@ -247,7 +246,7 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
             assert(nativeOpacity && translucentTrailPixel);
             return tones;
         };
-        assert(checkPixels(trailing) & Accent);
+        assert(checkPixels(trailing, plain) & Accent);
 
         editor.setWindowActive(false);
         const auto inactive = capture(editor);
@@ -259,6 +258,11 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
         assert(capture(editor) == plain && focus.focusedArea() == editor.inputArea());
         assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
 
+        placeAt(1);
+        moveRight(1);
+        tickCursorTimers(5ms);
+        assert(checkPixels(capture(editor), shortPlain) & Accent);
+
         using Trail = Input::CaretTrailStyle;
         constexpr std::array styles{
             std::pair{Trail::MotionBlur, Accent},  std::pair{Trail::Blaze, Flame},
@@ -266,11 +270,11 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
             std::pair{Trail::Torpedo, Aqua},       std::pair{Trail::Pixiedust, Glitter}};
         for (const auto &[style, tone] : styles) {
             editor.setCaretStyle(Shape::Box, Blink::Off, true, style);
-            placeAtStart();
-            moveRight(2);
+            placeAt(1);
+            moveRight(1);
             tickCursorTimers(5ms);
-            assert(capture(editor) == shortPlain);
-            placeAtStart();
+            checkPixels(capture(editor), shortPlain);
+            placeAt();
             editor.setWindowActive(false);
             editor.setWindowActive(true);
             moveRight(4);
@@ -279,7 +283,7 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
             tickCursorTimers(26ms);
             const auto live = capture(editor);
             assert(live != plain && live != trailing);
-            assert(checkPixels(live) & tone);
+            assert(checkPixels(live, plain) & tone);
             assert(editor.editingStateMatches(moved) && sameImeRect(editor.textInputState(), ime));
             tickCursorTimers(550ms);
             assert(capture(editor) == plain);
@@ -404,6 +408,85 @@ void pixelPartitionCheck(wl_display *display, RenderContext &context) {
                    focus.pendingTouchPressArea() == nullptr);
             focus.setSceneRoot(&editor);
         }
+
+        auto &input = editor;
+        auto &dispatcher = focus;
+        dispatcher.setFocus(input.inputArea());
+        input.setCaretStyle(Shape::Box, Blink::Off, true);
+        const auto scrollFixture = [&](bool multiline, const std::string &value) {
+            input.setMultiline(multiline);
+            input.setValue(value);
+            auto atStart = input.editingState();
+            atStart.current.cursorPos = atStart.current.selectionAnchor = 0;
+            atStart.scrollX = atStart.scrollY = 0;
+            input.restoreEditingState(atStart);
+            input.measure(renderer, LayoutConstraints::exact(96, 54));
+            input.setSize(96, 54);
+            input.layout(renderer);
+        };
+        const auto key = [&](std::uint32_t sym, std::uint32_t utf32 = 0) {
+            dispatcher.keyEvent(sym, utf32, 0, true);
+            dispatcher.keyEvent(sym, utf32, 0, false);
+        };
+        const auto verifyNavigationScroll = [&](std::uint32_t sym, auto scroll) {
+            auto before = input.editingState();
+            for (std::size_t i = 0; i < before.current.value.size(); ++i) {
+                key(sym);
+                auto after = input.editingState();
+                assert(after.current.cursorPos > before.current.cursorPos);
+                if (after.*scroll > before.*scroll)
+                    break;
+                before = std::move(after);
+            }
+            // Replay just the scrolling keystroke, without a pending trail from earlier keys.
+            input.restoreEditingState(before);
+            input.layout(renderer);
+            assert(!trail->visible());
+            key(sym);
+            const auto after = input.editingState();
+            assert(after.current.value == before.current.value &&
+                   after.current.cursorPos > before.current.cursorPos &&
+                   after.*scroll > before.*scroll);
+            assert(!trail->visible());
+            tickCursorTimers(2ms);
+            assert(trail->visible() && caret->visible());
+        };
+        const std::string longLine(60, 'i');
+        scrollFixture(false, longLine);
+        verifyNavigationScroll(XKB_KEY_Right, &Input::EditingState::scrollX);
+        const auto insertion = input.cursorPosition();
+        const auto editedLine = longLine.substr(0, insertion) + 'x' + longLine.substr(insertion);
+        key(XKB_KEY_x, 'x');
+        assert(!trail->visible());
+        input.layout(renderer);
+        assert(input.cursorPosition() == insertion + 1 && input.value() == editedLine);
+        tickCursorTimers(15ms);
+        assert(!trail->visible());
+
+        key(XKB_KEY_Right);
+        tickCursorTimers(2ms);
+        assert(trail->visible());
+        key(XKB_KEY_BackSpace);
+        assert(!trail->visible());
+        input.layout(renderer);
+        assert(input.cursorPosition() == insertion + 1 &&
+               input.value() == editedLine.substr(0, insertion + 1) + editedLine.substr(insertion + 2));
+        tickCursorTimers(15ms);
+        assert(!trail->visible());
+
+        scrollFixture(true, "ii\nii\nii\nii\nii\nii");
+        verifyNavigationScroll(XKB_KEY_Down, &Input::EditingState::scrollY);
+        const auto beforeWheel = input.editingState();
+        input.restoreEditingState(beforeWheel);
+        input.layout(renderer);
+        assert(!trail->visible());
+        assert(dispatcher.pointerAxis(30, 20, WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                      WL_POINTER_AXIS_SOURCE_WHEEL, -15, 0, -120, -1.F));
+        input.layout(renderer);
+        const auto wheeled = input.editingState();
+        assert(wheeled.current == beforeWheel.current && wheeled.scrollY < beforeWheel.scrollY);
+        tickCursorTimers(15ms);
+        assert(!trail->visible());
         focus.setFocus(nullptr);
         focus.setSceneRoot(nullptr);
         MotionService::instance().setEnabled(motion);
@@ -1384,7 +1467,7 @@ void nativeCheck(bool pixelsOnly) {
         assert(moved.cursorRectX != beforeMove.cursorRectX ||
                moved.cursorRectY != beforeMove.cursorRectY);
         float x = 0, y = 0;
-        Node::mapToScene(viewport, caret->x() + caret->width() / 2,
+        Node::mapToScene(viewport, caret->x() + caret->width() / 4,
                          caret->y() + caret->height() / 2, x, y);
         assert(Node::hitTest(&input, x, y) == input.inputArea());
         tickCursorTimers(425ms);
@@ -1402,6 +1485,14 @@ void nativeCheck(bool pixelsOnly) {
         --selected.current.selectionAnchor;
         input.restoreEditingState(selected, true);
         assert(!trail->visible() && !caret->visible());
+
+        placeAtStart();
+        assert(dispatcher.pointerButton(x, y, BTN_LEFT, true, 1, 1000, false));
+        assert(dispatcher.pointerButton(x, y, BTN_LEFT, false, 2, 1010, false));
+        assert(input.cursorPosition() < start.current.cursorPos &&
+               input.cursorPosition() == input.selectionAnchor());
+        tickCursorTimers(2ms);
+        assert(trail->visible() && caret->visible());
 
         const TextInputEdit hiddenCaret{.commitText = {},
                                         .preeditText = "猫",

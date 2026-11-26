@@ -370,7 +370,7 @@ private:
   input_caret::Corners m_trailCorners{};
   std::optional<LayoutRect> m_trailTarget;
   LayoutRect m_trailPending{};
-  float m_trailCellWidth = 1.0F;
+  std::size_t m_trailCursorPos = 0;
   std::chrono::steady_clock::time_point m_trailMovedAt, m_trailSampledAt;
   Timer m_trailTimer;
   LayoutRect m_caretTrailViewport;

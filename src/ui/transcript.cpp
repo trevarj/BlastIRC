@@ -5342,10 +5342,12 @@ struct TranscriptView::Impl {
                         return true;
                 return false;
             };
+            const bool selected = keys->focused() && selectedIdentity == slot.focusIdentity;
+            const bool sourceJump = selected && sourceJumpIdentity == slot.focusIdentity;
             const bool interacting = (dispatcher && (owns(dispatcher->capturedArea()) ||
                                                      owns(dispatcher->pendingTouchPressArea()) ||
                                                      owns(dispatcher->focusedArea()))) ||
-                                     (keys->focused() && selectedIdentity == slot.focusIdentity) ||
+                                     selected ||
                                      (textDrag.armed && textDrag.owner == slot.focusIdentity);
             float finalLeft, finalTop, finalRight, finalBottom;
             Node::transformedBounds(slot.material, finalLeft, finalTop, finalRight, finalBottom);
@@ -5411,14 +5413,15 @@ struct TranscriptView::Impl {
             }
             const bool hovered =
                 dispatcher ? owns(dispatcher->hoveredArea()) : slot.area->hovered();
-            paintTextSelection(slot, textRange, top, bottom, hovered);
-            const auto normal = row.bodyInk[hovered];
+            const bool highlighted = hovered || (selected && !sourceJump);
+            paintTextSelection(slot, textRange, top, bottom, highlighted);
+            const auto normal = row.bodyInk[highlighted];
             if (slot.preview)
-                slot.preview->setBackdrop(row.backdrop[hovered]);
+                slot.preview->setBackdrop(row.backdrop[highlighted]);
             for (const auto &text : slot.text)
-                text.node->setColor(text.color[hovered].value_or(normal));
+                text.node->setColor(text.color[highlighted].value_or(normal));
             for (auto &[label, ink] : slot.labelInk)
-                label->setColor(ink[hovered]);
+                label->setColor(ink[highlighted]);
             if (slot.actionMarker)
                 slot.actionMarker->setTint(slot.leadingNick->color());
             if (slot.nickChip) {
@@ -5444,12 +5447,12 @@ struct TranscriptView::Impl {
                 slot.avatarInitial->setColor(
                     nickColor(model, entry.nick, sourceServer(*buffer, entry)));
             if (slot.channelTime)
-                slot.channelTime->setColor(row.metadataInk[hovered]);
+                slot.channelTime->setColor(row.metadataInk[highlighted]);
             if (slot.bubbleTime)
-                slot.bubbleTime->setColor(entry.own && !entry.action ? normal
-                                                                     : row.metadataInk[hovered]);
+                slot.bubbleTime->setColor(
+                    entry.own && !entry.action ? normal : row.metadataInk[highlighted]);
             const auto statusColor =
-                entry.action ? themePairedForeground(row.backdrop[hovered],
+                entry.action ? themePairedForeground(row.backdrop[highlighted],
                                                      themeForegroundColor("on_tertiary_container"))
                              : normal;
             if (slot.statusSpinner)
@@ -5495,24 +5498,27 @@ struct TranscriptView::Impl {
                                        slot.material->y() + slot.material->height() + padding) -
                                   highlightY);
             const float highlightRadius = std::min(
-                {(slot.material->visible() ? themeBubbleRadius() * .75f : g.cornerRadius) + padding,
+                {slot.material->visible() ? themeBubbleRadius() * .75f + padding : 6 * g.scale,
                  highlightWidth * .5f, highlightHeight * .5f});
             if (slot.dense) {
-                slot.dense->setVisible(typedActivity(entry) ||
-                                       (!entry.presence && (g.dense() || entry.action || hovered)));
-                slot.dense->setPosition(hovered ? highlightX : slot.material->x(),
-                                        hovered ? highlightY : slot.material->y());
-                slot.dense->setSize(hovered ? highlightWidth : contentWidth,
-                                    hovered ? highlightHeight : slot.material->height());
+                slot.dense->setVisible(
+                    typedActivity(entry) ||
+                    (!entry.presence && (g.dense() || entry.action || highlighted)));
+                slot.dense->setPosition(highlighted ? highlightX : slot.material->x(),
+                                        highlighted ? highlightY : slot.material->y());
+                slot.dense->setSize(highlighted ? highlightWidth : contentWidth,
+                                    highlighted ? highlightHeight : slot.material->height());
                 RoundedRectStyle denseStyle{};
-                denseStyle.fill = denseBackground(entry, hovered);
-                denseStyle.radius = hovered ? highlightRadius
-                                            : std::min({g.cornerRadius, slot.dense->width() * .5f,
-                                                        slot.dense->height() * .5f});
+                denseStyle.fill = denseBackground(entry, highlighted);
+                denseStyle.radius = highlighted
+                                        ? highlightRadius
+                                        : std::min({g.cornerRadius, slot.dense->width() * .5f,
+                                                    slot.dense->height() * .5f});
                 slot.dense->setStyle(denseStyle);
             } else {
                 slot.material->setMessage(
-                    themeSurfaceFill(themeMessageBackground(entry.own, false, hovered)), hovered);
+                    themeSurfaceFill(themeMessageBackground(entry.own, false, highlighted)),
+                    highlighted);
             }
             slot.material->sync();
             float l, t, r, b;
@@ -5539,9 +5545,7 @@ struct TranscriptView::Impl {
                     slot.statusSpinner->stop();
             }
             const bool focused =
-                inViewport && !slot.flight &&
-                (nativeFocus(*slot.area) ||
-                 (keys->focused() && cache->rows[slot.index].focusIdentity == selectedIdentity));
+                inViewport && !slot.flight && (nativeFocus(*slot.area) || sourceJump);
             slot.focusRing->setVisible(focused);
             if (focused) {
                 slot.focusRing->setPosition(highlightX, highlightY);

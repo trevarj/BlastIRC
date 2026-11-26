@@ -128,7 +128,7 @@ Bubbles keep separate surfaces for every message, with tighter spacing within a 
 
 Center nick-pill text using cached visible glyph coverage rather than the font strut, preserving rich-text shadow offsets. Align sprite avatars by their body center while reserving the full sprite footprint so fuses and accessories remain unclipped.
 
-Use the smaller local theme radius for message-area chips, reactions, reply/media cards and dense highlights, and 75% of the theme bubble radius for conversation bubbles. Clamp radii to the painted bounds. Hover changes a bubble's own surface without enlarging it. Dense message highlights keep a small UI-scaled outer gap. Neither changes layout or text selection. Preserve circular avatars and indicators; leave shell rounding unchanged.
+Use the smaller local theme radius for message-area chips, reactions, and reply/media cards, and 75% of the theme bubble radius for conversation bubbles. Dense message highlights use a fixed six-logical-pixel radius and a small UI-scaled outer gap. Hover and previous/next message selection use the same highlight; Tab focus and source jumps retain an outline. Bubble highlights change the existing surface without enlarging it. None of these states changes layout or text selection. Preserve circular avatars and indicators; leave shell rounding unchanged.
 
 For `/me`, place a compact eight-point tapered star and the actor’s regular-weight, message-sized nickname on the first line of the italic action text, even in the two-line layout. Long actions wrap normally. Include the star and nickname in prefix measurement, reserve the friend glyph’s space, and bound the prefix in narrow layouts.
 

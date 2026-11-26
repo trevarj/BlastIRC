@@ -10255,6 +10255,19 @@ void selectedContentGeometry(TranscriptTestRenderer &renderer) {
                         self(self, *child);
                 };
                 inspect(inspect, rendered.content);
+                near(highlight->style().radius.tl, 6 * model.settings.scale);
+                const auto hoverStyle = highlight->style();
+                const auto hoverBounds = sceneBounds(*highlight);
+                const int direction = i ? -1 : 1;
+                dispatcher.pointerLeave();
+                assert(view.navigateMessage(direction));
+                assert(view.navigateMessage(-direction));
+                view.arrange(renderer, viewport);
+                assert(highlight->style().fill == hoverStyle.fill);
+                nearRadii(highlight->style().radius, hoverStyle.radius);
+                containedBounds(sceneBounds(*highlight), hoverBounds);
+                containedBounds(hoverBounds, sceneBounds(*highlight));
+                assert(!ring->visible());
             }
         }
         // A partially visible selection keeps the material geometry, not its clipped anchor.

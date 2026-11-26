@@ -206,9 +206,10 @@ void InputDispatcher::pointerMotion(float x, float y, std::uint32_t serial) {
 }
 
 bool InputDispatcher::pointerButton(
-    float x, float y, std::uint32_t button, bool pressed, std::uint32_t serial, std::uint32_t time, bool touch
+    float x, float y, std::uint32_t button, bool pressed, std::uint32_t serial, std::uint32_t time,
+    bool touch, std::uint32_t modifiers
 ) {
-  return pointerButton(x, y, button, pressed, serial, time, touch, nullptr);
+  return pointerButton(x, y, button, pressed, serial, time, touch, modifiers, nullptr);
 }
 
 bool InputDispatcher::replayTouchPress(const TouchScrollGesture& gesture, bool retainReleaseOnFailure) {
@@ -218,7 +219,7 @@ bool InputDispatcher::replayTouchPress(const TouchScrollGesture& gesture, bool r
   // Keep the tracked identity live across focus callbacks inside native press dispatch.
   m_touchGesture = gesture;
   pointerButton(
-      gesture.pressX, gesture.pressY, gesture.button, true, gesture.serial, gesture.time, false, gesture.originalArea
+      gesture.pressX, gesture.pressY, gesture.button, true, gesture.serial, gesture.time, false, 0, gesture.originalArea
   );
   const bool ownsReplay = m_touchGesture.pending
       && (m_touchGesture.originalArea == gesture.originalArea || m_touchGesture.originalArea == nullptr);
@@ -238,7 +239,7 @@ bool InputDispatcher::replayTouchPress(const TouchScrollGesture& gesture, bool r
 
 bool InputDispatcher::pointerButton(
     float x, float y, std::uint32_t button, bool pressed, std::uint32_t serial, std::uint32_t time,
-    bool touch, InputArea* expectedArea
+    bool touch, std::uint32_t modifiers, InputArea* expectedArea
 ) {
   bool passiveRelease = false;
   const bool trackingTouch = expectedArea == nullptr && (m_touchGesture.pending || m_touchGesture.passivePress);
@@ -372,7 +373,7 @@ bool InputDispatcher::pointerButton(
       m_capturedArea = target;
       trackArea(target);
     }
-    target->dispatchPress(localX, localY, button, pressed, x, y, serial, time);
+    target->dispatchPress(localX, localY, button, pressed, x, y, serial, time, modifiers);
     if (pressed) {
       if (m_capturedArea == nullptr) {
         updateHover(x, y, m_lastSerial);

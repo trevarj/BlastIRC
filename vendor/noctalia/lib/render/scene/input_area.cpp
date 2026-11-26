@@ -214,7 +214,7 @@ void InputArea::dispatchMotion(float localX, float localY) {
 
 void InputArea::dispatchPress(
     float localX, float localY, std::uint32_t button, bool isPressed, float sceneX, float sceneY, std::uint32_t serial,
-    std::uint32_t time
+    std::uint32_t time, std::uint32_t modifiers
 ) {
   const PointerData data{
       .localX = localX,
@@ -224,6 +224,7 @@ void InputArea::dispatchPress(
       .serial = serial,
       .time = time,
       .button = button,
+      .modifiers = modifiers,
       .pressed = isPressed,
   };
   if (isPressed) {
@@ -233,6 +234,7 @@ void InputArea::dispatchPress(
     m_pressedSceneY = sceneY;
     m_pressedSerial = serial;
     m_pressedTime = time;
+    m_pressedModifiers = modifiers;
     if (m_onPress) {
       m_onPress(data);
     }
@@ -267,6 +269,7 @@ void InputArea::dispatchPress(
       clickData.sceneY = m_pressedSceneY;
       clickData.serial = m_pressedSerial;
       clickData.time = m_pressedTime;
+      clickData.modifiers = m_pressedModifiers;
       m_onClick(clickData);
     }
   }

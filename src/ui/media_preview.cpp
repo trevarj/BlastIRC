@@ -1235,12 +1235,13 @@ struct MediaPreviewCard::Impl {
         thumbnailAction->setFocusable(true);
         thumbnailAction->setTabStop(true);
         thumbnailAction->setAcceptedButtons(InputArea::buttonMask({BTN_LEFT, BTN_RIGHT}));
-        thumbnailAction->setTooltip("Open preview; right-click for Info and Copy Link");
+        thumbnailAction->setTooltip(
+            "Open preview; Ctrl+click to open externally; right-click for Info and Copy Link");
         thumbnailAction->setOnClick([this](const auto &pointer) {
             if (pointer.button == BTN_RIGHT)
                 menu(pointer);
             else
-                activate();
+                activate(pointer.button == BTN_LEFT && (pointer.modifiers & KeyMod::Ctrl));
         });
         thumbnailAction->setOnKeyDown([this](const auto &key) {
             if (key.preedit)
@@ -1284,9 +1285,14 @@ struct MediaPreviewCard::Impl {
         const auto entry = state.entries.find(message);
         return entry != state.entries.end() && state.mode(entry->second.kind) != PreviewMode::Off;
     }
-    void activate() {
-        if (readable(id))
-            controller.impl_->activate(id);
+    void activate(bool external = false) {
+        const auto message = id;
+        if (!readable(message))
+            return;
+        if (!external)
+            controller.impl_->activate(message);
+        else if (openLink)
+            openLink(controller.impl_->entries.at(message).original, message);
     }
     void menu(std::optional<InputArea::PointerData> pointer) {
         if (!readable(id))

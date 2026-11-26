@@ -30,6 +30,7 @@ public:
     std::uint32_t serial = 0;
     std::uint32_t time = 0;
     std::uint32_t button = 0;
+    std::uint32_t modifiers = 0;
     std::uint32_t axis = 0;
     std::uint32_t axisSource = 0;
     bool pressed = false;
@@ -196,7 +197,7 @@ public:
   void dispatchMotion(float localX, float localY);
   void dispatchPress(
       float localX, float localY, std::uint32_t button, bool isPressed, float sceneX = 0.0F, float sceneY = 0.0F,
-      std::uint32_t serial = 0, std::uint32_t time = 0
+      std::uint32_t serial = 0, std::uint32_t time = 0, std::uint32_t modifiers = 0
   );
   void dispatchCancel();
   bool dispatchAxis(
@@ -244,6 +245,7 @@ private:
   float m_pressedSceneY = 0.0F;
   std::uint32_t m_pressedSerial = 0;
   std::uint32_t m_pressedTime = 0;
+  std::uint32_t m_pressedModifiers = 0;
   // Detent-unit scroll accumulators, indexed by wl_pointer axis (vertical, horizontal).
   std::array<float, 2> m_scrollStepAccum{};
   // When the last step was delivered on each axis, and in which direction (0 = none this

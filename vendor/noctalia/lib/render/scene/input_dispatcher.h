@@ -41,7 +41,8 @@ public:
   void syncPointerHover();
   // Returns true if the event was consumed by a scene widget
   bool pointerButton(
-      float x, float y, std::uint32_t button, bool pressed, std::uint32_t serial, std::uint32_t time, bool touch
+      float x, float y, std::uint32_t button, bool pressed, std::uint32_t serial, std::uint32_t time,
+      bool touch, std::uint32_t modifiers = 0
   );
   bool pointerAxis(
       float x, float y, std::uint32_t axis, std::uint32_t axisSource, double value, std::int32_t discrete,
@@ -75,7 +76,7 @@ public:
 private:
   bool pointerButton(
       float x, float y, std::uint32_t button, bool pressed, std::uint32_t serial, std::uint32_t time,
-      bool touch, InputArea* expectedArea
+      bool touch, std::uint32_t modifiers, InputArea* expectedArea
   );
   InputArea* findInputAreaAt(float x, float y);
   bool isAttachedToScene(const InputArea* area) const;

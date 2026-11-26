@@ -390,7 +390,7 @@ int main(int argc, char **argv) {
                 break;
             case PointerEvent::Type::Button:
                 input.pointerButton(x, y, event.button, event.pressed, event.serial, event.time,
-                                    event.touch);
+                                    event.touch, event.touch ? 0 : connection.keyboardModifiers());
                 break;
             case PointerEvent::Type::Axis:
                 input.pointerAxis(x, y, event.axis, event.axisSource, event.axisValue,

@@ -729,6 +729,7 @@ void htmlThumbnailConsumers(Certificate &certificate, const std::string &body) {
         });
         const unsigned requests = scenario == "suffix" ? 3 : missing || denied || click ? 1 : 2;
         assert(server.requests == requests && !controller.active());
+        unsigned opened = 0;
         if (valid) {
             assert(controller.ready(17) && controller.error(17).empty());
             assert(controller.measure(renderer, 17, 400, 1) > 0);
@@ -740,6 +741,20 @@ void htmlThumbnailConsumers(Certificate &certificate, const std::string &body) {
             assert(!visibleLabelWithText(*view, url) && !controller.replacesUrl(17));
             assert(visibleLabelWithText(*view, server.endpoint.substr(8)));
             assert(bool(visibleLabelWithText(*view, "Thumbnail page")) == !untitled);
+            view->setOpenLink([&](std::string original, std::uint64_t message) {
+                assert(original == url && original != server.endpoint + "/thumb.png" &&
+                       message == 17);
+                ++opened;
+            });
+            auto *area = firstArea(*view);
+            assert(area && dispatcher.inputAreaAt(10, 10) == area);
+            area->dispatchPress(10, 10, BTN_LEFT, true, 10, 10, 1, 0, KeyMod::Ctrl);
+            area->dispatchPress(10, 10, BTN_LEFT, false, 10, 10, 1);
+            assert(opened == 1 && !controller.active() && server.requests == requests);
+            area->dispatchPress(10, 10, BTN_LEFT, true, 10, 10, 1);
+            area->dispatchPress(10, 10, BTN_LEFT, false, 10, 10, 1);
+            assert(opened == 1 && controller.active() && server.requests == requests);
+            controller.close();
         } else if (upload) {
             assert(controller.ready(17) && controller.error(17).empty());
             assert(view->measure(renderer, 400, 1) > 0); // CPU pixels alone are insufficient.
@@ -1055,17 +1070,23 @@ void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     root.layout(renderer);
     auto *area = firstArea(*view);
     assert(area && area->focusable() && area->tabStop());
-    auto rightClick = [&] {
-        area->dispatchPress(10, 10, BTN_RIGHT, true, 10, 10, 1);
+    auto leftClick = [&](std::uint32_t modifiers = 0) {
+        area->dispatchPress(10, 10, BTN_LEFT, true, 10, 10, 1, 0, modifiers);
+        area->dispatchPress(10, 10, BTN_LEFT, false, 10, 10, 1);
+    };
+    leftClick(KeyMod::Ctrl);
+    assert(opened == 1 && !controller.active() && !controller.ready(42) && server.requests == 0);
+    auto rightClick = [&](std::uint32_t modifiers = 0) {
+        area->dispatchPress(10, 10, BTN_RIGHT, true, 10, 10, 1, 0, modifiers);
         area->dispatchPress(10, 10, BTN_RIGHT, false, 10, 10, 1);
         assert(menu.opened);
     };
     rightClick();
     menu.choose("Copy Link");
     assert(clipboard.text == url && server.requests == 0);
-    rightClick();
+    rightClick(KeyMod::Ctrl);
     menu.choose("Open Link");
-    assert(opened == 1 && server.requests == 0 && !controller.active());
+    assert(opened == 2 && server.requests == 0 && !controller.active());
     rightClick();
     menu.choose("Info");
     auto *info = infoInput(root);
@@ -1143,9 +1164,8 @@ void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     checkCaption(renderer, *view, url, 120);
     auto *thumbnail = previewImage(*view);
     assert(thumbnail && thumbnail->visible() && thumbnail->hasImage());
-    area->dispatchPress(10, 10, BTN_LEFT, true, 10, 10, 1);
-    area->dispatchPress(10, 10, BTN_LEFT, false, 10, 10, 1);
-    assert(controller.active() && controller.ready(42) && server.requests == 1);
+    leftClick();
+    assert(opened == 2 && controller.active() && controller.ready(42) && server.requests == 1);
     controller.close();
     rightClick();
     menu.choose("Info");
@@ -1217,11 +1237,16 @@ void thumbnailConsumers(Certificate &certificate, const std::string &body) {
     area->dispatchKey(XKB_KEY_Return, 0, 0, true);
     assert(!controller.active() && view->measure(renderer, 400, 1) == 0);
     view->bind(42, url, true);
-    area->dispatchPress(10, 10, BTN_LEFT, true, 10, 10, 1);
-    area->dispatchPress(10, 10, BTN_LEFT, false, 10, 10, 1);
+    leftClick();
     assert(!controller.active() && view->measure(renderer, 400, 1) == 0 && server.requests == 2);
+    view->bind(42, url, true);
+    leftClick(KeyMod::Ctrl);
+    assert(opened == 2 && !controller.active() && view->measure(renderer, 400, 1) == 0);
     liveReadable = true;
+    view->bind(42, url, true);
     model.settings.imagePreviews = PreviewMode::Off;
+    leftClick(KeyMod::Ctrl);
+    assert(opened == 2 && !controller.active() && view->measure(renderer, 400, 1) == 0);
     controller.update(800, 600, 1);
     view->bind(42, url, true);
     assert(view->measure(renderer, 400, 1) == 0 && !controller.replacesUrl(42));

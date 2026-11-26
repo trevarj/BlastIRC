@@ -5504,7 +5504,10 @@ void messageLinkEnter(TranscriptTestRenderer &renderer) {
     blast::PaneState pane{.id = 1, .buffer = buffer.id, .reply = "untouched-reply"};
     Clipboard clipboard;
     MenuHost host;
+    Node overlay;
+    blast::MediaPreviewController controller(model, overlay);
     blast::TranscriptView view(model, pane, clipboard, [](auto) {}, [](auto) {});
+    view.setMediaPreviewController(&controller);
     view.setPopupContext(&host);
     view.setReadEligible(false);
     InputDispatcher dispatcher;
@@ -5590,6 +5593,29 @@ void messageLinkEnter(TranscriptTestRenderer &renderer) {
     dispatcher.keyEvent(XKB_KEY_Return, 0, 0, true);
     dispatcher.keyEvent(XKB_KEY_Return, 0, 0, false);
     opened("https://example.org/one"); // The native focused-link action still opens directly.
+
+    model.settings.previewAllowLocal = true;
+    constexpr std::string_view imageUrl = "https://127.0.0.1:1/image.png?size=full#original";
+    buffer.messages.front().text = imageUrl;
+    ++buffer.messagesRevision;
+    arrange();
+    const auto image = body(view, imageUrl);
+    assert(image.fragment.tabFocusKey().find(imageUrl) != std::string_view::npos);
+    const auto clickImage = [&](std::uint32_t serial, std::uint32_t modifiers) {
+        float x, y;
+        Node::mapToScene(&image.fragment, image.fragment.width() * .5f,
+                         image.fragment.height() * .5f, x, y);
+        assert(dispatcher.pointerButton(x, y, BTN_LEFT, true, serial, serial * 500, false,
+                                        modifiers));
+        assert(dispatcher.pointerButton(x, y, BTN_LEFT, false, serial + 1, serial * 500 + 10,
+                                        false));
+    };
+    clickImage(10, KeyMod::Ctrl);
+    opened(imageUrl);
+    assert(!controller.active());
+    clickImage(12, 0);
+    assert(controller.active() && !std::filesystem::exists(record));
+    controller.close();
 
     buffer.messages.front().text =
         "LinkBody \x02https://example.org/one\x02 and https://example.org/two "

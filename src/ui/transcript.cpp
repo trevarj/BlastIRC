@@ -5134,9 +5134,10 @@ struct TranscriptView::Impl {
                     if (!guard.expired())
                         cancelTextDrag(identity);
                 });
-                area->setOnClick([this, identity, url = fragment.url](const auto &) {
+                area->setOnClick([this, identity, url = fragment.url](const auto &pointer) {
                     if (!consumeSelectionClick(identity))
-                        launch(url, identity);
+                        launch(url, identity,
+                               pointer.button != BTN_LEFT || !(pointer.modifiers & KeyMod::Ctrl));
                 });
                 area->setOnKeyDown([this, identity, url = fragment.url](const auto &key) {
                     if (key.sym == XKB_KEY_Return || key.sym == XKB_KEY_space)

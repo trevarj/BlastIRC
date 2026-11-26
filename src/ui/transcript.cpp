@@ -761,15 +761,13 @@ struct Geometry {
     float authorAvatarInset() const {
         return bubbles && tight && avatars ? (metrics.avatarSize + 2) * scale : 0;
     }
-    float compactAvatarSize(bool inlineLayout) const {
-        return channel && avatars ? (inlineLayout ? 20 : 34) * scale : 0;
-    }
-    float compactAvatarInset(bool inlineLayout) const {
-        const float size = compactAvatarSize(inlineLayout);
+    float compactAvatarSize() const { return channel && avatars ? 20 * scale : 0; }
+    float compactAvatarInset() const {
+        const float size = compactAvatarSize();
         return size > 0 ? size + 6 * scale : 0;
     }
     float stackedAvatarY(float prefixHeight) const {
-        return std::max(0.f, (prefixHeight + bodyLine - compactAvatarSize(false)) * .5f);
+        return std::max(0.f, (prefixHeight - compactAvatarSize()) * .5f);
     }
     float channelNickWidth(bool clockVisible) const {
         return std::max(1.f, nickGutter -
@@ -778,14 +776,14 @@ struct Geometry {
     float ownLabelExtent(const Message &entry, bool clockVisible, float friendExtent) const {
         const float extent = ownLabelWidth + 4 * scale;
         return ownLabelWidth > 0 && entry.own && !entry.action && !entry.presence &&
-                       extent + compactAvatarInset(false) + friendExtent + metadataFont <=
+                       extent + compactAvatarInset() + friendExtent + metadataFont <=
                            channelNickWidth(clockVisible)
                    ? extent
                    : 0;
     }
     float prefixWidth(bool presence) const {
         return presence  ? timeGutter
-               : channel ? (inlineChannel ? channelPrefix() : compactAvatarInset(false))
+               : channel ? (inlineChannel ? channelPrefix() : compactAvatarInset())
                : dense() ? timeGutter
                          : 0;
     }
@@ -909,7 +907,7 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
     result.unread = std::max(30 * result.scale, result.header + 10 * result.scale);
     if (result.channel) {
         const float available = std::max(1.f, width - result.sideInsets(false));
-        const float nickAdornment = result.compactAvatarInset(true) + 2 * result.chipPadding();
+        const float nickAdornment = result.compactAvatarInset() + 2 * result.chipPadding();
         auto actorFont = themeUiFont();
         actorFont.weight = FontWeight::Bold;
         const float preferredNick =
@@ -4003,7 +4001,7 @@ struct TranscriptView::Impl {
         row.prefixWidth = notice ? 0 : g.prefixWidth(entry.presence);
         float availableBody = activityBodyWidth(row, entry, g, c.width);
         if (stackedEmote) {
-            const float prefix = g.compactAvatarInset(false) + (row.showClock ? g.timeGutter : 0);
+            const float prefix = g.compactAvatarInset() + (row.showClock ? g.timeGutter : 0);
             availableBody = std::max(1.f, availableBody + row.prefixWidth - prefix);
             row.prefixWidth = prefix;
         }
@@ -4225,10 +4223,9 @@ struct TranscriptView::Impl {
             };
             if (!stackedEmote && g.nickVisible(row.grouped, entry.presence)) {
                 const auto align = g.inlineChannel ? TextAlign::End : TextAlign::Start;
-                const float nickWidth =
-                    std::max(1.f, g.channelNickWidth(row.showClock) -
-                                      g.compactAvatarInset(g.inlineChannel) - friendExtent -
-                                      ownLabel - (g.ownNickPill(entry) ? 2 * g.chipPadding() : 0));
+                const float nickWidth = std::max(
+                    1.f, g.channelNickWidth(row.showClock) - g.compactAvatarInset() - friendExtent -
+                             ownLabel - (g.ownNickPill(entry) ? 2 * g.chipPadding() : 0));
                 const float marker = emote ? g.actionMarkerWidth(nickWidth) : 0;
                 include(entry.nick, nickWidth - marker, align, true);
                 if (ownLabel > 0)
@@ -4251,8 +4248,8 @@ struct TranscriptView::Impl {
                 row.prefixHeight =
                     std::max(row.prefixHeight, g.metadataHeader + 2 * g.chipPaddingY());
             if (g.inlineChannel && g.nickVisible(row.grouped, entry.presence) &&
-                g.compactAvatarSize(true) > 0) {
-                const float size = g.compactAvatarSize(true);
+                g.compactAvatarSize() > 0) {
+                const float size = g.compactAvatarSize();
                 const float center = avatarBodyCenter(buffer, entry);
                 const float offset = entry.own && !entry.action
                                          ? 0
@@ -4285,7 +4282,7 @@ struct TranscriptView::Impl {
         if (!collapsed && ((g.channel && !entry.presence) || (entry.presence && row.showClock)))
             bodyEnd = std::max(bodyEnd, row.prefixBaseline - row.prefixAscent + row.prefixHeight);
         if (stackedEmote)
-            bodyEnd = std::max(bodyEnd, row.bodyOffset + g.compactAvatarSize(false));
+            bodyEnd = std::max(bodyEnd, row.bodyOffset + g.compactAvatarSize());
         row.selectionWidth = row.contentWidth;
         if (!g.bubbles && !entry.presence) {
             row.selectionWidth = layout.width;
@@ -4295,7 +4292,7 @@ struct TranscriptView::Impl {
             if (g.channel && !g.inlineChannel && !stackedEmote) {
                 float metadataWidth = 0;
                 if (g.nickVisible(row.grouped, entry.presence)) {
-                    const float adornments = g.compactAvatarInset(false) + friendExtent;
+                    const float adornments = g.compactAvatarInset() + friendExtent;
                     const float textLimit =
                         std::max(1.f, g.channelNickWidth(row.showClock) - adornments - ownLabel);
                     auto actorFont = themeUiFont();
@@ -4336,9 +4333,9 @@ struct TranscriptView::Impl {
             bodyEnd += g.reaction;
         row.contentEnd = bodyEnd;
         if (!collapsed && g.stackedPrefix(row.grouped, entry.presence) && g.avatars)
-            bodyEnd = std::max(bodyEnd, row.prefixBaseline - row.prefixAscent +
-                                            g.stackedAvatarY(row.prefixHeight) +
-                                            g.compactAvatarSize(false));
+            bodyEnd =
+                std::max(bodyEnd, row.prefixBaseline - row.prefixAscent +
+                                      g.stackedAvatarY(row.prefixHeight) + g.compactAvatarSize());
         const float footer =
             g.footerVisible(entry, row.showClock) ? row.footerHeight + g.footerGap() : 0;
         row.height = bodyEnd + footer + paddingY;
@@ -4757,8 +4754,8 @@ struct TranscriptView::Impl {
                             nickMenu(buffer, nick, {}, identity);
                         }
                     });
-                    const float avatarSize = g.compactAvatarSize(g.inlineChannel);
-                    const float avatarInset = g.compactAvatarInset(g.inlineChannel);
+                    const float avatarSize = g.compactAvatarSize();
+                    const float avatarInset = g.compactAvatarInset();
                     const bool ownPill = g.ownNickPill(entry);
                     const float chipPadding = ownPill ? g.chipPadding() : 0;
                     const float available = width - avatarInset - 2 * chipPadding - friendExtent;
@@ -4898,7 +4895,7 @@ struct TranscriptView::Impl {
             const auto ink = senderInk(entry);
             if (stackedEmote && g.avatars)
                 avatar(renderer, slot, entry, surfaceX + (row.showClock ? g.timeGutter : 0),
-                       row.bodyOffset, g.compactAvatarSize(false));
+                       row.bodyOffset, g.compactAvatarSize());
             const float left = x - row.emotePrefix + g.authorAvatarInset();
             const float available = row.emotePrefix - g.authorAvatarInset() - friendExtent -
                                     8 * g.scale;
@@ -6530,8 +6527,7 @@ struct TranscriptView::Impl {
             std::max(0.f, trayWidth - dotsWidth - (reserveOverflow ? overflowWidth + textGap : 0)),
             fullPhraseWidth));
         float phraseReserve = phraseWidth + dotsWidth;
-        const float avatarSize =
-            g.bubbles ? g.metrics.avatarSize * g.scale : g.compactAvatarSize(true);
+        const float avatarSize = g.bubbles ? g.metrics.avatarSize * g.scale : g.compactAvatarSize();
         const float avatarStep = avatarSize * .5625f;
         const float avatarGap = 8 * g.scale;
         size_t avatarCount = g.avatars ? std::min(typingParticipants.size(), size_t(3)) : 0;

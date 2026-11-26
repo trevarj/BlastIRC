@@ -935,7 +935,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 viewport.width <= 240 * zoom ||
                 model.settings.messageLayouts.at(buffer.id) == blast::MessageLayout::Stacked;
             if (stacked) {
-                const float headerX = hx + (enabled ? 40 * zoom : 0);
+                const float headerX = hx + (enabled ? (20 + 6) * zoom : 0);
                 near(labelBounds.x, headerX);
                 near(bodyBounds.x, headerX);
                 near(bodyBounds.y, hy + hit->height() + 4 * zoom);
@@ -957,7 +957,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
             }
             assert(hx >= viewport.x - .02f &&
                    hx + hit->width() <= viewport.x + viewport.width + .02f);
-            auto *picture = avatar(rendered, (stacked ? 34 : 20) * zoom);
+            auto *picture = avatar(rendered, 20 * zoom);
             assert(bool(picture) == enabled);
             if (picture) {
                 float ax, ay;
@@ -969,8 +969,8 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 assert(ax + picture->width() <= labelX + .02f);
                 assert(labelX - ax - picture->width() <= 20 * zoom + .02f);
                 if (stacked) {
-                    assert(ay >= hy - .02f && ay <= bodyBounds.y + .02f);
-                    assert(ay + picture->height() > bodyBounds.y + 3 * zoom);
+                    near(ay, hy + std::max(0.f, (hit->height() - picture->height()) * .5f));
+                    assert(ay + picture->height() <= bodyBounds.y + .02f);
                     const auto rowBounds = sceneBounds(rendered.row);
                     assert(ay + picture->height() <= rowBounds.y + rowBounds.height + .02f);
                 } else {
@@ -1078,7 +1078,7 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
     assert(scroll && scroll->maxScrollOffset() > 0);
     scroll->setScrollOffset(scroll->maxScrollOffset());
     arrange();
-    assert(avatar(body(view, "DecorationBody79", true), 34 * zoom));
+    assert(avatar(body(view, "DecorationBody79", true), 20 * zoom));
     scroll->setScrollOffset(0);
     arrange();
     geometry(true, true);

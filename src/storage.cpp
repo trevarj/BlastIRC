@@ -945,6 +945,7 @@ void parseSettings(const toml::table &document, Settings &settings) {
         field(*row, "enabled", settings.sound);
         field(*row, "master_volume", settings.masterVolume);
         field(*row, "pitch_variation", settings.pitchVariation);
+        exactField(*row, "typing_sounds", settings.typingSounds);
         if (const auto *cues = table(*row, "cues")) {
             for (const auto &[name, value] : *cues) {
                 const auto *cue = value.as_table();
@@ -1198,6 +1199,7 @@ toml::table settingsDocument(const Settings &settings) {
         {"audio", toml::table{{"enabled", settings.sound},
                               {"master_volume", settings.masterVolume},
                               {"pitch_variation", settings.pitchVariation},
+                              {"typing_sounds", settings.typingSounds},
                               {"cues", std::move(cues)}}},
         {"presence",
          toml::table{{"mode", presenceName(settings.presence)}, {"channels", std::move(channels)}}},

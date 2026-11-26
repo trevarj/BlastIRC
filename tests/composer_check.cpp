@@ -999,6 +999,129 @@ void checkComposerEditingCommands(Renderer &renderer) {
     assert(!editors.handleCompositionKey(0x732b, 0x732b, 0, true, false, model.settings.bindings));
     assert(input->editingStateMatches(composing));
     input->textInputResetPreedit();
+    const auto key = [&](std::uint32_t sym, std::uint32_t utf32 = 0, std::uint32_t modifiers = 0) {
+        input->inputArea()->dispatchKey(sym, utf32, modifiers, true);
+        input->inputArea()->dispatchKey(sym, 0, modifiers, false);
+        frame();
+    };
+    reset("", 0, 0);
+    key(XKB_KEY_a, 'a');
+    assert(input->value() == "a" && !model.typingSoundPending);
+    model.settings.typingSounds = true;
+    model.settings.reducedMotion = true;
+    key(XKB_KEY_space, ' ');
+    assert(input->value() == "a " &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    key(XKB_KEY_BackSpace);
+    assert(input->value() == "a" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::DeleteCharacter);
+    key(XKB_KEY_b, 'b');
+    assert(input->value() == "ab" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Character);
+    key(XKB_KEY_Home);
+    assert(input->cursorPosition() == 0 && !model.typingSoundPending);
+    key(XKB_KEY_BackSpace);
+    assert(input->value() == "ab" && !model.typingSoundPending);
+    key(XKB_KEY_Delete);
+    assert(input->value() == "b" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::DeleteCharacter);
+    reset("alpha beta", 0, 0);
+    key(XKB_KEY_Delete, 0, KeyMod::Ctrl);
+    assert(input->value() == " beta" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::DeleteWord);
+    execute("end-of-line");
+    key(XKB_KEY_BackSpace, 0, KeyMod::Ctrl);
+    assert(input->value() == " " &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::DeleteWord);
+    key(XKB_KEY_Delete, 0, KeyMod::Ctrl);
+    assert(input->value() == " " && !model.typingSoundPending);
+    key(XKB_KEY_u, 0, KeyMod::Ctrl);
+    assert(input->value().empty() &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::DeleteWord);
+    key(XKB_KEY_u, 0, KeyMod::Ctrl);
+    assert(!model.typingSoundPending);
+    execute("paste");
+    clipboard.deliver("draft");
+    frame();
+    assert(input->value() == "draft" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    execute("paste");
+    clipboard.deliver("");
+    frame();
+    assert(input->value() == "draft" && !model.typingSoundPending);
+    execute("newline");
+    assert(input->value() == "draft\n" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    key(XKB_KEY_Return, '\r', KeyMod::Shift);
+    assert(input->value() == "draft\n\n" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    execute("undo");
+    assert(input->value() == "draft\n" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    key(XKB_KEY_y, 0, KeyMod::Ctrl);
+    assert(input->value() == "draft\n\n" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    key(XKB_KEY_z, 0, KeyMod::Ctrl);
+    assert(input->value() == "draft\n" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    reset("draft", 5, 5);
+    execute("backward-kill-line");
+    assert(input->value().empty() &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::DeleteWord);
+    execute("backward-kill-line");
+    assert(!model.typingSoundPending);
+    execute("yank");
+    assert(input->value() == "draft" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    execute("transpose-chars");
+    assert(input->value() == "dratf" &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Character);
+    execute("select-all");
+    execute("copy");
+    assert(!model.typingSoundPending);
+    execute("cut");
+    assert(input->value().empty() &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::DeleteWord);
+    const std::string reviewed = "one\ntwo\nthree\nfour\nfive\nsix";
+    execute("paste");
+    clipboard.deliver(reviewed);
+    frame();
+    assert(input->value().empty() && !model.typingSoundPending);
+    auto *pasteInsert = composerAction(*composer, ":paste-insert");
+    assert(pasteInsert && pasteInsert->inputArea()->enabled());
+    dispatcher.setFocus(pasteInsert->inputArea());
+    activateComposerAction(*composer, ":paste-insert");
+    frame();
+    assert(input->value() == reviewed &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    editors.setOverlayHost(&root);
+    reset("/joi", 4, 4);
+    assert(editors.handleCompletionKey(XKB_KEY_Return, 0));
+    frame();
+    assert(input->value() == "/join " &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    editors.setOverlayHost(nullptr);
+
+    reset("", 0, 0);
+    input->textInputApplyEdit({.commitText = {}, .preeditText = "猫", .hasPreedit = true});
+    assert(input->composing() && !model.typingSoundPending);
+    input->textInputApplyEdit({.commitText = "猫", .preeditText = {}, .hasCommitText = true});
+    assert(input->value() == "猫" && !input->composing() &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::Character);
+    input->textInputApplyEdit(
+        {.commitText = {}, .preeditText = {}, .deleteBeforeLength = 3, .hasDelete = true});
+    assert(input->value().empty() &&
+           std::exchange(model.typingSoundPending, {}) == TypingSound::DeleteCharacter);
+    input->textInputApplyEdit(
+        {.commitText = {}, .preeditText = {}, .deleteBeforeLength = 3, .hasDelete = true});
+    assert(!model.typingSoundPending);
+    input->setWindowActive(false);
+    key(XKB_KEY_a, 'a');
+    assert(!model.typingSoundPending);
+    input->setWindowActive(true);
+    model.settings.fx = FxLevel::Off;
+    key(XKB_KEY_b, 'b');
+    assert(!model.typingSoundPending);
     reset("private draft", 13, 13);
     execute("paste");
     buffer.draft.clear();
@@ -1250,10 +1373,13 @@ void checkComposerSpellcheck(Renderer &renderer) {
            original.history->undo == originalUndo && original.history->redo == originalRedo);
     openKeyboard();
     assert(menu.entry("Spelling/the"));
+    model.settings.typingSounds = true;
     menu.select("Spelling/the");
     frame();
     assert(input->displayProjection()->text == "😀 the suffix" &&
            input->editingState().history->undo.size() == originalUndo.size() + 1);
+    assert(std::exchange(model.typingSoundPending, {}) == TypingSound::Space);
+    model.settings.typingSounds = false;
     const auto corrected = parseIrcFormatting(input->value(), foreground, background);
     const auto before = parseIrcFormatting(raw, foreground, background);
     assert(!corrected.runs.empty() && corrected.runs.back().style == before.runs.back().style);

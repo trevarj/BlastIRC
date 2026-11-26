@@ -50,6 +50,7 @@ public:
   // Paint state only. Call on buffer identity changes, pane hiding and external geometry changes.
   void resetCaretEffects();
   void setWindowActive(bool active);
+  bool windowActive() const noexcept { return m_windowActive; }
   void setAnimationManager(AnimationManager* manager) override;
   // Native wrapped logical height plus padding, floored by the same font strut for empty/nonempty text.
   float measuredMultilineHeight() const noexcept;
@@ -87,6 +88,8 @@ public:
   bool composing() const noexcept { return m_preeditBase.has_value(); }
   bool textGeometryDirty() const noexcept { return m_textMetricsDirty; }
   static bool usesTextGeometry(std::uint32_t sym) noexcept;
+  enum class KeyEdit { Character, Space, DeleteCharacter, DeleteWord };
+  void setOnKeyEdit(std::function<void(KeyEdit)> callback) { m_onKeyEdit = std::move(callback); }
   void setOnEditingStateChanged(std::function<void()> callback);
   // Runs before keyboard, clipboard, or IME insertion. Rejection changes no text/history.
   void setEditValidator(std::function<bool(std::string_view, std::string_view, bool)> validator);
@@ -195,8 +198,10 @@ private:
   };
 
   bool insertionAllowed(std::string_view text, bool preedit = false) const;
-  bool replaceTextRange(std::size_t start, std::size_t end, std::string_view text,
-                        EditCoalesceKind kind, bool preedit = false);
+  bool replaceTextRange(
+      std::size_t start, std::size_t end, std::string_view text, EditCoalesceKind kind, bool preedit = false,
+      bool* textChanged = nullptr
+  );
   bool rewriteEdit(const EditSnapshot& before, EditSnapshot& after, bool preedit) const;
   void trackPreeditRange(const EditSnapshot& before, std::size_t replacedStart, std::size_t replacedEnd);
 
@@ -390,6 +395,7 @@ private:
   std::function<bool(std::string_view, std::string_view, bool)> m_editValidator;
   std::function<void(const std::string&)> m_onSubmit;
   std::function<bool(std::uint32_t, std::uint32_t)> m_onKeyEvent;
+  std::function<void(KeyEdit)> m_onKeyEdit;
   std::function<void(const InputArea::PointerData*)> m_onContextMenu;
   std::function<void()> m_onFocusLoss;
   std::function<void()> m_onFocusGain;

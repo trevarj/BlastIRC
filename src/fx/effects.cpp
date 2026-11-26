@@ -11,12 +11,15 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <iterator>
 #include <limits>
+#include <optional>
 #include <render/backend/render_backend.h>
 #include <render/core/texture_manager.h>
 #include <render/text/cairo_text_renderer.h>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace blast {
@@ -151,8 +154,19 @@ constexpr Directive director[] = {{"kick", Effect::Kick, "boom"},
                                   {"message", Effect::None, "tick"},
                                   {"action", Effect::None, "tick"},
                                   {"notice", Effect::None, "tick"}};
-constexpr const char *clipNames[] = {"boom",   "rumble", "ding", "blip", "tick",
-                                     "whoosh", "click",  "pop",  "hush", "power_down"};
+constexpr const char *clipNames[] = {"boom",          "rumble",
+                                     "ding",          "blip",
+                                     "tick",          "whoosh",
+                                     "click",         "pop",
+                                     "hush",          "power_down",
+                                     "keytap",        "keytap_space",
+                                     "keytap_delete", "keytap_delete_word"};
+consteval std::size_t typingClipIndex(std::string_view name) {
+    const auto clip = std::ranges::find(clipNames, name);
+    if (clip == std::end(clipNames))
+        throw "unknown typing clip";
+    return clip - std::begin(clipNames);
+}
 struct NativeState {
     GLint framebuffer = 0;
     std::array<GLint, 4> viewport{}, scissor{};
@@ -366,6 +380,8 @@ struct Effects::Impl {
     std::size_t count = 0;
     MIX_Mixer *mixer = nullptr;
     std::array<MIX_Audio *, std::size(clipNames)> audio{};
+    MIX_Track *composerTrack = nullptr;
+    bool composerSoundEnabled = false;
     struct Voice {
         MIX_Track *track = nullptr;
         std::size_t directive = 0;
@@ -437,6 +453,8 @@ struct Effects::Impl {
         for (auto &v : voices)
             if (v.track)
                 MIX_DestroyTrack(v.track);
+        if (composerTrack)
+            MIX_DestroyTrack(composerTrack);
         for (auto *a : audio)
             if (a)
                 MIX_DestroyAudio(a);
@@ -514,6 +532,44 @@ struct Effects::Impl {
         MIX_SetTrackFrequencyRatio(voice->track, std::clamp(config.pitch * variation, .25f, 4.f));
         MIX_PlayTrack(voice->track, 0);
         voice->directive = index;
+    }
+    void soundTyping(TypingSound sound) {
+        MIX_Audio *clip;
+        switch (sound) {
+        case TypingSound::Character:
+            clip = audio[typingClipIndex("keytap")];
+            break;
+        case TypingSound::Space:
+            clip = audio[typingClipIndex("keytap_space")];
+            break;
+        case TypingSound::DeleteCharacter:
+            clip = audio[typingClipIndex("keytap_delete")];
+            break;
+        case TypingSound::DeleteWord:
+            clip = audio[typingClipIndex("keytap_delete_word")];
+            break;
+        default:
+            return;
+        }
+        if (!mixer || !clip)
+            return;
+        if (!composerTrack) {
+            composerTrack = MIX_CreateTrack(mixer);
+            if (!composerTrack) {
+                audioError = SDL_GetError();
+                return;
+            }
+            MIX_SetTrackGain(composerTrack, .45f);
+        }
+        if (MIX_GetTrackAudio(composerTrack) != clip) {
+            MIX_StopTrack(composerTrack, 0);
+            if (!MIX_SetTrackAudio(composerTrack, clip)) {
+                audioError = SDL_GetError();
+                return;
+            }
+        }
+        // Restart the short tap in place; a busy track never queues another tap.
+        MIX_PlayTrack(composerTrack, 0);
     }
     Particle *add(Shape shape, Vec2 position, Color tint, float life, float size) {
         if (count == particles.size())
@@ -827,6 +883,12 @@ void Effects::draw(Model &model) {
         model.status = "Audio: " + p.audioError;
         p.audioError.clear();
     }
+    const auto typingPending = std::exchange(model.typingSoundPending, std::nullopt);
+    const bool composerSound = model.settings.fx != FxLevel::Off && model.settings.sound &&
+                               model.settings.typingSounds && model.settings.masterVolume > 0;
+    if (!composerSound && p.composerSoundEnabled && p.composerTrack)
+        MIX_StopTrack(p.composerTrack, 0);
+    p.composerSoundEnabled = composerSound;
     if (model.settings.fx == FxLevel::Off) {
         p.stop();
         invalidate();
@@ -836,6 +898,8 @@ void Effects::draw(Model &model) {
     if (p.mixer)
         MIX_SetMixerGain(
             p.mixer, model.settings.sound ? std::clamp(model.settings.masterVolume, 0.f, 1.f) : 0);
+    if (composerSound && typingPending)
+        p.soundTyping(*typingPending);
     for (auto &voice : p.voices)
         if (voice.track && MIX_TrackPlaying(voice.track)) {
             const auto config = p.cue(model.settings, director[voice.directive]);

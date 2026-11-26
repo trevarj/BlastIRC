@@ -104,6 +104,80 @@ class EffectsTestAccess {
         model.now = 33;
         effects.draw(model);
         assert(playing() == 0 && p.count == 0);
+        model.effects.clear();
+        model.settings.fx = FxLevel::Full;
+        const auto drawTyping = [&](std::optional<TypingSound> tap = std::nullopt) {
+            model.now += .1;
+            model.typingSoundPending = tap;
+            effects.draw(model);
+            assert(!model.typingSoundPending && playing() == 0);
+        };
+        const auto expectSilent = [&] {
+            assert(!p.composerTrack || !MIX_TrackPlaying(p.composerTrack));
+        };
+        drawTyping(TypingSound::Character);
+        assert(!p.composerTrack);
+        model.settings.typingSounds = true;
+        model.settings.reducedMotion = true;
+        model.settings.masterVolume = .4f;
+        drawTyping();
+        assert(!p.composerTrack);
+        const std::pair<TypingSound, std::string_view> typingClips[] = {
+            {TypingSound::Character, "keytap"},
+            {TypingSound::Space, "keytap_space"},
+            {TypingSound::DeleteCharacter, "keytap_delete"},
+            {TypingSound::DeleteWord, "keytap_delete_word"},
+        };
+        MIX_Track *track = nullptr;
+        for (const auto &[sound, name] : typingClips) {
+            const auto clip = std::ranges::find(clipNames, name);
+            assert(clip != std::end(clipNames));
+            auto *audio = p.audio[clip - std::begin(clipNames)];
+            assert(audio);
+            const auto duration = MIX_AudioFramesToMS(audio, MIX_GetAudioDuration(audio));
+            assert(duration >= 20 && duration <= 50);
+            for (int i = 0; i < 2; ++i) {
+                drawTyping(sound);
+                if (!track)
+                    track = p.composerTrack;
+                assert(track && p.composerTrack == track && MIX_TrackPlaying(track));
+                assert(MIX_GetTrackAudio(track) == audio);
+                assert(MIX_GetTrackGain(track) == .45f && MIX_GetMixerGain(p.mixer) == .4f);
+                assert(MIX_GetTrackPlaybackPosition(track) == 0);
+                // Simulate an in-flight tap before either a repeat or a clip switch.
+                assert(MIX_SetTrackPlaybackPosition(track, 100));
+                assert(MIX_GetTrackPlaybackPosition(track) == 100);
+            }
+        }
+        drawTyping();
+        assert(MIX_TrackPlaying(p.composerTrack)); // Idle frames leave the tap alone.
+        model.settings.fx = FxLevel::Off;
+        drawTyping(TypingSound::Space);
+        expectSilent();
+        model.settings.fx = FxLevel::Full;
+        drawTyping();
+        expectSilent();
+        drawTyping(TypingSound::DeleteCharacter);
+        model.settings.sound = false;
+        drawTyping(TypingSound::DeleteWord);
+        expectSilent();
+        model.settings.sound = true;
+        drawTyping();
+        expectSilent();
+        drawTyping(TypingSound::DeleteWord);
+        model.settings.masterVolume = 0;
+        drawTyping(TypingSound::Character);
+        expectSilent();
+        model.settings.masterVolume = .4f;
+        drawTyping();
+        expectSilent();
+        drawTyping(TypingSound::Space);
+        model.settings.typingSounds = false;
+        drawTyping(TypingSound::DeleteCharacter);
+        expectSilent();
+        model.settings.typingSounds = true;
+        drawTyping();
+        expectSilent();
         MIX_UnlockMixer(p.mixer);
     }
 };

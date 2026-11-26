@@ -12,14 +12,21 @@ function smooth(t){t=Math.max(0,Math.min(1,t));return t*t*(3-2*t);}
 const output=path.join(path.dirname(fileURLToPath(import.meta.url)),'sfx');
 mkdirSync(output,{recursive:true});
 const ffmpeg=process.argv[2]||process.env.FFMPEG_BIN||'ffmpeg';
-const definitions={boom:1.45,rumble:2.4,ding:1.3,blip:.25,tick:.12,whoosh:.65,click:.13,pop:.3,hush:.7,power_down:1.4};
+const definitions={boom:1.45,rumble:2.4,ding:1.3,blip:.25,tick:.12,whoosh:.65,click:.13,pop:.3,hush:.7,power_down:1.4,keytap:.032,keytap_space:.036,keytap_delete:.026,keytap_delete_word:.032};
+const typing={
+    keytap:             {pitch:320,sweep:240,body:.42,damping:410,contact:.32,reverse:0},
+    keytap_space:       {pitch:265,sweep:180,body:.39,damping:365,contact:.22,reverse:0},
+    keytap_delete:      {pitch:295,sweep:195,body:.46,damping:560,contact:.30,reverse:.010},
+    keytap_delete_word: {pitch:240,sweep:160,body:.45,damping:430,contact:.27,reverse:.013},
+};
 for(const [name,duration] of Object.entries(definitions)){
+    const tap=typing[name];
     const samples=Math.ceil(duration*rate),mono=new Float64Array(samples);
-    let phase=0,filtered=0,slow=0;
+    let phase=0,filtered=0,slow=0,fast=0;
     for(let i=0;i<samples;i++){
         const t=i/rate,u=t/duration,n=noise();
         filtered+=(n-filtered)*.11;slow+=(n-slow)*.008;
-        const edge=smooth(t/.008)*(1-smooth((u-.82)/.18));
+        const edge=smooth(t/(tap ? .00045 : .008))*(1-smooth((u-.82)/.18));
         let value=0;
         switch(name){
         case 'boom':{
@@ -59,12 +66,27 @@ for(const [name,duration] of Object.entries(definitions)){
             phase+=tau*(32+230*Math.exp(-t*3.1))/rate;
             value=(Math.sin(phase)*.33+Math.sin(phase*2)*.08+slow*.12)*smooth(t/.055)*Math.exp(-t*2.1);
             break;
+        case 'keytap':
+        case 'keytap_space':
+        case 'keytap_delete':
+        case 'keytap_delete_word':
+            // A damped low knock with a much shorter, band-limited contact transient.
+            phase+=tau*(tap.pitch+tap.sweep*Math.exp(-t*820))/rate;
+            fast+=(n-fast)*.45;
+            value=Math.sin(phase)*tap.body*Math.exp(-t*tap.damping)+(fast-filtered)*tap.contact*Math.exp(-t*1150);
+            break;
         }
         mono[i]=value*edge;
     }
-    // A small stereo room adds cinematic space without clipping or harsh transients.
+    if(tap?.reverse){
+        // Reverse just the contact, not the silence that pads the clip.
+        const end=Math.ceil(tap.reverse*rate);
+        mono.subarray(0,end).reverse();
+        mono.fill(0,end);
+    }
+    // A small stereo room adds space to event cues; typing taps stay dry.
     const stereo=Buffer.alloc(samples*8);
-    const taps=name==='tick'||name==='click'?[[.021,.08]]:[[.057,.16],[.113,.10],[.193,.055],[.317,.025]];
+    const taps=tap?[]:name==='tick'||name==='click'?[[.021,.08]]:[[.057,.16],[.113,.10],[.193,.055],[.317,.025]];
     for(let i=0;i<samples;i++){
         let left=mono[i],right=mono[i]*.96;
         for(const [delay,gain] of taps){

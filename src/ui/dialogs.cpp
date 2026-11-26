@@ -110,6 +110,7 @@ std::string_view settingsAliases(std::string_view name) {
         {"Reduced motion", "animation accessibility"},
         {"Join, quit & nickname changes", "presence rows leave part events"},
         {"Smooth blink fade (ms)", "cursor blink speed"},
+        {"Typing sounds", "composer keyboard tap keypress audio space backspace delete"},
         {"Retention days (1–3650)", "scrollback keep messages"},
         {"Reset BlastIRC…", "factory reset erase all data"},
     };
@@ -2539,6 +2540,10 @@ struct Dialogs::Impl {
                        model.settings.pitchVariation = pitchIds[index];
                });
         label(*master, "Effects Off mutes event sounds; Reduced motion does not.");
+        toggle(*master, "Typing sounds", model.settings.typingSounds,
+               [this](bool value) { model.settings.typingSounds = value; });
+        label(*master, "Plays short keyboard taps for typing and edits in the composer. "
+                       "Uses Master volume; Effects Off mutes it.");
         auto *cues = section("sounds.cues", "Event cues");
         label(*cues,
               "Each event has its own switch, volume and pitch; master volume applies to all.");

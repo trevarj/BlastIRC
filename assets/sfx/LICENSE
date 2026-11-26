@@ -1,7 +1,8 @@
-BlastIRC original cinematic sound set
+BlastIRC original sound set
 
 boom.ogg, rumble.ogg, ding.ogg, blip.ogg, tick.ogg, whoosh.ogg,
-click.ogg, pop.ogg, hush.ogg, and power_down.ogg were synthesized for
+click.ogg, pop.ogg, hush.ogg, power_down.ogg, keytap.ogg, keytap_space.ogg,
+keytap_delete.ogg, and keytap_delete_word.ogg were synthesized for
 BlastIRC by assets/generate-sfx.mjs. They contain no samples, recordings,
 melodies, or other material from third parties.
 

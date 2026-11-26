@@ -112,6 +112,7 @@ struct Settings {
     string spellcheckLanguage = "auto";
     vector<string> spellcheckDictionaryPaths;
     bool wordPrediction = false;
+    bool typingSounds = false;
     string cursorShape = "line", cursorBlink = "step";
     int cursorSmoothBlinkMs = 1500;
     bool cursorTrail = false;
@@ -397,6 +398,7 @@ struct SourceJumpRequest {
     uint64_t revision = 0;
     string buffer, message;
 };
+enum class TypingSound { Character, Space, DeleteCharacter, DeleteWord };
 struct Model {
     vector<Identity> identities;
     vector<ServerConfig> servers;
@@ -411,6 +413,7 @@ struct Model {
     uint64_t spellcheckDictionaryRevision = 0;
     double now = 0;
     vector<Event> effects;
+    std::optional<TypingSound> typingSoundPending;
     vector<Action> actions;
     uint64_t settingsSaveRequest = 0;
     SettingsSaveResult settingsSaveResult;

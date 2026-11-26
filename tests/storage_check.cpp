@@ -3753,6 +3753,7 @@ int main() {
             s.cursorTrailStyle = trailStyles[index % std::size(trailStyles)];
             s.reducedMotion = true;
             s.sound = true;
+            s.typingSounds = index % 2 == 0;
             Storage storage;
             storage.save(configured);
             const string saved = contents(config / "settings.toml");
@@ -3760,6 +3761,7 @@ int main() {
             assert(document["cursor"]["trail_style"].value<string>() == s.cursorTrailStyle);
             assert(document["cursor"]["smooth_blink_ms"].value_exact<int64_t>() ==
                    s.cursorSmoothBlinkMs);
+            assert(document["audio"]["typing_sounds"].value_exact<bool>() == s.typingSounds);
             Model actual;
             storage.load(actual);
             assert(actual.settings.fx == s.fx && actual.settings.cursorShape == s.cursorShape &&
@@ -3767,9 +3769,24 @@ int main() {
                    actual.settings.cursorSmoothBlinkMs == s.cursorSmoothBlinkMs &&
                    actual.settings.cursorTrail == s.cursorTrail &&
                    actual.settings.cursorTrailStyle == s.cursorTrailStyle);
+            assert(actual.settings.typingSounds == s.typingSounds);
             assert(actual.settings.reducedMotion && actual.settings.sound &&
                    contents(config / "settings.toml") == saved &&
                    contents(config / "config.toml") == originalConfig);
+        }
+        {
+            const auto file = config / "settings.toml";
+            const string source = "[audio]\ntyping_sounds = 1\n";
+            std::ofstream(file) << source;
+            Storage storage;
+            Model actual;
+            bool failed = false;
+            try {
+                storage.load(actual);
+            } catch (const std::runtime_error &) {
+                failed = true;
+            }
+            assert(failed && contents(file) == source);
         }
         // Legacy movement modes migrate to Trail unless an explicit Trail key is present.
         struct CursorCase {
@@ -3802,6 +3819,7 @@ int main() {
                    actual.settings.cursorSmoothBlinkMs == 1500 &&
                    actual.settings.cursorTrail == test.trail &&
                    actual.settings.cursorTrailStyle == "classic" && contents(file) == source);
+            assert(!actual.settings.typingSounds);
             storage.save(actual);
             const auto saved = toml::parse_file(file.string());
             const auto cursor = saved["cursor"];

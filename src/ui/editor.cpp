@@ -391,10 +391,12 @@ struct EditorStore::Impl {
         void cycleSpelling();
         void applySpellingCycle();
         void updateSpelling();
+        bool replaceSpelling(SpellRange range, std::string_view suggestion);
         void excludeSpelling();
         bool updateNickDecoration();
         Input::DisplayProjection project(std::string_view);
         void contextMenu(const InputArea::PointerData *);
+        void playTypingSound(TypingSound sound);
         Composer(Impl &, PaneState &);
         ~Composer() override;
         Button *button(Flex &, std::string_view, std::function<void()>);
@@ -488,7 +490,8 @@ struct EditorStore::Impl {
     ui_logic::Editor editor(const Draft &) const;
     void publish(const std::string &, Draft &);
     void apply(const std::string &, Draft &, ui_logic::Editor,
-               std::optional<std::uint64_t> sourcePane, bool remember = true);
+               std::optional<std::uint64_t> sourcePane,
+               std::optional<TypingSound> sound = std::nullopt, bool remember = true);
     void capture(Composer &, bool publishChange = true);
     void refresh(const std::string &);
     void recover(const std::string &, Draft &);
@@ -542,7 +545,8 @@ void EditorStore::Impl::publish(const std::string &id, Draft &d) {
     }
 }
 void EditorStore::Impl::apply(const std::string &id, Draft &d, ui_logic::Editor e,
-                              std::optional<std::uint64_t> sourcePane, bool remember) {
+                              std::optional<std::uint64_t> sourcePane,
+                              std::optional<TypingSound> sound, bool remember) {
     const auto &before = committed(d.state);
     const bool changed = before.value != e.text;
     const bool edited =
@@ -568,6 +572,13 @@ void EditorStore::Impl::apply(const std::string &id, Draft &d, ui_logic::Editor 
     ++d.revision;
     publish(id, d);
     refresh(id);
+    if (changed && sound && sourcePane && model.settings.typingSounds) {
+        const auto view = std::find_if(views.begin(), views.end(), [&](const Composer *composer) {
+            return composer->pane.id == *sourcePane && composer->buffer == id;
+        });
+        if (view != views.end())
+            (*view)->playTypingSound(*sound);
+    }
     if (edited)
         onEditingStateChanged(*sourcePane);
 }
@@ -854,7 +865,7 @@ bool EditorStore::Impl::insert(PaneState &pane, std::string_view text) {
     e.anchor = candidate.selectionAnchor;
     if (!valid(committed(d.state).value, e.text))
         return false;
-    apply(pane.buffer, d, std::move(e), pane.id);
+    apply(pane.buffer, d, std::move(e), pane.id, TypingSound::Space);
     pane.focusComposer = true;
     return true;
 }
@@ -1158,7 +1169,7 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
             e.cursor = state.cursorPos;
             e.anchor = state.selectionAnchor;
             e.mark = e.cursor != e.anchor;
-            apply(pane.buffer, d, std::move(e), pane.id, false);
+            apply(pane.buffer, d, std::move(e), pane.id, TypingSound::Space, false);
         }
         pane.focusComposer = true;
         return true;
@@ -1418,9 +1429,28 @@ bool EditorStore::Impl::execute(std::string_view op, PaneState &pane) {
         return true;
     if (wordKill)
         kill.assign(committed(d.state).value, wordKill->first, wordKill->second - wordKill->first);
-    apply(pane.buffer, d, std::move(e), pane.id);
+    std::optional<TypingSound> sound;
+    if (op == "kill-word" || op == "backward-kill-word" || op == "kill-line" ||
+        op == "backward-kill-line" || op == "kill-region")
+        sound = TypingSound::DeleteWord;
+    else if (op == "delete-char" || op == "backward-delete")
+        sound = TypingSound::DeleteCharacter;
+    else if (op == "newline" || op == "yank")
+        sound = TypingSound::Space;
+    else if (op == "transpose-chars")
+        sound = TypingSound::Character;
+    apply(pane.buffer, d, std::move(e), pane.id, sound);
     pane.focusComposer = true;
     return true;
+}
+
+void EditorStore::Impl::Composer::playTypingSound(TypingSound sound) {
+    const auto &settings = owner.model.settings;
+    if (settings.typingSounds && settings.sound && settings.masterVolume > 0 &&
+        settings.fx != FxLevel::Off && buffer == pane.buffer && input->windowActive() &&
+        visibleInScene(*this) &&
+        (input->inputArea()->focused() || pasteButtons[0]->inputArea()->focused()))
+        owner.model.typingSoundPending = sound;
 }
 
 bool EditorStore::Impl::Composer::updateNickDecoration() {
@@ -1855,11 +1885,9 @@ void EditorStore::Impl::Composer::applySpellingCycle() {
     const auto *projection = input->displayProjection();
     const auto displayBegin = projection->rawToDisplay[cycle.range.begin];
     const auto &suggestion = cycle.suggestions[cycle.index];
-    spellingEdit = cycle.range;
     cyclingSpelling = true;
-    const bool replaced = input->replaceRange(cycle.range.begin, cycle.range.end, suggestion);
+    const bool replaced = replaceSpelling(cycle.range, suggestion);
     cyclingSpelling = false;
-    spellingEdit.reset();
     if (!replaced) {
         spellingCycle.reset();
         return;
@@ -1874,6 +1902,21 @@ void EditorStore::Impl::Composer::applySpellingCycle() {
     cycle.raw = input->value();
     cycle.caret = input->cursorPosition();
     cycle.revision = revision;
+}
+
+bool EditorStore::Impl::Composer::replaceSpelling(SpellRange range, std::string_view suggestion) {
+    const auto *projection = input->displayProjection();
+    const auto &offsets = projection->rawToDisplay;
+    const auto current =
+        std::string_view(projection->text)
+            .substr(offsets[range.begin], offsets[range.end] - offsets[range.begin]);
+    const bool changed = current != suggestion;
+    spellingEdit = range;
+    const bool replaced = input->replaceRange(range.begin, range.end, suggestion);
+    spellingEdit.reset();
+    if (changed && replaced)
+        playTypingSound(TypingSound::Space);
+    return replaced;
 }
 
 void EditorStore::Impl::syncSpelling() {
@@ -2106,12 +2149,8 @@ void EditorStore::Impl::Composer::contextMenu(const InputArea::PointerData *poin
                             spellTicket != spellingTicket || !correctionRange ||
                             sourceIdentity.lock() != current.identity)
                             return;
-                        spellingEdit = correctionRange;
-                        const bool replaced =
-                            input->replaceRange(correctionRange->begin, correctionRange->end,
-                                                corrections[index - correctionFirst]);
-                        spellingEdit.reset();
-                        if (replaced) {
+                        if (replaceSpelling(*correctionRange,
+                                            corrections[index - correctionFirst])) {
                             pane.focusComposer = true;
                             if (owner.dispatcher)
                                 owner.dispatcher->setFocus(input->inputArea());
@@ -2503,7 +2542,7 @@ bool EditorStore::Impl::Composer::acceptCommandCompletion(size_t index) {
     editor.cursor = candidate.cursorPos;
     editor.anchor = candidate.selectionAnchor;
     hideCompletion();
-    owner.apply(buffer, draft, std::move(editor), pane.id);
+    owner.apply(buffer, draft, std::move(editor), pane.id, TypingSound::Space);
     pane.focusComposer = true;
     updateCompletion(true);
     return true;
@@ -2782,7 +2821,11 @@ bool EditorStore::Impl::Composer::acceptPrediction() {
     const auto suffix = word.substr(prefix.size());
     spellingCycle.reset();
     hideCompletion();
-    return input->replaceRange(caret, caret, suffix);
+    if (!input->replaceRange(caret, caret, suffix))
+        return false;
+    if (!suffix.empty())
+        playTypingSound(TypingSound::Space);
+    return true;
 }
 bool EditorStore::Impl::Composer::acceptCompletion(size_t index) {
     if (owner.emojiOwner != this || index >= owner.emojiMatches.size() || !owner.dispatcher ||
@@ -2809,7 +2852,7 @@ bool EditorStore::Impl::Composer::acceptCompletion(size_t index) {
     editor.cursor = candidate.cursorPos;
     editor.anchor = candidate.selectionAnchor;
     hideCompletion();
-    owner.apply(buffer, draft, std::move(editor), pane.id);
+    owner.apply(buffer, draft, std::move(editor), pane.id, TypingSound::Space);
     pane.focusComposer = true;
     updateCompletion(true);
     return true;
@@ -2886,6 +2929,22 @@ EditorStore::Impl::Composer::Composer(Impl &impl, PaneState &state)
     });
     input->setEditValidator([this](std::string_view before, std::string_view after, bool) {
         return owner.valid(before, after);
+    });
+    input->setOnKeyEdit([this](Input::KeyEdit edit) {
+        switch (edit) {
+        case Input::KeyEdit::Character:
+            playTypingSound(TypingSound::Character);
+            break;
+        case Input::KeyEdit::Space:
+            playTypingSound(TypingSound::Space);
+            break;
+        case Input::KeyEdit::DeleteCharacter:
+            playTypingSound(TypingSound::DeleteCharacter);
+            break;
+        case Input::KeyEdit::DeleteWord:
+            playTypingSound(TypingSound::DeleteWord);
+            break;
+        }
     });
     input->setOnEditingStateChanged([this] {
         const auto previousRevision = revision;

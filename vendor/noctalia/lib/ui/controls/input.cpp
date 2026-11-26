@@ -914,14 +914,17 @@ void Input::trackPreeditRange(const EditSnapshot& before, std::size_t replacedSt
   m_preeditLen = clampToUtf8End(m_value, end) - start;
 }
 
-bool Input::replaceTextRange(std::size_t start, std::size_t end, std::string_view text,
-                             EditCoalesceKind kind, bool preedit) {
+bool Input::replaceTextRange(
+    std::size_t start, std::size_t end, std::string_view text, EditCoalesceKind kind, bool preedit, bool* textChanged
+) {
   if (m_editRewriter || m_preeditBase) {
     auto before = currentEditSnapshot();
     auto after = before;
     after.value.replace(start, end - start, text);
     after.cursorPos = after.selectionAnchor = start + text.size();
     if (!rewriteEdit(before, after, preedit)) return false;
+    if (textChanged)
+      *textChanged = before.value != after.value;
     removePreeditText();
     if (!preedit) pushUndoSnapshot(kind);
     m_value = std::move(after.value);
@@ -938,6 +941,8 @@ bool Input::replaceTextRange(std::size_t start, std::size_t end, std::string_vie
     after.replace(start, end - start, text);
     if (!m_editValidator(m_value, after, preedit)) return false;
   }
+  if (textChanged)
+    *textChanged = m_value.compare(start, end - start, text) != 0;
   if (preedit) m_preeditBase = currentEditSnapshot();
   else pushUndoSnapshot(kind);
   m_value.replace(start, end - start, text);
@@ -1405,6 +1410,13 @@ void Input::textInputApplyEdit(const TextInputEdit& edit) {
   const auto onChange = m_onChange;
   const auto onSubmit = m_onSubmit;
   if (changed && onChange) onChange(permanent.value);
+  if (changed && !alive.expired() && m_windowActive && m_onKeyEdit) {
+    auto keyEdit = KeyEdit::DeleteCharacter;
+    if (edit.hasCommitText && !edit.commitText.empty()) {
+      keyEdit = (edit.commitText == " " || edit.commitText == "\n") ? KeyEdit::Space : KeyEdit::Character;
+    }
+    m_onKeyEdit(keyEdit);
+  }
   if (edit.submit && onSubmit) onSubmit(permanent.value);
 }
 
@@ -1877,13 +1889,25 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
   bool displayTextCurrent = false;
   auto previousPreedit = m_editValidator && m_preeditBase
       ? std::optional<EditingState>(editingState()) : std::nullopt;
+  std::optional<KeyEdit> keyEdit;
+  const bool reportDeletion = !composing();
   bool rejected = false;
-  auto replace = [&](std::size_t start, std::size_t end, std::string_view text,
-                     EditCoalesceKind kind, bool isPreedit = false) {
-    const bool accepted = replaceTextRange(start, end, text, kind, isPreedit);
+  auto replace = [&](std::size_t start, std::size_t end, std::string_view text, EditCoalesceKind kind,
+                     std::optional<KeyEdit> sound, bool isPreedit = false) {
+    const bool report = sound && m_onKeyEdit && !preedit;
+    bool textChanged = false;
+    const bool accepted = replaceTextRange(start, end, text, kind, isPreedit, report ? &textChanged : nullptr);
     rejected = !accepted;
-    if (accepted) displayTextCurrent = false;
+    if (accepted) {
+      displayTextCurrent = false;
+      if (textChanged)
+        keyEdit = sound;
+    }
     return accepted;
+  };
+  auto erase = [&](std::size_t start, std::size_t end, bool word) {
+    const auto sound = word ? KeyEdit::DeleteWord : KeyEdit::DeleteCharacter;
+    return replace(start, end, {}, EditCoalesceKind::Discrete, reportDeletion ? std::optional{sound} : std::nullopt);
   };
   auto eraseVisible = [&](bool backward, bool word) {
     std::size_t start = m_cursorPos, end = m_cursorPos;
@@ -1900,8 +1924,7 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
       start = rawByteForDisplay(displayByte(m_cursorPos), true);
       end = word ? nextWordEndForByteOffset(m_cursorPos) : nextCharPos(m_value, start);
     }
-    if (start >= end) return false;
-    return replace(start, end, {}, EditCoalesceKind::Discrete);
+    return start < end && erase(start, end, word);
   };
 
   // Remove previous preedit text before processing
@@ -1926,25 +1949,12 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
       (ctrl && (sym == 'x' || sym == 'X')) || (!ctrl && shift && KeySymbol::isDelete(sym) && hasSelection());
   const bool pasteShortcut = (ctrl && (sym == 'v' || sym == 'V')) || (!ctrl && shift && KeySymbol::isInsert(sym));
 
-  if (undoShortcut) {
-    if (undoEdit()) {
-      return;
-    }
-    if (changed) {
-      if (!displayTextCurrent) {
-        updateDisplayText();
-        markTextContentChanged();
-      }
-      revealCursor();
-      notifyTextInputStateChanged(TextInputChangeCause::Other);
-      if (!preedit && m_onChange) {
-        m_onChange(m_value);
-      }
-    }
-    return;
-  }
-  if (redoShortcut) {
-    if (redoEdit()) {
+  if (undoShortcut || redoShortcut) {
+    const auto& source = undoShortcut ? m_editHistory->undo : m_editHistory->redo;
+    const bool textDiffers = !preedit && m_onKeyEdit && !source.empty() && source.back().value != m_value;
+    if (undoShortcut ? undoEdit() : redoEdit()) {
+      if (textDiffers && !alive.expired() && m_windowActive && m_onKeyEdit)
+        m_onKeyEdit(KeyEdit::Space);
       return;
     }
     if (changed) {
@@ -1964,11 +1974,11 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     resetUndoCoalescing();
     if (g_readlineShortcuts) {
       if (m_cursorPos > 0) {
-        changed = replace(0, m_cursorPos, {}, EditCoalesceKind::Discrete) || changed;
+        changed = replace(0, m_cursorPos, {}, EditCoalesceKind::Discrete, KeyEdit::DeleteWord) || changed;
       }
     } else {
       if (!m_value.empty() || hasSelection()) {
-        changed = replace(0, m_value.size(), {}, EditCoalesceKind::Discrete) || changed;
+        changed = replace(0, m_value.size(), {}, EditCoalesceKind::Discrete, KeyEdit::DeleteWord) || changed;
       }
     }
   } else if (ctrl && (sym == 'a' || sym == 'A')) {
@@ -2010,13 +2020,13 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     m_selectionAnchor = m_cursorPos;
   } else if (lineEditDeleteWordBack) {
     if (hasSelection()) {
-      changed = replace(selectionStart(), selectionEnd(), {}, EditCoalesceKind::Discrete) || changed;
+      changed = erase(selectionStart(), selectionEnd(), true) || changed;
     } else {
       changed = eraseVisible(true, true) || changed;
     }
   } else if (lineEditDeleteToEnd) {
     if (m_cursorPos < m_value.size()) {
-      changed = replace(m_cursorPos, m_value.size(), {}, EditCoalesceKind::Discrete) || changed;
+      changed = replace(m_cursorPos, m_value.size(), {}, EditCoalesceKind::Discrete, KeyEdit::DeleteWord) || changed;
     }
   } else if (lineEditDeleteWordForward) {
     changed = eraseVisible(false, true) || changed;
@@ -2029,7 +2039,8 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
       if (!m_passwordMode) {
         g_clipboard->setClipboardText(m_value.substr(selectionStart(), selectionEnd() - selectionStart()));
       }
-      changed = replace(selectionStart(), selectionEnd(), {}, EditCoalesceKind::Discrete) || changed;
+      changed =
+          replace(selectionStart(), selectionEnd(), {}, EditCoalesceKind::Discrete, KeyEdit::DeleteWord) || changed;
     }
   } else if (pasteShortcut) {
     if (g_clipboard != nullptr) {
@@ -2041,13 +2052,13 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     }
   } else if (KeySymbol::isBackspace(sym)) {
     if (hasSelection()) {
-      changed = replace(selectionStart(), selectionEnd(), {}, EditCoalesceKind::Discrete) || changed;
+      changed = erase(selectionStart(), selectionEnd(), ctrl) || changed;
     } else if (m_cursorPos > 0) {
       changed = eraseVisible(true, ctrl) || changed;
     }
   } else if (KeySymbol::isDelete(sym)) {
     if (hasSelection()) {
-      changed = replace(selectionStart(), selectionEnd(), {}, EditCoalesceKind::Discrete) || changed;
+      changed = erase(selectionStart(), selectionEnd(), ctrl) || changed;
     } else if (m_cursorPos < m_value.size()) {
       changed = eraseVisible(false, ctrl) || changed;
     }
@@ -2100,8 +2111,11 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
         }
       }
     } else {
-      changed = replace(selectionStart(), selectionEnd(), "\n",
-                        hasSelection() ? EditCoalesceKind::Discrete : EditCoalesceKind::Typing) || changed;
+      changed = replace(
+                    selectionStart(), selectionEnd(), "\n",
+                    hasSelection() ? EditCoalesceKind::Discrete : EditCoalesceKind::Typing, KeyEdit::Space
+                )
+          || changed;
       if (!rejected) noteTypingEditEnd();
     }
   } else if (KeySymbol::isHome(sym)) {
@@ -2126,11 +2140,13 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
   } else if (utf32 >= 0x20U && utf32 != 0x7FU) {
     // Printable character (skip DEL = 0x7F)
     const auto bytes = StringUtils::utf32ToUtf8(utf32);
-    changed = replace(selectionStart(), selectionEnd(), bytes,
-                      hasSelection() ? EditCoalesceKind::Discrete : EditCoalesceKind::Typing, preedit) || changed;
-    if (!preedit && !rejected) {
+    const bool accepted = replace(
+        selectionStart(), selectionEnd(), bytes, hasSelection() ? EditCoalesceKind::Discrete : EditCoalesceKind::Typing,
+        utf32 == ' ' ? KeyEdit::Space : KeyEdit::Character, preedit
+    );
+    changed = accepted || changed;
+    if (accepted && !preedit)
       noteTypingEditEnd();
-    }
   }
   if (rejected) {
     if (previousPreedit) {
@@ -2149,7 +2165,6 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     }
     return;
   }
-
   if (changed) {
     if (!displayTextCurrent) {
       updateDisplayText();
@@ -2165,6 +2180,8 @@ void Input::handleKey(std::uint32_t sym, std::uint32_t utf32, std::uint32_t modi
     revealCursor();
     notifyTextInputStateChanged(TextInputChangeCause::Other);
   }
+  if (keyEdit && !alive.expired() && m_windowActive && m_onKeyEdit)
+    m_onKeyEdit(*keyEdit);
 }
 
 void Input::notifyTextInputStateChanged(TextInputChangeCause cause) {

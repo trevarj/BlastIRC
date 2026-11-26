@@ -76,9 +76,21 @@ struct ConnectionSetup {
     std::optional<Identity> identity;
 };
 enum class LocalData { ChatHistory, ServerLogs, Drafts, Connections, Preferences, Cache, All };
-enum class CueSound { Soft, Clear };
+enum class CueSound { Soft, Clear, Bubble, WoodTap, Marimba, Chime };
+inline constexpr std::pair<const char *, const char *> cueSoundOptions[] = {
+    {"soft", "Soft"},         {"clear", "Clear"},     {"bubble", "Bubble"},
+    {"wood-tap", "Wood Tap"}, {"marimba", "Marimba"}, {"chime", "Chime"},
+};
+static_assert(std::size(cueSoundOptions) == std::size_t(CueSound::Chime) + 1);
 inline constexpr std::array<std::string_view, 3> chatSoundEvents{"message", "send", "mention"};
+inline constexpr std::array<std::string_view, 16> soundEvents{
+    "action",     "ban",   "disconnect", "echo",   "join", "kick", "mention", "message",
+    "netsplit",   "notice", "part",      "quit",   "reaction", "redact", "send", "unread",
+};
 inline bool hasCueSoundChoice(std::string_view event) {
+    return std::ranges::find(soundEvents, event) != soundEvents.end();
+}
+inline bool hasClearCueSound(std::string_view event) {
     return std::ranges::find(chatSoundEvents, event) != chatSoundEvents.end();
 }
 struct Cue {

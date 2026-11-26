@@ -125,14 +125,19 @@ class EffectsTestAccess {
             model.settings.cues[event].sound = CueSound::Clear;
             checkLive(event, clear);
         }
-        // Both variants use the original clip key when the event has no settings.
+        // Legacy clip settings retain gain and the existing per-event Clear variant.
         model.settings.cues.erase("message");
         model.settings.cues["tick"] = {.volume = .3125f, .sound = CueSound::Clear};
         model.settings.cues["tick_clear"].enabled = false;
         checkLive("message", "tick_clear", .3125f);
         checkLive("notice", "tick", .3125f);
+        model.settings.cues["tick"].sound = CueSound::Bubble;
+        checkLive("message", "tick", .3125f);
+        checkLive("notice", "tick", .3125f);
         model.settings.cues["tick"].sound = CueSound::Soft;
         checkLive("message", "tick", .3125f);
+        model.settings.cues["notice"].sound = CueSound::Clear;
+        checkLive("notice", "tick");
         p.stop();
         model.effects.clear();
 
@@ -142,7 +147,7 @@ class EffectsTestAccess {
             effects.draw(model);
             assert(model.cuePreviewPending.empty() && playing() == 0);
         };
-        drawPreview("notice");
+        drawPreview("bogus");
         assert(!p.previewTrack);
         auto &mentionCue = model.settings.cues["mention"];
         mentionCue = {.enabled = false, .volume = .375f, .pitch = .875f, .sound = CueSound::Clear};
@@ -182,6 +187,24 @@ class EffectsTestAccess {
         checkPreviewMute(model.settings.fx, FxLevel::Off);
         checkPreviewMute(model.settings.masterVolume, 0.f);
         checkPreviewMute(mentionCue.volume, 0.f);
+
+        constexpr std::pair<CueSound, std::string_view> sharedClips[] = {
+            {CueSound::Bubble, "bubble"},
+            {CueSound::WoodTap, "wood-tap"},
+            {CueSound::Marimba, "marimba"},
+            {CueSound::Chime, "chime"},
+        };
+        for (const char *event : {"message", "send", "mention", "notice"}) {
+            for (const auto &[sound, name] : sharedClips) {
+                model.settings.cues[event] = {.sound = sound};
+                checkLive(event, name);
+                p.stop();
+                model.effects.clear();
+                drawPreview(event);
+                assert(MIX_TrackPlaying(preview) && MIX_GetTrackAudio(preview) == findClip(name));
+            }
+        }
+        p.stop();
 
         const auto drawTyping = [&](std::optional<TypingSound> tap = std::nullopt) {
             model.now += .1;

@@ -3742,6 +3742,11 @@ int main() {
         const int fades[] = {200, 333, 500, 625, 1000, 5000};
         const char *trailStyles[] = {"classic", "motion-blur", "blaze", "lightning",
                                      "railgun", "torpedo", "pixiedust"};
+        const std::pair<CueSound, std::string_view> sounds[] = {
+            {CueSound::Soft, "soft"},       {CueSound::Clear, "clear"},
+            {CueSound::Bubble, "bubble"},   {CueSound::WoodTap, "wood-tap"},
+            {CueSound::Marimba, "marimba"}, {CueSound::Chime, "chime"},
+        };
         for (std::size_t index = 0; index < 2 * std::size(trailStyles); ++index) {
             Model configured = legacy;
             auto &s = configured.settings;
@@ -3756,8 +3761,10 @@ int main() {
             s.typingSounds = index % 2 == 0;
             for (std::size_t i = 0; i < chatSoundEvents.size(); ++i)
                 s.cues.at(string(chatSoundEvents[i])).sound =
-                    (index & (1u << i)) ? CueSound::Clear : CueSound::Soft;
+                    sounds[(index + i) % std::size(sounds)].first;
             s.cues.at("join").sound = CueSound::Clear;
+            s.cues.at("part").sound = CueSound::Marimba;
+            s.cues.at("blip").sound = CueSound::Bubble;
             Storage storage;
             storage.save(configured);
             const string saved = contents(config / "settings.toml");
@@ -3767,13 +3774,17 @@ int main() {
                    s.cursorSmoothBlinkMs);
             assert(document["audio"]["typing_sounds"].value_exact<bool>() == s.typingSounds);
             const auto cues = document["audio"]["cues"];
-            for (const auto event : chatSoundEvents) {
-                if (s.cues.at(string(event)).sound == CueSound::Clear)
-                    assert(cues[event]["sound"].value_exact<std::string_view>() == "clear");
+            for (std::size_t i = 0; i < chatSoundEvents.size(); ++i) {
+                const auto [sound, id] = sounds[(index + i) % std::size(sounds)];
+                const auto savedSound = cues[chatSoundEvents[i]]["sound"];
+                if (sound == CueSound::Soft)
+                    assert(!savedSound);
                 else
-                    assert(!cues[event]["sound"]);
+                    assert(savedSound.value_exact<std::string_view>() == id);
             }
             assert(!cues["join"]["sound"]);
+            assert(cues["part"]["sound"].value_exact<std::string_view>() == "marimba");
+            assert(!cues["blip"]["sound"]);
             Model actual;
             storage.load(actual);
             assert(actual.settings.fx == s.fx && actual.settings.cursorShape == s.cursorShape &&
@@ -3786,6 +3797,8 @@ int main() {
                 assert(actual.settings.cues.at(string(event)).sound ==
                        s.cues.at(string(event)).sound);
             assert(actual.settings.cues.at("join").sound == CueSound::Soft);
+            assert(actual.settings.cues.at("part").sound == CueSound::Marimba);
+            assert(actual.settings.cues.at("blip").sound == CueSound::Soft);
             assert(actual.settings.reducedMotion && actual.settings.sound &&
                    contents(config / "settings.toml") == saved &&
                    contents(config / "config.toml") == originalConfig);
@@ -3815,7 +3828,7 @@ int main() {
         for (const auto &[event, sound] :
              {std::pair{"message", "'Clear'"}, std::pair{"send", "1"},
               std::pair{"mention", "{}"}, std::pair{"join", "'clear'"},
-              std::pair{"custom", "'soft'"}}) {
+              std::pair{"blip", "'bubble'"}, std::pair{"custom", "'soft'"}}) {
             const auto file = config / "settings.toml";
             const string key = "audio.cues." + string(event);
             const string source = "[" + key + "]\nsound = " + sound + "\n";

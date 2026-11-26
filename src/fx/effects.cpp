@@ -133,15 +133,20 @@ float random01() {
 }
 float random(float low, float high) { return low + (high - low) * random01(); }
 enum class Effect { None, Kick, Split, React, Redact, Join, Part, Disconnect };
-constexpr const char *clipNames[] = {"boom",          "rumble",
-                                     "ding",          "blip",
-                                     "tick",          "whoosh",
-                                     "click",         "pop",
-                                     "hush",          "power_down",
-                                     "keytap",        "keytap_space",
-                                     "keytap_delete", "keytap_delete_word",
-                                     "tick_clear",    "click_clear",
-                                     "ding_clear"};
+constexpr const char *baseClipNames[] = {
+    "boom", "rumble", "ding", "blip", "tick", "whoosh", "click", "pop", "hush", "power_down",
+    "keytap", "keytap_space", "keytap_delete", "keytap_delete_word", "tick_clear", "click_clear",
+    "ding_clear",
+};
+constexpr auto firstSharedSound = std::size_t(CueSound::Bubble);
+constexpr auto sharedClipOffset = std::size(baseClipNames) - firstSharedSound;
+constexpr auto clipNames = [] {
+    std::array<const char *, sharedClipOffset + std::size(cueSoundOptions)> names{};
+    std::ranges::copy(baseClipNames, names.begin());
+    for (std::size_t i = firstSharedSound; i < std::size(cueSoundOptions); ++i)
+        names[sharedClipOffset + i] = cueSoundOptions[i].first;
+    return names;
+}();
 constexpr std::size_t clipIndex(std::string_view name) {
     const auto clip = std::ranges::find(clipNames, name);
     if (clip == std::end(clipNames))
@@ -505,16 +510,21 @@ struct Effects::Impl {
         if (mixer)
             MIX_SetMixerGain(mixer, 0);
     }
-    const Cue &cue(const Settings &s, const Directive &d) const {
+    std::pair<const Cue &, CueSound> cue(const Settings &s, const Directive &d) const {
         static constexpr Cue defaults;
         if (auto i = s.cues.find(d.event); i != s.cues.end())
-            return i->second;
+            return {i->second, i->second.sound};
         if (auto i = s.cues.find(d.clipKey); i != s.cues.end())
-            return i->second;
-        return defaults;
+            return {i->second, i->second.sound == CueSound::Clear ? CueSound::Clear : CueSound::Soft};
+        return {defaults, CueSound::Soft};
     }
-    MIX_Audio *cueAudio(const Directive &d, const Cue &config) const {
-        return audio[config.sound == CueSound::Clear ? d.clearClip : d.clip];
+    MIX_Audio *cueAudio(const Directive &d, CueSound choice) const {
+        if (choice == CueSound::Clear)
+            return audio[d.clearClip];
+        const auto sound = std::size_t(choice);
+        if (sound >= firstSharedSound && sound < std::size(cueSoundOptions))
+            return audio[sharedClipOffset + sound];
+        return audio[d.clip];
     }
     void updatePreview(const Settings &s, const std::string &pending, bool enabled) {
         if (!enabled) {
@@ -525,7 +535,7 @@ struct Effects::Impl {
             if (!MIX_TrackPlaying(previewTrack)) {
                 previewDirective.reset();
             } else {
-                const float volume = cue(s, director[*previewDirective]).volume;
+                const float volume = cue(s, director[*previewDirective]).first.volume;
                 if (volume <= 0)
                     stopPreview();
                 else
@@ -535,10 +545,10 @@ struct Effects::Impl {
         if (!mixer || pending.empty())
             return;
         const auto *d = std::ranges::find(director, pending, &Directive::event);
-        if (d == std::end(director) || d->clip == d->clearClip)
+        if (d == std::end(director))
             return;
-        const auto &config = cue(s, *d);
-        auto *clip = cueAudio(*d, config);
+        const auto [config, choice] = cue(s, *d);
+        auto *clip = cueAudio(*d, choice);
         if (!clip || config.volume <= 0)
             return;
         if (!previewTrack) {
@@ -565,14 +575,14 @@ struct Effects::Impl {
     void sound(const Settings &s, const Directive &d, std::size_t index, double now) {
         if (!mixer || !s.sound)
             return;
-        const auto &config = cue(s, d);
+        const auto [config, choice] = cue(s, d);
         if (!config.enabled || config.volume <= 0)
             return;
         // ponytail: the existing per-cue 45ms budget caps burst spam within 24 voices.
         if (now - lastCue[index] < .045)
             return;
         lastCue[index] = now;
-        auto *clip = cueAudio(d, config);
+        auto *clip = cueAudio(d, choice);
         if (!clip)
             return;
         Voice *voice = nullptr;
@@ -971,7 +981,7 @@ void Effects::draw(Model &model) {
     p.updatePreview(model.settings, previewPending, audioEnabled);
     for (auto &voice : p.voices)
         if (voice.track && MIX_TrackPlaying(voice.track)) {
-            const auto &config = p.cue(model.settings, director[voice.directive]);
+            const auto &config = p.cue(model.settings, director[voice.directive]).first;
             if (!model.settings.sound || !config.enabled || config.volume <= 0)
                 MIX_StopTrack(voice.track, 0);
             else

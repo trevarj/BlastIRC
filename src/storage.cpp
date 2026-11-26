@@ -958,12 +958,18 @@ void parseSettings(const toml::table &document, Settings &settings) {
                 if (const auto *sound = cue->get("sound")) {
                     if (!hasCueSoundChoice(name.str()))
                         invalid("audio.cues." + string(name.str()) + ".sound",
-                                "a sound choice only for message, send, or mention");
+                                "a sound choice only for a named audio event");
                     const auto choice = sound->value_exact<std::string_view>();
-                    if (!choice || (*choice != "soft" && *choice != "clear"))
+                    const auto option = std::ranges::find_if(cueSoundOptions, [&](const auto &entry) {
+                        return choice && *choice == entry.first;
+                    });
+                    if (option == std::end(cueSoundOptions))
                         invalid("audio.cues." + string(name.str()) + ".sound",
-                                "the string 'soft' or 'clear'");
-                    config.sound = *choice == "clear" ? CueSound::Clear : CueSound::Soft;
+                                "a supported sound ID string");
+                    config.sound = static_cast<CueSound>(option - std::begin(cueSoundOptions));
+                    if (config.sound == CueSound::Clear && !hasClearCueSound(name.str()))
+                        invalid("audio.cues." + string(name.str()) + ".sound",
+                                "a bundled sound choice for this event");
                 }
                 settings.cues[string(name.str())] = config;
             }
@@ -1128,8 +1134,10 @@ toml::table settingsDocument(const Settings &settings) {
     toml::table cues, channels, bufferFools, messageLayouts;
     for (const auto &[name, cue] : settings.cues) {
         toml::table row{{"enabled", cue.enabled}, {"volume", cue.volume}, {"pitch", cue.pitch}};
-        if (cue.sound == CueSound::Clear && hasCueSoundChoice(name))
-            row.insert("sound", "clear");
+        const auto sound = std::size_t(cue.sound);
+        if (cue.sound != CueSound::Soft && sound < std::size(cueSoundOptions) &&
+            hasCueSoundChoice(name) && (cue.sound != CueSound::Clear || hasClearCueSound(name)))
+            row.insert("sound", cueSoundOptions[sound].first);
         cues.insert(name, std::move(row));
     }
     for (const auto &[name, mode] : settings.channelPresence)

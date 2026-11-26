@@ -2547,7 +2547,7 @@ struct Dialogs::Impl {
         auto *cues = section("sounds.cues", "Event cues");
         label(*cues, "Each event has its own switch, volume and pitch. Play previews the selected "
                      "sound even if its event is off. Sound enabled, Effects and volume still apply.");
-        const auto addCue = [&](const std::string &name, const Cue &cue, bool selectable) {
+        const auto addCue = [&](const std::string &name, const Cue &cue) {
             auto caption = name;
             if (!caption.empty())
                 caption.front() =
@@ -2555,21 +2555,29 @@ struct Dialogs::Impl {
             auto group = column(12);
             toggle(*group, caption + " sounds", cue.enabled,
                    [this, name](bool value) { model.settings.cues.at(name).enabled = value; });
-            if (selectable) {
-                auto *picker = row(*group, false);
-                picker->setAlign(FlexAlign::End);
-                auto *sound = select(*picker, caption + " sound", {"Soft", "Clear"},
-                                     cue.sound == CueSound::Clear ? "Clear" : "Soft",
-                                     [this, name](std::size_t choice, std::string_view) {
-                                         model.settings.cues.at(name).sound =
-                                             choice == 1 ? CueSound::Clear : CueSound::Soft;
-                                     });
-                auto *field = static_cast<Flex *>(sound->parent());
-                field->setFillWidth(false);
-                field->setFlexGrow(1);
-                button(*picker, "Play " + name,
-                       [this, name] { model.cuePreviewPending = name; });
-            }
+            auto *picker = row(*group, false);
+            picker->setAlign(FlexAlign::End);
+            const bool clear = hasClearCueSound(name);
+            const char *defaultLabel = clear ? cueSoundOptions[0].second : "Default";
+            std::vector<std::string> options;
+            options.reserve(std::size(cueSoundOptions));
+            options.emplace_back(defaultLabel);
+            for (auto i = std::size_t(clear ? CueSound::Clear : CueSound::Bubble);
+                 i < std::size(cueSoundOptions); ++i)
+                options.emplace_back(cueSoundOptions[i].second);
+            const std::string_view selected =
+                cue.sound == CueSound::Soft || (!clear && cue.sound == CueSound::Clear)
+                    ? defaultLabel
+                    : cueSoundOptions[std::size_t(cue.sound)].second;
+            auto *sound = select(*picker, caption + " sound", std::move(options), selected,
+                                 [this, name, clear](std::size_t choice, std::string_view) {
+                                     model.settings.cues.at(name).sound =
+                                         CueSound(choice + (!clear && choice != 0));
+                                 });
+            auto *field = static_cast<Flex *>(sound->parent());
+            field->setFillWidth(false);
+            field->setFlexGrow(1);
+            button(*picker, "Play " + name, [this, name] { model.cuePreviewPending = name; });
             slider(*group, caption + " volume", cue.volume, 0, 1, .01,
                    [this, name](float value) { model.settings.cues.at(name).volume = value; });
             slider(*group, caption + " pitch", cue.pitch, .25, 4, .01,
@@ -2579,10 +2587,10 @@ struct Dialogs::Impl {
         for (const auto event : chatSoundEvents)
             if (const auto it = model.settings.cues.find(std::string(event));
                 it != model.settings.cues.end())
-                addCue(it->first, it->second, true);
+                addCue(it->first, it->second);
         for (const auto &[name, cue] : model.settings.cues)
-            if (!hasCueSoundChoice(name))
-                addCue(name, cue, false);
+            if (hasCueSoundChoice(name) && !hasClearCueSound(name))
+                addCue(name, cue);
     }
 
     void color(Flex &parent, const std::string &name) {

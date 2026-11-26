@@ -935,12 +935,10 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                 viewport.width <= 240 * zoom ||
                 model.settings.messageLayouts.at(buffer.id) == blast::MessageLayout::Stacked;
             if (stacked) {
-                const float indent =
-                    1.5f *
-                    renderer.measureText("0", rendered.text.fontSize(), rendered.text.font()).width;
                 const float headerX = hx + (enabled ? 40 * zoom : 0);
-                near(bodyBounds.x, headerX + indent);
-                near(i == 1 ? sceneBounds(*find<RectNode>(*hit)).x : labelBounds.x, headerX);
+                near(labelBounds.x, headerX);
+                near(bodyBounds.x, headerX);
+                near(bodyBounds.y, hy + hit->height() + 4 * zoom);
                 assert(nativeInk.y + nativeInk.height <= bodyBounds.y + .02f);
             } else {
                 assert(labelBounds.x + labelBounds.width <= bodyBounds.x + .02f);
@@ -991,17 +989,24 @@ void traditionalDecorations(TranscriptTestRenderer &renderer, float zoom) {
                     assert(ax + picture->width() + 5.9f * zoom <= bodyBounds.x);
             }
             if (i == 1) {
-                auto *chip = find<RectNode>(*hit);
                 assert(!find<GlyphNode>(*hit));
-                assert(chip && chip->visible() &&
-                       chip->style().fill == blast::themeColor("primary"));
-                assert(nick->color() == blast::themeForegroundColor("on_primary"));
-                const auto chipBounds = sceneBounds(*chip);
-                near(nativeInk.y + nativeInk.height * .5f, chipBounds.y + chipBounds.height * .5f);
-                const auto labelBounds = sceneBounds(*nick->parent());
-                const float padding = labelBounds.x - chipBounds.x;
-                assert(padding > 0);
-                near(chipBounds.width, nick->maxWidth() + 2 * padding);
+                auto *chip = find<RectNode>(*hit);
+                if (stacked) {
+                    assert(!chip);
+                    const auto backdrop = blast::themeConversationBackdrop();
+                    const auto accent = blast::themeForegroundColor("primary");
+                    assert(nick->color() == blast::themePairedForeground(backdrop, accent));
+                } else {
+                    assert(chip && chip->visible() &&
+                           chip->style().fill == blast::themeColor("primary"));
+                    assert(nick->color() == blast::themeForegroundColor("on_primary"));
+                    const auto chipBounds = sceneBounds(*chip);
+                    near(nativeInk.y + nativeInk.height * .5f,
+                         chipBounds.y + chipBounds.height * .5f);
+                    const float padding = labelBounds.x - chipBounds.x;
+                    assert(padding > 0);
+                    near(chipBounds.width, nick->maxWidth() + 2 * padding);
+                }
                 assert(!plainText(rendered.content, "YOU") && !plainText(rendered.content, "Sent"));
                 rail(rendered);
             }
@@ -1206,6 +1211,7 @@ void traditionalClocks(TranscriptTestRenderer &renderer, float zoom) {
                    timeBounds.x + timeBounds.width <= rowBounds.x + rowBounds.width + .02f);
             const auto nickInk = nativeTextInk(renderer, *nick);
             if (stacked) {
+                near(nickBounds.x, bodyBounds.x);
                 near(time->fontSize(), .75f * blast::messageTextSize(model.settings, buffer));
                 assert(time->font() == blast::themeUiFont());
                 float clusterRight = nickBounds.x + nickBounds.width;
@@ -1451,11 +1457,7 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
     auto *compactHit = nickControl(*compactAuthor);
     assert(compactHit && compactHit->y() + compactHit->height() <= compact.y() + .02f);
     assert(compact.x() < withTime);
-    const auto indent = [&](const Body &rendered) {
-        return 1.5f *
-               renderer.measureText("0", rendered.text.fontSize(), rendered.text.font()).width;
-    };
-    near(sceneBounds(compact.body).x, sceneBounds(*compactAuthor->parent()).x + indent(compact));
+    near(sceneBounds(compact.body).x, sceneBounds(*compactAuthor->parent()).x);
     assert(sceneBounds(compact.body).width + .02f >= compactAuthor->parent()->width());
     visibleNickInk(*compactAuthor, *compactHit);
     const auto compactGrouped = body(view, "GroupedLine");
@@ -1465,6 +1467,20 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
     near(compactGrouped.x(), compactLead.x());
     const auto previousBounds = bounds(compactLead);
     assert(bounds(compactGrouped).top >= previousBounds.top + previousBounds.height);
+    const auto compactWrapped = body(view, "ChannelAnchor");
+    auto *wrappedAuthor = plainText(compactWrapped.content, "Bob");
+    assert(wrappedAuthor);
+    const float column = sceneBounds(*wrappedAuthor->parent()).x;
+    float lastLine = -1;
+    int lines = 0;
+    for (const auto &child : compactWrapped.body.children())
+        if (const auto *fragment = dynamic_cast<InputArea *>(child.get());
+            fragment && fragment->y() > lastLine) {
+            near(sceneBounds(*fragment).x, column);
+            lastLine = fragment->y();
+            ++lines;
+        }
+    assert(lines > 1);
     if (zoom == 2.f) {
         arrangeFirstRows({17, 23, 720, narrow.height});
         const auto minimum = body(view, "AlphaLine");
@@ -1474,7 +1490,7 @@ void channelConversation(TranscriptTestRenderer &renderer, float zoom) {
         assert(prefix && prefix->y() + prefix->height() <= minimum.y() + .02f);
         const auto minimumBody = sceneBounds(minimum.body);
         const auto minimumNick = sceneBounds(*minimumAuthor->parent());
-        near(minimumBody.x, minimumNick.x + indent(minimum));
+        near(minimumBody.x, minimumNick.x);
         assert(minimumNick.x + minimumNick.width <= minimumBody.x + minimumBody.width + .02f);
         containedBounds(minimumBody, nativeHistoryClip(view));
         containedBounds(sceneBounds(*prefix), nativeHistoryClip(view));
@@ -2854,6 +2870,21 @@ void minuteAuthorGroups(TranscriptTestRenderer &renderer, const char *kind) {
             assert(&lead.row != &next.row);
             near(lead.x(), next.x());
             assert(bounds(next).top >= bounds(lead).top + bounds(lead).height - .02f);
+            if (layout != blast::MessageLayout::Bubbles) {
+                const auto *leadSender = plainText(lead.content, "Peer[");
+                assert(leadSender);
+                near(sceneBounds(*leadSender->parent()).x, sceneBounds(next.body).x);
+                const auto ownLead = body(view, "OwnStart");
+                const auto *sender = plainText(ownLead.content, "Peer[");
+                assert(sender);
+                const auto authorHeader = sceneBounds(*sender->parent()->parent());
+                const auto nextRow = sceneBounds(next.row);
+                const auto runOn = sceneBounds(next.body);
+                near(runOn.y, nextRow.y);
+                const auto scale = blast::themeScale();
+                near(nextRow.y + nextRow.height - (runOn.y + runOn.height), 3 * scale);
+                near(authorHeader.y - (runOn.y + runOn.height), 14 * scale);
+            }
             clock("RunStart", "12:34", timestamps);
             for (const auto token :
                  {"RunContinues", "OwnStart", "OwnContinues", "IncomingAgain", "EmoteBreak"})
@@ -9557,9 +9588,10 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
     InputDispatcher dispatcher;
     dispatcher.setSceneRoot(&view);
     view.setInputDispatcher(dispatcher);
+    float width = 1800;
     const auto arrange = [&] {
         view.sync();
-        view.arrange(renderer, {17, 23, 1800, 1000});
+        view.arrange(renderer, {17, 23, width, 1000});
     };
     arrange();
     const auto rendered = body(view, original, true);
@@ -9706,8 +9738,13 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
         theme.update(model);
         for (const char *mode : {"THEME", "CLASSIC", "VIVID"}) {
             model.settings.nickPalette = mode;
-            for (const auto layout : {blast::MessageLayout::Bubbles, blast::MessageLayout::Irc,
-                                      blast::MessageLayout::Stacked}) {
+            for (const auto &[layout, layoutWidth] :
+                 {std::pair{blast::MessageLayout::Bubbles, 1800.f},
+                  std::pair{blast::MessageLayout::Irc, 1800.f},
+                  std::pair{blast::MessageLayout::Irc, 240.f},
+                  std::pair{blast::MessageLayout::Stacked, 1800.f}}) {
+                width = layoutWidth;
+                const bool stacked = layout == blast::MessageLayout::Stacked || width == 240;
                 model.settings.messageLayouts[buffer.id] = layout;
                 for (const bool own : {false, true}) {
                     buffer.messages.front().own = own;
@@ -9721,9 +9758,19 @@ void inlineNicknameChips(TranscriptTestRenderer &renderer) {
                     const auto ink = nicknameInk("Alice", true);
                     assert(contrast(ink, surface) >= 4.5f);
                     const auto current = body(view, original, true);
-                    if (!own && layout != blast::MessageLayout::Bubbles) {
+                    if (layout != blast::MessageLayout::Bubbles) {
                         auto *sender = plainText(current.content, "Alice");
-                        assert(sender && contrast(sender->color(), surface) >= 4.5f);
+                        assert(sender);
+                        if (!own)
+                            assert(contrast(sender->color(), surface) >= 4.5f);
+                        else if (stacked) {
+                            const auto backdrop = blast::themeConversationBackdrop();
+                            assert(!find<RectNode>(*sender->parent()->parent()));
+                            const auto accent = blast::themeForegroundColor("primary");
+                            assert(sender->color() ==
+                                   blast::themePairedForeground(backdrop, accent));
+                            assert(contrast(sender->color(), backdrop) >= 4.5f);
+                        }
                     }
                     auto *quote = plainText(current.content, "{Nick}");
                     assert(quote && contrast(quote->color(), blast::themeSurfaceColor(

@@ -699,7 +699,6 @@ struct Geometry {
     TextFont nickStyle, activityStyle;
     float header = 20, footer = 14, quote = 24, reaction = 29, day = 36, unread = 30;
     float bodyLine = 0, nickLine = 0, nickHeader = 0, activityLine = 0, metadataHeader = 0;
-    float stackedBodyIndent = 0;
     float verticalPadding = 0;
     bool conversation = false, channel = false, inlineChannel = false;
     bool bubbles = false, avatars = false, timestamps = false, tight = false;
@@ -717,6 +716,10 @@ struct Geometry {
     float paddingY(bool presence) const { return presence ? 0 : verticalPadding * scale; }
     float chipPadding() const { return (tight ? 4 : 6) * scale; }
     float chipPaddingY() const { return scale; }
+    float stackedHeaderGap() const { return 4 * scale; }
+    bool ownNickPill(const Message &entry) const {
+        return inlineChannel && entry.own && !entry.action;
+    }
     float activityPadding() const { return (tight ? 6 : 8) * scale; }
     float activityPaddingY() const { return 2 * scale; }
     float activityClockFont() const { return activityFont * (5.f / 6); }
@@ -772,8 +775,7 @@ struct Geometry {
     }
     float prefixWidth(bool presence) const {
         return presence  ? timeGutter
-               : channel ? (inlineChannel ? channelPrefix()
-                                          : compactAvatarInset(false) + stackedBodyIndent)
+               : channel ? (inlineChannel ? channelPrefix() : compactAvatarInset(false))
                : dense() ? timeGutter
                          : 0;
     }
@@ -916,8 +918,7 @@ Geometry geometry(Renderer &renderer, const Buffer &buffer, const Model &model, 
             result.nickGutter = inlineNick;
         else {
             result.nickGutter = available;
-            result.stackedBodyIndent =
-                1.5f * renderer.measureText("0", result.font, themeMessageFont()).width;
+            result.metrics.rowGap += 2;
         }
     }
     if (result.groupsByMinute()) {
@@ -3367,11 +3368,12 @@ struct TranscriptView::Impl {
         const float line = notice ? g.activityLine : g.bodyLine;
         const float lines = std::max(1.f, std::ceil(float(text.size()) * font * .5f / bodyWidth));
         row.bodyHeight = line * lines;
+        const float header = g.bubbles      ? g.nickHeader
+                             : entry.action ? 0
+                                            : g.metadataHeader + g.stackedHeaderGap();
         row.bodyOffset = paddingY + (row.day ? g.day : 0) + (row.unread ? g.unread : 0) +
                          g.groupGap(entry.presence, row.grouped) +
-                         (!collapsed && g.authorHeader(row.grouped, entry.presence)
-                              ? (g.bubbles ? g.nickHeader : g.metadataHeader)
-                              : 0) +
+                         (!collapsed && g.authorHeader(row.grouped, entry.presence) ? header : 0) +
                          (entry.reply.empty() ? 0 : g.quote) +
                          (buffer.kind == "mentions" ? g.metadataHeader : 0);
         const float footer = g.footerVisible(entry, row.showClock)
@@ -4210,10 +4212,9 @@ struct TranscriptView::Impl {
             };
             if (!stackedEmote && g.nickVisible(row.grouped, entry.presence)) {
                 const auto align = g.inlineChannel ? TextAlign::End : TextAlign::Start;
-                const float nickWidth =
-                    std::max(1.f, g.channelNickWidth(row.showClock) -
-                                      g.compactAvatarInset(g.inlineChannel) - friendExtent -
-                                      (entry.own && !entry.action ? 2 * g.chipPadding() : 0));
+                const float nickWidth = std::max(
+                    1.f, g.channelNickWidth(row.showClock) - g.compactAvatarInset(g.inlineChannel) -
+                             friendExtent - (g.ownNickPill(entry) ? 2 * g.chipPadding() : 0));
                 const float marker = emote ? g.actionMarkerWidth(nickWidth) : 0;
                 include(entry.nick, nickWidth - marker, align, true);
             }
@@ -4230,9 +4231,9 @@ struct TranscriptView::Impl {
             }
             const float textHeight = row.prefixAscent + descent;
             row.prefixHeight = std::max(entry.presence ? 0.f : g.metadataHeader, textHeight);
-            if (!stackedEmote && g.nickVisible(row.grouped, entry.presence))
-                row.prefixHeight = std::max(
-                    row.prefixHeight, g.metadataHeader + (entry.own ? 2 * g.chipPaddingY() : 0));
+            if (g.inlineChannel && entry.own && g.nickVisible(row.grouped, entry.presence))
+                row.prefixHeight =
+                    std::max(row.prefixHeight, g.metadataHeader + 2 * g.chipPaddingY());
             if (g.inlineChannel && g.nickVisible(row.grouped, entry.presence) &&
                 g.compactAvatarSize(true) > 0) {
                 const float size = g.compactAvatarSize(true);
@@ -4244,14 +4245,14 @@ struct TranscriptView::Impl {
                     std::max({row.prefixHeight, size,
                               2 * std::max(size * center - offset, size * (1 - center) + offset)});
             }
-            row.prefixAscent =
-                entry.own && !entry.action && g.nickVisible(row.grouped, entry.presence)
-                    ? row.prefixHeight * .5f - nickInkCenter
-                    : row.prefixAscent + (row.prefixHeight - textHeight) * .5f;
+            row.prefixAscent = g.ownNickPill(entry) && g.nickVisible(row.grouped, entry.presence)
+                                   ? row.prefixHeight * .5f - nickInkCenter
+                                   : row.prefixAscent + (row.prefixHeight - textHeight) * .5f;
             row.prefixBaseline = row.bodyOffset + row.prefixAscent;
         }
         if (!collapsed && !emote && g.authorHeader(row.grouped, entry.presence))
-            row.bodyOffset += g.channel ? row.prefixHeight : row.authorHeader;
+            row.bodyOffset +=
+                g.channel ? row.prefixHeight + g.stackedHeaderGap() : row.authorHeader;
         row.bodyOffset += row.quoteHeight;
         if (buffer.kind == "mentions")
             row.bodyOffset += g.metadataHeader;
@@ -4278,9 +4279,7 @@ struct TranscriptView::Impl {
             if (g.channel && !g.inlineChannel && !stackedEmote) {
                 float metadataWidth = 0;
                 if (g.nickVisible(row.grouped, entry.presence)) {
-                    const float chipPadding = entry.own && !entry.action ? g.chipPadding() : 0;
-                    const float adornments =
-                        g.compactAvatarInset(false) + 2 * chipPadding + friendExtent;
+                    const float adornments = g.compactAvatarInset(false) + friendExtent;
                     const float textLimit =
                         std::max(1.f, g.channelNickWidth(row.showClock) - adornments);
                     auto actorFont = themeUiFont();
@@ -4745,7 +4744,8 @@ struct TranscriptView::Impl {
                     });
                     const float avatarSize = g.compactAvatarSize(g.inlineChannel);
                     const float avatarInset = g.compactAvatarInset(g.inlineChannel);
-                    const float chipPadding = entry.own && !entry.action ? g.chipPadding() : 0;
+                    const bool ownPill = g.ownNickPill(entry);
+                    const float chipPadding = ownPill ? g.chipPadding() : 0;
                     const float available = width - avatarInset - 2 * chipPadding - friendExtent;
                     const float marker = emote ? g.actionMarkerWidth(available) : 0;
                     const float textLimit = std::max(1.f, available - marker);
@@ -4763,7 +4763,7 @@ struct TranscriptView::Impl {
                     const float clusterX =
                         g.inlineChannel ? std::max(0.f, width - clusterWidth) : 0;
                     const float nameX = clusterX + avatarInset + marker;
-                    if (entry.own && !entry.action) {
+                    if (ownPill) {
                         slot.ownNickChip = true;
                         const float chipHeight =
                             std::min(row.prefixHeight, g.metadataHeader + 2 * g.chipPaddingY());
@@ -4771,7 +4771,16 @@ struct TranscriptView::Impl {
                             *area, nameX, (row.prefixHeight - chipHeight) * .5f, chipWidth,
                             chipHeight, themeForegroundColor("primary"), g.cornerRadius);
                     }
-                    const auto ink = !slot.ownNickChip ? senderInk(entry) : std::array<Color, 2>{};
+                    const auto ink = [&] {
+                        if (ownPill)
+                            return std::array<Color, 2>{};
+                        if (stacked && entry.own) {
+                            const auto accent = themeForegroundColor("primary");
+                            return std::array{themePairedForeground(row.backdrop[0], accent),
+                                              themePairedForeground(row.backdrop[1], accent)};
+                        }
+                        return senderInk(entry);
+                    }();
                     if (marker > 0)
                         slot.actionMarker = renderActionMarker(renderer, *area, nameX - marker,
                                                                row.prefixHeight * .5f,
@@ -4807,10 +4816,9 @@ struct TranscriptView::Impl {
                         slot.friendBadge = friendGlyph(
                             *area, nameX + chipPadding + textWidth + 4 * g.scale,
                             (row.prefixHeight - 14 * g.scale) * .5f, 14 * g.scale,
-                            entry.own && !entry.action
-                                ? themeForegroundColor("on_primary")
-                                : nickColor(model, entry.nick, sourceServer(buffer, entry)));
-                    if (entry.own && !entry.action)
+                            ownPill ? themeForegroundColor("on_primary")
+                                    : nickColor(model, entry.nick, sourceServer(buffer, entry)));
+                    if (ownPill)
                         slot.nickChipText = name;
                     else
                         rememberSender(name, ink);
@@ -4846,8 +4854,8 @@ struct TranscriptView::Impl {
                        g.channelNickWidth(row.showClock), true);
             if (row.showClock && stacked)
                 prefix(clockText(entry), clusterEnd + 8 * g.scale, g.clockWidth, false);
-            if (stacked)
-                y += row.prefixHeight;
+            if (stacked && g.nickVisible(row.grouped, entry.presence))
+                y += row.prefixHeight + g.stackedHeaderGap();
         }
         if (g.dense() && !g.channel && !entry.presence && row.showClock)
             slot.labelInk.emplace_back(label(*slot.content, clockText(entry), surfaceX, y,

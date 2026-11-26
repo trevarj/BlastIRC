@@ -116,8 +116,9 @@ inline void appendEscaped(std::string &out, std::string_view text) {
 }
 inline void appendMarkup(std::string &out, std::string_view text, const IrcStyle &style,
                          bool colors) {
+    const bool hasColor = style.foreground || style.background;
     const bool span = style.bold || style.italic || style.underline || style.strike ||
-                      style.monospace || (colors && (style.foreground || style.background));
+                      style.monospace || hasColor;
     if (span) {
         out += "<span";
         if (style.bold)
@@ -134,6 +135,8 @@ inline void appendMarkup(std::string &out, std::string_view text, const IrcStyle
             out += " foreground=\"" + formatRgbHex(*style.foreground) + "\"";
         if (colors && style.background)
             out += " background=\"" + formatRgbHex(*style.background) + "\"";
+        if (!colors && hasColor)
+            out += " alpha=\"65535\"";
         out += '>';
     }
     appendEscaped(out, text);

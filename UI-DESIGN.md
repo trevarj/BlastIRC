@@ -204,6 +204,8 @@ Preserve:
 
 The native Input remains the sole raw-document, caret, undo, selection, and IME authority across conversation changes. App-owned IRC parsing supplies cached visible text, escaped markup, contrast markup, and raw/display UTF-8 boundary mapping. Use the same native shaping for drawing, measurement, hit testing, selection, caret cells, and IME geometry; colored markup needs the RGBA path, while shadows retain coverage-mask semantics.
 
+Contrast markup removes IRC foreground and background colors but retains their Pango run boundaries with a fully opaque foreground-alpha attribute. This keeps fallback-font caret metrics and glyph placement aligned with the colored text.
+
 Input matches the actual active buffer's message font and text size, not interface scale. Known-nickname coloring is a display-only projection; explicit mIRC formatting takes precedence without mutating raw bytes, copy, undo, or preedit. While the composer has authoritative IME preedit, physical Enter/Return must not discard it or submit; wait for the input method's commit. Native text-box `C-e` moves to logical hard-newline end rather than soft-wrap end; open reactions only when a message owns focus.
 
 Composer `C-SPC` sets the selection mark. `C-e` extends it to the end of the line without collapsing the region; `C-x C-SPC` remains the separate activity shortcut.
